@@ -44,6 +44,9 @@ import {
   loadRun,
   loadTimeline,
   loadThreadTimeline,
+  loadChannelMessage,
+  loadHumanNotificationCounts,
+  loadHumanNotifications,
   loadWorkspaceConfig,
   moveMemoriesScope,
   moveMemoryScope,
@@ -57,6 +60,8 @@ import {
   submitCommand,
   streamTimeline,
   streamAgentChanges,
+  streamHumanNotifications,
+  markHumanNotificationRead,
   updateRuntimeSettings,
   updateRoutingPolicy,
   updateGitHubSettings,
@@ -1834,7 +1839,6 @@ describe("Workshop client API", () => {
   });
 
   it("creates the stream identity without secure-context randomUUID", async () => {
-    sessionStorage.removeItem("kai.workshop.event-stream-id.v1");
     const availableCrypto = globalThis.crypto;
     vi.stubGlobal("crypto", {
       getRandomValues: availableCrypto.getRandomValues.bind(availableCrypto),
@@ -2158,6 +2162,151 @@ describe("Workshop client API", () => {
     const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
     expect(headers.get("Last-Event-ID")).toBe("95");
     expect(headers.get("X-Kai-Stream-ID")).toMatch(/:agents$/);
+  });
+
+  it("loads and mutates the canonical Mentions inbox with channel counts", async () => {
+    const notification = {
+      channel_name: "General",
+      created_at: "2026-08-31T15:00:00Z",
+      created_event_position: 80,
+      kind: "mention",
+      last_event_position: 80,
+      notification_id: "ntf_00000000000000000000000000000001",
+      read: false,
+      read_at: null,
+      source_author_display_name: "Scott",
+      source_author_principal_id: "prn_00000000000000000000000000000003",
+      source_channel_id: channelId,
+      source_message_id: "msg_00000000000000000000000000000080",
+      source_thread_root_id: null,
+      state_version: 0,
+    };
+    const counts = {
+      read: 0,
+      total: 1,
+      unread: 1,
+      unread_by_channel: { [channelId]: 1 },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        counts,
+        next_cursor: "older",
+        notifications: [notification],
+        through_position: 80,
+        version: 1,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...counts, version: 1 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        changed: true,
+        notification: {
+          ...notification,
+          last_event_position: 81,
+          read: true,
+          read_at: "2026-08-31T15:01:00Z",
+          state_version: 1,
+        },
+        replayed: false,
+        version: 1,
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const page = await loadHumanNotifications("session-secret", { limit: 25 });
+    const loadedCounts = await loadHumanNotificationCounts("session-secret");
+    const mutation = await markHumanNotificationRead(
+      "session-secret",
+      notification.notification_id,
+      0,
+      "read-one",
+    );
+
+    expect(page.counts.unreadByChannel).toEqual({ [channelId]: 1 });
+    expect(page.notifications[0]).toMatchObject({
+      notificationId: notification.notification_id,
+      sourceAuthorDisplayName: "Scott",
+    });
+    expect(loadedCounts.unread).toBe(1);
+    expect(mutation.notification.read).toBe(true);
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/v1/client/notifications?limit=25",
+      "/v1/client/notifications/counts",
+      `/v1/client/notifications/${notification.notification_id}/read`,
+    ]);
+  });
+
+  it("streams typed human notification changes over a distinct live connection", async () => {
+    const notification = {
+      channel_name: "General",
+      created_at: "2026-08-31T15:00:00Z",
+      created_event_position: 80,
+      kind: "mention",
+      last_event_position: 80,
+      notification_id: "ntf_00000000000000000000000000000001",
+      read: false,
+      read_at: null,
+      source_author_display_name: "Scott",
+      source_author_principal_id: "prn_00000000000000000000000000000003",
+      source_channel_id: channelId,
+      source_message_id: "msg_00000000000000000000000000000080",
+      source_thread_root_id: null,
+      state_version: 0,
+    };
+    const frame = [
+      "id: 80",
+      "event: human_notification.changed",
+      `data: ${JSON.stringify({
+        event_position: 80,
+        event_type: "human_notification.created",
+        notification,
+        version: 1,
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(stream, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onChanged = vi.fn();
+
+    await streamHumanNotifications(
+      "session-secret",
+      "79",
+      { onChanged, onConnected: vi.fn() },
+      new AbortController().signal,
+    );
+
+    expect(onChanged).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventPosition: 80,
+        transition: "human_notification.created",
+      }),
+      "80",
+    );
+    const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
+    expect(headers.get("Last-Event-ID")).toBe("79");
+    expect(headers.get("X-Kai-Stream-ID")).toMatch(/:mentions$/);
+  });
+
+  it("loads one exact authorized channel message", async () => {
+    const messageId = "msg_00000000000000000000000000000080";
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      channel_id: channelId,
+      message: { ...message(80), message_id: messageId },
+      version: 1,
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loadedMessage = await loadChannelMessage(session, messageId);
+
+    expect(loadedMessage.messageId).toBe(messageId);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/v1/channels/${channelId}/messages/${messageId}`,
+      expect.objectContaining({ cache: "no-store" }),
+    );
   });
 
   it("loads and changes canonical human channel membership", async () => {

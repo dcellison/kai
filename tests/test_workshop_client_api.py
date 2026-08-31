@@ -4186,6 +4186,22 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             await client.close()
             await store.close()
 
+    async def test_default_stream_capacity_supports_four_workshop_pages(self):
+        principal_id = PrincipalId("prn_00000000000000000000000000000001")
+        limiter = WorkshopEventStreamLimiter()
+
+        claims = tuple(
+            limiter.acquire(principal_id, f"page-{page}:{stream}".encode())
+            for page in range(4)
+            for stream in ("timeline", "agents", "mentions")
+        )
+
+        assert all(claim is not None for claim in claims)
+        assert limiter.acquire(principal_id, b"fifth-page:timeline") is None
+        for claim in claims:
+            assert claim is not None
+            limiter.release(claim)
+
     async def test_concurrent_stream_capacity_is_bounded_and_released_on_disconnect(self, tmp_path: Path):
         store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
         limiter = WorkshopEventStreamLimiter(per_principal_limit=1, global_limit=1)

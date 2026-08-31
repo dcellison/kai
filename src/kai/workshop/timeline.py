@@ -508,6 +508,41 @@ async def read_channel_timeline(
     )
 
 
+async def read_channel_message(
+    store: WorkshopEventStore,
+    *,
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    authorizer: ChannelTimelineAuthorizer,
+) -> TimelineMessage:
+    """Read one exact visible message from an authorized canonical channel."""
+    _validate_request(principal_id, channel_id, 1)
+    if not isinstance(message_id, MessageId):
+        raise ValueError("message_id must be a MessageId")
+    await _authorize(authorizer, principal_id, channel_id)
+    if not await _channel_exists(store, channel_id):
+        raise TimelineAccessDeniedError("Message access denied")
+    through_position = await _latest_message_position(store, channel_id)
+    async with store.connection.execute(
+        "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
+        "m.reply_to_message_id, m.thread_root_id, m.body, m.created_event_position, m.created_at, "
+        "m.mentions_json, e.metadata_json, "
+        "(SELECT COUNT(*) FROM messages tr WHERE tr.thread_root_id = m.id), "
+        "(SELECT MAX(tr.created_at) FROM messages tr WHERE tr.thread_root_id = m.id) "
+        "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
+        "WHERE m.id = ? AND m.channel_id = ? "
+        f"AND {_VISIBLE_MESSAGE_PREDICATE}",
+        (message_id, channel_id),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id)
+    if len(messages) != 1 or messages[0].event_position > through_position:
+        raise TimelineAccessDeniedError("Message access denied")
+    return messages[0]
+
+
 async def _read_thread_root(
     store: WorkshopEventStore,
     channel_id: ChannelId,

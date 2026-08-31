@@ -221,6 +221,7 @@ from kai.workshop.timeline import (
     TimelineCursorError,
     TimelineMessage,
     TimelineResumeError,
+    read_channel_message,
     read_channel_timeline,
     read_thread_timeline,
 )
@@ -232,6 +233,7 @@ from kai.workshop.wake_policy import (
 )
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
+_CHANNEL_MESSAGE_PATH = "/v1/channels/{channel_id}/messages/{message_id}"
 _THREAD_TIMELINE_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _MESSAGE_REACTIONS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions"
@@ -2810,7 +2812,7 @@ class _WorkshopEventStreamClaim:
 class WorkshopEventStreamLimiter:
     """Bound concurrent long-lived streams per principal and process."""
 
-    def __init__(self, *, per_principal_limit: int = 4, global_limit: int = 32) -> None:
+    def __init__(self, *, per_principal_limit: int = 12, global_limit: int = 96) -> None:
         if per_principal_limit < 1 or global_limit < per_principal_limit:
             raise ValueError("Event-stream concurrency bounds are invalid")
         self._per_principal_limit = per_principal_limit
@@ -4130,6 +4132,39 @@ async def _handle_channel_timeline(
     )
 
 
+async def _handle_channel_message(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid message request")
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        message_id = MessageId(request.match_info["message_id"])
+        message = await read_channel_message(
+            store,
+            principal_id=principal_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            authorizer=CanonicalChannelAuthorizer(store),
+        )
+    except TimelineAccessDeniedError:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid message request")
+    return _json_response(
+        {"version": 1, "channel_id": str(channel_id), "message": _serialize_message(message)},
+        status=200,
+    )
+
+
 async def _handle_thread_timeline(
     request: web.Request,
     *,
@@ -4524,8 +4559,10 @@ async def _handle_human_notifications(
                 "total": page.counts.total,
                 "unread": page.counts.unread,
                 "read": page.counts.read,
+                "unread_by_channel": {str(channel_id): count for channel_id, count in page.counts.unread_by_channel},
             },
             "next_cursor": page.next_cursor,
+            "through_position": page.through_position,
         },
         status=200,
     )
@@ -4546,7 +4583,13 @@ async def _handle_human_notification_counts(
         return _error_response(status=400, code="invalid_request", message="Invalid notification count request")
     counts = await service.counts(principal_id)
     return _json_response(
-        {"version": 1, "total": counts.total, "unread": counts.unread, "read": counts.read},
+        {
+            "version": 1,
+            "total": counts.total,
+            "unread": counts.unread,
+            "read": counts.read,
+            "unread_by_channel": {str(channel_id): count for channel_id, count in counts.unread_by_channel},
+        },
         status=200,
     )
 
@@ -5762,6 +5805,14 @@ def register_workshop_read_routes(
             routing_policy=routing_policy,
         )
 
+    async def handle_channel_message(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_message(
+                request,
+                store=store,
+                authenticator=authenticator,
+            )
+
     async def handle_human_notifications(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_human_notifications(
@@ -5888,6 +5939,7 @@ def register_workshop_read_routes(
         app.router.add_post(_AGENT_ENABLE_PATH, handle_agent_enable)
         app.router.add_post(_AGENT_DISABLE_PATH, handle_agent_disable)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
+    app.router.add_get(_CHANNEL_MESSAGE_PATH, handle_channel_message)
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
     app.router.add_put(_MESSAGE_REACTIONS_PATH, handle_message_reaction)

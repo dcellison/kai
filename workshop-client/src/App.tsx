@@ -23,6 +23,7 @@ import {
   detachChannelAgent,
   loadAppearancePreferences,
   loadChannelMembers,
+  loadChannelMessage,
   loadAgentEnablements,
   loadNavigation,
   loadNotificationPreferences,
@@ -60,9 +61,10 @@ import type {
   WorkshopAgentEnablement,
   WorkshopAppearancePreferences,
   WorkshopHumanMembership,
+  WorkshopHumanNotification,
   WorkshopReaction,
 } from "./types";
-import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN } from "./types";
+import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN, MESSAGE_PATTERN } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
 import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
@@ -72,6 +74,8 @@ import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
 import { SettingsWorkspace } from "./SettingsWorkspace";
 import { AgentWorkspace } from "./AgentWorkspace";
+import { MentionsInbox } from "./MentionsInbox";
+import { useHumanNotifications } from "./useHumanNotifications";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 
@@ -91,7 +95,7 @@ const COLLAPSED_SIDEBAR_WIDTH_PX = 56 * UI_SCALE;
 const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
 
 type WorkshopDestination =
-  | { kind: "conversation" }
+  | { kind: "conversation"; messageId?: string; threadRootId?: string | null }
   | {
       kind: "agents";
       creating: boolean;
@@ -99,6 +103,7 @@ type WorkshopDestination =
       section: "runtime" | null;
     }
   | { kind: "memory"; memoryId: string | null }
+  | { kind: "mentions" }
   | {
       kind: "settings";
       runtimeChannelId: string | null;
@@ -106,6 +111,9 @@ type WorkshopDestination =
 
 function destinationFromLocation(): WorkshopDestination {
   const parameters = new URLSearchParams(window.location.search);
+  if (parameters.get("view") === "mentions") {
+    return { kind: "mentions" };
+  }
   if (parameters.get("view") === "settings") {
     const runtimeChannelId = parameters.get("runtime");
     const agentDefinitionId = parameters.get("agent");
@@ -141,7 +149,13 @@ function destinationFromLocation(): WorkshopDestination {
     };
   }
   if (parameters.get("view") !== "memory") {
-    return { kind: "conversation" };
+    const messageId = parameters.get("message");
+    const threadRootId = parameters.get("thread");
+    return {
+      kind: "conversation",
+      ...(messageId && MESSAGE_PATTERN.test(messageId) ? { messageId } : {}),
+      ...(threadRootId && MESSAGE_PATTERN.test(threadRootId) ? { threadRootId } : {}),
+    };
   }
   const memoryId = parameters.get("memory");
   return {
@@ -161,6 +175,8 @@ function writeDestination(
   url.searchParams.delete("runtime");
   url.searchParams.delete("new");
   url.searchParams.delete("section");
+  url.searchParams.delete("message");
+  url.searchParams.delete("thread");
   if (destination.kind === "memory") {
     url.searchParams.set("view", "memory");
     if (destination.memoryId) {
@@ -181,6 +197,15 @@ function writeDestination(
     }
     if (destination.section) {
       url.searchParams.set("section", destination.section);
+    }
+  } else if (destination.kind === "mentions") {
+    url.searchParams.set("view", "mentions");
+  } else if (destination.kind === "conversation") {
+    if (destination.messageId) {
+      url.searchParams.set("message", destination.messageId);
+    }
+    if (destination.threadRootId) {
+      url.searchParams.set("thread", destination.threadRootId);
     }
   }
   window.history[mode === "push" ? "pushState" : "replaceState"](
@@ -771,6 +796,7 @@ const MESSAGE_REACTIONS: {
 ];
 
 function MessageItem({
+  highlighted = false,
   message,
   notification = false,
   onDownloadArtifact,
@@ -778,6 +804,7 @@ function MessageItem({
   onOpenThread,
   onSetReaction,
 }: {
+  highlighted?: boolean;
   message: TimelineMessage;
   notification?: boolean;
   onDownloadArtifact: (artifactId: string) => void;
@@ -817,7 +844,7 @@ function MessageItem({
   };
   if (notification) {
     return (
-      <li className="notification-row">
+      <li className={`notification-row ${highlighted ? "focused-message" : ""}`} data-message-id={message.messageId}>
         <span className="notification-source" aria-hidden="true">GH</span>
         <article>
           <header className="message-meta">
@@ -840,7 +867,10 @@ function MessageItem({
     );
   }
   return (
-    <li className={`message-row ${isAgent ? "agent" : "human"}`}>
+    <li
+      className={`message-row ${isAgent ? "agent" : "human"} ${highlighted ? "focused-message" : ""}`}
+      data-message-id={message.messageId}
+    >
       <span className="message-avatar" aria-hidden="true">
         {displayName.slice(0, 1).toUpperCase()}
       </span>
@@ -1677,6 +1707,7 @@ function ViewIcon(): React.JSX.Element {
 function ThreadPane({
   channelName,
   liveMessages,
+  focusedMessage,
   onClose,
   onDownloadArtifact,
   onLoadArtifact,
@@ -1690,6 +1721,7 @@ function ThreadPane({
 }: {
   channelName: string;
   liveMessages: TimelineMessage[];
+  focusedMessage: TimelineMessage | null;
   onClose: () => void;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
@@ -1748,10 +1780,23 @@ function ThreadPane({
         byId.set(message.messageId, message);
       }
     }
+    if (focusedMessage?.threadRootId === rootMessage.messageId) {
+      byId.set(focusedMessage.messageId, focusedMessage);
+    }
     return Array.from(byId.values()).sort(
       (left, right) => left.eventPosition - right.eventPosition,
     );
-  }, [liveMessages, rootMessage.messageId, snapshot?.messages]);
+  }, [focusedMessage, liveMessages, rootMessage.messageId, snapshot?.messages]);
+
+  useEffect(() => {
+    if (!focusedMessage) return;
+    const frame = window.requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-message-id="${focusedMessage.messageId}"]`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusedMessage, replies.length]);
 
   const loadMore = async (): Promise<void> => {
     if (!snapshot?.nextCursor || loadingMore) {
@@ -1814,6 +1859,7 @@ function ThreadPane({
       <div className="thread-scroll">
         <ol className="thread-message-list">
           <MessageItem
+            highlighted={focusedMessage?.messageId === rootMessage.messageId}
             message={(() => {
               const message = snapshot?.root ?? rootMessage;
               return {
@@ -1827,6 +1873,7 @@ function ThreadPane({
           />
           {replies.map((message) => (
             <MessageItem
+              highlighted={focusedMessage?.messageId === message.messageId}
               key={message.messageId}
               message={{
                 ...message,
@@ -1902,6 +1949,11 @@ function WorkshopView({
   threadMessages,
   memoryDestination,
   memoryToken,
+  mentionsDestination,
+  inbox,
+  focusedMessage,
+  focusedThreadRoot,
+  focusedMessageError,
   settingsDestination,
   settingsRuntimeLabel,
   settingsSession,
@@ -1930,6 +1982,8 @@ function WorkshopView({
   onChangeChannelMember,
   onMemoryAuthenticationFailure,
   onOpenMemory,
+  onOpenMentions,
+  onOpenHumanNotification,
   onCreateAgent,
   onOpenAgentDefinition,
   onOpenAgentChannel,
@@ -1957,6 +2011,11 @@ function WorkshopView({
   threadMessages: TimelineMessage[];
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
+  mentionsDestination: boolean;
+  inbox: ReturnType<typeof useHumanNotifications>;
+  focusedMessage: TimelineMessage | null;
+  focusedThreadRoot: TimelineMessage | null;
+  focusedMessageError: string | null;
   settingsDestination: boolean;
   settingsRuntimeLabel: string;
   settingsSession: WorkshopSession;
@@ -1994,6 +2053,8 @@ function WorkshopView({
   ) => Promise<number>;
   onMemoryAuthenticationFailure: (message: string) => void;
   onOpenMemory: () => void;
+  onOpenMentions: () => void;
+  onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onCreateAgent: () => void;
   onOpenAgentDefinition: (agentId: string) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
@@ -2027,8 +2088,9 @@ function WorkshopView({
   const channelId = channel.channelId;
   const agentsOpen = agentDestination !== null;
   const memoryOpen = memoryDestination !== null;
+  const mentionsOpen = mentionsDestination;
   const settingsOpen = settingsDestination;
-  const auxiliaryWorkspaceOpen = agentsOpen || memoryOpen || settingsOpen;
+  const auxiliaryWorkspaceOpen = agentsOpen || memoryOpen || mentionsOpen || settingsOpen;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
@@ -2095,29 +2157,52 @@ function WorkshopView({
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
   const threadRootMessage = useMemo(
-    () => messages.find((message) => message.messageId === threadRootMessageId) ?? null,
-    [messages, threadRootMessageId],
+    () => messages.find((message) => message.messageId === threadRootMessageId) ??
+      (focusedThreadRoot?.messageId === threadRootMessageId ? focusedThreadRoot : null),
+    [focusedThreadRoot, messages, threadRootMessageId],
   );
   const displayedMessages = useMemo(
-    () => messages.map((message) => {
-      const liveReplies = threadMessages.filter(
-        (candidate) => candidate.threadRootId === message.messageId,
-      );
-      if (liveReplies.length === 0) {
-        return message;
-      }
-      return {
-        ...message,
-        replyCount: message.replyCount + liveReplies.length,
-        latestReplyAt: liveReplies[liveReplies.length - 1].createdAt,
-      };
-    }),
-    [messages, threadMessages],
+    () => {
+      const roots = focusedThreadRoot &&
+        !messages.some((message) => message.messageId === focusedThreadRoot.messageId)
+        ? [...messages, focusedThreadRoot].sort(
+            (left, right) => left.eventPosition - right.eventPosition,
+          )
+        : messages;
+      return roots.map((message) => {
+        const liveReplies = threadMessages.filter(
+          (candidate) => candidate.threadRootId === message.messageId,
+        );
+        if (liveReplies.length === 0) {
+          return message;
+        }
+        return {
+          ...message,
+          replyCount: message.replyCount + liveReplies.length,
+          latestReplyAt: liveReplies[liveReplies.length - 1].createdAt,
+        };
+      });
+    },
+    [focusedThreadRoot, messages, threadMessages],
   );
 
   useEffect(() => {
     setThreadRootMessageId(null);
   }, [channelId]);
+  useEffect(() => {
+    if (focusedMessage?.threadRootId) {
+      setThreadRootMessageId(focusedMessage.threadRootId);
+    }
+  }, [focusedMessage]);
+  useEffect(() => {
+    if (!focusedMessage || focusedMessage.threadRootId !== null) return;
+    const frame = window.requestAnimationFrame(() => {
+      timelineRef.current
+        ?.querySelector(`[data-message-id="${focusedMessage.messageId}"]`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [displayedMessages.length, focusedMessage]);
   const availableAgents = useMemo(() => {
     const unique = new Map<string, WorkshopAgentSummary>();
     for (const availableChannel of workshop.channels) {
@@ -2891,7 +2976,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${memoryOpen ? "memory-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -2936,6 +3021,21 @@ function WorkshopView({
             <span aria-hidden="true">◇</span>
             <span>Memory</span>
             {memoryOpen && <span className="live-pip" aria-label="Open" />}
+          </button>
+          <button
+            className={`channel-link mentions-link ${mentionsOpen ? "active" : ""}`}
+            type="button"
+            aria-label={`Mentions${inbox.counts.unread > 0 ? `, ${inbox.counts.unread} unread` : ""}`}
+            title="Mentions"
+            onClick={onOpenMentions}
+          >
+            <span aria-hidden="true">@</span>
+            <span>Mentions</span>
+            {inbox.counts.unread > 0 && (
+              <span className="mention-count" aria-hidden="true">
+                {inbox.counts.unread > 99 ? "99+" : inbox.counts.unread}
+              </span>
+            )}
           </button>
 
           {workshop.channels.some(
@@ -3005,13 +3105,24 @@ function WorkshopView({
               <button
                 className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                 type="button"
-                aria-label={channelDisplayName(availableChannel)}
+                aria-label={`${channelDisplayName(availableChannel)}${
+                  (inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0
+                    ? `, ${inbox.counts.unreadByChannel[availableChannel.channelId]} unread mentions`
+                    : ""
+                }`}
                 title={channelDisplayName(availableChannel)}
                 onClick={() => onSelectChannel(availableChannel.channelId)}
                 key={availableChannel.channelId}
               >
                 <span>{channelSymbol(availableChannel)}</span>
                 <span>{channelDisplayName(availableChannel)}</span>
+                {(inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0 && (
+                  <span className="mention-count" aria-label={`${inbox.counts.unreadByChannel[availableChannel.channelId]} unread mentions`}>
+                    {inbox.counts.unreadByChannel[availableChannel.channelId] > 99
+                      ? "99+"
+                      : inbox.counts.unreadByChannel[availableChannel.channelId]}
+                  </span>
+                )}
                 {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
                   <span className="live-pip" aria-label="Live" />
                 )}
@@ -3192,6 +3303,12 @@ function WorkshopView({
           onSelectMemory={onSelectMemory}
           token={memoryToken}
         />
+      ) : mentionsOpen ? (
+        <MentionsInbox
+          inbox={inbox}
+          onClose={() => onSelectChannel(channelId)}
+          onOpen={onOpenHumanNotification}
+        />
       ) : (
         <>
       <section className="conversation-pane">
@@ -3266,7 +3383,13 @@ function WorkshopView({
             </div>
           )}
 
-          {messages.length === 0 ? (
+          {focusedMessageError && (
+            <p className="source-navigation-error" role="alert">
+              {focusedMessageError} You can return to Mentions and update its read state there.
+            </p>
+          )}
+
+          {displayedMessages.length === 0 ? (
             <p className="empty-timeline">No messages yet. New activity will appear here.</p>
           ) : (
             <ol
@@ -3275,6 +3398,7 @@ function WorkshopView({
             >
               {displayedMessages.map((message) => (
                 <MessageItem
+                  highlighted={focusedMessage?.messageId === message.messageId}
                   key={message.messageId}
                   message={message}
                   notification={channel.kind === "notification"}
@@ -3532,6 +3656,7 @@ function WorkshopView({
           <ThreadPane
             channelName={channelName}
             liveMessages={threadMessages}
+            focusedMessage={focusedMessage}
             onClose={() => setThreadRootMessageId(null)}
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
@@ -3869,6 +3994,8 @@ function ActiveWorkshopClient({
   onOpenAgentDefinition,
   onOpenAgentChannel,
   onOpenMemory,
+  onOpenMentions,
+  onOpenHumanNotification,
   onOpenSettings,
   onRestoreChannel,
   onSelectChannel,
@@ -3889,6 +4016,8 @@ function ActiveWorkshopClient({
   onOpenAgentDefinition: (agentId: string) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenMemory: () => void;
+  onOpenMentions: () => void;
+  onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onOpenSettings: () => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectChannel: (channelId: string) => void;
@@ -3933,6 +4062,10 @@ function ActiveWorkshopClient({
     }),
     [session.channelId, session.token, settingsChannel?.channelId],
   );
+  const inbox = useHumanNotifications(session.token, onAuthenticationFailure);
+  const [focusedMessage, setFocusedMessage] = useState<TimelineMessage | null>(null);
+  const [focusedThreadRoot, setFocusedThreadRoot] = useState<TimelineMessage | null>(null);
+  const [focusedMessageError, setFocusedMessageError] = useState<string | null>(null);
   const {
     connection,
     messages,
@@ -3951,6 +4084,48 @@ function ActiveWorkshopClient({
       onAuthenticationFailure,
       onChannelAccessFailure,
     );
+  useEffect(() => {
+    if (destination.kind !== "conversation" || !destination.messageId) {
+      setFocusedMessage(null);
+      setFocusedThreadRoot(null);
+      setFocusedMessageError(null);
+      return;
+    }
+    const controller = new AbortController();
+    const messageId = destination.messageId;
+    setFocusedMessage(null);
+    setFocusedThreadRoot(null);
+    setFocusedMessageError(null);
+    const loadSource = async (): Promise<void> => {
+      try {
+        const source = await loadChannelMessage(
+          session,
+          messageId,
+          controller.signal,
+        );
+        const root = source.threadRootId
+          ? await loadChannelMessage(session, source.threadRootId, controller.signal)
+          : source;
+        if (!controller.signal.aborted) {
+          setFocusedMessage(source);
+          setFocusedThreadRoot(root);
+        }
+      } catch (caught) {
+        if (controller.signal.aborted) return;
+        if (caught instanceof AuthenticationError) {
+          onAuthenticationFailure(caught.message);
+          return;
+        }
+        setFocusedMessageError(
+          caught instanceof Error
+            ? caught.message
+            : "This mention's source message is no longer accessible.",
+        );
+      }
+    };
+    void loadSource();
+    return () => controller.abort();
+  }, [destination, onAuthenticationFailure, session]);
   const withAccessHandling = useCallback(
     async <Result,>(operation: () => Promise<Result>): Promise<Result> => {
       try {
@@ -4094,6 +4269,11 @@ function ActiveWorkshopClient({
       messages={messages}
       threadMessages={threadMessages}
       memoryDestination={destination.kind === "memory" ? destination : null}
+      mentionsDestination={destination.kind === "mentions"}
+      inbox={inbox}
+      focusedMessage={focusedMessage}
+      focusedThreadRoot={focusedThreadRoot}
+      focusedMessageError={focusedMessageError}
       memoryToken={session.token}
       settingsDestination={destination.kind === "settings"}
       settingsRuntimeLabel={settingsChannel ? channelDisplayName(settingsChannel) : "assigned runtime"}
@@ -4126,6 +4306,8 @@ function ActiveWorkshopClient({
       onOpenAgentChannel={onOpenAgentChannel}
       onOpenAgentDefinition={onOpenAgentDefinition}
       onOpenMemory={onOpenMemory}
+      onOpenMentions={onOpenMentions}
+      onOpenHumanNotification={onOpenHumanNotification}
       onOpenSettings={onOpenSettings}
       onRestoreChannel={onRestoreChannel}
       onSelectMemory={onSelectMemory}
@@ -4364,6 +4546,38 @@ function WorkshopApp(): React.JSX.Element {
     const nextDestination: WorkshopDestination = { kind: "memory", memoryId: null };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");
+  };
+
+  const openMentions = async (): Promise<void> => {
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !await confirm("Discard unsaved preference changes?")
+    ) {
+      return;
+    }
+    const nextDestination: WorkshopDestination = { kind: "mentions" };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
+  const openHumanNotification = (
+    notification: WorkshopHumanNotification,
+  ): boolean => {
+    if (!session || !navigation || !findNavigationChannel(navigation, notification.sourceChannelId)) {
+      return false;
+    }
+    const nextSession = { ...session, channelId: notification.sourceChannelId };
+    storeWorkshopAccess(nextSession);
+    setSession(nextSession);
+    const nextDestination: WorkshopDestination = {
+      kind: "conversation",
+      messageId: notification.sourceMessageId,
+      threadRootId: notification.sourceThreadRootId,
+    };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+    return true;
   };
 
   const openAgents = async (
@@ -4634,9 +4848,11 @@ function WorkshopApp(): React.JSX.Element {
       onForget={() => forgetSession()}
       onAgentNavigationChanged={refreshAgentNavigation}
       onCreateAgent={() => void openAgents(null, true)}
-          onOpenAgentChannel={openAgentChannel}
-          onOpenAgentDefinition={openAgentDefinition}
-          onOpenMemory={() => void openMemory()}
+      onOpenAgentChannel={openAgentChannel}
+      onOpenAgentDefinition={openAgentDefinition}
+      onOpenMemory={() => void openMemory()}
+      onOpenMentions={() => void openMentions()}
+      onOpenHumanNotification={openHumanNotification}
       onOpenSettings={openSettings}
       onRestoreChannel={(channelId, clientOperationId) =>
         changeWorkshopChannelLifecycle(channelId, clientOperationId, "restore")

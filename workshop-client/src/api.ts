@@ -58,8 +58,13 @@ import type {
   WorkshopAgentEnablement,
   WorkshopHumanChannelMember,
   WorkshopHumanMembership,
+  WorkshopHumanNotification,
+  WorkshopHumanNotificationCounts,
+  WorkshopHumanNotificationMutation,
+  WorkshopHumanNotificationPage,
+  WorkshopHumanNotificationSignal,
 } from "./types";
-import { MESSAGE_PATTERN } from "./types";
+import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
 import {
   AGENT_PATTERN,
@@ -177,8 +182,8 @@ async function responsePayload(response: Response): Promise<unknown> {
   }
 }
 
-const EVENT_STREAM_ID_KEY = "kai.workshop.event-stream-id.v1";
 const EVENT_STREAM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+let activeEventStreamId: string | null = null;
 
 function createEventStreamId(): string {
   const bytes = new Uint8Array(16);
@@ -187,15 +192,18 @@ function createEventStreamId(): string {
 }
 
 function eventStreamId(): string {
-  const stored = sessionStorage.getItem(EVENT_STREAM_ID_KEY);
-  if (stored !== null && EVENT_STREAM_ID_PATTERN.test(stored)) {
-    return stored;
+  if (
+    activeEventStreamId !== null &&
+    EVENT_STREAM_ID_PATTERN.test(activeEventStreamId)
+  ) {
+    return activeEventStreamId;
   }
   // getRandomValues remains available on plain-HTTP LAN origins, unlike
-  // randomUUID(), which browsers restrict to secure contexts.
-  const created = createEventStreamId();
-  sessionStorage.setItem(EVENT_STREAM_ID_KEY, created);
-  return created;
+  // randomUUID(), which browsers restrict to secure contexts. Keep this
+  // identity page-local: sessionStorage may be cloned into a duplicated tab,
+  // which would make otherwise independent event streams replace each other.
+  activeEventStreamId = createEventStreamId();
+  return activeEventStreamId;
 }
 
 async function authorizedFetch(
@@ -3386,6 +3394,298 @@ export async function cancelRun(
   return run;
 }
 
+function parseHumanNotification(value: unknown): WorkshopHumanNotification | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const {
+    channel_name: channelName,
+    created_at: createdAt,
+    created_event_position: createdEventPosition,
+    kind,
+    last_event_position: lastEventPosition,
+    notification_id: notificationId,
+    read,
+    read_at: readAt,
+    source_author_display_name: sourceAuthorDisplayName,
+    source_author_principal_id: sourceAuthorPrincipalId,
+    source_channel_id: sourceChannelId,
+    source_message_id: sourceMessageId,
+    source_thread_root_id: sourceThreadRootId,
+    state_version: stateVersion,
+  } = value;
+  if (
+    (channelName !== null && typeof channelName !== "string") ||
+    typeof createdAt !== "string" ||
+    !Number.isSafeInteger(createdEventPosition) ||
+    kind !== "mention" ||
+    !Number.isSafeInteger(lastEventPosition) ||
+    typeof notificationId !== "string" ||
+    !HUMAN_NOTIFICATION_PATTERN.test(notificationId) ||
+    typeof read !== "boolean" ||
+    (readAt !== null && typeof readAt !== "string") ||
+    typeof sourceAuthorDisplayName !== "string" ||
+    typeof sourceAuthorPrincipalId !== "string" ||
+    !PRINCIPAL_PATTERN.test(sourceAuthorPrincipalId) ||
+    typeof sourceChannelId !== "string" ||
+    !CHANNEL_PATTERN.test(sourceChannelId) ||
+    typeof sourceMessageId !== "string" ||
+    !MESSAGE_PATTERN.test(sourceMessageId) ||
+    (sourceThreadRootId !== null &&
+      (typeof sourceThreadRootId !== "string" ||
+        !MESSAGE_PATTERN.test(sourceThreadRootId))) ||
+    !Number.isSafeInteger(stateVersion) ||
+    (stateVersion as number) < 0
+  ) {
+    return null;
+  }
+  return {
+    channelName,
+    createdAt,
+    createdEventPosition: createdEventPosition as number,
+    kind: "mention",
+    lastEventPosition: lastEventPosition as number,
+    notificationId,
+    read,
+    readAt,
+    sourceAuthorDisplayName,
+    sourceAuthorPrincipalId,
+    sourceChannelId,
+    sourceMessageId,
+    sourceThreadRootId,
+    stateVersion: stateVersion as number,
+  };
+}
+
+function parseHumanNotificationCounts(value: unknown): WorkshopHumanNotificationCounts | null {
+  if (
+    !isRecord(value) ||
+    !Number.isSafeInteger(value.total) ||
+    !Number.isSafeInteger(value.unread) ||
+    !Number.isSafeInteger(value.read) ||
+    (value.total as number) < 0 ||
+    (value.unread as number) < 0 ||
+    (value.read as number) < 0 ||
+    (value.total as number) !== (value.unread as number) + (value.read as number) ||
+    !isRecord(value.unread_by_channel)
+  ) {
+    return null;
+  }
+  const unreadByChannel: Record<string, number> = {};
+  let channelTotal = 0;
+  for (const [channelId, count] of Object.entries(value.unread_by_channel)) {
+    if (
+      !CHANNEL_PATTERN.test(channelId) ||
+      !Number.isSafeInteger(count) ||
+      (count as number) < 1
+    ) {
+      return null;
+    }
+    unreadByChannel[channelId] = count as number;
+    channelTotal += count as number;
+  }
+  if (channelTotal !== value.unread) {
+    return null;
+  }
+  return {
+    read: value.read as number,
+    total: value.total as number,
+    unread: value.unread as number,
+    unreadByChannel,
+  };
+}
+
+function parseHumanNotificationPage(payload: unknown): WorkshopHumanNotificationPage {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !Array.isArray(payload.notifications) ||
+    !Number.isSafeInteger(payload.through_position) ||
+    (payload.through_position as number) < 0 ||
+    (payload.next_cursor !== null && typeof payload.next_cursor !== "string")
+  ) {
+    throw new Error("Kai returned an unsupported Mentions inbox.");
+  }
+  const counts = parseHumanNotificationCounts(payload.counts);
+  const notifications = payload.notifications.map(parseHumanNotification);
+  if (!counts || notifications.some((notification) => notification === null)) {
+    throw new Error("Kai returned an unsupported Mentions inbox.");
+  }
+  return {
+    counts,
+    nextCursor: payload.next_cursor,
+    notifications: notifications as WorkshopHumanNotification[],
+    throughPosition: payload.through_position as number,
+  };
+}
+
+export async function loadHumanNotifications(
+  token: string,
+  options: { cursor?: string; limit?: number; unreadOnly?: boolean } = {},
+  signal?: AbortSignal,
+): Promise<WorkshopHumanNotificationPage> {
+  const query = new URLSearchParams();
+  if (options.cursor) query.set("cursor", options.cursor);
+  query.set("limit", String(options.limit ?? 50));
+  if (options.unreadOnly) query.set("unread", "1");
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/client/notifications?${query}`,
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load mentions."));
+  }
+  return parseHumanNotificationPage(payload);
+}
+
+export async function loadHumanNotificationCounts(
+  token: string,
+  signal?: AbortSignal,
+): Promise<WorkshopHumanNotificationCounts> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/notifications/counts",
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok || !isRecord(payload) || payload.version !== 1) {
+    throw new Error(safeErrorMessage(payload, "Could not load mention counts."));
+  }
+  const counts = parseHumanNotificationCounts(payload);
+  if (!counts) {
+    throw new Error("Kai returned unsupported mention counts.");
+  }
+  return counts;
+}
+
+async function mutateHumanNotification(
+  token: string,
+  notificationId: string,
+  expectedStateVersion: number,
+  read: boolean,
+  clientOperationId: string,
+): Promise<WorkshopHumanNotificationMutation> {
+  if (!HUMAN_NOTIFICATION_PATTERN.test(notificationId)) {
+    throw new Error("Invalid notification identity.");
+  }
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/client/notifications/${encodeURIComponent(notificationId)}/${read ? "read" : "unread"}`,
+    {
+      body: JSON.stringify({
+        client_operation_id: clientOperationId,
+        expected_state_version: expectedStateVersion,
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  const payload = await responsePayload(response);
+  const notification = isRecord(payload)
+    ? parseHumanNotification(payload.notification)
+    : null;
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !notification ||
+    typeof payload.changed !== "boolean" ||
+    typeof payload.replayed !== "boolean"
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not update this mention."));
+  }
+  return { changed: payload.changed, notification, replayed: payload.replayed };
+}
+
+export function markHumanNotificationRead(
+  token: string,
+  notificationId: string,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopHumanNotificationMutation> {
+  return mutateHumanNotification(
+    token,
+    notificationId,
+    expectedStateVersion,
+    true,
+    clientOperationId,
+  );
+}
+
+export function markHumanNotificationUnread(
+  token: string,
+  notificationId: string,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopHumanNotificationMutation> {
+  return mutateHumanNotification(
+    token,
+    notificationId,
+    expectedStateVersion,
+    false,
+    clientOperationId,
+  );
+}
+
+export async function markHumanNotificationsRead(
+  token: string,
+  notifications: { notificationId: string; expectedStateVersion: number }[],
+  clientOperationId: string,
+): Promise<WorkshopHumanNotificationMutation[]> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/notifications/read",
+    {
+      body: JSON.stringify({
+        client_operation_id: clientOperationId,
+        notifications: notifications.map((notification) => ({
+          expected_state_version: notification.expectedStateVersion,
+          notification_id: notification.notificationId,
+        })),
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok || !isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.notifications)) {
+    throw new Error(safeErrorMessage(payload, "Could not mark mentions read."));
+  }
+  return payload.notifications.map((raw) => {
+    if (!isRecord(raw)) {
+      throw new Error("Kai returned an unsupported mention mutation.");
+    }
+    const notification = parseHumanNotification(raw.notification);
+    if (!notification || typeof raw.changed !== "boolean" || typeof raw.replayed !== "boolean") {
+      throw new Error("Kai returned an unsupported mention mutation.");
+    }
+    return { changed: raw.changed, notification, replayed: raw.replayed };
+  });
+}
+
+export async function loadChannelMessage(
+  session: WorkshopSession,
+  messageId: string,
+  signal?: AbortSignal,
+): Promise<TimelineMessage> {
+  if (!MESSAGE_PATTERN.test(messageId)) {
+    throw new Error("Invalid message identity.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/messages/${encodeURIComponent(messageId)}`,
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  const message = isRecord(payload) ? parseMessage(payload.message, session.channelId) : null;
+  if (!response.ok || !isRecord(payload) || payload.version !== 1 || !message) {
+    throw new Error(safeErrorMessage(payload, "Could not open the source message."));
+  }
+  return message;
+}
+
 function parseTimelinePage(payload: unknown, channelId: string): TimelineSnapshot {
   if (
     !isRecord(payload) ||
@@ -3630,6 +3930,81 @@ export async function streamAgentChanges(
               : "enablement",
           occurredAt: payload.occurred_at,
           revisionId: payload.revision_id,
+        },
+        event.eventId,
+      );
+    }
+  }
+}
+
+export async function streamHumanNotifications(
+  token: string,
+  lastEventId: string | null,
+  handlers: {
+    onChanged: (signal: WorkshopHumanNotificationSignal, eventId: string) => void;
+    onConnected: () => void;
+  },
+  signal: AbortSignal,
+): Promise<void> {
+  const headers = new Headers();
+  if (lastEventId !== null) {
+    headers.set("Last-Event-ID", lastEventId);
+  }
+  headers.set("X-Kai-Stream-ID", `${eventStreamId()}:mentions`);
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/notifications/events",
+    { headers, signal },
+  );
+  if (response.status === 409) {
+    throw new ResynchronizationRequired();
+  }
+  if (!response.ok || !response.body) {
+    const payload = await responsePayload(response);
+    throw new Error(safeErrorMessage(payload, "Live mention updates are unavailable."));
+  }
+  handlers.onConnected();
+  const reader = response.body.getReader();
+  const textDecoder = new TextDecoder();
+  const eventDecoder = new EventStreamDecoder();
+  while (!signal.aborted) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    for (const event of eventDecoder.push(textDecoder.decode(value, { stream: true }))) {
+      if (
+        event.eventName !== "human_notification.changed" ||
+        !event.eventId ||
+        !/^\d+$/.test(event.eventId)
+      ) {
+        continue;
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        continue;
+      }
+      const eventPosition = Number(event.eventId);
+      if (
+        !isRecord(payload) ||
+        payload.version !== 1 ||
+        payload.event_position !== eventPosition ||
+        !Number.isSafeInteger(eventPosition) ||
+        ![
+          "human_notification.created",
+          "human_notification.read",
+          "human_notification.unread",
+        ].includes(String(payload.event_type))
+      ) {
+        continue;
+      }
+      const notification = parseHumanNotification(payload.notification);
+      if (!notification) continue;
+      handlers.onChanged(
+        {
+          eventPosition,
+          notification,
+          transition: payload.event_type as WorkshopHumanNotificationSignal["transition"],
         },
         event.eventId,
       );
