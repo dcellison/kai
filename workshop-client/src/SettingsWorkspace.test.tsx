@@ -980,6 +980,64 @@ describe("Settings workspace", () => {
     expect(screen.getByLabelText("Timezone")).toHaveValue("America/Toronto");
   });
 
+  it("keeps notification controls together and saves validated DND drafts", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateChannelNotificationPolicy).mockImplementation(async (_session, _revision, change) => ({
+      ...channelNotificationPolicy,
+      doNotDisturb: change.field === "do_not_disturb"
+        ? {
+            enabled: change.enabled,
+            timezone: change.timezone,
+            start: change.start,
+            end: change.end,
+          }
+        : channelNotificationPolicy.doNotDisturb,
+      mutation: { changed: true, operation: `set_${change.field}` },
+      revision: "cnp_changed",
+    }));
+    renderSettings();
+
+    const heading = await screen.findByRole("heading", { name: "Notification delivery" });
+    const section = heading.closest("section");
+    const content = section?.querySelector(".settings-section-content");
+    expect(section).not.toBeNull();
+    expect(content).not.toBeNull();
+    expect(section?.children).toHaveLength(2);
+    expect(content).toContainElement(screen.getByLabelText("GitHub").closest("article"));
+
+    const timezone = screen.getByLabelText("Timezone");
+    expect(timezone.tagName).toBe("SELECT");
+    expect(within(timezone).getByRole("option", { name: "America/Toronto" })).toBeVisible();
+
+    const start = screen.getByLabelText("Start");
+    const end = screen.getByLabelText("End");
+    expect(start).toHaveAttribute("type", "text");
+    expect(end).toHaveAttribute("type", "text");
+    await user.clear(start);
+    expect(screen.getByRole("button", { name: "Save schedule" })).toBeDisabled();
+    await user.type(start, "09:30");
+    await user.clear(end);
+    await user.type(end, "17:45");
+    await user.click(screen.getByLabelText("Pause external delivery on this schedule"));
+    await user.click(screen.getByRole("button", { name: "Save schedule" }));
+
+    expect(updateChannelNotificationPolicy).toHaveBeenCalledWith(
+      session,
+      "cnp_current",
+      {
+        field: "do_not_disturb",
+        enabled: true,
+        timezone: "America/Toronto",
+        start: "09:30",
+        end: "17:45",
+      },
+    );
+    const mutedMention = screen.getByLabelText("Direct mentions override muted channels");
+    expect(mutedMention.nextElementSibling).toHaveTextContent(
+      "Direct mentions override muted channels",
+    );
+  });
+
   it("edits voice output for the authenticated client binding", async () => {
     const user = userEvent.setup();
     vi.mocked(updateClientPreference).mockResolvedValue({

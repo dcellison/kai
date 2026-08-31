@@ -3448,15 +3448,26 @@ button:disabled {
   width: 100%;
 }
 
-.settings-checkbox-row {
+.settings-section-content {
+  min-width: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.settings-card > label.settings-checkbox-row {
   display: flex;
   align-items: center;
   gap: 0.5rem;
 }
 
-.settings-checkbox-row input {
+.settings-card > label.settings-checkbox-row input {
+  flex: 0 0 auto;
   width: auto;
   margin: 0;
+}
+
+.settings-checkbox-row span {
+  min-width: 0;
 }
 
 .settings-inline-fields {
@@ -3470,8 +3481,8 @@ button:disabled {
   gap: 0.3rem;
 }
 
-.settings-dnd-card > input {
-  width: 100%;
+.settings-card .settings-control-error {
+  color: var(--color-danger);
 }
 
 .notification-routing-summary {

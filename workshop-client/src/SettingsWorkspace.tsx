@@ -76,6 +76,42 @@ type SettingsSectionId =
   | (typeof GENERAL_SETTINGS_SECTIONS)[number]["id"]
   | (typeof AGENT_RUNTIME_SECTIONS)[number]["id"];
 
+const DND_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+const FALLBACK_TIMEZONES = [
+  "UTC",
+  "America/Toronto",
+  "America/Vancouver",
+  "America/Edmonton",
+  "America/Winnipeg",
+  "America/Halifax",
+  "America/St_Johns",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "Europe/London",
+  "Europe/Paris",
+  "Asia/Tokyo",
+  "Australia/Sydney",
+] as const;
+
+function availableTimezones(current: string): string[] {
+  const supportedValuesOf = (
+    Intl as unknown as { supportedValuesOf?: (key: "timeZone") => string[] }
+  ).supportedValuesOf;
+  let supported: string[] = [];
+  if (supportedValuesOf) {
+    try {
+      supported = supportedValuesOf("timeZone");
+    } catch {
+      supported = [];
+    }
+  }
+  return [...new Set(["UTC", current, ...(supported.length > 0 ? supported : FALLBACK_TIMEZONES)])]
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
+}
+
 function formatDate(value: string | null): string {
   if (!value) {
     return "Not saved yet";
@@ -219,9 +255,14 @@ function SettingsWorkspaceContent({
   const [channelNotificationBusy, setChannelNotificationBusy] = useState(false);
   const [channelNotificationError, setChannelNotificationError] = useState<string | null>(null);
   const [channelNotificationNotice, setChannelNotificationNotice] = useState<string | null>(null);
+  const [dndEnabled, setDndEnabled] = useState(false);
   const [dndTimezone, setDndTimezone] = useState("UTC");
   const [dndStart, setDndStart] = useState("22:00");
   const [dndEnd, setDndEnd] = useState("07:00");
+  const dndTimeValid = DND_TIME_PATTERN.test(dndStart)
+    && DND_TIME_PATTERN.test(dndEnd)
+    && dndStart !== dndEnd;
+  const dndTimezones = useMemo(() => availableTimezones(dndTimezone), [dndTimezone]);
 
   const [clients, setClients] = useState<WorkshopClientPreferences | null>(null);
   const [clientLoading, setClientLoading] = useState(true);
@@ -525,6 +566,7 @@ function SettingsWorkspaceContent({
     try {
       const snapshot = await loadChannelNotificationPolicy(session);
       setChannelNotifications(snapshot);
+      setDndEnabled(snapshot.doNotDisturb.enabled);
       setDndTimezone(snapshot.doNotDisturb.timezone);
       setDndStart(snapshot.doNotDisturb.start);
       setDndEnd(snapshot.doNotDisturb.end);
@@ -824,6 +866,7 @@ function SettingsWorkspaceContent({
         change,
       );
       setChannelNotifications(changed);
+      setDndEnabled(changed.doNotDisturb.enabled);
       setDndTimezone(changed.doNotDisturb.timezone);
       setDndStart(changed.doNotDisturb.start);
       setDndEnd(changed.doNotDisturb.end);
@@ -1745,6 +1788,7 @@ function SettingsWorkspaceContent({
               should pause, and where personal integration notifications appear.
             </p>
           </div>
+          <div className="settings-section-content notification-settings-content">
           {channelNotificationLoading ? (
             <p role="status">Loading channel notification policy…</p>
           ) : channelNotifications ? (
@@ -1782,7 +1826,7 @@ function SettingsWorkspaceContent({
                       enabled: event.target.checked,
                     })}
                   />
-                  Direct mentions override muted channels
+                  <span>Direct mentions override muted channels</span>
                 </label>
                 <p>A direct @mention can still create an in-app notification.</p>
               </article>
@@ -1791,45 +1835,52 @@ function SettingsWorkspaceContent({
                 <label className="settings-checkbox-row">
                   <input
                     type="checkbox"
-                    checked={channelNotifications.doNotDisturb.enabled}
+                    checked={dndEnabled}
                     disabled={channelNotificationBusy}
-                    onChange={(event) => void mutateChannelNotificationPolicy({
-                      field: "do_not_disturb",
-                      enabled: event.target.checked,
-                      timezone: dndTimezone,
-                      start: dndStart,
-                      end: dndEnd,
-                    })}
+                    onChange={(event) => setDndEnabled(event.target.checked)}
                   />
-                  Pause external delivery on this schedule
+                  <span>Pause external delivery on this schedule</span>
                 </label>
                 <label htmlFor="dnd-timezone">Timezone</label>
-                <input
+                <select
                   id="dnd-timezone"
                   value={dndTimezone}
                   disabled={channelNotificationBusy}
                   onChange={(event) => setDndTimezone(event.target.value)}
-                  placeholder="America/Toronto"
-                />
+                >
+                  {dndTimezones.map((timezone) => (
+                    <option key={timezone} value={timezone}>{timezone}</option>
+                  ))}
+                </select>
                 <div className="settings-inline-fields">
                   <label htmlFor="dnd-start">
                     Start
                     <input
                       id="dnd-start"
-                      type="time"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]"
+                      maxLength={5}
                       value={dndStart}
                       disabled={channelNotificationBusy}
                       onChange={(event) => setDndStart(event.target.value)}
+                      placeholder="22:00"
+                      autoComplete="off"
                     />
                   </label>
                   <label htmlFor="dnd-end">
                     End
                     <input
                       id="dnd-end"
-                      type="time"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]"
+                      maxLength={5}
                       value={dndEnd}
                       disabled={channelNotificationBusy}
                       onChange={(event) => setDndEnd(event.target.value)}
+                      placeholder="07:00"
+                      autoComplete="off"
                     />
                   </label>
                 </div>
@@ -1837,10 +1888,10 @@ function SettingsWorkspaceContent({
                   <button
                     className="quiet-button"
                     type="button"
-                    disabled={channelNotificationBusy}
+                    disabled={channelNotificationBusy || !dndTimeValid}
                     onClick={() => void mutateChannelNotificationPolicy({
                       field: "do_not_disturb",
-                      enabled: channelNotifications.doNotDisturb.enabled,
+                      enabled: dndEnabled,
                       timezone: dndTimezone,
                       start: dndStart,
                       end: dndEnd,
@@ -1849,6 +1900,11 @@ function SettingsWorkspaceContent({
                     Save schedule
                   </button>
                 </div>
+                {!dndTimeValid && (
+                  <p className="settings-control-error" role="alert">
+                    Enter different start and end times in 24-hour HH:MM format.
+                  </p>
+                )}
                 <p>Workshop notifications remain immediate. Adapter delivery uses this policy.</p>
               </article>
             </div>
@@ -1942,6 +1998,7 @@ function SettingsWorkspaceContent({
           {notificationError && notifications && (
             <p className="settings-error" role="alert">{notificationError}</p>
           )}
+          </div>
         </section>
 
         <section className="settings-section" id="settings-section-clients">
