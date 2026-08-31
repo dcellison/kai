@@ -451,6 +451,47 @@ function observeMessagesAsVisible(): void {
   vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
 }
 
+function observeMessagesAtViewportEdge(): void {
+  class TestIntersectionObserver {
+    readonly root = null;
+    readonly rootMargin: string;
+    readonly thresholds: number[];
+
+    constructor(
+      private readonly callback: IntersectionObserverCallback,
+      options?: IntersectionObserverInit,
+    ) {
+      this.rootMargin = options?.rootMargin ?? "0px";
+      const threshold = options?.threshold ?? 0;
+      this.thresholds = Array.isArray(threshold) ? threshold : [threshold];
+    }
+
+    disconnect(): void {}
+
+    observe(target: Element): void {
+      const bounds = target.getBoundingClientRect();
+      const isIntersecting = this.rootMargin === "0px";
+      this.callback([{
+        boundingClientRect: bounds,
+        intersectionRatio: isIntersecting ? 1 : 0,
+        intersectionRect: bounds,
+        isIntersecting,
+        rootBounds: null,
+        target,
+        time: 0,
+      }], this as unknown as IntersectionObserver);
+    }
+
+    takeRecords(): IntersectionObserverEntry[] {
+      return [];
+    }
+
+    unobserve(): void {}
+  }
+
+  vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+}
+
 describe("Workshop React client", () => {
   let handlers: StreamHandlers | null;
   let humanNotificationHandlers: HumanNotificationStreamHandlers | null;
@@ -984,6 +1025,71 @@ describe("Workshop React client", () => {
     render(<App />);
 
     expect(await screen.findByText(historyMessage.body)).toBeVisible();
+    await waitFor(() => expect(markHumanNotificationRead).toHaveBeenCalledWith(
+      "session-secret",
+      mention.notificationId,
+      0,
+      expect.stringMatching(/^mention-viewed-/),
+    ));
+    await waitFor(() => expect(
+      screen.getByRole("button", { name: "Mentions" }),
+    ).toBeVisible());
+  });
+
+  it("marks a live mention read when its source is already visible at the timeline edge", async () => {
+    observeMessagesAtViewportEdge();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    const mention: WorkshopHumanNotification = {
+      channelName: "Conversation",
+      createdAt: "2026-08-31T15:00:00Z",
+      createdEventPosition: historyMessage.eventPosition,
+      kind: "mention",
+      lastEventPosition: historyMessage.eventPosition,
+      notificationId: "ntf_00000000000000000000000000000004",
+      read: false,
+      readAt: null,
+      sourceAuthorDisplayName: "Kai",
+      sourceAuthorPrincipalId: historyMessage.authorPrincipalId,
+      sourceChannelId: channelId,
+      sourceMessageId: historyMessage.messageId,
+      sourceThreadRootId: null,
+      stateVersion: 0,
+    };
+    vi.mocked(loadHumanNotificationCounts).mockResolvedValue({
+      read: 1,
+      total: 1,
+      unread: 0,
+      unreadByChannel: {},
+    });
+    vi.mocked(markHumanNotificationRead).mockResolvedValue({
+      changed: true,
+      notification: {
+        ...mention,
+        read: true,
+        readAt: "2026-08-31T15:01:00Z",
+        stateVersion: 1,
+      },
+      replayed: false,
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(historyMessage.body)).toBeVisible();
+    await waitFor(() => expect(streamHumanNotifications).toHaveBeenCalled());
+    act(() => {
+      humanNotificationHandlers?.onChanged(
+        {
+          eventPosition: historyMessage.eventPosition,
+          notification: mention,
+          transition: "human_notification.created",
+        },
+        String(historyMessage.eventPosition),
+      );
+    });
+
     await waitFor(() => expect(markHumanNotificationRead).toHaveBeenCalledWith(
       "session-secret",
       mention.notificationId,
