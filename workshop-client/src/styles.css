@@ -640,13 +640,21 @@ button:disabled {
 .mention-count {
   display: inline-grid;
   place-items: center;
-  min-width: 1.3rem;
-  min-height: 1.3rem;
+  min-width: 0.95rem;
+  min-height: 0.95rem;
   border-radius: 999px;
-  padding: 0 0.3rem;
+  padding: 0 0.2rem;
   background: var(--color-accent);
   color: var(--color-canvas);
-  font: 750 0.58rem var(--sans);
+  font: 750 0.48rem var(--sans);
+  line-height: 1;
+}
+
+.channel-link-status {
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  gap: 0.3rem;
 }
 
 .live-pip {
@@ -844,6 +852,10 @@ button:disabled {
   padding: 0;
   color: transparent;
   font-size: 0;
+}
+
+.channel-sidebar.collapsed .channel-link-status {
+  display: contents;
 }
 
 .channel-sidebar.collapsed .agent-link {
@@ -2034,6 +2046,12 @@ button:disabled {
 
 .context-section-heading h3 {
   margin-right: auto;
+}
+
+.context-section-heading .panel-icon-button svg {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
 }
 
 .agent-attention-section ul {
