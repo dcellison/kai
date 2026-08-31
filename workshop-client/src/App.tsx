@@ -3116,15 +3116,23 @@ function WorkshopView({
               >
                 <span>{channelSymbol(availableChannel)}</span>
                 <span>{channelDisplayName(availableChannel)}</span>
-                {(inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0 && (
-                  <span className="mention-count" aria-label={`${inbox.counts.unreadByChannel[availableChannel.channelId]} unread mentions`}>
-                    {inbox.counts.unreadByChannel[availableChannel.channelId] > 99
-                      ? "99+"
-                      : inbox.counts.unreadByChannel[availableChannel.channelId]}
+                {((inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0 ||
+                  (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
+                  <span className="channel-link-status">
+                    {(inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0 && (
+                      <span
+                        className="mention-count"
+                        aria-label={`${inbox.counts.unreadByChannel[availableChannel.channelId]} unread mentions`}
+                      >
+                        {inbox.counts.unreadByChannel[availableChannel.channelId] > 99
+                          ? "99+"
+                          : inbox.counts.unreadByChannel[availableChannel.channelId]}
+                      </span>
+                    )}
+                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
+                      <span className="live-pip" aria-label="Live" />
+                    )}
                   </span>
-                )}
-                {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
-                  <span className="live-pip" aria-label="Live" />
                 )}
               </button>
             ))}
