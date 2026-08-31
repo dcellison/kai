@@ -68,6 +68,7 @@ export function useHumanNotifications(
 ): HumanNotificationState & {
   loadMore: () => void;
   markAllRead: () => Promise<void>;
+  markVisibleRead: (messageId: string) => Promise<void>;
   setRead: (notification: WorkshopHumanNotification, read: boolean) => Promise<void>;
 } {
   const [state, setState] = useState<HumanNotificationState>({
@@ -82,6 +83,7 @@ export function useHumanNotifications(
   const cursorRef = useRef<string | null>(null);
   const loadMorePendingRef = useRef(false);
   const countsRefreshRef = useRef<number | null>(null);
+  const visibleReadPendingRef = useRef(new Set<string>());
 
   const refreshCounts = useCallback(async (signal?: AbortSignal): Promise<void> => {
     const counts = await loadHumanNotificationCounts(token, signal);
@@ -289,5 +291,54 @@ export function useHumanNotifications(
     }
   }, [onAuthenticationFailure, token]);
 
-  return { ...state, loadMore, markAllRead, setRead };
+  const markVisibleRead = useCallback(async (messageId: string): Promise<void> => {
+    const unread = state.notifications.filter(
+      (notification) =>
+        !notification.read &&
+        notification.sourceMessageId === messageId &&
+        !visibleReadPendingRef.current.has(notification.notificationId),
+    );
+    if (unread.length === 0) {
+      return;
+    }
+    for (const notification of unread) {
+      visibleReadPendingRef.current.add(notification.notificationId);
+    }
+    try {
+      const mutations = await Promise.all(
+        unread.map((notification) => markHumanNotificationRead(
+          token,
+          notification.notificationId,
+          notification.stateVersion,
+          operationId("mention-viewed"),
+        )),
+      );
+      const counts = await loadHumanNotificationCounts(token);
+      setState((current) => ({
+        ...current,
+        counts,
+        notifications: mutations.reduce(
+          (items, mutation) => mergeNotification(items, mutation.notification),
+          current.notifications,
+        ),
+      }));
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        onAuthenticationFailure(caught.message);
+        return;
+      }
+      setState((current) => ({
+        ...current,
+        error: caught instanceof Error
+          ? caught.message
+          : "Could not mark the displayed mention read.",
+      }));
+    } finally {
+      for (const notification of unread) {
+        visibleReadPendingRef.current.delete(notification.notificationId);
+      }
+    }
+  }, [onAuthenticationFailure, state.notifications, token]);
+
+  return { ...state, loadMore, markAllRead, markVisibleRead, setRead };
 }
