@@ -36,6 +36,7 @@ from kai.workshop.domain import (
     WorkshopEventType,
     WorkshopId,
 )
+from kai.workshop.human_handles import normalize_human_handle
 from kai.workshop.store import StoredEvent
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -88,26 +89,84 @@ async def _require_active_channel(
         raise ValueError("Archived Workshop channels are read-only")
 
 
+async def _insert_human_handle(
+    connection: aiosqlite.Connection,
+    event: StoredEvent,
+    raw_handle: object,
+) -> None:
+    """Project one human handle while enforcing the shared Workshop namespace."""
+    envelope = event.envelope
+    principal_id = PrincipalId(str(envelope.aggregate_id))
+    handle = normalize_human_handle(raw_handle)
+    async with connection.execute(
+        "SELECT p.kind, EXISTS(SELECT 1 FROM workshop_memberships wm "
+        "WHERE wm.principal_id = p.id AND wm.workshop_id = ?) "
+        "FROM principals p WHERE p.id = ?",
+        (envelope.workshop_id, principal_id),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    if len(rows) != 1 or str(rows[0][0]) != "human":
+        raise ValueError("Workshop human handle must reference one human principal")
+    if envelope.event_type == WorkshopEventType.PRINCIPAL_HANDLE_ASSIGNED and not bool(rows[0][1]):
+        raise ValueError("Workshop human handle must reference a member in its workshop")
+    async with connection.execute(
+        "SELECT 1 FROM agent_definitions WHERE workshop_id = ? AND handle = ? COLLATE NOCASE",
+        (envelope.workshop_id, handle),
+    ) as cursor:
+        if await cursor.fetchone() is not None:
+            raise ValueError("Workshop human handle conflicts with an agent handle")
+    await connection.execute(
+        "INSERT INTO human_handles "
+        "(workshop_id, principal_id, handle, created_at, created_event_position) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            envelope.workshop_id,
+            principal_id,
+            handle,
+            envelope.occurred_at.isoformat(),
+            event.position,
+        ),
+    )
+
+
 async def _message_mentions_json(
     connection: aiosqlite.Connection,
     channel_id: ChannelId,
     body: str,
     raw_mentions: object,
+    *,
+    canonical_handles: bool,
 ) -> str:
     if not isinstance(raw_mentions, list):
         raise ValueError("Workshop message mentions must be a list")
     if not raw_mentions:
         return "[]"
-    async with connection.execute(
-        "SELECT p.id, p.kind, COALESCE(ad.handle, p.display_name) "
-        "FROM channel_memberships cm "
+    handles_supported = canonical_handles and await _table_has_column(
+        connection,
+        "human_handles",
+        "handle",
+    )
+    if canonical_handles and not handles_supported:
+        raise ValueError("Canonical human-handle authority is unavailable")
+    member_query = (
+        "SELECT p.id, p.kind, CASE p.kind WHEN 'human' THEN hh.handle ELSE ad.handle END "
+        "FROM channel_memberships cm JOIN channels c ON c.id = cm.channel_id "
         "JOIN principals p ON p.id = cm.principal_id "
+        "LEFT JOIN human_handles hh ON hh.workshop_id = c.workshop_id AND hh.principal_id = p.id "
         "LEFT JOIN agents a ON a.principal_id = p.id "
-        "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id "
-        "WHERE cm.channel_id = ?",
-        (channel_id,),
-    ) as cursor:
-        members = {PrincipalId(str(row[0])): (str(row[1]), str(row[2])) for row in await cursor.fetchall()}
+        "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id WHERE cm.channel_id = ?"
+        if handles_supported
+        else "SELECT p.id, p.kind, COALESCE(ad.handle, p.display_name) "
+        "FROM channel_memberships cm JOIN principals p ON p.id = cm.principal_id "
+        "LEFT JOIN agents a ON a.principal_id = p.id "
+        "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id WHERE cm.channel_id = ?"
+    )
+    async with connection.execute(member_query, (channel_id,)) as cursor:
+        members = {
+            PrincipalId(str(row[0])): (str(row[1]), str(row[2]))
+            for row in await cursor.fetchall()
+            if row[2] is not None
+        }
     normalized: list[dict[str, object]] = []
     previous_end = 0
     for raw in raw_mentions:
@@ -130,7 +189,7 @@ async def _message_mentions_json(
         if member is None or member[0] != kind:
             raise ValueError("Workshop message mention must resolve to a channel member")
         if body[start + 1 : end].casefold() != member[1].casefold():
-            raise ValueError("Workshop message mention span must match the member display name")
+            raise ValueError("Workshop message mention span must match the member handle")
         normalized.append(
             {
                 "kind": kind,
@@ -1037,7 +1096,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent definitions project durable draft, active, and archived lifecycle state.
-    version = 16
+    version = 17
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1070,6 +1129,7 @@ class CanonicalConversationProjection:
             "agent_definition_revisions",
             "agent_definitions",
             "agents",
+            "human_handles",
             "workshop_memberships",
             "external_identities",
             "principals",
@@ -1123,15 +1183,34 @@ class CanonicalConversationProjection:
                 (envelope.aggregate_id, _required_text(payload, "name"), occurred_at),
             )
         elif envelope.event_type == WorkshopEventType.PRINCIPAL_CREATED:
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop principal creation event version")
+            kind = _required_text(payload, "kind")
+            display_name = _required_text(payload, "display_name")
+            expected_keys = {"kind", "display_name"}
+            if envelope.event_version == 2:
+                expected_keys.add("handle")
+                if kind != "human":
+                    raise ValueError("Only human principals may carry a human handle")
+            _require_exact_payload(payload, expected_keys)
             await connection.execute(
                 "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)",
                 (
                     envelope.aggregate_id,
-                    _required_text(payload, "kind"),
-                    _required_text(payload, "display_name"),
+                    kind,
+                    display_name,
                     occurred_at,
                 ),
             )
+            if envelope.event_version == 2:
+                await _insert_human_handle(connection, event, payload.get("handle"))
+        elif envelope.event_type == WorkshopEventType.PRINCIPAL_HANDLE_ASSIGNED:
+            if envelope.event_version != 1:
+                raise ValueError("Unsupported Workshop human-handle event version")
+            if not isinstance(envelope.aggregate_id, PrincipalId) or envelope.aggregate_type != "principal_handle":
+                raise ValueError("Workshop human-handle assignment requires a typed principal aggregate")
+            _require_exact_payload(payload, {"handle"})
+            await _insert_human_handle(connection, event, payload.get("handle"))
         elif envelope.event_type == WorkshopEventType.EXTERNAL_IDENTITY_BOUND:
             await connection.execute(
                 "INSERT INTO external_identities "
@@ -1272,6 +1351,13 @@ class CanonicalConversationProjection:
                 agent_row = await cursor.fetchone()
             if agent_row is None or WorkshopId(str(agent_row[0])) != envelope.workshop_id:
                 raise ValueError("Workshop agent definition must reference an agent in its workshop")
+            if await _table_has_column(connection, "human_handles", "handle"):
+                async with connection.execute(
+                    "SELECT 1 FROM human_handles WHERE workshop_id = ? AND handle = ? COLLATE NOCASE",
+                    (envelope.workshop_id, handle),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise ValueError("Workshop agent handle conflicts with a human handle")
             await connection.execute(
                 "INSERT INTO agent_definitions "
                 "(id, workshop_id, agent_id, handle, display_name, description, "
@@ -1754,6 +1840,8 @@ class CanonicalConversationProjection:
                     (runtime_profile_id, channel_id, agent_id),
                 )
         elif envelope.event_type == WorkshopEventType.MESSAGE_CREATED:
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop message creation event version")
             reply_to = payload.get("reply_to_message_id")
             if reply_to is not None and not isinstance(reply_to, str):
                 raise ValueError("Workshop reply_to_message_id must be a string or null")
@@ -1777,6 +1865,7 @@ class CanonicalConversationProjection:
                 channel_id,
                 body,
                 payload.get("mentions", []),
+                canonical_handles=envelope.event_version == 2,
             )
             await connection.execute(
                 "INSERT INTO messages "

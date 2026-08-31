@@ -81,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     provision.add_argument("--provisioning-key", required=True)
     provision.add_argument("--display-name", required=True)
+    provision.add_argument("--handle")
     provision.add_argument("--role", required=True, choices=("admin", "member"))
     provision.add_argument("--workshop-id")
     client_actions.add_parser(
@@ -499,6 +500,7 @@ async def _run(args: argparse.Namespace) -> int:
                     return 0
                 for human in humans:
                     print(f"Human: {human.display_name}")
+                    print(f"Handle: @{human.handle}")
                     print(f"Principal: {human.principal_id}")
                     if human.direct_channels:
                         for channel_id in human.direct_channels:
@@ -512,8 +514,10 @@ async def _run(args: argparse.Namespace) -> int:
                     args.display_name,
                     args.role,
                     workshop_id=(_workshop_id(args.workshop_id) if args.workshop_id is not None else None),
+                    handle=args.handle,
                 )
                 print(f"Human: {human.display_name}")
+                print(f"Handle: @{human.handle}")
                 print(f"Principal: {human.principal_id}")
                 print(f"Workshop: {human.workshop_id}")
                 print(f"Direct channel: {human.channel_id}")

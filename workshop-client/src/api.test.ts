@@ -1309,6 +1309,7 @@ describe("Workshop client API", () => {
         principal: {
           principal_id: "prn_00000000000000000000000000000001",
           display_name: "Daniel",
+          handle: "daniel",
         },
         workshops: [
           {
@@ -1330,6 +1331,7 @@ describe("Workshop client API", () => {
                     engaged: false,
                     engaged_until: null,
                     memory_scope: "private",
+                    handle: "kai",
                     name: "Kai",
                     runtime_profile_id:
                       "rtp_00000000000000000000000000000001",
@@ -1343,6 +1345,7 @@ describe("Workshop client API", () => {
                     principal_id: "prn_00000000000000000000000000000002",
                     kind: "agent",
                     display_name: "Kai",
+                    handle: "kai",
                   },
                 ],
               },
@@ -1356,6 +1359,7 @@ describe("Workshop client API", () => {
     await expect(loadNavigation("session-secret")).resolves.toEqual({
       principal: {
         displayName: "Daniel",
+        handle: "daniel",
         principalId: "prn_00000000000000000000000000000001",
       },
       workshops: [
@@ -1368,6 +1372,7 @@ describe("Workshop client API", () => {
                   available: true,
                   engaged: false,
                   engagedUntil: null,
+                  handle: "kai",
                   memoryScope: "private",
                   name: "Kai",
                   principalId: "prn_00000000000000000000000000000002",
@@ -1385,6 +1390,7 @@ describe("Workshop client API", () => {
               participants: [
                 {
                   displayName: "Kai",
+                  handle: "kai",
                   kind: "agent",
                   principalId: "prn_00000000000000000000000000000002",
                 },

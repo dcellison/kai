@@ -44,12 +44,17 @@ class TestWorkshopHumanProvisioner:
                 "charlie",
                 "  Charlie  ",
                 "member",
+                handle="charlie_ops",
             )
 
+            assert provisioned.handle == "charlie_ops"
+
             async with store.connection.execute(
-                "SELECT p.display_name, wm.role, c.kind, cm.role "
+                "SELECT p.display_name, hh.handle, wm.role, c.kind, cm.role "
                 "FROM principals p "
                 "JOIN workshop_memberships wm ON wm.principal_id = p.id "
+                "JOIN human_handles hh ON hh.workshop_id = wm.workshop_id "
+                "AND hh.principal_id = p.id "
                 "JOIN channel_memberships cm ON cm.principal_id = p.id "
                 "JOIN channels c ON c.id = cm.channel_id AND c.workshop_id = wm.workshop_id "
                 "WHERE p.id = ? AND c.id = ?",
@@ -57,7 +62,7 @@ class TestWorkshopHumanProvisioner:
             ) as cursor:
                 row = await cursor.fetchone()
             assert row is not None
-            assert tuple(row) == ("Charlie", "member", "direct", "owner")
+            assert tuple(row) == ("Charlie", "charlie_ops", "member", "direct", "owner")
 
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM external_identities WHERE principal_id = ?",
@@ -150,6 +155,30 @@ class TestWorkshopHumanProvisioner:
                 await provisioner.provision("charlie", "Charles", "member")
             async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
                 assert (await cursor.fetchone())[0] == after_first
+        finally:
+            await store.close()
+
+    async def test_shared_human_and_agent_handle_namespace_fails_closed(self, tmp_path: Path):
+        store = await _store(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
+                before = int((await cursor.fetchone())[0])
+            with pytest.raises(WorkshopHumanProvisioningError, match="already used"):
+                await WorkshopHumanProvisioner(store).provision(
+                    "another-kai",
+                    "Another Kai",
+                    "member",
+                    handle="kai",
+                )
+            with pytest.raises(WorkshopHumanProvisioningError, match="already used"):
+                await WorkshopHumanProvisioner(store).provision(
+                    "another-alice",
+                    "Another Alice",
+                    "member",
+                    handle="alice",
+                )
+            async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
+                assert int((await cursor.fetchone())[0]) == before
         finally:
             await store.close()
 

@@ -17,6 +17,7 @@ from kai.workshop.domain import (
     WorkshopId,
     WorkshopMembershipId,
 )
+from kai.workshop.human_handles import derive_human_handle, normalize_human_handle
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 
@@ -34,6 +35,7 @@ class ProvisionedWorkshopHuman:
     role: str
     provisioning_key: str
     created: bool
+    handle: str
 
 
 _PROVISIONING_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -85,10 +87,17 @@ class WorkshopHumanProvisioner:
         role: str,
         *,
         workshop_id: WorkshopId | None = None,
+        handle: str | None = None,
     ) -> ProvisionedWorkshopHuman:
         normalized_key = _normalize_provisioning_key(provisioning_key)
         normalized_name = _normalize_display_name(display_name)
         normalized_role = _normalize_role(role)
+        try:
+            normalized_handle = (
+                normalize_human_handle(handle) if handle is not None else derive_human_handle(normalized_name)
+            )
+        except ValueError as exc:
+            raise WorkshopHumanProvisioningError(str(exc)) from exc
         if workshop_id is not None and not isinstance(workshop_id, WorkshopId):
             raise WorkshopHumanProvisioningError("workshop_id must be a WorkshopId when provided")
 
@@ -102,6 +111,11 @@ class WorkshopHumanProvisioner:
             principal_id, channel_id = provisioned_human_ids(
                 resolved_workshop_id,
                 normalized_key,
+            )
+            await self._require_available_handle(
+                resolved_workshop_id,
+                normalized_handle,
+                principal_id,
             )
             membership_id = WorkshopMembershipId.derived(
                 resolved_workshop_id,
@@ -129,6 +143,7 @@ class WorkshopHumanProvisioner:
                     agent_principal_id,
                     normalized_name,
                     normalized_role,
+                    normalized_handle,
                 ):
                     raise WorkshopHumanProvisioningError(
                         "Provisioning key already exists with different human or channel semantics"
@@ -142,17 +157,22 @@ class WorkshopHumanProvisioner:
                     normalized_role,
                     normalized_key,
                     False,
+                    normalized_handle,
                 )
             events = (
                 EventEnvelope.create(
                     event_type=WorkshopEventType.PRINCIPAL_CREATED,
-                    event_version=1,
+                    event_version=2,
                     workshop_id=resolved_workshop_id,
                     aggregate_type="principal",
                     aggregate_id=principal_id,
                     occurred_at=now,
                     idempotency_key=principal_event_key,
-                    payload={"kind": "human", "display_name": normalized_name},
+                    payload={
+                        "kind": "human",
+                        "display_name": normalized_name,
+                        "handle": normalized_handle,
+                    },
                     metadata={"source": "operator_cli"},
                 ),
                 EventEnvelope.create(
@@ -243,6 +263,7 @@ class WorkshopHumanProvisioner:
             normalized_role,
             normalized_key,
             inserted_states == {True},
+            normalized_handle,
         )
 
     async def _matches_existing_provisioning(
@@ -254,11 +275,14 @@ class WorkshopHumanProvisioner:
         agent_principal_id: PrincipalId,
         display_name: str,
         role: str,
+        handle: str,
     ) -> bool:
         async with self._store.connection.execute(
             "SELECT 1 FROM principals p "
             "JOIN workshop_memberships wm ON wm.principal_id = p.id "
             "AND wm.workshop_id = ? AND wm.role = ? "
+            "JOIN human_handles hh ON hh.workshop_id = wm.workshop_id "
+            "AND hh.principal_id = p.id AND hh.handle = ? COLLATE NOCASE "
             "JOIN channels c ON c.id = ? AND c.workshop_id = wm.workshop_id "
             "AND c.kind = 'direct' "
             "JOIN channel_memberships human_cm ON human_cm.channel_id = c.id "
@@ -270,6 +294,7 @@ class WorkshopHumanProvisioner:
             (
                 workshop_id,
                 role,
+                handle,
                 channel_id,
                 agent_id,
                 agent_principal_id,
@@ -286,6 +311,25 @@ class WorkshopHumanProvisioner:
         ) as cursor:
             count_row = await cursor.fetchone()
         return count_row is not None and int(count_row[0]) == 6
+
+    async def _require_available_handle(
+        self,
+        workshop_id: WorkshopId,
+        handle: str,
+        principal_id: PrincipalId,
+    ) -> None:
+        async with self._store.connection.execute(
+            "SELECT hh.principal_id FROM human_handles hh "
+            "WHERE hh.workshop_id = ? AND hh.handle = ? COLLATE NOCASE "
+            "AND hh.principal_id <> ? "
+            "UNION ALL "
+            "SELECT ad.agent_id FROM agent_definitions ad "
+            "WHERE ad.workshop_id = ? AND ad.handle = ? COLLATE NOCASE",
+            (workshop_id, handle, principal_id, workshop_id, handle),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        if rows:
+            raise WorkshopHumanProvisioningError("Human handle is already used by a human or agent in this Workshop")
 
     async def _resolve_workshop(self, workshop_id: WorkshopId | None) -> WorkshopId:
         if workshop_id is None:

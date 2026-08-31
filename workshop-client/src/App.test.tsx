@@ -99,6 +99,7 @@ const runtimeProfileId = "rtp_00000000000000000000000000000001";
 const navigation: WorkshopNavigation = {
   principal: {
     displayName: "Daniel",
+    handle: "daniel",
     principalId: "prn_00000000000000000000000000000001",
   },
   workshops: [
@@ -111,6 +112,7 @@ const navigation: WorkshopNavigation = {
               available: true,
               engaged: false,
               engagedUntil: null,
+              handle: "kai",
               memoryScope: "private",
               name: "Kai",
               principalId: "prn_00000000000000000000000000000002",
@@ -126,6 +128,7 @@ const navigation: WorkshopNavigation = {
           participants: [
             {
               displayName: "Kai",
+              handle: "kai",
               kind: "agent",
               principalId: "prn_00000000000000000000000000000002",
             },
@@ -139,6 +142,7 @@ const navigation: WorkshopNavigation = {
               available: true,
               engaged: false,
               engagedUntil: null,
+              handle: "kai",
               memoryScope: "private",
               name: "Kai",
               principalId: "prn_00000000000000000000000000000002",
@@ -154,6 +158,7 @@ const navigation: WorkshopNavigation = {
           participants: [
             {
               displayName: "Kai",
+              handle: "kai",
               kind: "agent",
               principalId: "prn_00000000000000000000000000000002",
             },
@@ -169,6 +174,7 @@ const navigation: WorkshopNavigation = {
           participants: [
             {
               displayName: "Scott",
+              handle: "scott",
               kind: "human",
               principalId: "prn_00000000000000000000000000000003",
             },
@@ -1638,14 +1644,51 @@ describe("Workshop React client", () => {
       "Message Wake policy qualification",
     );
     await user.type(composer, "@ka");
-    await user.click(screen.getByRole("option", { name: "@Kai — agent" }));
-    expect(composer).toHaveValue("@Kai ");
+    await user.click(screen.getByRole("option", { name: "@kai — Kai — agent" }));
+    expect(composer).toHaveValue("@kai ");
     await user.type(composer, "reply plainly{Enter}");
 
     await waitFor(() => expect(submitCommand).toHaveBeenCalledOnce());
     expect(vi.mocked(submitCommand).mock.calls[0]?.[2]).toBe(
-      "@Kai reply plainly",
+      "@kai reply plainly",
     );
+  });
+
+  it("shows a human handle with secondary display name only when the human is a channel member", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    const groupNavigation = navigationWithGroup();
+    const channels = groupNavigation.workshops[0].channels;
+    const group = channels[channels.length - 1];
+    group.participants = [
+      ...group.participants,
+      {
+        displayName: "Scott Ellison",
+        handle: "scott",
+        kind: "human",
+        principalId: "prn_55555555555555555555555555555555",
+      },
+    ];
+    vi.mocked(loadNavigation).mockResolvedValue(groupNavigation);
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    const composer = await screen.findByLabelText(
+      "Message Wake policy qualification",
+    );
+    await user.type(composer, "@sc");
+    await user.click(
+      screen.getByRole("option", { name: "@scott — Scott Ellison — human" }),
+    );
+    expect(composer).toHaveValue("@scott ");
+    expect(screen.queryByRole("option", { name: /Daniel/ })).toBeNull();
   });
 
   it("opens a group-message thread and submits replies against its canonical root", async () => {
@@ -1970,6 +2013,7 @@ describe("Workshop React client", () => {
           available: true,
           engaged: false,
           engagedUntil: null,
+          handle: qualificationDefinition.handle,
           memoryScope: "private",
           name: qualificationDefinition.displayName,
           principalId: "prn_44444444444444444444444444444444",
@@ -1983,6 +2027,7 @@ describe("Workshop React client", () => {
       participants: [
         {
           displayName: qualificationDefinition.displayName,
+          handle: qualificationDefinition.handle,
           kind: "agent",
           principalId: "prn_44444444444444444444444444444444",
         },

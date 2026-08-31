@@ -490,6 +490,12 @@ class WorkshopAgentLifecycleService:
                 ) as cursor:
                     if await cursor.fetchone() is not None:
                         raise WorkshopAgentLifecycleConflict("Agent handle is already in use")
+                async with connection.execute(
+                    "SELECT 1 FROM human_handles WHERE workshop_id = ? AND handle = ? COLLATE NOCASE LIMIT 1",
+                    (workshop_id, exclusive_handle),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        raise WorkshopAgentLifecycleConflict("Agent handle is already used by a human")
             for event in events:
                 await self._store.append_in_transaction(event)
             await self._store.project_pending_in_transaction(CanonicalConversationProjection())

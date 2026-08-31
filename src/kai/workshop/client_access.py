@@ -28,6 +28,7 @@ class IssuedClientEnrollment:
 class EnrollableWorkshopHuman:
     principal_id: PrincipalId
     display_name: str
+    handle: str
     direct_channels: tuple[ChannelId, ...]
 
 
@@ -53,22 +54,23 @@ class WorkshopClientAccess:
     async def list_humans(self) -> tuple[EnrollableWorkshopHuman, ...]:
         """List canonical humans and their owned direct channels."""
         async with self._store.connection.execute(
-            "SELECT p.id, p.display_name, c.id FROM principals p "
+            "SELECT p.id, p.display_name, hh.handle, c.id FROM principals p "
             "JOIN workshop_memberships wm ON wm.principal_id = p.id "
+            "JOIN human_handles hh ON hh.workshop_id = wm.workshop_id AND hh.principal_id = p.id "
             "LEFT JOIN channel_memberships cm ON cm.principal_id = p.id AND cm.role = 'owner' "
             "LEFT JOIN channels c ON c.id = cm.channel_id AND c.workshop_id = wm.workshop_id "
             "AND c.kind = 'direct' WHERE p.kind = 'human' ORDER BY p.display_name, p.id, c.id"
         ) as cursor:
             rows = list(await cursor.fetchall())
-        humans: dict[PrincipalId, tuple[str, list[ChannelId]]] = {}
+        humans: dict[PrincipalId, tuple[str, str, list[ChannelId]]] = {}
         for row in rows:
             principal_id = PrincipalId(str(row[0]))
-            entry = humans.setdefault(principal_id, (str(row[1]), []))
-            if row[2] is not None:
-                entry[1].append(ChannelId(str(row[2])))
+            entry = humans.setdefault(principal_id, (str(row[1]), str(row[2]), []))
+            if row[3] is not None:
+                entry[2].append(ChannelId(str(row[3])))
         return tuple(
-            EnrollableWorkshopHuman(principal_id, display_name, tuple(channels))
-            for principal_id, (display_name, channels) in humans.items()
+            EnrollableWorkshopHuman(principal_id, display_name, handle, tuple(channels))
+            for principal_id, (display_name, handle, channels) in humans.items()
         )
 
     async def _require_direct_human(

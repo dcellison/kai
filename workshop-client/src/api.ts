@@ -66,6 +66,7 @@ import {
   AGENT_REVISION_PATTERN,
   ARTIFACT_PATTERN,
   CHANNEL_PATTERN,
+  HUMAN_HANDLE_PATTERN,
   PRINCIPAL_PATTERN,
   RUNTIME_PROFILE_PATTERN,
   WORKSHOP_PATTERN,
@@ -459,6 +460,9 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
     typeof payload.principal.principal_id !== "string" ||
     !PRINCIPAL_PATTERN.test(payload.principal.principal_id) ||
     typeof payload.principal.display_name !== "string" ||
+    (payload.principal.handle !== null &&
+      (typeof payload.principal.handle !== "string" ||
+        !HUMAN_HANDLE_PATTERN.test(payload.principal.handle))) ||
     !Array.isArray(payload.workshops)
   ) {
     throw new Error("Kai returned unsupported Workshop navigation.");
@@ -518,7 +522,9 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
               !PRINCIPAL_PATTERN.test(rawAgent.sponsor_principal_id))) ||
           (rawAgent.sponsor_display_name !== null &&
             typeof rawAgent.sponsor_display_name !== "string") ||
-          typeof rawAgent.name !== "string"
+          typeof rawAgent.name !== "string" ||
+          typeof rawAgent.handle !== "string" ||
+          !HUMAN_HANDLE_PATTERN.test(rawAgent.handle)
         ) {
           throw new Error("Kai returned unsupported Workshop navigation.");
         }
@@ -527,6 +533,7 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           available: rawAgent.available,
           engaged: rawAgent.engaged,
           engagedUntil: rawAgent.engaged_until,
+          handle: rawAgent.handle,
           memoryScope: rawAgent.memory_scope as "private" | "shared_channel",
           name: rawAgent.name,
           principalId: rawAgent.principal_id,
@@ -541,12 +548,16 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           typeof rawParticipant.principal_id !== "string" ||
           !PRINCIPAL_PATTERN.test(rawParticipant.principal_id) ||
           typeof rawParticipant.kind !== "string" ||
-          typeof rawParticipant.display_name !== "string"
+          typeof rawParticipant.display_name !== "string" ||
+          (rawParticipant.handle !== null &&
+            (typeof rawParticipant.handle !== "string" ||
+              !HUMAN_HANDLE_PATTERN.test(rawParticipant.handle)))
         ) {
           throw new Error("Kai returned unsupported Workshop navigation.");
         }
         return {
           displayName: rawParticipant.display_name,
+          handle: rawParticipant.handle,
           kind: rawParticipant.kind,
           principalId: rawParticipant.principal_id,
         };
@@ -577,6 +588,7 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
   return {
     principal: {
       displayName: payload.principal.display_name,
+      handle: payload.principal.handle,
       principalId: payload.principal.principal_id,
     },
     workshops,

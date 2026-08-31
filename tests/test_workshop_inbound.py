@@ -20,6 +20,7 @@ from kai.workshop.domain import (
     PrincipalId,
     WorkshopEventType,
     WorkshopId,
+    WorkshopMembershipId,
 )
 from kai.workshop.inbound import InboundBindingNotFoundError, InboundMessage, record_inbound_message
 from kai.workshop.projection import CanonicalConversationProjection
@@ -33,6 +34,7 @@ def _human(telegram_id: int) -> BootstrapHuman:
         transport="telegram",
         external_subject=str(telegram_id),
         external_channel_id=str(telegram_id),
+        handle=f"human_{telegram_id}",
     )
 
 
@@ -74,13 +76,29 @@ async def _add_channel_member(
     await store.append(
         EventEnvelope.create(
             event_type=WorkshopEventType.PRINCIPAL_CREATED,
-            event_version=1,
+            event_version=2,
             workshop_id=WorkshopId(workshop_id),
             aggregate_type="principal",
             aggregate_id=principal_id,
             actor_principal_id=PrincipalId(actor_principal_id),
             occurred_at=occurred_at,
-            payload={"kind": "agent", "display_name": display_name},
+            payload={
+                "kind": "human",
+                "display_name": display_name,
+                "handle": "kai_smith",
+            },
+        )
+    )
+    await store.append(
+        EventEnvelope.create(
+            event_type=WorkshopEventType.WORKSHOP_MEMBER_ADDED,
+            event_version=1,
+            workshop_id=WorkshopId(workshop_id),
+            aggregate_type="workshop_membership",
+            aggregate_id=WorkshopMembershipId.new(),
+            actor_principal_id=PrincipalId(actor_principal_id),
+            occurred_at=occurred_at,
+            payload={"principal_id": principal_id, "role": "member"},
         )
     )
     await store.append(
@@ -179,16 +197,16 @@ class TestInboundShadowRecording:
             )
             await store.project_pending(CanonicalConversationProjection())
 
-            body = "Ask @kai smith, then @KAI; ignore @Outsider and @Unknown."
+            body = "Ask @kai_smith, then @KAI; ignore @Outsider and @Unknown."
             result = await record_inbound_message(store, _message(body=body))
             mentions = result.event.envelope.payload["mentions"]
 
             assert mentions == [
                 {
                     "principal_id": kai_smith_id,
-                    "kind": "agent",
-                    "start": body.index("@kai smith"),
-                    "length": len("@kai smith"),
+                    "kind": "human",
+                    "start": body.index("@kai_smith"),
+                    "length": len("@kai_smith"),
                 },
                 {
                     "principal_id": mentions[1]["principal_id"],

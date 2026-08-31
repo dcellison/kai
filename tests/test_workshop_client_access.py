@@ -252,6 +252,7 @@ class TestWorkshopClientAccessCLI:
         assert await workshop_cli._run(args) == 0
         output = capsys.readouterr().out
         assert "Human: Alice" in output
+        assert "Handle: @alice" in output
         assert f"Principal: {principal_id}" in output
         assert f"Direct channel: {channel_id}" in output
 
@@ -280,6 +281,7 @@ class TestWorkshopClientAccessCLI:
         assert await workshop_cli._run(args) == 0
         output = capsys.readouterr().out
         assert "Human: Charlie" in output
+        assert "Handle: @charlie" in output
         assert "Principal: prn_" in output
         assert "Workshop: wsp_" in output
         assert "Direct channel: chn_" in output
