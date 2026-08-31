@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 51
+WORKSHOP_SCHEMA_VERSION = 52
 
 
 @dataclass(frozen=True, slots=True)
@@ -2413,6 +2413,15 @@ _CANONICAL_HUMAN_HANDLE_SCHEMA = SchemaMigration(
     ),
 )
 
+_MULTI_HUMAN_CHANNEL_MEMBERSHIP_SCHEMA = SchemaMigration(
+    version=52,
+    name="multi_human_channel_membership",
+    statements=(
+        "ALTER TABLE channels ADD COLUMN membership_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2465,6 +2474,7 @@ _MIGRATIONS = (
     _BOUNDED_AGENT_DELEGATION_SCHEMA,
     _REVERSIBLE_CHANNEL_ARCHIVAL_SCHEMA,
     _CANONICAL_HUMAN_HANDLE_SCHEMA,
+    _MULTI_HUMAN_CHANNEL_MEMBERSHIP_SCHEMA,
 )
 
 

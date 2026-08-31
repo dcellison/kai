@@ -36,6 +36,23 @@ export interface WorkshopParticipantSummary {
   principalId: string;
 }
 
+export interface WorkshopHumanChannelMember {
+  displayName: string;
+  handle: string;
+  principalId: string;
+  role: "owner" | "participant" | null;
+}
+
+export interface WorkshopHumanMembership {
+  archived: boolean;
+  canManage: boolean;
+  channelId: string;
+  eligibleHumans: WorkshopHumanChannelMember[];
+  members: WorkshopHumanChannelMember[];
+  stateVersion: number;
+  workshopId: string;
+}
+
 export type WorkshopChannelKind = "direct" | "group" | "notification";
 
 export interface WorkshopChannelSummary {
@@ -122,10 +139,10 @@ export interface WorkshopAgentEnablement {
 }
 
 export interface WorkshopAgentChangeSignal {
-  definitionId: string;
+  definitionId: string | null;
   eventPosition: number;
   eventType: string;
-  kind: "definition" | "enablement";
+  kind: "definition" | "enablement" | "navigation";
   occurredAt: string;
   revisionId: string | null;
 }

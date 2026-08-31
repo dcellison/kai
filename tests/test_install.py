@@ -5361,12 +5361,21 @@ class TestCmdStatus:
         connection = sqlite3.connect(db_path)
         connection.executescript(
             "CREATE TABLE channels (id TEXT PRIMARY KEY, workshop_id TEXT, kind TEXT, "
-            "name TEXT, archived_at TEXT, lifecycle_event_position INTEGER);"
+            "name TEXT, archived_at TEXT, lifecycle_event_position INTEGER, membership_event_position INTEGER);"
+            "CREATE TABLE principals (id TEXT PRIMARY KEY, kind TEXT);"
+            "CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT, role TEXT);"
+            "CREATE TABLE workshop_memberships (workshop_id TEXT, principal_id TEXT);"
+            "CREATE TABLE human_handles (workshop_id TEXT, principal_id TEXT);"
             "CREATE TABLE event_log (position INTEGER PRIMARY KEY, aggregate_id TEXT, "
             "aggregate_type TEXT, event_type TEXT);"
             "INSERT INTO channels VALUES "
-            "('chn_active','wsp_one','group','Active',NULL,NULL),"
-            "('chn_archived','wsp_one','group','Archived','2026-08-30T15:00:00Z',7);"
+            "('chn_active','wsp_one','group','Active',NULL,NULL,NULL),"
+            "('chn_archived','wsp_one','group','Archived','2026-08-30T15:00:00Z',7,NULL);"
+            "INSERT INTO principals VALUES ('prn_one','human'),('prn_two','human');"
+            "INSERT INTO channel_memberships VALUES "
+            "('chn_active','prn_one','owner'),('chn_archived','prn_two','owner');"
+            "INSERT INTO workshop_memberships VALUES ('wsp_one','prn_one'),('wsp_one','prn_two');"
+            "INSERT INTO human_handles VALUES ('wsp_one','prn_one'),('wsp_one','prn_two');"
             "INSERT INTO event_log VALUES "
             "(7,'chn_archived','channel','channel.archived');"
         )
@@ -5375,7 +5384,8 @@ class TestCmdStatus:
 
         assert _channel_lifecycle_status(db_path) == (
             "Workshop channel lifecycle: active; group channels=2, active=1, "
-            "archived=1, integrity gaps=0; authority=canonical"
+            "archived=1, human members=2 (owners=2, participants=0), "
+            "integrity gaps=0; authority=canonical"
         )
 
     def test_status_reports_canonical_internal_api_context_coverage(self, tmp_path):

@@ -67,6 +67,9 @@ from kai.workshop.channel_lifecycle import (
     WorkshopChannelLifecycleService,
     WorkshopChannelLifecycleStorageError,
     WorkshopChannelLifecycleValidationError,
+    WorkshopHumanChannelMember,
+    WorkshopHumanMembershipMutation,
+    WorkshopHumanMembershipSnapshot,
 )
 from kai.workshop.client_commands import (
     ClientCommandExecutorUnavailableError,
@@ -226,6 +229,9 @@ _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
 _CHANNEL_ARCHIVAL_PATH = "/v1/channels/{channel_id}/archive"
 _CHANNEL_RESTORATION_PATH = "/v1/channels/{channel_id}/restore"
+_CHANNEL_MEMBERS_PATH = "/v1/channels/{channel_id}/members"
+_CHANNEL_MEMBER_ADDITION_PATH = "/v1/channels/{channel_id}/members/{principal_id}/add"
+_CHANNEL_MEMBER_REMOVAL_PATH = "/v1/channels/{channel_id}/members/{principal_id}/remove"
 _AGENT_DEFINITIONS_PATH = "/v1/client/agents"
 _AGENT_EVENTS_PATH = "/v1/client/agents/events"
 _AGENT_DEFINITION_PATH = "/v1/client/agents/{definition_id}"
@@ -303,6 +309,8 @@ _CHANNEL_CREATION_REQUEST_FIELDS = frozenset({"name", "agent_ids", "origin_chann
 _MAX_CHANNEL_CREATION_BODY_BYTES = 8_192
 _CHANNEL_AGENT_OPERATION_FIELDS = frozenset({"client_operation_id"})
 _MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES = 1_024
+_CHANNEL_MEMBER_OPERATION_FIELDS = frozenset({"client_operation_id", "expected_state_version"})
+_MAX_CHANNEL_MEMBER_OPERATION_BODY_BYTES = 1_024
 _AGENT_CREATION_FIELDS = frozenset(
     {
         "idempotency_key",
@@ -681,6 +689,46 @@ def _serialize_channel_lifecycle_mutation(
             "archived": mutation.archived,
             "changed": mutation.changed,
             "occurred_at": mutation.occurred_at.isoformat(),
+        },
+    }
+
+
+def _serialize_human_membership_snapshot(
+    snapshot: WorkshopHumanMembershipSnapshot,
+) -> dict[str, object]:
+    def member_payload(member: WorkshopHumanChannelMember) -> dict[str, object]:
+        return {
+            "principal_id": str(member.principal_id),
+            "display_name": member.display_name,
+            "handle": member.handle,
+            "role": member.role,
+        }
+
+    return {
+        "version": 1,
+        "channel_id": str(snapshot.channel_id),
+        "workshop_id": str(snapshot.workshop_id),
+        "archived": snapshot.archived,
+        "can_manage": snapshot.can_manage,
+        "state_version": snapshot.state_version,
+        "members": [member_payload(member) for member in snapshot.members],
+        "eligible_humans": [member_payload(member) for member in snapshot.eligible_humans],
+    }
+
+
+def _serialize_human_membership_mutation(
+    mutation: WorkshopHumanMembershipMutation,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "operation": mutation.operation,
+        "changed": mutation.changed,
+        "state_version": mutation.state_version,
+        "member": {
+            "principal_id": str(mutation.member.principal_id),
+            "display_name": mutation.member.display_name,
+            "handle": mutation.member.handle,
+            "role": mutation.member.role,
         },
     }
 
@@ -3407,6 +3455,101 @@ async def _handle_channel_lifecycle_operation(
     return _json_response(_serialize_channel_lifecycle_mutation(mutation), status=200)
 
 
+async def _handle_channel_members(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelLifecycleService,
+) -> web.Response:
+    """Return principal-bounded human membership state for one group channel."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid channel members request")
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        snapshot = await service.human_members(principal_id, channel_id)
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid channel members request")
+    except WorkshopChannelLifecycleAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopChannelLifecycleStorageError:
+        return _error_response(
+            status=503,
+            code="channel_membership_unavailable",
+            message="Channel membership is temporarily unavailable",
+        )
+    return _json_response(_serialize_human_membership_snapshot(snapshot), status=200)
+
+
+async def _handle_channel_member_operation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelLifecycleService,
+    operation: str,
+) -> web.Response:
+    """Add or remove one eligible Workshop human from a private group channel."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid channel member operation")
+    if request.content_length is not None and request.content_length > _MAX_CHANNEL_MEMBER_OPERATION_BODY_BYTES:
+        return _error_response(status=400, code="invalid_request", message="Channel member operation is too large")
+    raw = await request.content.read(_MAX_CHANNEL_MEMBER_OPERATION_BODY_BYTES + 1)
+    try:
+        payload = json.loads(raw)
+        channel_id = ChannelId(request.match_info["channel_id"])
+        member_principal_id = PrincipalId(request.match_info["principal_id"])
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid channel member operation")
+    if len(raw) > _MAX_CHANNEL_MEMBER_OPERATION_BODY_BYTES or (
+        not isinstance(payload, dict) or set(payload) != _CHANNEL_MEMBER_OPERATION_FIELDS
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid channel member operation")
+    try:
+        mutation = (
+            await service.add_human_member(
+                principal_id,
+                channel_id,
+                member_principal_id,
+                expected_state_version=payload["expected_state_version"],
+                client_operation_id=payload["client_operation_id"],
+            )
+            if operation == "add"
+            else await service.remove_human_member(
+                principal_id,
+                channel_id,
+                member_principal_id,
+                expected_state_version=payload["expected_state_version"],
+                client_operation_id=payload["client_operation_id"],
+            )
+        )
+    except WorkshopChannelLifecycleAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopChannelLifecycleValidationError as exc:
+        return _error_response(status=409, code="channel_membership_conflict", message=str(exc))
+    except WorkshopChannelLifecycleStorageError:
+        return _error_response(
+            status=503,
+            code="channel_membership_unavailable",
+            message="Channel membership is temporarily unavailable",
+        )
+    except WorkshopChannelLifecycleError:
+        return _error_response(
+            status=409,
+            code="channel_membership_conflict",
+            message="Channel membership conflicted with current state",
+        )
+    return _json_response(_serialize_human_membership_mutation(mutation), status=200)
+
+
 async def _handle_channel_agent_operation(
     request: web.Request,
     *,
@@ -4094,7 +4237,11 @@ async def _read_agent_lifecycle_events(
         WorkshopEventType.PRINCIPAL_AGENT_DISABLED,
         WorkshopEventType.PRINCIPAL_AGENT_RUNTIME_CHANGED,
     )
-    queried_types = definition_event_types + enablement_event_types
+    membership_event_types = (
+        WorkshopEventType.CHANNEL_MEMBER_ADDED,
+        WorkshopEventType.CHANNEL_MEMBER_REMOVED,
+    )
+    queried_types = definition_event_types + enablement_event_types + membership_event_types
     visible_definition_types = (
         frozenset(definition_event_types) if role == "admin" else frozenset(definition_event_types[2:])
     )
@@ -4102,8 +4249,15 @@ async def _read_agent_lifecycle_events(
     async with store.connection.execute(
         "SELECT position, event_type, aggregate_id, payload_json, metadata_json, occurred_at "
         "FROM event_log WHERE workshop_id = ? AND position > ? "
-        f"AND event_type IN ({placeholders}) ORDER BY position LIMIT ?",
-        (workshop_id, after_position, *queried_types, _EVENT_BATCH_SIZE),
+        f"AND event_type IN ({placeholders}) "
+        "AND (event_type != ? OR event_version = 2) ORDER BY position LIMIT ?",
+        (
+            workshop_id,
+            after_position,
+            *queried_types,
+            WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            _EVENT_BATCH_SIZE,
+        ),
     ) as cursor:
         rows = list(await cursor.fetchall())
     serialized: list[bytes] = []
@@ -4113,7 +4267,22 @@ async def _read_agent_lifecycle_events(
         event_type = str(row[1])
         payload = json.loads(str(row[3]))
         metadata = json.loads(str(row[4]))
-        if event_type in definition_event_types:
+        if event_type in membership_event_types:
+            channel_id = payload.get("channel_id")
+            target_principal_id = payload.get("principal_id")
+            if not isinstance(channel_id, str) or not isinstance(target_principal_id, str):
+                continue
+            visible = role == "admin" or target_principal_id == str(principal_id)
+            if not visible:
+                async with store.connection.execute(
+                    "SELECT 1 FROM channel_memberships WHERE channel_id = ? AND principal_id = ?",
+                    (channel_id, principal_id),
+                ) as visibility_cursor:
+                    visible = await visibility_cursor.fetchone() is not None
+            if not visible:
+                continue
+            event_name = "workshop.navigation.changed"
+        elif event_type in definition_event_types:
             if event_type not in visible_definition_types:
                 continue
             event_name = "agent.definition.changed"
@@ -4121,12 +4290,14 @@ async def _read_agent_lifecycle_events(
             if payload.get("principal_id") != str(principal_id):
                 continue
             event_name = "agent.enablement.changed"
-        definition_id = metadata.get("definition_id")
-        if not isinstance(definition_id, str):
-            if event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
-                definition_id = payload.get("definition_id")
-            else:
-                definition_id = str(row[2])
+        definition_id: str | None = None
+        if event_type not in membership_event_types:
+            definition_id = metadata.get("definition_id")
+            if not isinstance(definition_id, str):
+                if event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
+                    definition_id = payload.get("definition_id")
+                else:
+                    definition_id = str(row[2])
         revision_id: str | None = None
         if event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
             revision_id = str(row[2])
@@ -5151,6 +5322,32 @@ def register_workshop_read_routes(
                 operation="restore",
             )
 
+    async def handle_channel_members(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_members(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+            )
+
+    async def handle_channel_member_addition(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_member_operation(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+                operation="add",
+            )
+
+    async def handle_channel_member_removal(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_channel_member_operation(
+                request,
+                authenticator=authenticator,
+                service=channel_lifecycle,
+                operation="remove",
+            )
+
     async def handle_channel_agent_attachment(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_channel_agent_operation(
@@ -5258,6 +5455,9 @@ def register_workshop_read_routes(
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
     app.router.add_post(_CHANNEL_ARCHIVAL_PATH, handle_channel_archival)
     app.router.add_post(_CHANNEL_RESTORATION_PATH, handle_channel_restoration)
+    app.router.add_get(_CHANNEL_MEMBERS_PATH, handle_channel_members)
+    app.router.add_post(_CHANNEL_MEMBER_ADDITION_PATH, handle_channel_member_addition)
+    app.router.add_post(_CHANNEL_MEMBER_REMOVAL_PATH, handle_channel_member_removal)
     app.router.add_post(_AGENT_ATTACHMENT_PATH, handle_channel_agent_attachment)
     app.router.add_post(_AGENT_DETACHMENT_PATH, handle_channel_agent_detachment)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)

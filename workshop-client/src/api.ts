@@ -56,6 +56,8 @@ import type {
   WorkshopAgentChangeSignal,
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
+  WorkshopHumanChannelMember,
+  WorkshopHumanMembership,
 } from "./types";
 import { MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -1076,6 +1078,104 @@ export async function restoreChannel(
   clientOperationId: string,
 ): Promise<void> {
   await mutateChannelLifecycle(token, channelId, "restore", clientOperationId);
+}
+
+function parseHumanChannelMember(value: unknown): WorkshopHumanChannelMember | null {
+  if (
+    !isRecord(value) ||
+    typeof value.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(value.principal_id) ||
+    typeof value.display_name !== "string" ||
+    typeof value.handle !== "string" ||
+    !HUMAN_HANDLE_PATTERN.test(value.handle) ||
+    !["owner", "participant", null].includes(value.role as string | null)
+  ) {
+    return null;
+  }
+  return {
+    displayName: value.display_name,
+    handle: value.handle,
+    principalId: value.principal_id,
+    role: value.role as "owner" | "participant" | null,
+  };
+}
+
+export async function loadChannelMembers(
+  session: WorkshopSession,
+): Promise<WorkshopHumanMembership> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/members`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load channel members."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.channel_id !== session.channelId ||
+    typeof payload.workshop_id !== "string" ||
+    !WORKSHOP_PATTERN.test(payload.workshop_id) ||
+    typeof payload.archived !== "boolean" ||
+    typeof payload.can_manage !== "boolean" ||
+    !Number.isSafeInteger(payload.state_version) ||
+    (payload.state_version as number) < 0 ||
+    !Array.isArray(payload.members) ||
+    !Array.isArray(payload.eligible_humans)
+  ) {
+    throw new Error("Kai returned unsupported channel membership state.");
+  }
+  const members = payload.members.map(parseHumanChannelMember);
+  const eligibleHumans = payload.eligible_humans.map(parseHumanChannelMember);
+  if (members.some((member) => member === null) || eligibleHumans.some((member) => member === null)) {
+    throw new Error("Kai returned unsupported channel membership state.");
+  }
+  return {
+    archived: payload.archived,
+    canManage: payload.can_manage,
+    channelId: payload.channel_id,
+    eligibleHumans: eligibleHumans as WorkshopHumanChannelMember[],
+    members: members as WorkshopHumanChannelMember[],
+    stateVersion: payload.state_version as number,
+    workshopId: payload.workshop_id,
+  };
+}
+
+export async function changeChannelMember(
+  session: WorkshopSession,
+  principalId: string,
+  operation: "add" | "remove",
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<number> {
+  if (!PRINCIPAL_PATTERN.test(principalId)) {
+    throw new Error("Invalid human identity.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/members/${encodeURIComponent(principalId)}/${operation}`,
+    {
+      body: JSON.stringify({
+        client_operation_id: clientOperationId,
+        expected_state_version: expectedStateVersion,
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.operation !== operation ||
+    typeof payload.changed !== "boolean" ||
+    !Number.isSafeInteger(payload.state_version)
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not update channel members."));
+  }
+  return payload.state_version as number;
 }
 
 async function mutateChannelAgent(
@@ -3487,7 +3587,8 @@ export async function streamAgentChanges(
     for (const event of eventDecoder.push(textDecoder.decode(value, { stream: true }))) {
       if (
         (event.eventName !== "agent.definition.changed" &&
-          event.eventName !== "agent.enablement.changed") ||
+          event.eventName !== "agent.enablement.changed" &&
+          event.eventName !== "workshop.navigation.changed") ||
         !event.eventId ||
         !/^\d+$/.test(event.eventId)
       ) {
@@ -3506,8 +3607,10 @@ export async function streamAgentChanges(
         payload.event_position !== eventPosition ||
         !Number.isSafeInteger(eventPosition) ||
         typeof payload.event_type !== "string" ||
-        typeof payload.definition_id !== "string" ||
-        !AGENT_DEFINITION_PATTERN.test(payload.definition_id) ||
+        (event.eventName === "workshop.navigation.changed"
+          ? payload.definition_id !== null
+          : typeof payload.definition_id !== "string" ||
+            !AGENT_DEFINITION_PATTERN.test(payload.definition_id)) ||
         (payload.revision_id !== null &&
           (typeof payload.revision_id !== "string" ||
             !AGENT_REVISION_PATTERN.test(payload.revision_id))) ||
@@ -3517,11 +3620,12 @@ export async function streamAgentChanges(
       }
       handlers.onChanged(
         {
-          definitionId: payload.definition_id,
+          definitionId: payload.definition_id as string | null,
           eventPosition,
           eventType: payload.event_type,
-          kind:
-            event.eventName === "agent.definition.changed"
+          kind: event.eventName === "workshop.navigation.changed"
+            ? "navigation"
+            : event.eventName === "agent.definition.changed"
               ? "definition"
               : "enablement",
           occurredAt: payload.occurred_at,

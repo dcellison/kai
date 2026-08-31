@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -18,7 +19,7 @@ from kai.workshop.domain import (
     WorkshopId,
 )
 from kai.workshop.projection import CanonicalConversationProjection
-from kai.workshop.store import WorkshopEventStore
+from kai.workshop.store import StoredEvent, WorkshopEventStore
 
 
 class WorkshopChannelLifecycleError(RuntimeError):
@@ -72,6 +73,40 @@ class WorkshopChannelLifecycleMutation:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkshopHumanChannelMember:
+    """One human eligible for or holding membership in a private group channel."""
+
+    principal_id: PrincipalId
+    display_name: str
+    handle: str
+    role: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkshopHumanMembershipSnapshot:
+    """Principal-bounded human membership state for one group channel."""
+
+    channel_id: ChannelId
+    workshop_id: WorkshopId
+    archived: bool
+    can_manage: bool
+    state_version: int
+    members: tuple[WorkshopHumanChannelMember, ...]
+    eligible_humans: tuple[WorkshopHumanChannelMember, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkshopHumanMembershipMutation:
+    """One replayable human participant addition or removal."""
+
+    channel_id: ChannelId
+    member: WorkshopHumanChannelMember
+    operation: str
+    state_version: int
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _AgentAttachment:
     agent_id: AgentId
     agent_principal_id: PrincipalId
@@ -118,11 +153,292 @@ def _normalize_operation_id(value: object) -> str:
     return normalized
 
 
+def _normalize_membership_version(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise WorkshopChannelLifecycleValidationError("expected_state_version must be a non-negative integer")
+    return value
+
+
 class WorkshopChannelLifecycleService:
     """Create group channels and manage their explicit agent sponsorships."""
 
     def __init__(self, store: WorkshopEventStore) -> None:
         self._store = store
+
+    async def human_members(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+    ) -> WorkshopHumanMembershipSnapshot:
+        """Return human membership and eligible Workshop humans without cross-Workshop discovery."""
+        workshop_id, archived, state_version, can_manage = await self._resolve_human_membership_access(
+            principal_id,
+            channel_id,
+        )
+        async with self._store.connection.execute(
+            "SELECT p.id, p.display_name, hh.handle, cm.role "
+            "FROM channel_memberships cm JOIN principals p ON p.id = cm.principal_id "
+            "AND p.kind = 'human' JOIN human_handles hh ON hh.workshop_id = ? "
+            "AND hh.principal_id = p.id WHERE cm.channel_id = ? "
+            "ORDER BY CASE cm.role WHEN 'owner' THEN 0 ELSE 1 END, lower(p.display_name), p.id",
+            (workshop_id, channel_id),
+        ) as cursor:
+            member_rows = list(await cursor.fetchall())
+        members = tuple(self._human_member_from_row(row, with_role=True) for row in member_rows)
+        eligible: tuple[WorkshopHumanChannelMember, ...] = ()
+        if can_manage and not archived:
+            async with self._store.connection.execute(
+                "SELECT p.id, p.display_name, hh.handle FROM workshop_memberships wm "
+                "JOIN principals p ON p.id = wm.principal_id AND p.kind = 'human' "
+                "JOIN human_handles hh ON hh.workshop_id = wm.workshop_id AND hh.principal_id = p.id "
+                "WHERE wm.workshop_id = ? AND NOT EXISTS (SELECT 1 FROM channel_memberships cm "
+                "WHERE cm.channel_id = ? AND cm.principal_id = p.id) "
+                "ORDER BY lower(p.display_name), p.id",
+                (workshop_id, channel_id),
+            ) as cursor:
+                eligible_rows = list(await cursor.fetchall())
+            eligible = tuple(self._human_member_from_row(row, with_role=False) for row in eligible_rows)
+        return WorkshopHumanMembershipSnapshot(
+            channel_id,
+            workshop_id,
+            archived,
+            can_manage and not archived,
+            state_version,
+            members,
+            eligible,
+        )
+
+    async def add_human_member(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        member_principal_id: PrincipalId,
+        *,
+        expected_state_version: object,
+        client_operation_id: object,
+    ) -> WorkshopHumanMembershipMutation:
+        """Add one Workshop human as a group participant."""
+        return await self._change_human_membership(
+            principal_id,
+            channel_id,
+            member_principal_id,
+            operation="add",
+            expected_state_version=expected_state_version,
+            client_operation_id=client_operation_id,
+        )
+
+    async def remove_human_member(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        member_principal_id: PrincipalId,
+        *,
+        expected_state_version: object,
+        client_operation_id: object,
+    ) -> WorkshopHumanMembershipMutation:
+        """Remove one human participant; immutable owners cannot be removed or transferred."""
+        return await self._change_human_membership(
+            principal_id,
+            channel_id,
+            member_principal_id,
+            operation="remove",
+            expected_state_version=expected_state_version,
+            client_operation_id=client_operation_id,
+        )
+
+    async def _change_human_membership(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        member_principal_id: PrincipalId,
+        *,
+        operation: str,
+        expected_state_version: object,
+        client_operation_id: object,
+    ) -> WorkshopHumanMembershipMutation:
+        expected_version = _normalize_membership_version(expected_state_version)
+        operation_id = _normalize_operation_id(client_operation_id)
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            workshop_id, archived, current_version, can_manage = await self._resolve_human_membership_access(
+                principal_id,
+                channel_id,
+            )
+            if not can_manage:
+                raise WorkshopChannelLifecycleAccessDenied(
+                    "Human membership changes require group-channel owner or Workshop administrator authority"
+                )
+            if archived:
+                raise WorkshopChannelLifecycleValidationError("Archived channels are read-only")
+            member = await self._resolve_workshop_human(workshop_id, member_principal_id)
+            idempotency_key = f"workshop-client:channel:{channel_id}:human-membership:{principal_id}:{operation_id}"
+            existing = await self._store.event_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                result = self._human_membership_result_from_event(
+                    existing,
+                    principal_id=principal_id,
+                    workshop_id=workshop_id,
+                    channel_id=channel_id,
+                    member=member,
+                    operation=operation,
+                )
+                await connection.rollback()
+                return result
+            if expected_version != current_version:
+                raise WorkshopChannelLifecycleValidationError(
+                    "Channel membership changed; reload members before saving"
+                )
+            async with connection.execute(
+                "SELECT role FROM channel_memberships WHERE channel_id = ? AND principal_id = ?",
+                (channel_id, member_principal_id),
+            ) as cursor:
+                current = await cursor.fetchone()
+            if operation == "add":
+                if current is not None:
+                    raise WorkshopChannelLifecycleValidationError("Human is already a channel member")
+                event_type = WorkshopEventType.CHANNEL_MEMBER_ADDED
+                event_version = 2
+            else:
+                if current is None:
+                    raise WorkshopChannelLifecycleValidationError("Human is not a channel member")
+                if str(current[0]) == "owner":
+                    raise WorkshopChannelLifecycleValidationError(
+                        "Channel ownership is immutable; owners cannot be removed or transferred"
+                    )
+                if str(current[0]) != "participant":
+                    raise WorkshopChannelLifecycleValidationError("Only human participants may be removed")
+                event_type = WorkshopEventType.CHANNEL_MEMBER_REMOVED
+                event_version = 1
+            event = EventEnvelope.create(
+                event_type=event_type,
+                event_version=event_version,
+                workshop_id=workshop_id,
+                aggregate_type="channel_membership",
+                aggregate_id=ChannelMembershipId.derived(channel_id, f"principal:{member_principal_id}"),
+                actor_principal_id=principal_id,
+                occurred_at=datetime.now(UTC),
+                idempotency_key=idempotency_key,
+                payload={
+                    "channel_id": channel_id,
+                    "principal_id": member_principal_id,
+                    "role": "participant",
+                },
+                metadata={"source": "workshop_client"},
+            )
+            appended = await self._store.append_in_transaction(event)
+            if not appended.inserted:
+                raise WorkshopChannelLifecycleError("New membership event unexpectedly already exists")
+            await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            await connection.commit()
+            return WorkshopHumanMembershipMutation(
+                channel_id,
+                WorkshopHumanChannelMember(
+                    member.principal_id,
+                    member.display_name,
+                    member.handle,
+                    "participant" if operation == "add" else None,
+                ),
+                operation,
+                appended.event.position,
+                True,
+            )
+        except WorkshopChannelLifecycleError:
+            await connection.rollback()
+            raise
+        except Exception as exc:
+            await connection.rollback()
+            raise WorkshopChannelLifecycleStorageError("Human membership change could not be persisted") from exc
+
+    async def _resolve_human_membership_access(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+    ) -> tuple[WorkshopId, bool, int, bool]:
+        async with self._store.connection.execute(
+            "SELECT c.workshop_id, c.archived_at, coalesce(c.membership_event_position, 0), "
+            "(coalesce(cm.role, '') = 'owner' OR wm.role = 'admin') AS can_manage "
+            "FROM channels c JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+            "AND wm.principal_id = ? JOIN principals actor ON actor.id = wm.principal_id "
+            "AND actor.kind = 'human' LEFT JOIN channel_memberships cm ON cm.channel_id = c.id "
+            "AND cm.principal_id = wm.principal_id WHERE c.id = ? AND c.kind = 'group' "
+            "AND (cm.id IS NOT NULL OR wm.role = 'admin')",
+            (principal_id, channel_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise WorkshopChannelLifecycleAccessDenied("Channel membership is unavailable")
+        return WorkshopId(str(row[0])), row[1] is not None, int(row[2]), bool(row[3])
+
+    async def _resolve_workshop_human(
+        self,
+        workshop_id: WorkshopId,
+        principal_id: PrincipalId,
+    ) -> WorkshopHumanChannelMember:
+        async with self._store.connection.execute(
+            "SELECT p.id, p.display_name, hh.handle FROM workshop_memberships wm "
+            "JOIN principals p ON p.id = wm.principal_id AND p.kind = 'human' "
+            "JOIN human_handles hh ON hh.workshop_id = wm.workshop_id AND hh.principal_id = p.id "
+            "WHERE wm.workshop_id = ? AND wm.principal_id = ?",
+            (workshop_id, principal_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise WorkshopChannelLifecycleValidationError("Human is not eligible for this Workshop channel")
+        return self._human_member_from_row(row, with_role=False)
+
+    @staticmethod
+    def _human_member_from_row(
+        row: Sequence[object],
+        *,
+        with_role: bool,
+    ) -> WorkshopHumanChannelMember:
+        values = row
+        return WorkshopHumanChannelMember(
+            PrincipalId(str(values[0])),
+            str(values[1]),
+            str(values[2]),
+            str(values[3]) if with_role else None,
+        )
+
+    @staticmethod
+    def _human_membership_result_from_event(
+        stored: StoredEvent,
+        *,
+        principal_id: PrincipalId,
+        workshop_id: WorkshopId,
+        channel_id: ChannelId,
+        member: WorkshopHumanChannelMember,
+        operation: str,
+    ) -> WorkshopHumanMembershipMutation:
+        envelope = stored.envelope
+        position = stored.position
+        expected_type = (
+            WorkshopEventType.CHANNEL_MEMBER_ADDED if operation == "add" else WorkshopEventType.CHANNEL_MEMBER_REMOVED
+        )
+        if (
+            envelope.event_type != expected_type
+            or envelope.workshop_id != workshop_id
+            or envelope.actor_principal_id != principal_id
+            or envelope.payload.get("channel_id") != channel_id
+            or envelope.payload.get("principal_id") != member.principal_id
+            or envelope.payload.get("role") != "participant"
+        ):
+            raise WorkshopChannelLifecycleValidationError(
+                "client_operation_id is already bound to a different membership operation"
+            )
+        return WorkshopHumanMembershipMutation(
+            channel_id,
+            WorkshopHumanChannelMember(
+                member.principal_id,
+                member.display_name,
+                member.handle,
+                "participant" if operation == "add" else None,
+            ),
+            operation,
+            position,
+            False,
+        )
 
     async def archive(
         self,

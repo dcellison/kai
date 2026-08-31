@@ -17,10 +17,12 @@ import {
   attachChannelAgent,
   cancelRun,
   ChannelAccessError,
+  changeChannelMember,
   createChannel,
   dismissChannelAgent,
   detachChannelAgent,
   loadAppearancePreferences,
+  loadChannelMembers,
   loadAgentEnablements,
   loadNavigation,
   loadNotificationPreferences,
@@ -30,9 +32,11 @@ import {
   loadSettingsWorkspace,
   loadThreadTimeline,
   redeemEnrollment,
+  ResynchronizationRequired,
   restoreChannel,
   setMessageReaction,
   submitCommand,
+  streamAgentChanges,
   switchWorkspace,
 } from "./api";
 import type {
@@ -55,6 +59,7 @@ import type {
   WorkshopAgentSummary,
   WorkshopAgentEnablement,
   WorkshopAppearancePreferences,
+  WorkshopHumanMembership,
   WorkshopReaction,
 } from "./types";
 import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN } from "./types";
@@ -1344,6 +1349,117 @@ function ChannelAgentManagementDialog({
   );
 }
 
+function ChannelMemberManagementDialog({
+  membership,
+  onCancel,
+  onChange,
+}: {
+  membership: WorkshopHumanMembership;
+  onCancel: () => void;
+  onChange: (
+    principalId: string,
+    operation: "add" | "remove",
+    expectedStateVersion: number,
+    clientOperationId: string,
+  ) => Promise<number>;
+}): React.JSX.Element {
+  const initialIds = useMemo(
+    () => membership.members.map((member) => member.principalId),
+    [membership.members],
+  );
+  const [selectedIds, setSelectedIds] = useState(initialIds);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const choices = useMemo(
+    () => [...membership.members, ...membership.eligibleHumans].sort((left, right) => {
+      if (left.role === "owner" && right.role !== "owner") return -1;
+      if (right.role === "owner" && left.role !== "owner") return 1;
+      return left.displayName.localeCompare(right.displayName);
+    }),
+    [membership.eligibleHumans, membership.members],
+  );
+  const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      let stateVersion = membership.stateVersion;
+      const initial = new Set(initialIds);
+      const selected = new Set(selectedIds);
+      for (const member of membership.members) {
+        if (member.role !== "owner" && !selected.has(member.principalId)) {
+          stateVersion = await onChange(
+            member.principalId,
+            "remove",
+            stateVersion,
+            createClientMessageId(),
+          );
+        }
+      }
+      for (const member of membership.eligibleHumans) {
+        if (!initial.has(member.principalId) && selected.has(member.principalId)) {
+          stateVersion = await onChange(
+            member.principalId,
+            "add",
+            stateVersion,
+            createClientMessageId(),
+          );
+        }
+      }
+      onCancel();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update channel members.");
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop">
+      <section className="channel-creation-dialog" role="dialog" aria-modal="true" aria-labelledby="manage-channel-members-title">
+        <p className="overline">Channel management</p>
+        <h2 id="manage-channel-members-title">People</h2>
+        <p>
+          Members can read this private channel and mention its people and agents.
+          The channel owner is permanent; ownership transfer is not available.
+        </p>
+        <form onSubmit={(event) => void submit(event)}>
+          <fieldset>
+            <legend>Human members</legend>
+            {choices.map((member) => (
+              <label className="channel-agent-choice" key={member.principalId}>
+                <input
+                  type="checkbox"
+                  checked={selectedIds.includes(member.principalId)}
+                  disabled={busy || member.role === "owner"}
+                  onChange={(event) =>
+                    setSelectedIds((current) =>
+                      event.target.checked
+                        ? [...current, member.principalId]
+                        : current.filter((principalId) => principalId !== member.principalId),
+                    )
+                  }
+                />
+                <span>
+                  {member.displayName}
+                  <small>@{member.handle}{member.role === "owner" ? " · owner" : ""}</small>
+                </span>
+              </label>
+            ))}
+          </fieldset>
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="form-actions">
+            <button className="primary-button" type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+            <button className="quiet-button" type="button" onClick={onCancel} disabled={busy}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function ArchivedChannelsDialog({
   channels,
   busyChannelId,
@@ -1519,6 +1635,16 @@ function ManageAgentsIcon(): React.JSX.Element {
         strokeLinejoin="round"
         strokeWidth="1.5"
       />
+    </svg>
+  );
+}
+
+function ManageMembersIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <circle cx="9" cy="8" r="3" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="17" cy="10" r="2.5" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M3.5 20v-2a5.5 5.5 0 0 1 11 0v2M14 15.3A4.5 4.5 0 0 1 20.5 19v1" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
     </svg>
   );
 }
@@ -1796,10 +1922,12 @@ function WorkshopView({
   onDownloadArtifact,
   onLoadEarlier,
   onLoadArtifact,
+  onLoadChannelMembers,
   onLoadRun,
   onLoadRunTrace,
   onLoadSettingsWorkspace,
   onLoadThread,
+  onChangeChannelMember,
   onMemoryAuthenticationFailure,
   onOpenMemory,
   onCreateAgent,
@@ -1849,6 +1977,7 @@ function WorkshopView({
   onDownloadArtifact: (artifactId: string) => void;
   onLoadEarlier: () => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
+  onLoadChannelMembers: () => Promise<WorkshopHumanMembership>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onLoadSettingsWorkspace: () => Promise<WorkshopSettingsWorkspace>;
@@ -1857,6 +1986,12 @@ function WorkshopView({
     cursor: string | null,
     signal?: AbortSignal,
   ) => Promise<ThreadTimelineSnapshot>;
+  onChangeChannelMember: (
+    principalId: string,
+    operation: "add" | "remove",
+    expectedStateVersion: number,
+    clientOperationId: string,
+  ) => Promise<number>;
   onMemoryAuthenticationFailure: (message: string) => void;
   onOpenMemory: () => void;
   onCreateAgent: () => void;
@@ -1930,6 +2065,8 @@ function WorkshopView({
   const [channelLifecycleBusy, setChannelLifecycleBusy] = useState<string | null>(null);
   const [agentManagement, setAgentManagement] = useState<WorkshopAgentEnablement[] | null>(null);
   const [agentManagementLoading, setAgentManagementLoading] = useState(false);
+  const [memberManagement, setMemberManagement] = useState<WorkshopHumanMembership | null>(null);
+  const [memberManagementLoading, setMemberManagementLoading] = useState(false);
   const [dismissedAgents, setDismissedAgents] = useState<Record<string, number>>({});
   const [dismissingAgentId, setDismissingAgentId] = useState<string | null>(null);
   const [engagementClock, setEngagementClock] = useState(() => Date.now());
@@ -2165,6 +2302,39 @@ function WorkshopView({
     } finally {
       setAgentManagementLoading(false);
     }
+  };
+
+  const openMemberManagement = async (): Promise<void> => {
+    if (memberManagementLoading) {
+      return;
+    }
+    setMemberManagementLoading(true);
+    setSubmissionError(null);
+    try {
+      setMemberManagement(await onLoadChannelMembers());
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Could not load channel members.",
+      );
+    } finally {
+      setMemberManagementLoading(false);
+    }
+  };
+
+  const changeMemberManagement = async (
+    principalId: string,
+    operation: "add" | "remove",
+    expectedStateVersion: number,
+    clientOperationId: string,
+  ): Promise<number> => {
+    const nextVersion = await onChangeChannelMember(
+      principalId,
+      operation,
+      expectedStateVersion,
+      clientOperationId,
+    );
+    await onAgentNavigationChanged();
+    return nextVersion;
   };
 
   const saveAgentManagement = async (agentIds: string[]): Promise<void> => {
@@ -3434,6 +3604,48 @@ function WorkshopView({
             <section className="context-section agent-attention-section">
               <span className="section-number">04</span>
               <div className="context-section-heading">
+                <h3>People</h3>
+                {(channel.role === "owner" || workshop.role === "admin") && !channelIsArchived(channel) && (
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label="Manage channel members"
+                    title="Manage channel members"
+                    disabled={memberManagementLoading}
+                    onClick={() => void openMemberManagement()}
+                  >
+                    <ManageMembersIcon />
+                  </button>
+                )}
+              </div>
+              <ul>
+                <li>
+                  <span>
+                    <strong>{navigation.principal.displayName}</strong>
+                    <small>
+                      {navigation.principal.handle ? `@${navigation.principal.handle} · ` : ""}
+                      {channel.role}
+                    </small>
+                  </span>
+                </li>
+                {channel.participants
+                  .filter((participant) => participant.kind === "human")
+                  .map((participant) => (
+                    <li key={participant.principalId}>
+                      <span>
+                        <strong>{participant.displayName}</strong>
+                        {participant.handle && <small>@{participant.handle} · participant</small>}
+                      </span>
+                    </li>
+                  ))}
+              </ul>
+            </section>
+          )}
+
+          {channel.kind === "group" && (
+            <section className="context-section agent-attention-section">
+              <span className="section-number">05</span>
+              <div className="context-section-heading">
                 <h3>Agent attention</h3>
                 {channel.role === "owner" && !channelIsArchived(channel) && (
                   <button
@@ -3493,7 +3705,7 @@ function WorkshopView({
 
           <section className="context-section trace-section">
             <span className="section-number">
-              {channel.kind === "group" ? "05" : "04"}
+              {channel.kind === "group" ? "06" : "04"}
             </span>
             <h3>Runtime and workspace</h3>
             {settingsWorkspace ? (
@@ -3538,7 +3750,7 @@ function WorkshopView({
 
           <section className="context-section trace-section">
             <span className="section-number">
-              {channel.kind === "group" ? "06" : "05"}
+              {channel.kind === "group" ? "07" : "05"}
             </span>
             <h3>Run inspector</h3>
             <RunTraceCard
@@ -3587,6 +3799,13 @@ function WorkshopView({
           enablements={agentManagement}
           onCancel={() => setAgentManagement(null)}
           onSave={saveAgentManagement}
+        />
+      )}
+      {memberManagement && (
+        <ChannelMemberManagementDialog
+          membership={memberManagement}
+          onCancel={() => setMemberManagement(null)}
+          onChange={changeMemberManagement}
         />
       )}
         </>
@@ -3827,6 +4046,27 @@ function ActiveWorkshopClient({
       ),
     [session, withAccessHandling],
   );
+  const loadSelectedChannelMembers = useCallback(
+    () => withAccessHandling(() => loadChannelMembers(session)),
+    [session, withAccessHandling],
+  );
+  const changeSelectedChannelMember = useCallback(
+    (
+      principalId: string,
+      operation: "add" | "remove",
+      expectedStateVersion: number,
+      clientOperationId: string,
+    ) => withAccessHandling(() =>
+      changeChannelMember(
+        session,
+        principalId,
+        operation,
+        expectedStateVersion,
+        clientOperationId,
+      )
+    ),
+    [session, withAccessHandling],
+  );
   const setSelectedMessageReaction = useCallback(
     (messageId: string, reaction: WorkshopReaction, active: boolean) =>
       withAccessHandling(async () => {
@@ -3862,6 +4102,7 @@ function ActiveWorkshopClient({
       onLoadEarlier={loadEarlier}
       onDownloadArtifact={downloadSelectedArtifact}
       onLoadArtifact={loadSelectedArtifact}
+      onLoadChannelMembers={loadSelectedChannelMembers}
       runActivity={runActivity}
       runPreview={runPreview}
       runTrace={runTrace}
@@ -3880,6 +4121,7 @@ function ActiveWorkshopClient({
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
       onLoadThread={loadSelectedThread}
+      onChangeChannelMember={changeSelectedChannelMember}
       onMemoryAuthenticationFailure={onAuthenticationFailure}
       onOpenAgentChannel={onOpenAgentChannel}
       onOpenAgentDefinition={onOpenAgentDefinition}
@@ -4220,6 +4462,57 @@ function WorkshopApp(): React.JSX.Element {
       }
     }
   }, [forgetSession, session]);
+
+  useEffect(() => {
+    if (!session || destination.kind === "agents") {
+      return;
+    }
+    const controller = new AbortController();
+    let lastEventId: string | null = null;
+    const synchronize = async (): Promise<void> => {
+      while (!controller.signal.aborted) {
+        try {
+          await streamAgentChanges(
+            session.token,
+            lastEventId,
+            {
+              onChanged: (_signal, eventId) => {
+                lastEventId = eventId;
+                void refreshAgentNavigation().catch(() => undefined);
+              },
+              onConnected: () => undefined,
+            },
+            controller.signal,
+          );
+        } catch (caught) {
+          if (controller.signal.aborted) {
+            return;
+          }
+          if (caught instanceof AuthenticationError) {
+            forgetSession(caught.message);
+            return;
+          }
+          if (caught instanceof ResynchronizationRequired) {
+            lastEventId = null;
+            await refreshAgentNavigation();
+          }
+          await new Promise<void>((resolve) => {
+            const timeout = window.setTimeout(resolve, 2000);
+            controller.signal.addEventListener(
+              "abort",
+              () => {
+                window.clearTimeout(timeout);
+                resolve();
+              },
+              { once: true },
+            );
+          });
+        }
+      }
+    };
+    void synchronize();
+    return () => controller.abort();
+  }, [destination.kind, forgetSession, refreshAgentNavigation, session]);
 
   const openAgentChannel = useCallback(async (channelId: string): Promise<void> => {
     if (!session) {
