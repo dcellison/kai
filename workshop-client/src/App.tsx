@@ -835,7 +835,7 @@ function MessageItem({
         onMessageVisible(message.messageId);
       }
     }, {
-      rootMargin: "-15% 0px -35% 0px",
+      rootMargin: "0px",
       threshold: 0,
     });
     observer.observe(row);
