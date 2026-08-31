@@ -1003,7 +1003,11 @@ describe("Settings workspace", () => {
     expect(section).not.toBeNull();
     expect(content).not.toBeNull();
     expect(section?.children).toHaveLength(2);
+    const channelGrid = screen.getByLabelText("General").closest(".settings-card-grid");
+    const githubGrid = screen.getByLabelText("GitHub").closest(".settings-card-grid");
     expect(content).toContainElement(screen.getByLabelText("GitHub").closest("article"));
+    expect(content?.querySelectorAll(".notification-preference-grid")).toHaveLength(1);
+    expect(githubGrid).toBe(channelGrid);
 
     const timezone = screen.getByLabelText("Timezone");
     expect(timezone.tagName).toBe("SELECT");

@@ -1789,11 +1789,39 @@ function SettingsWorkspaceContent({
             </p>
           </div>
           <div className="settings-section-content notification-settings-content">
-          {channelNotificationLoading ? (
+          {channelNotificationLoading && (
             <p role="status">Loading channel notification policy…</p>
-          ) : channelNotifications ? (
+          )}
+          {!channelNotificationLoading && !channelNotifications && (
+            <div className="settings-failure">
+              <p role="alert">
+                {channelNotificationError ?? "Channel notification policy is unavailable."}
+              </p>
+              <button className="quiet-button" type="button" onClick={() => void refreshChannelNotifications()}>
+                Retry
+              </button>
+            </div>
+          )}
+          {notificationLoading && (
+            <p role="status">Loading notification destinations…</p>
+          )}
+          {!notificationLoading && !notifications && (
+            <div className="settings-failure">
+              <p role="alert">
+                {notificationError ?? "Notification preferences are unavailable."}
+              </p>
+              <button
+                className="quiet-button"
+                type="button"
+                onClick={() => void refreshNotifications()}
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          {(channelNotifications || notifications) && (
             <div className="settings-card-grid notification-preference-grid">
-              {channelNotifications.channels.map((channel) => (
+              {channelNotifications?.channels.map((channel) => (
                 <article className="settings-card" key={channel.channelId}>
                   <label htmlFor={`channel-notification-${channel.channelId}`}>
                     {channel.channelName}
@@ -1815,120 +1843,103 @@ function SettingsWorkspaceContent({
                   <p>{channel.source}</p>
                 </article>
               ))}
-              <article className="settings-card">
-                <label className="settings-checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={channelNotifications.mutedMentionsNotify}
-                    disabled={channelNotificationBusy}
-                    onChange={(event) => void mutateChannelNotificationPolicy({
-                      field: "muted_mentions_notify",
-                      enabled: event.target.checked,
-                    })}
-                  />
-                  <span>Direct mentions override muted channels</span>
-                </label>
-                <p>A direct @mention can still create an in-app notification.</p>
-              </article>
-              <article className="settings-card settings-dnd-card">
-                <h3>Do not disturb</h3>
-                <label className="settings-checkbox-row">
-                  <input
-                    type="checkbox"
-                    checked={dndEnabled}
-                    disabled={channelNotificationBusy}
-                    onChange={(event) => setDndEnabled(event.target.checked)}
-                  />
-                  <span>Pause external delivery on this schedule</span>
-                </label>
-                <label htmlFor="dnd-timezone">Timezone</label>
-                <select
-                  id="dnd-timezone"
-                  value={dndTimezone}
-                  disabled={channelNotificationBusy}
-                  onChange={(event) => setDndTimezone(event.target.value)}
-                >
-                  {dndTimezones.map((timezone) => (
-                    <option key={timezone} value={timezone}>{timezone}</option>
-                  ))}
-                </select>
-                <div className="settings-inline-fields">
-                  <label htmlFor="dnd-start">
-                    Start
-                    <input
-                      id="dnd-start"
-                      type="text"
-                      inputMode="numeric"
-                      pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]"
-                      maxLength={5}
-                      value={dndStart}
+              {channelNotifications && (
+                <>
+                  <article className="settings-card">
+                    <label className="settings-checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={channelNotifications.mutedMentionsNotify}
+                        disabled={channelNotificationBusy}
+                        onChange={(event) => void mutateChannelNotificationPolicy({
+                          field: "muted_mentions_notify",
+                          enabled: event.target.checked,
+                        })}
+                      />
+                      <span>Direct mentions override muted channels</span>
+                    </label>
+                    <p>A direct @mention can still create an in-app notification.</p>
+                  </article>
+                  <article className="settings-card settings-dnd-card">
+                    <h3>Do not disturb</h3>
+                    <label className="settings-checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={dndEnabled}
+                        disabled={channelNotificationBusy}
+                        onChange={(event) => setDndEnabled(event.target.checked)}
+                      />
+                      <span>Pause external delivery on this schedule</span>
+                    </label>
+                    <label htmlFor="dnd-timezone">Timezone</label>
+                    <select
+                      id="dnd-timezone"
+                      value={dndTimezone}
                       disabled={channelNotificationBusy}
-                      onChange={(event) => setDndStart(event.target.value)}
-                      placeholder="22:00"
-                      autoComplete="off"
-                    />
-                  </label>
-                  <label htmlFor="dnd-end">
-                    End
-                    <input
-                      id="dnd-end"
-                      type="text"
-                      inputMode="numeric"
-                      pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]"
-                      maxLength={5}
-                      value={dndEnd}
-                      disabled={channelNotificationBusy}
-                      onChange={(event) => setDndEnd(event.target.value)}
-                      placeholder="07:00"
-                      autoComplete="off"
-                    />
-                  </label>
-                </div>
-                <div className="settings-actions">
-                  <button
-                    className="quiet-button"
-                    type="button"
-                    disabled={channelNotificationBusy || !dndTimeValid}
-                    onClick={() => void mutateChannelNotificationPolicy({
-                      field: "do_not_disturb",
-                      enabled: dndEnabled,
-                      timezone: dndTimezone,
-                      start: dndStart,
-                      end: dndEnd,
-                    })}
-                  >
-                    Save schedule
-                  </button>
-                </div>
-                {!dndTimeValid && (
-                  <p className="settings-control-error" role="alert">
-                    Enter different start and end times in 24-hour HH:MM format.
-                  </p>
-                )}
-                <p>Workshop notifications remain immediate. Adapter delivery uses this policy.</p>
-              </article>
-            </div>
-          ) : (
-            <div className="settings-failure">
-              <p role="alert">
-                {channelNotificationError ?? "Channel notification policy is unavailable."}
-              </p>
-              <button className="quiet-button" type="button" onClick={() => void refreshChannelNotifications()}>
-                Retry
-              </button>
-            </div>
-          )}
-          {channelNotificationNotice && (
-            <p className="settings-notice" role="status">{channelNotificationNotice}</p>
-          )}
-          {channelNotificationError && channelNotifications && (
-            <p className="settings-error" role="alert">{channelNotificationError}</p>
-          )}
-          {notificationLoading ? (
-            <p role="status">Loading notification destinations…</p>
-          ) : notifications ? (
-            <div className="settings-card-grid notification-preference-grid">
-              {notifications.preferences.map((preference) => {
+                      onChange={(event) => setDndTimezone(event.target.value)}
+                    >
+                      {dndTimezones.map((timezone) => (
+                        <option key={timezone} value={timezone}>{timezone}</option>
+                      ))}
+                    </select>
+                    <div className="settings-inline-fields">
+                      <label htmlFor="dnd-start">
+                        Start
+                        <input
+                          id="dnd-start"
+                          type="text"
+                          inputMode="numeric"
+                          pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]"
+                          maxLength={5}
+                          value={dndStart}
+                          disabled={channelNotificationBusy}
+                          onChange={(event) => setDndStart(event.target.value)}
+                          placeholder="22:00"
+                          autoComplete="off"
+                        />
+                      </label>
+                      <label htmlFor="dnd-end">
+                        End
+                        <input
+                          id="dnd-end"
+                          type="text"
+                          inputMode="numeric"
+                          pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]"
+                          maxLength={5}
+                          value={dndEnd}
+                          disabled={channelNotificationBusy}
+                          onChange={(event) => setDndEnd(event.target.value)}
+                          placeholder="07:00"
+                          autoComplete="off"
+                        />
+                      </label>
+                    </div>
+                    <div className="settings-actions">
+                      <button
+                        className="quiet-button"
+                        type="button"
+                        disabled={channelNotificationBusy || !dndTimeValid}
+                        onClick={() => void mutateChannelNotificationPolicy({
+                          field: "do_not_disturb",
+                          enabled: dndEnabled,
+                          timezone: dndTimezone,
+                          start: dndStart,
+                          end: dndEnd,
+                        })}
+                      >
+                        Save schedule
+                      </button>
+                    </div>
+                    {!dndTimeValid && (
+                      <p className="settings-control-error" role="alert">
+                        Enter different start and end times in 24-hour HH:MM format.
+                      </p>
+                    )}
+                    <p>Workshop notifications remain immediate. Adapter delivery uses this policy.</p>
+                  </article>
+                </>
+              )}
+              {notifications?.preferences.map((preference) => {
                 const choices = notifications.destinations.filter((destination) =>
                   destination.supportedClasses.includes(preference.integrationClass));
                 return (
@@ -1978,19 +1989,12 @@ function SettingsWorkspaceContent({
                 );
               })}
             </div>
-          ) : (
-            <div className="settings-failure">
-              <p role="alert">
-                {notificationError ?? "Notification preferences are unavailable."}
-              </p>
-              <button
-                className="quiet-button"
-                type="button"
-                onClick={() => void refreshNotifications()}
-              >
-                Retry
-              </button>
-            </div>
+          )}
+          {channelNotificationNotice && (
+            <p className="settings-notice" role="status">{channelNotificationNotice}</p>
+          )}
+          {channelNotificationError && channelNotifications && (
+            <p className="settings-error" role="alert">{channelNotificationError}</p>
           )}
           {notificationNotice && (
             <p className="settings-notice" role="status">{notificationNotice}</p>
