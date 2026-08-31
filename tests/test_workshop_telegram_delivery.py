@@ -14,6 +14,7 @@ from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, Re
 
 from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.delivery_fragments import (
     DeliveryFragment,
     DeliveryFragmentOperationKind,
@@ -21,6 +22,7 @@ from kai.workshop.delivery_fragments import (
 )
 from kai.workshop.delivery_outbox import (
     CONVERSATION_REPLY_PURPOSE,
+    NOTIFICATION_PURPOSE,
     QUALIFICATION_PURPOSE,
     SEND_FRAGMENTS_CONTRACT,
     DeliveryClaim,
@@ -33,11 +35,19 @@ from kai.workshop.domain import (
     DeliveryAttemptId,
     DeliveryId,
     EventEnvelope,
+    HumanNotificationId,
     MessageId,
+    PrincipalId,
     WorkshopEventType,
     WorkshopId,
 )
-from kai.workshop.inbound import InboundMessage, record_inbound_message
+from kai.workshop.human_notifications import HUMAN_NOTIFICATION_DELIVERY_MODE
+from kai.workshop.inbound import (
+    ClientInboundMessage,
+    InboundMessage,
+    record_client_inbound_message_in_transaction,
+    record_inbound_message,
+)
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
 from kai.workshop.proactive_publication import (
@@ -69,6 +79,7 @@ def _claim(
     transport: str = "telegram",
     mode: str = "text",
     body: str = "Hello from Workshop",
+    human_notification_id: HumanNotificationId | None = None,
 ) -> DeliveryClaim:
     return DeliveryClaim(
         delivery_id=DeliveryId.new(),
@@ -87,6 +98,7 @@ def _claim(
         author_display_name="Workshop Human",
         body=body,
         lease_expires_at=_NOW + timedelta(seconds=30),
+        human_notification_id=human_notification_id,
     )
 
 
@@ -334,6 +346,30 @@ class TestWorkshopTelegramDeliveryAdapter:
             text="Workshop Human via Workshop:\nHello from the browser",
         )
 
+    async def test_human_notification_uses_safe_plain_text_adapter_contract(self):
+        bot = _successful_bot()
+        claim = _claim(
+            mode=HUMAN_NOTIFICATION_DELIVERY_MODE,
+            body="Daniel mentioned you in #General.",
+            human_notification_id=HumanNotificationId.new(),
+        )
+
+        assert await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(claim, _fragment(claim)) == 1001
+
+        bot.send_message.assert_awaited_once_with(
+            chat_id=101,
+            text="Daniel mentioned you in #General.",
+        )
+
+    async def test_human_notification_requires_canonical_notification_identity(self):
+        bot = _successful_bot()
+        claim = _claim(mode=HUMAN_NOTIFICATION_DELIVERY_MODE)
+
+        with pytest.raises(TelegramDeliveryContractError, match="telegram_notification_identity_missing"):
+            await WorkshopTelegramDeliveryAdapter(bot).deliver_fragment(claim, _fragment(claim))
+
+        bot.send_message.assert_not_awaited()
+
     async def test_thread_activity_is_flattened_as_ordered_ordinary_telegram_messages(self):
         bot = _successful_bot(1001, 1002)
         adapter = WorkshopTelegramDeliveryAdapter(bot)
@@ -565,6 +601,128 @@ class TestWorkshopTelegramDeliveryAdapterContinued:
 
 
 class TestWorkshopTelegramDeliveryWorker:
+    async def test_human_mentions_fan_out_once_and_survive_worker_restart(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store = await WorkshopEventStore.open(path)
+        bootstrap = await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman("Daniel", "admin", "telegram", "101", "101", profile_id(101)),
+                BootstrapHuman("Scott", "member", "telegram", "202", "202", profile_id(202)),
+                BootstrapHuman("Alex", "member", "telegram", "303", "303", profile_id(303)),
+            ),
+        )
+        async with store.connection.execute(
+            "SELECT ei.principal_id, cb.channel_id, ei.external_subject FROM external_identities ei "
+            "JOIN channel_bindings cb ON cb.transport = ei.provider "
+            "AND cb.external_channel_id = ei.external_subject WHERE ei.provider = 'telegram'"
+        ) as cursor:
+            identities = {
+                str(row[2]): (PrincipalId(str(row[0])), ChannelId(str(row[1]))) for row in await cursor.fetchall()
+            }
+        daniel_id, daniel_direct = identities["101"]
+        scott_id, _ = identities["202"]
+        alex_id, _ = identities["303"]
+        lifecycle = WorkshopChannelLifecycleService(store)
+        group = await lifecycle.create_group(
+            daniel_id,
+            name="Delivery qualification",
+            agent_ids=[bootstrap.agent_id],
+            origin_channel_id=daniel_direct,
+        )
+        membership = await lifecycle.human_members(daniel_id, group.channel_id)
+        added_scott = await lifecycle.add_human_member(
+            daniel_id,
+            group.channel_id,
+            scott_id,
+            expected_state_version=membership.state_version,
+            client_operation_id="delivery-add-scott",
+        )
+        await lifecycle.add_human_member(
+            daniel_id,
+            group.channel_id,
+            alex_id,
+            expected_state_version=added_scott.state_version,
+            client_operation_id="delivery-add-alex",
+        )
+        try:
+            await store.connection.execute("BEGIN IMMEDIATE")
+            await record_client_inbound_message_in_transaction(
+                store,
+                ClientInboundMessage(
+                    daniel_id,
+                    group.channel_id,
+                    "human-delivery-two-recipients",
+                    "@scott and @alex private content",
+                    _NOW,
+                ),
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            )
+            await store.connection.commit()
+        except Exception:
+            await store.connection.rollback()
+            await store.close()
+            raise
+
+        bot = _successful_bot(2001, 3001)
+        worker = WorkshopTelegramDeliveryWorker(
+            WorkshopDeliveryOutbox(store),
+            WorkshopDeliveryFragments(store),
+            WorkshopTelegramDeliveryAdapter(bot),
+            worker_id="human-notification-worker",
+            purpose=NOTIFICATION_PURPOSE,
+            modes=(HUMAN_NOTIFICATION_DELIVERY_MODE,),
+        )
+        try:
+            assert (await worker.run_once()).outcome == TelegramWorkOutcome.SUCCEEDED
+            assert (await worker.run_once()).outcome == TelegramWorkOutcome.SUCCEEDED
+            assert (await worker.run_once()).outcome == TelegramWorkOutcome.IDLE
+            targets = {call.kwargs["chat_id"] for call in bot.send_message.await_args_list}
+            assert targets == {202, 303}
+            assert all("private content" not in call.kwargs["text"] for call in bot.send_message.await_args_list)
+
+            await store.connection.execute("BEGIN IMMEDIATE")
+            await record_client_inbound_message_in_transaction(
+                store,
+                ClientInboundMessage(
+                    daniel_id,
+                    group.channel_id,
+                    "human-delivery-revoked-after-publication",
+                    "@alex queued before revocation",
+                    _NOW + timedelta(seconds=1),
+                ),
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            )
+            await store.connection.commit()
+            await store.connection.execute(
+                "DELETE FROM external_identities WHERE principal_id = ? AND provider = 'telegram'",
+                (alex_id,),
+            )
+            await store.connection.commit()
+
+            revoked = await worker.run_once()
+            assert revoked.outcome == TelegramWorkOutcome.FAILED
+            assert revoked.error_code == "notification_recipient_binding_revoked"
+            assert len(bot.send_message.await_args_list) == 2
+        finally:
+            await store.close()
+
+        reopened = await WorkshopEventStore.open(path)
+        restarted_bot = _successful_bot()
+        restarted_worker = WorkshopTelegramDeliveryWorker(
+            WorkshopDeliveryOutbox(reopened),
+            WorkshopDeliveryFragments(reopened),
+            WorkshopTelegramDeliveryAdapter(restarted_bot),
+            worker_id="human-notification-worker-restarted",
+            purpose=NOTIFICATION_PURPOSE,
+            modes=(HUMAN_NOTIFICATION_DELIVERY_MODE,),
+        )
+        try:
+            assert (await restarted_worker.run_once()).outcome == TelegramWorkOutcome.IDLE
+            restarted_bot.send_message.assert_not_awaited()
+        finally:
+            await reopened.close()
+
     async def test_client_mode_worker_delivers_attributed_human_echo(self, tmp_path: Path):
         store, _, _ = await _open_with_outbound(tmp_path / "kai.db")
         async with store.connection.execute(

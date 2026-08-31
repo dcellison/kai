@@ -111,6 +111,7 @@ class WorkshopConversationCommandService:
         self._store = store
         self._artifact_storage_root = artifact_storage_root
         effective_policy = delivery_policy or WorkshopDeliveryBindingPolicy.disabled()
+        self._delivery_policy = effective_policy
         self._delivery_planner = WorkshopDeliveryPlanner(self._store, effective_policy)
 
     async def accept(
@@ -124,7 +125,11 @@ class WorkshopConversationCommandService:
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            inbound = await record_inbound_message_in_transaction(self._store, message)
+            inbound = await record_inbound_message_in_transaction(
+                self._store,
+                message,
+                delivery_policy=self._delivery_policy,
+            )
             inbound_message_id = inbound.event.envelope.aggregate_id
             if not isinstance(inbound_message_id, MessageId):
                 raise ConversationCommandStateConflictError("Canonical inbound event did not identify a message")
@@ -173,7 +178,11 @@ class WorkshopConversationCommandService:
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            inbound = await record_client_inbound_message_in_transaction(self._store, message)
+            inbound = await record_client_inbound_message_in_transaction(
+                self._store,
+                message,
+                delivery_policy=self._delivery_policy,
+            )
             inbound_message_id = inbound.event.envelope.aggregate_id
             if not isinstance(inbound_message_id, MessageId):
                 raise ConversationCommandStateConflictError("Canonical inbound event did not identify a message")
@@ -238,7 +247,11 @@ class WorkshopConversationCommandService:
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            inbound = await record_scheduled_inbound_message_in_transaction(self._store, message)
+            inbound = await record_scheduled_inbound_message_in_transaction(
+                self._store,
+                message,
+                delivery_policy=self._delivery_policy,
+            )
             inbound_message_id = inbound.event.envelope.aggregate_id
             if not isinstance(inbound_message_id, MessageId):
                 raise ConversationCommandStateConflictError("Scheduled inbound event did not identify a message")

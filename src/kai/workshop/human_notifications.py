@@ -7,7 +7,11 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from kai.workshop.delivery_outbox import NOTIFICATION_PURPOSE
+from kai.workshop.delivery_planning import CanonicalDeliveryIntent, WorkshopDeliveryPlanner
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     ChannelId,
     EventEnvelope,
@@ -22,6 +26,7 @@ from kai.workshop.store import AppendResult, StoredEvent, WorkshopEventStore
 
 MAX_NOTIFICATION_PAGE_SIZE = 100
 MAX_NOTIFICATION_MUTATION_BATCH = 100
+HUMAN_NOTIFICATION_DELIVERY_MODE = "human_notification"
 
 
 class WorkshopHumanNotificationError(RuntimeError):
@@ -172,9 +177,76 @@ def _decode_cursor(value: object) -> tuple[int, HumanNotificationId]:
         raise WorkshopHumanNotificationValidationError("Invalid notification cursor") from exc
 
 
+def _safe_label(value: object, *, fallback: str) -> str:
+    normalized = " ".join(str(value).split()).strip()
+    return normalized[:200] if normalized else fallback
+
+
+async def _external_delivery_policy_result(
+    store: WorkshopEventStore,
+    principal_id: PrincipalId,
+    occurred_at: datetime,
+) -> str:
+    """Apply personal DND only to adapter publication, never the inbox."""
+    async with store.connection.execute(
+        "SELECT dnd_enabled, dnd_timezone, dnd_start_minute, dnd_end_minute "
+        "FROM principal_human_notification_policies WHERE principal_id = ?",
+        (principal_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or not bool(row[0]):
+        return "eligible"
+    try:
+        local = occurred_at.astimezone(ZoneInfo(str(row[1])))
+    except ZoneInfoNotFoundError:
+        return "suppressed_dnd"
+    minute = local.hour * 60 + local.minute
+    start = int(row[2])
+    end = int(row[3])
+    inside = start <= minute < end if start < end else minute >= start or minute < end
+    return "suppressed_dnd" if inside else "eligible"
+
+
+async def _publication_body(
+    store: WorkshopEventStore,
+    *,
+    author_principal_id: PrincipalId,
+    source_channel_id: ChannelId,
+    source_thread_root_id: MessageId | None,
+    kind: str,
+    deep_link: str | None,
+) -> str:
+    """Render bounded adapter-safe text without copying message content."""
+    async with store.connection.execute(
+        "SELECT p.display_name, c.name FROM principals p CROSS JOIN channels c WHERE p.id = ? AND c.id = ?",
+        (author_principal_id, source_channel_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Canonical human notification source context is unavailable")
+    author = _safe_label(row[0], fallback="Someone")
+    channel = _safe_label(row[1], fallback="a Workshop channel")
+    location = f"#{channel}" if row[1] is not None else channel
+    if source_thread_root_id is not None:
+        location = f"a thread in {location}"
+    verb = {
+        "mention": "mentioned you in",
+        "reply": "replied to you in",
+        "message": "posted a message in",
+    }.get(kind)
+    if verb is None:
+        raise RuntimeError("Canonical human notification kind is unsupported")
+    body = f"{author} {verb} {location}."
+    if deep_link is not None:
+        body = f"{body}\nOpen Workshop: {deep_link}"
+    return body
+
+
 async def append_human_notifications_in_transaction(
     store: WorkshopEventStore,
     message_event: StoredEvent,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
 ) -> tuple[AppendResult, ...]:
     """Append policy-qualified notification facts for one canonical message."""
     if not store.connection.in_transaction:
@@ -211,8 +283,8 @@ async def append_human_notifications_in_transaction(
 
     async with store.connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' "
-        "AND name IN ('human_notifications', 'principal_channel_notification_policies', "
-        "'principal_human_notification_policies')"
+        "AND name IN ('human_notifications', 'human_notification_publications', "
+        "'principal_channel_notification_policies', 'principal_human_notification_policies')"
     ) as cursor:
         notification_tables = {str(row[0]) for row in await cursor.fetchall()}
     if "human_notifications" not in notification_tables:
@@ -221,6 +293,7 @@ async def append_human_notifications_in_transaction(
         "principal_channel_notification_policies",
         "principal_human_notification_policies",
     } <= notification_tables
+    publication_available = "human_notification_publications" in notification_tables
 
     reply_recipient: PrincipalId | None = None
     reply_target = envelope.payload.get("reply_to_message_id") or source_thread_root
@@ -267,9 +340,28 @@ async def append_human_notifications_in_transaction(
             envelope.workshop_id,
             f"human-mention:{envelope.aggregate_id}:{recipient_id}",
         )
+        publication: dict[str, object] | None = None
+        if publication_available:
+            policy_result = await _external_delivery_policy_result(
+                store,
+                recipient_id,
+                envelope.occurred_at,
+            )
+            publication = {
+                "policy_result": policy_result,
+                "alert_body": await _publication_body(
+                    store,
+                    author_principal_id=author_principal_id,
+                    source_channel_id=source_channel_id,
+                    source_thread_root_id=source_thread_root,
+                    kind=kind,
+                    deep_link=(delivery_policy.notification_deep_link if delivery_policy is not None else None),
+                ),
+                "deep_link": delivery_policy.notification_deep_link if delivery_policy is not None else None,
+            }
         notification = EventEnvelope.create(
             event_type=WorkshopEventType.HUMAN_NOTIFICATION_CREATED,
-            event_version=2 if policy_available else 1,
+            event_version=3 if publication is not None else 2 if policy_available else 1,
             workshop_id=envelope.workshop_id,
             aggregate_type="human_notification",
             aggregate_id=notification_id,
@@ -282,19 +374,43 @@ async def append_human_notifications_in_transaction(
                 "source_channel_id": source_channel_id,
                 "source_thread_root_id": source_thread_root,
                 "kind": kind,
+                **({"publication": publication} if publication is not None else {}),
             },
             metadata={"source": "canonical_message_notification_policy"},
         )
-        results.append(await store.append_in_transaction(notification))
+        appended = await store.append_in_transaction(notification)
+        results.append(appended)
+        if appended.inserted and publication is not None:
+            await store.project_pending_in_transaction(CanonicalConversationProjection())
+            if publication["policy_result"] == "eligible":
+                effective_policy = delivery_policy or WorkshopDeliveryBindingPolicy.disabled()
+                await WorkshopDeliveryPlanner(store, effective_policy).plan_in_transaction(
+                    CanonicalDeliveryIntent(
+                        message_id=MessageId(str(envelope.aggregate_id)),
+                        channel_id=source_channel_id,
+                        mode=HUMAN_NOTIFICATION_DELIVERY_MODE,
+                        purpose=NOTIFICATION_PURPOSE,
+                        occurred_at=envelope.occurred_at,
+                        recipient_principal_id=recipient_id,
+                        human_notification_id=notification_id,
+                        workshop_id=envelope.workshop_id,
+                    )
+                )
     return tuple(results)
 
 
 async def append_human_mention_notifications_in_transaction(
     store: WorkshopEventStore,
     message_event: StoredEvent,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
 ) -> tuple[AppendResult, ...]:
     """Compatibility name for canonical policy-qualified notification creation."""
-    return await append_human_notifications_in_transaction(store, message_event)
+    return await append_human_notifications_in_transaction(
+        store,
+        message_event,
+        delivery_policy=delivery_policy,
+    )
 
 
 class WorkshopHumanNotificationService:

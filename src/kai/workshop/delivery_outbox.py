@@ -18,6 +18,7 @@ from kai.workshop.domain import (
     DeliveryId,
     EventEnvelope,
     EventId,
+    HumanNotificationId,
     MessageId,
     PrincipalId,
     WorkshopEventType,
@@ -79,6 +80,7 @@ class DeliveryRequest:
     occurred_at: datetime
     execution_contract: DeliveryExecutionContract = SEND_FRAGMENTS_CONTRACT
     authority_epoch_id: DeliveryAuthorityEpochId | None = None
+    human_notification_id: HumanNotificationId | None = None
     max_attempts: int = 5
 
     def __post_init__(self) -> None:
@@ -97,6 +99,11 @@ class DeliveryRequest:
             raise ValueError("streaming conversation delivery requires a DeliveryAuthorityEpochId")
         if not requires_epoch and self.authority_epoch_id is not None:
             raise ValueError("authority_epoch_id is only valid for streaming conversation delivery")
+        if self.human_notification_id is not None:
+            if not isinstance(self.human_notification_id, HumanNotificationId):
+                raise ValueError("human_notification_id must be a HumanNotificationId when supplied")
+            if self.purpose != NOTIFICATION_PURPOSE or self.execution_contract != SEND_FRAGMENTS_CONTRACT:
+                raise ValueError("human notifications require send-fragments notification delivery")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
         if (
@@ -118,6 +125,7 @@ class DeliveryState:
     purpose: DeliveryPurpose
     execution_contract: DeliveryExecutionContract
     authority_epoch_id: DeliveryAuthorityEpochId | None
+    human_notification_id: HumanNotificationId | None
     status: str
     max_attempts: int
     attempt_count: int
@@ -151,6 +159,8 @@ class DeliveryClaim:
     author_display_name: str
     body: str
     lease_expires_at: datetime
+    human_notification_id: HumanNotificationId | None = None
+    recipient_binding_current: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +278,9 @@ class WorkshopDeliveryOutbox:
         if not connection.in_transaction:
             raise RuntimeError("request_delivery_in_transaction requires an active transaction")
 
+        has_human_notification_column = await self._has_human_notification_column()
+        if request.human_notification_id is not None and not has_human_notification_column:
+            raise DeliveryTargetNotFoundError("Canonical human notification publication schema is unavailable")
         resolved = await self._resolve_target(request)
         workshop_id, channel_id, author_principal_id, transport = resolved
         if request.authority_epoch_id is not None:
@@ -299,6 +312,7 @@ class WorkshopDeliveryOutbox:
                 or existing.purpose != request.purpose
                 or existing.execution_contract != request.execution_contract
                 or existing.authority_epoch_id != request.authority_epoch_id
+                or existing.human_notification_id != request.human_notification_id
             ):
                 raise DeliveryRequestConflictError("Delivery request identity has different semantics")
             return DeliveryRequestResult(delivery=existing, inserted=False)
@@ -319,6 +333,8 @@ class WorkshopDeliveryOutbox:
         if streaming_finalization:
             payload["execution_contract"] = request.execution_contract
             payload["authority_epoch_id"] = request.authority_epoch_id
+        if request.human_notification_id is not None:
+            payload["human_notification_id"] = request.human_notification_id
         event = EventEnvelope.create(
             event_id=EventId.derived(
                 workshop_id,
@@ -344,30 +360,57 @@ class WorkshopDeliveryOutbox:
             raise DeliveryRequestConflictError("Delivery request event exists without outbox state")
 
         timestamp = _format_timestamp(occurred_at)
-        await connection.execute(
-            "INSERT INTO delivery_outbox "
-            "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, purpose, "
-            "execution_contract, authority_epoch_id, "
-            "status, max_attempts, attempt_count, available_at, requested_event_position, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
-            (
-                delivery_id,
-                workshop_id,
-                channel_id,
-                request.channel_binding_id,
-                request.message_id,
-                transport,
-                request.mode,
-                request.purpose,
-                request.execution_contract,
-                request.authority_epoch_id,
-                request.max_attempts,
-                timestamp,
-                appended.event.position,
-                timestamp,
-                timestamp,
-            ),
-        )
+        if has_human_notification_column:
+            await connection.execute(
+                "INSERT INTO delivery_outbox "
+                "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, purpose, "
+                "execution_contract, authority_epoch_id, human_notification_id, status, max_attempts, "
+                "attempt_count, available_at, requested_event_position, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
+                (
+                    delivery_id,
+                    workshop_id,
+                    channel_id,
+                    request.channel_binding_id,
+                    request.message_id,
+                    transport,
+                    request.mode,
+                    request.purpose,
+                    request.execution_contract,
+                    request.authority_epoch_id,
+                    request.human_notification_id,
+                    request.max_attempts,
+                    timestamp,
+                    appended.event.position,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        else:
+            await connection.execute(
+                "INSERT INTO delivery_outbox "
+                "(id, workshop_id, channel_id, channel_binding_id, message_id, transport, mode, purpose, "
+                "execution_contract, authority_epoch_id, status, max_attempts, attempt_count, available_at, "
+                "requested_event_position, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?)",
+                (
+                    delivery_id,
+                    workshop_id,
+                    channel_id,
+                    request.channel_binding_id,
+                    request.message_id,
+                    transport,
+                    request.mode,
+                    request.purpose,
+                    request.execution_contract,
+                    request.authority_epoch_id,
+                    request.max_attempts,
+                    timestamp,
+                    appended.event.position,
+                    timestamp,
+                    timestamp,
+                ),
+            )
         state = await self._state_by_id(delivery_id)
         return DeliveryRequestResult(delivery=state, inserted=True)
 
@@ -404,6 +447,7 @@ class WorkshopDeliveryOutbox:
         now = self._now()
         try:
             await connection.execute("BEGIN IMMEDIATE")
+            has_human_notification_column = await self._has_human_notification_column()
             await self._recover_expired_in_transaction(
                 now,
                 purposes=purposes,
@@ -456,15 +500,46 @@ class WorkshopDeliveryOutbox:
                 placeholders = ", ".join("?" for _ in modes)
                 filters.append(f"o.mode IN ({placeholders})")
                 parameters.extend(modes)
+            publication_body = "COALESCE(np.alert_body, m.body)" if has_human_notification_column else "m.body"
+            publication_join = (
+                "LEFT JOIN human_notification_publications np ON np.notification_id = o.human_notification_id "
+                if has_human_notification_column
+                else ""
+            )
+            binding_scope = (
+                "AND (o.human_notification_id IS NOT NULL OR cb.channel_id = o.channel_id) "
+                if has_human_notification_column
+                else "AND cb.channel_id = o.channel_id "
+            )
+            notification_identity = "o.human_notification_id" if has_human_notification_column else "NULL"
+            binding_current = (
+                "CASE WHEN o.human_notification_id IS NULL THEN 1 ELSE EXISTS ("
+                "SELECT 1 FROM human_notification_publications current_np "
+                "JOIN external_identities current_ei "
+                "ON current_ei.principal_id = current_np.recipient_principal_id "
+                "AND current_ei.provider = o.transport "
+                "AND current_ei.external_subject = cb.external_channel_id "
+                "JOIN channels current_channel ON current_channel.id = cb.channel_id "
+                "AND current_channel.kind = 'direct' "
+                "AND current_channel.workshop_id = current_np.workshop_id "
+                "JOIN channel_memberships current_cm ON current_cm.channel_id = current_channel.id "
+                "AND current_cm.principal_id = current_np.recipient_principal_id "
+                "WHERE current_np.notification_id = o.human_notification_id) END"
+                if has_human_notification_column
+                else "1"
+            )
             async with connection.execute(
                 "SELECT o.id, o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, "
                 "o.transport, o.mode, o.purpose, o.execution_contract, o.authority_epoch_id, o.attempt_count, "
-                "m.body, cb.external_channel_id, p.display_name "
+                f"{publication_body}, cb.external_channel_id, p.display_name, {notification_identity}, "
+                f"{binding_current} "
                 "FROM delivery_outbox o "
                 "JOIN messages m ON m.id = o.message_id AND m.channel_id = o.channel_id "
                 "JOIN principals p ON p.id = m.author_principal_id "
+                f"{publication_join}"
                 "JOIN channel_bindings cb ON cb.id = o.channel_binding_id "
-                "AND cb.channel_id = o.channel_id AND cb.transport = o.transport "
+                "AND cb.transport = o.transport "
+                f"{binding_scope}"
                 f"WHERE {' AND '.join(filters)} "
                 "ORDER BY o.requested_event_position LIMIT 1",
                 parameters,
@@ -515,6 +590,8 @@ class WorkshopDeliveryOutbox:
                 purpose=_delivery_purpose(row[7]),
                 execution_contract=_delivery_execution_contract(row[8]),
                 authority_epoch_id=(DeliveryAuthorityEpochId(str(row[9])) if row[9] is not None else None),
+                human_notification_id=(HumanNotificationId(str(row[14])) if row[14] is not None else None),
+                recipient_binding_current=bool(row[15]),
                 author_display_name=str(row[13]),
                 body=str(row[11]),
                 external_channel_id=str(row[12]),
@@ -635,6 +712,7 @@ class WorkshopDeliveryOutbox:
                         transport=str(row[12]),
                         mode=str(row[13]),
                         authority_epoch_id=persisted_epoch,
+                        human_notification_id=claim.human_notification_id,
                         attempt_number=int(row[1]),
                         status="succeeded",
                         error_code=None,
@@ -726,6 +804,7 @@ class WorkshopDeliveryOutbox:
                     transport=str(row[12]),
                     mode=str(row[13]),
                     authority_epoch_id=persisted_epoch,
+                    human_notification_id=claim.human_notification_id,
                     attempt_number=attempt_count,
                     status=status,
                     error_code=error_code,
@@ -766,9 +845,12 @@ class WorkshopDeliveryOutbox:
             parameters = (*parameters, authority_epoch_id)
         if delivery_id is not None:
             parameters = (*parameters, delivery_id)
+        has_human_notification_column = await self._has_human_notification_column()
+        notification_identity = "human_notification_id" if has_human_notification_column else "NULL"
         async with connection.execute(
             "SELECT id, lease_id, attempt_count, max_attempts, workshop_id, channel_id, "
-            "channel_binding_id, message_id, transport, mode, authority_epoch_id FROM delivery_outbox "
+            f"channel_binding_id, message_id, transport, mode, authority_epoch_id, {notification_identity} "
+            "FROM delivery_outbox "
             f"WHERE status = 'leased' AND lease_expires_at <= ? "
             f"AND purpose IN ({purpose_placeholders}) "
             f"AND execution_contract IN ({contract_placeholders}){authority_filter}"
@@ -828,6 +910,7 @@ class WorkshopDeliveryOutbox:
                     transport=str(row[8]),
                     mode=str(row[9]),
                     authority_epoch_id=(DeliveryAuthorityEpochId(str(row[10])) if row[10] is not None else None),
+                    human_notification_id=(HumanNotificationId(str(row[11])) if row[11] is not None else None),
                     attempt_number=int(row[2]),
                     status="failed",
                     error_code=error_code,
@@ -849,6 +932,7 @@ class WorkshopDeliveryOutbox:
         transport: str,
         mode: str,
         authority_epoch_id: DeliveryAuthorityEpochId | None,
+        human_notification_id: HumanNotificationId | None,
         attempt_number: int,
         status: str,
         error_code: str | None,
@@ -868,8 +952,10 @@ class WorkshopDeliveryOutbox:
             payload["error_code"] = error_code
         if authority_epoch_id is not None:
             payload["authority_epoch_id"] = authority_epoch_id
-        event_identity_version = "v3" if authority_epoch_id is not None else "v2"
-        event_version = 3 if authority_epoch_id is not None else 2
+        if human_notification_id is not None:
+            payload["human_notification_id"] = human_notification_id
+        event_identity_version = "v4" if human_notification_id is not None else "v3" if authority_epoch_id else "v2"
+        event_version = 4 if human_notification_id is not None else 3 if authority_epoch_id else 2
         event_type = (
             WorkshopEventType.DELIVERY_SUCCEEDED if status == "succeeded" else WorkshopEventType.DELIVERY_FAILED
         )
@@ -894,13 +980,36 @@ class WorkshopDeliveryOutbox:
         self,
         request: DeliveryRequest,
     ) -> tuple[WorkshopId, ChannelId, PrincipalId, str]:
-        async with self._store.connection.execute(
-            "SELECT c.workshop_id, m.channel_id, m.author_principal_id, cb.transport "
-            "FROM messages m JOIN channels c ON c.id = m.channel_id "
-            "JOIN channel_bindings cb ON cb.channel_id = m.channel_id "
-            "WHERE m.id = ? AND cb.id = ?",
-            (request.message_id, request.channel_binding_id),
-        ) as cursor:
+        if request.human_notification_id is None:
+            query = (
+                "SELECT c.workshop_id, m.channel_id, m.author_principal_id, cb.transport "
+                "FROM messages m JOIN channels c ON c.id = m.channel_id "
+                "JOIN channel_bindings cb ON cb.channel_id = m.channel_id "
+                "WHERE m.id = ? AND cb.id = ?"
+            )
+            parameters: tuple[object, ...] = (request.message_id, request.channel_binding_id)
+        else:
+            query = (
+                "SELECT np.workshop_id, np.source_channel_id, m.author_principal_id, cb.transport "
+                "FROM human_notification_publications np "
+                "JOIN messages m ON m.id = np.source_message_id "
+                "AND m.channel_id = np.source_channel_id "
+                "JOIN external_identities ei ON ei.principal_id = np.recipient_principal_id "
+                "JOIN channel_bindings cb ON cb.id = ? AND cb.transport = ei.provider "
+                "AND cb.external_channel_id = ei.external_subject "
+                "JOIN channels target ON target.id = cb.channel_id AND target.kind = 'direct' "
+                "AND target.workshop_id = np.workshop_id "
+                "JOIN channel_memberships cm ON cm.channel_id = target.id "
+                "AND cm.principal_id = np.recipient_principal_id "
+                "WHERE np.notification_id = ? AND np.source_message_id = ? "
+                "AND np.policy_result = 'eligible'"
+            )
+            parameters = (
+                request.channel_binding_id,
+                request.human_notification_id,
+                request.message_id,
+            )
+        async with self._store.connection.execute(query, parameters) as cursor:
             row = await cursor.fetchone()
         if row is None:
             raise DeliveryTargetNotFoundError("Canonical message and channel binding were not found together")
@@ -927,6 +1036,12 @@ class WorkshopDeliveryOutbox:
             row = await cursor.fetchone()
         return self._state_from_row(row) if row is not None else None
 
+    async def _has_human_notification_column(self) -> bool:
+        async with self._store.connection.execute(
+            "SELECT 1 FROM pragma_table_info('delivery_outbox') WHERE name = 'human_notification_id'"
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
     async def _state_by_id(self, delivery_id: DeliveryId) -> DeliveryState:
         async with self._store.connection.execute(
             "SELECT * FROM delivery_outbox WHERE id = ?",
@@ -939,6 +1054,10 @@ class WorkshopDeliveryOutbox:
 
     @staticmethod
     def _state_from_row(row: aiosqlite.Row) -> DeliveryState:
+        try:
+            raw_human_notification_id = row["human_notification_id"]
+        except IndexError:
+            raw_human_notification_id = None
         return DeliveryState(
             delivery_id=DeliveryId(str(row["id"])),
             message_id=MessageId(str(row["message_id"])),
@@ -952,6 +1071,9 @@ class WorkshopDeliveryOutbox:
                 DeliveryAuthorityEpochId(str(row["authority_epoch_id"]))
                 if row["authority_epoch_id"] is not None
                 else None
+            ),
+            human_notification_id=(
+                HumanNotificationId(str(raw_human_notification_id)) if raw_human_notification_id is not None else None
             ),
             status=str(row["status"]),
             max_attempts=int(row["max_attempts"]),

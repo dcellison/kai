@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 54
+WORKSHOP_SCHEMA_VERSION = 55
 
 
 @dataclass(frozen=True, slots=True)
@@ -2527,6 +2527,42 @@ _CHANNEL_NOTIFICATION_POLICY_SCHEMA = SchemaMigration(
     ),
 )
 
+_HUMAN_NOTIFICATION_PUBLICATION_SCHEMA = SchemaMigration(
+    version=55,
+    name="canonical_human_notification_publication",
+    statements=(
+        """
+        CREATE TABLE human_notification_publications (
+            notification_id TEXT PRIMARY KEY
+                REFERENCES human_notifications(id) ON DELETE CASCADE,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            recipient_principal_id TEXT NOT NULL
+                REFERENCES principals(id) ON DELETE CASCADE,
+            source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            source_channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            source_thread_root_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            policy_result TEXT NOT NULL CHECK (
+                policy_result IN ('eligible', 'suppressed_dnd')
+            ),
+            alert_body TEXT NOT NULL CHECK (length(alert_body) BETWEEN 1 AND 2000),
+            deep_link TEXT CHECK (deep_link IS NULL OR length(deep_link) BETWEEN 1 AND 1000),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX human_notification_publications_recipient_idx "
+        "ON human_notification_publications (recipient_principal_id, created_event_position)",
+        "CREATE INDEX human_notification_publications_policy_idx "
+        "ON human_notification_publications (policy_result, created_event_position)",
+        # The durable outbox deliberately survives projection rebuilds, so it
+        # cannot hold a foreign key into a replayed projection table.
+        "ALTER TABLE delivery_outbox ADD COLUMN human_notification_id TEXT",
+        "CREATE INDEX delivery_outbox_human_notification_idx "
+        "ON delivery_outbox (human_notification_id, status, requested_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2582,6 +2618,7 @@ _MIGRATIONS = (
     _MULTI_HUMAN_CHANNEL_MEMBERSHIP_SCHEMA,
     _CANONICAL_HUMAN_NOTIFICATION_SCHEMA,
     _CHANNEL_NOTIFICATION_POLICY_SCHEMA,
+    _HUMAN_NOTIFICATION_PUBLICATION_SCHEMA,
 )
 
 

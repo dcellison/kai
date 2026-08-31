@@ -1119,6 +1119,7 @@ class CanonicalConversationProjection:
             "run_attempts",
             "runs",
             "message_reactions",
+            "human_notification_publications",
             "human_notifications",
             "messages",
             "principal_agent_enablements",
@@ -1991,18 +1992,18 @@ class CanonicalConversationProjection:
         elif envelope.event_type == WorkshopEventType.HUMAN_NOTIFICATION_CREATED:
             if not isinstance(envelope.aggregate_id, HumanNotificationId):
                 raise ValueError("Workshop human notification requires a typed notification aggregate")
-            if envelope.event_version not in {1, 2}:
+            if envelope.event_version not in {1, 2, 3}:
                 raise ValueError("Unsupported Workshop human notification event version")
-            _require_exact_payload(
-                payload,
-                {
-                    "recipient_principal_id",
-                    "source_message_id",
-                    "source_channel_id",
-                    "source_thread_root_id",
-                    "kind",
-                },
-            )
+            expected_payload = {
+                "recipient_principal_id",
+                "source_message_id",
+                "source_channel_id",
+                "source_thread_root_id",
+                "kind",
+            }
+            if envelope.event_version == 3:
+                expected_payload.add("publication")
+            _require_exact_payload(payload, expected_payload)
             recipient_id = PrincipalId(_required_text(payload, "recipient_principal_id"))
             source_message_id = MessageId(_required_text(payload, "source_message_id"))
             source_channel_id = ChannelId(_required_text(payload, "source_channel_id"))
@@ -2063,6 +2064,43 @@ class CanonicalConversationProjection:
                     event.position,
                 ),
             )
+            if envelope.event_version == 3:
+                publication = payload.get("publication")
+                if not isinstance(publication, dict):
+                    raise ValueError("Workshop human notification publication is malformed")
+                _require_exact_payload(publication, {"policy_result", "alert_body", "deep_link"})
+                policy_result = _required_text(publication, "policy_result")
+                if policy_result not in {"eligible", "suppressed_dnd"}:
+                    raise ValueError("Workshop human notification publication policy is invalid")
+                alert_body = _required_text(publication, "alert_body")
+                if len(alert_body) > 2000:
+                    raise ValueError("Workshop human notification publication body is too large")
+                deep_link = publication.get("deep_link")
+                if deep_link is not None and (
+                    not isinstance(deep_link, str)
+                    or not deep_link.startswith(("http://", "https://"))
+                    or len(deep_link) > 1000
+                ):
+                    raise ValueError("Workshop human notification publication link is invalid")
+                await connection.execute(
+                    "INSERT INTO human_notification_publications "
+                    "(notification_id, workshop_id, recipient_principal_id, source_message_id, "
+                    "source_channel_id, source_thread_root_id, policy_result, alert_body, deep_link, "
+                    "created_at, created_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        envelope.aggregate_id,
+                        envelope.workshop_id,
+                        recipient_id,
+                        source_message_id,
+                        source_channel_id,
+                        source_thread_root_id,
+                        policy_result,
+                        alert_body,
+                        deep_link,
+                        occurred_at,
+                        event.position,
+                    ),
+                )
         elif envelope.event_type in {
             WorkshopEventType.HUMAN_NOTIFICATION_READ,
             WorkshopEventType.HUMAN_NOTIFICATION_UNREAD,
@@ -2238,6 +2276,47 @@ class CanonicalConversationProjection:
                     binding_row = await cursor.fetchone()
                 if binding_row is None:
                     raise ValueError("Workshop delivery message and binding must belong to the same channel")
+            elif envelope.event_version == 4:
+                channel_binding_id = _required_text(payload, "channel_binding_id")
+                human_notification_id = HumanNotificationId(_required_text(payload, "human_notification_id"))
+                async with connection.execute(
+                    "SELECT 1 FROM human_notification_publications np "
+                    "JOIN messages m ON m.id = np.source_message_id "
+                    "AND m.channel_id = np.source_channel_id "
+                    "JOIN external_identities ei ON ei.principal_id = np.recipient_principal_id "
+                    "JOIN channel_bindings cb ON cb.id = ? AND cb.transport = ei.provider "
+                    "AND cb.external_channel_id = ei.external_subject "
+                    "WHERE np.notification_id = ? AND np.source_message_id = ? "
+                    "AND np.source_channel_id = ? AND cb.transport = ?",
+                    (channel_binding_id, human_notification_id, message_id, channel_id, transport),
+                ) as cursor:
+                    binding_row = await cursor.fetchone()
+                if binding_row is None:
+                    # A binding may be revoked after the publication was
+                    # durably requested. The terminal failure remains valid
+                    # when it carries the explicit sanitized revocation code.
+                    async with connection.execute(
+                        "SELECT 1 FROM human_notification_publications np "
+                        "JOIN messages m ON m.id = np.source_message_id "
+                        "AND m.channel_id = np.source_channel_id "
+                        "JOIN delivery_outbox o ON o.human_notification_id = np.notification_id "
+                        "AND o.message_id = np.source_message_id AND o.channel_id = np.source_channel_id "
+                        "AND o.channel_binding_id = ? AND o.transport = ? "
+                        "JOIN channel_bindings cb ON cb.id = o.channel_binding_id "
+                        "AND cb.transport = o.transport "
+                        "JOIN channels target ON target.id = cb.channel_id AND target.kind = 'direct' "
+                        "AND target.workshop_id = np.workshop_id "
+                        "WHERE np.notification_id = ? AND np.source_message_id = ? "
+                        "AND np.source_channel_id = ?",
+                        (channel_binding_id, transport, human_notification_id, message_id, channel_id),
+                    ) as cursor:
+                        revoked_binding_row = await cursor.fetchone()
+                    if (
+                        revoked_binding_row is None
+                        or envelope.event_type != WorkshopEventType.DELIVERY_FAILED
+                        or payload.get("error_code") != "notification_recipient_binding_revoked"
+                    ):
+                        raise ValueError("Workshop human notification delivery target is not canonical")
             else:
                 raise ValueError("Workshop delivery event version is unsupported")
             await connection.execute(
