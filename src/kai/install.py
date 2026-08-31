@@ -86,6 +86,7 @@ from kai.workshop.diagnostics import (
     workshop_delivery_authority_status,
     workshop_execution_state_status,
     workshop_human_handle_status,
+    workshop_human_notification_status,
     workshop_legacy_jsonl_archive_status,
     workshop_memory_authority_status,
     workshop_operational_state_status,
@@ -9556,6 +9557,7 @@ def _cmd_status() -> None:
     )
     print(workshop_agent_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_human_handle_status(Path(data_dir) / "kai.db"))
+    print(workshop_human_notification_status(Path(data_dir) / "kai.db"))
     print(_channel_lifecycle_status(Path(data_dir) / "kai.db"))
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))

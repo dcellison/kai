@@ -100,6 +100,7 @@ from kai.workshop.domain import (
     AgentId,
     ArtifactId,
     ChannelId,
+    HumanNotificationId,
     MessageId,
     MessageReactionSummary,
     PrincipalId,
@@ -117,6 +118,15 @@ from kai.workshop.github_settings import (
     WorkshopGitHubSettingsService,
     WorkshopGitHubSettingsStorageError,
     WorkshopGitHubSettingsValidationError,
+)
+from kai.workshop.human_notifications import (
+    HumanNotification,
+    HumanNotificationMutation,
+    HumanNotificationStateRequest,
+    WorkshopHumanNotificationAccessDenied,
+    WorkshopHumanNotificationConflict,
+    WorkshopHumanNotificationService,
+    WorkshopHumanNotificationValidationError,
 )
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.memory_queries import (
@@ -266,6 +276,12 @@ _GITHUB_SETTINGS_PATH = "/v1/settings/github"
 _NOTIFICATION_PREFERENCES_PATH = "/v1/settings/notifications"
 _CLIENT_PREFERENCES_PATH = "/v1/settings/clients"
 _APPEARANCE_PREFERENCES_PATH = "/v1/settings/appearance"
+_HUMAN_NOTIFICATIONS_PATH = "/v1/client/notifications"
+_HUMAN_NOTIFICATION_COUNTS_PATH = "/v1/client/notifications/counts"
+_HUMAN_NOTIFICATION_EVENTS_PATH = "/v1/client/notifications/events"
+_HUMAN_NOTIFICATION_READ_PATH = "/v1/client/notifications/{notification_id}/read"
+_HUMAN_NOTIFICATION_UNREAD_PATH = "/v1/client/notifications/{notification_id}/unread"
+_HUMAN_NOTIFICATION_BULK_READ_PATH = "/v1/client/notifications/read"
 _MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
 _MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
 _MAX_REACTION_BODY_BYTES = 256
@@ -305,6 +321,10 @@ _CLIENT_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "binding_choice_id", 
 _MAX_CLIENT_PREFERENCE_BODY_BYTES = 2_048
 _APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
 _MAX_APPEARANCE_PREFERENCE_BODY_BYTES = 1_024
+_MAX_HUMAN_NOTIFICATION_BODY_BYTES = 32_768
+_HUMAN_NOTIFICATION_STATE_FIELDS = frozenset({"expected_state_version", "client_operation_id"})
+_HUMAN_NOTIFICATION_BULK_FIELDS = frozenset({"notifications", "client_operation_id"})
+_HUMAN_NOTIFICATION_BULK_ITEM_FIELDS = frozenset({"notification_id", "expected_state_version"})
 _CHANNEL_CREATION_REQUEST_FIELDS = frozenset({"name", "agent_ids", "origin_channel_id"})
 _MAX_CHANNEL_CREATION_BODY_BYTES = 8_192
 _CHANNEL_AGENT_OPERATION_FIELDS = frozenset({"client_operation_id"})
@@ -2964,6 +2984,38 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
     }
 
 
+def _serialize_human_notification(notification: HumanNotification) -> dict[str, object]:
+    """Serialize notification metadata without duplicating source message content."""
+    return {
+        "notification_id": str(notification.notification_id),
+        "kind": notification.kind,
+        "source_message_id": str(notification.source_message_id),
+        "source_channel_id": str(notification.source_channel_id),
+        "source_thread_root_id": (
+            str(notification.source_thread_root_id) if notification.source_thread_root_id is not None else None
+        ),
+        "source_author_principal_id": str(notification.source_author_principal_id),
+        "source_author_display_name": notification.source_author_display_name,
+        "channel_name": notification.channel_name,
+        "created_at": _format_timestamp(notification.created_at),
+        "created_event_position": notification.created_event_position,
+        "read": notification.read,
+        "read_at": (_format_timestamp(notification.read_at) if notification.read_at is not None else None),
+        "state_version": notification.state_version,
+        "last_event_position": notification.last_event_position,
+    }
+
+
+def _serialize_human_notification_mutation(
+    mutation: HumanNotificationMutation,
+) -> dict[str, object]:
+    return {
+        "notification": _serialize_human_notification(mutation.notification),
+        "changed": mutation.changed,
+        "replayed": mutation.replayed,
+    }
+
+
 def _serialize_reactions(reactions: Sequence[MessageReactionSummary]) -> list[dict[str, object]]:
     return [
         {
@@ -4434,6 +4486,272 @@ async def _handle_agent_event_stream(
     return response
 
 
+async def _handle_human_notifications(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanNotificationService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.can_read_body or not set(request.query).issubset({"cursor", "limit", "unread"}):
+        return _error_response(status=400, code="invalid_request", message="Invalid notification request")
+    try:
+        cursor = _single_query_value(request, "cursor")
+        raw_limit = _single_query_value(request, "limit")
+        raw_unread = _single_query_value(request, "unread")
+        if raw_limit is not None and not _DECIMAL_INTEGER.fullmatch(raw_limit):
+            raise ValueError
+        limit = 50 if raw_limit is None else int(raw_limit)
+        if raw_unread not in {None, "0", "1"}:
+            raise ValueError
+        page = await service.list(
+            principal_id,
+            limit=limit,
+            cursor=cursor,
+            unread_only=raw_unread == "1",
+        )
+    except (TypeError, ValueError, WorkshopHumanNotificationValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid notification request")
+    return _json_response(
+        {
+            "version": 1,
+            "notifications": [_serialize_human_notification(notification) for notification in page.notifications],
+            "counts": {
+                "total": page.counts.total,
+                "unread": page.counts.unread,
+                "read": page.counts.read,
+            },
+            "next_cursor": page.next_cursor,
+        },
+        status=200,
+    )
+
+
+async def _handle_human_notification_counts(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanNotificationService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid notification count request")
+    counts = await service.counts(principal_id)
+    return _json_response(
+        {"version": 1, "total": counts.total, "unread": counts.unread, "read": counts.read},
+        status=200,
+    )
+
+
+async def _read_human_notification_mutation_payload(
+    request: web.Request,
+) -> dict[str, object] | None:
+    if request.query or request.content_type != "application/json":
+        return None
+    if request.content_length is not None and request.content_length > _MAX_HUMAN_NOTIFICATION_BODY_BYTES:
+        return None
+    raw = await request.content.read(_MAX_HUMAN_NOTIFICATION_BODY_BYTES + 1)
+    if len(raw) > _MAX_HUMAN_NOTIFICATION_BODY_BYTES:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _handle_human_notification_state(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanNotificationService,
+    read: bool,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    payload = await _read_human_notification_mutation_payload(request)
+    if payload is None or set(payload) != _HUMAN_NOTIFICATION_STATE_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid notification mutation")
+    try:
+        mutation = await service.set_read_state(
+            principal_id,
+            HumanNotificationId(request.match_info["notification_id"]),
+            read=read,
+            expected_state_version=payload["expected_state_version"],
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (TypeError, ValueError, WorkshopHumanNotificationValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid notification mutation")
+    except WorkshopHumanNotificationAccessDenied:
+        return _error_response(status=404, code="notification_not_found", message="Notification not found")
+    except WorkshopHumanNotificationConflict as exc:
+        return _error_response(status=409, code="notification_conflict", message=str(exc))
+    return _json_response(
+        {"version": 1, **_serialize_human_notification_mutation(mutation)},
+        status=200,
+    )
+
+
+async def _handle_human_notification_bulk_read(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanNotificationService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    payload = await _read_human_notification_mutation_payload(request)
+    if payload is None or set(payload) != _HUMAN_NOTIFICATION_BULK_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid notification mutation")
+    raw_items = payload.get("notifications")
+    try:
+        if not isinstance(raw_items, list):
+            raise ValueError
+        items = tuple(
+            HumanNotificationStateRequest(
+                HumanNotificationId(item["notification_id"]),
+                item["expected_state_version"],
+            )
+            for item in raw_items
+            if isinstance(item, dict) and set(item) == _HUMAN_NOTIFICATION_BULK_ITEM_FIELDS
+        )
+        if len(items) != len(raw_items) or any(
+            not isinstance(item.expected_state_version, int)
+            or isinstance(item.expected_state_version, bool)
+            or item.expected_state_version < 0
+            for item in items
+        ):
+            raise ValueError
+        mutations = await service.set_many_read(
+            principal_id,
+            items,
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (TypeError, ValueError, WorkshopHumanNotificationValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid notification mutation")
+    except WorkshopHumanNotificationAccessDenied:
+        return _error_response(status=404, code="notification_not_found", message="Notification not found")
+    except WorkshopHumanNotificationConflict as exc:
+        return _error_response(status=409, code="notification_conflict", message=str(exc))
+    return _json_response(
+        {
+            "version": 1,
+            "notifications": [_serialize_human_notification_mutation(mutation) for mutation in mutations],
+        },
+        status=200,
+    )
+
+
+async def _handle_human_notification_event_stream(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanNotificationService,
+    request_lock: asyncio.Lock,
+    poll_interval: float,
+    heartbeat_interval: float,
+    authentication_recheck_interval: float,
+    stream_limiter: WorkshopEventStreamLimiter,
+    shutdown_event: asyncio.Event,
+) -> web.StreamResponse:
+    try:
+        async with request_lock:
+            principal_id = await authenticator.authenticate(request)
+            if not isinstance(principal_id, PrincipalId):
+                response = _error_response(
+                    status=401,
+                    code="authentication_required",
+                    message="Authentication required",
+                )
+                response.headers["WWW-Authenticate"] = "Bearer"
+                return response
+            after_position = _parse_agent_event_stream_request(request)
+            stream_key = _event_stream_key(request)
+            batch = await service.events(principal_id, after_position=after_position)
+    except (TypeError, ValueError, WorkshopHumanNotificationValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid notification event stream")
+    claim = stream_limiter.acquire(principal_id, stream_key)
+    if claim is None:
+        response = _error_response(
+            status=429,
+            code="stream_capacity_exceeded",
+            message="Too many active event streams",
+        )
+        response.headers["Retry-After"] = "5"
+        return response
+    response = web.StreamResponse(status=200)
+    try:
+        response.content_type = "text/event-stream"
+        response.charset = "utf-8"
+        _apply_client_security_headers(response)
+        response.headers["X-Accel-Buffering"] = "no"
+        await response.prepare(request)
+        await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
+        position = batch.next_position
+        last_heartbeat = time.monotonic()
+        last_authentication_check = last_heartbeat
+        while True:
+            if not stream_limiter.is_current(claim):
+                break
+            transport = request.transport
+            if transport is None or transport.is_closing():
+                break
+            if batch.events:
+                for event in batch.events:
+                    data = json.dumps(
+                        {
+                            "version": 1,
+                            "event_position": event.event_position,
+                            "event_type": event.transition.value,
+                            "notification": _serialize_human_notification(event.notification),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    await response.write(
+                        f"id: {event.event_position}\nevent: human_notification.changed\ndata: {data}\n\n".encode()
+                    )
+                batch = type(batch)((), position)
+                last_heartbeat = time.monotonic()
+                continue
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_interval:
+                await response.write(b": keep-alive\n\n")
+                last_heartbeat = now
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
+                break
+            except TimeoutError:
+                pass
+            async with request_lock:
+                if time.monotonic() - last_authentication_check >= authentication_recheck_interval:
+                    if await authenticator.authenticate(request) != principal_id:
+                        break
+                    last_authentication_check = time.monotonic()
+                batch = await service.events(principal_id, after_position=position)
+                position = batch.next_position
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        stream_limiter.release(claim)
+    return response
+
+
 async def _latest_channel_trace(store: WorkshopEventStore, channel_id: ChannelId) -> tuple[str, int] | None:
     """Return (run_id, seq) of the channel's appending run's trace tip.
 
@@ -5264,6 +5582,7 @@ def register_workshop_read_routes(
     stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
     channel_lifecycle = WorkshopChannelLifecycleService(store)
     agent_lifecycle = WorkshopAgentLifecycleService(store)
+    human_notifications = WorkshopHumanNotificationService(store)
     shutdown_event = asyncio.Event()
 
     async def stop_event_streams(_app: web.Application) -> None:
@@ -5443,6 +5762,61 @@ def register_workshop_read_routes(
             routing_policy=routing_policy,
         )
 
+    async def handle_human_notifications(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_notifications(
+                request,
+                authenticator=authenticator,
+                service=human_notifications,
+            )
+
+    async def handle_human_notification_counts(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_notification_counts(
+                request,
+                authenticator=authenticator,
+                service=human_notifications,
+            )
+
+    async def handle_human_notification_read(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_notification_state(
+                request,
+                authenticator=authenticator,
+                service=human_notifications,
+                read=True,
+            )
+
+    async def handle_human_notification_unread(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_notification_state(
+                request,
+                authenticator=authenticator,
+                service=human_notifications,
+                read=False,
+            )
+
+    async def handle_human_notification_bulk_read(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_notification_bulk_read(
+                request,
+                authenticator=authenticator,
+                service=human_notifications,
+            )
+
+    async def handle_human_notification_event_stream(request: web.Request) -> web.StreamResponse:
+        return await _handle_human_notification_event_stream(
+            request,
+            authenticator=authenticator,
+            service=human_notifications,
+            request_lock=request_lock,
+            poll_interval=event_poll_interval,
+            heartbeat_interval=event_heartbeat_interval,
+            authentication_recheck_interval=event_authentication_recheck_interval,
+            stream_limiter=stream_limiter,
+            shutdown_event=shutdown_event,
+        )
+
     async def handle_message_reaction(request: web.Request) -> web.Response:
         return await _handle_message_reaction(
             request,
@@ -5452,6 +5826,12 @@ def register_workshop_read_routes(
         )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
+    app.router.add_get(_HUMAN_NOTIFICATIONS_PATH, handle_human_notifications)
+    app.router.add_get(_HUMAN_NOTIFICATION_COUNTS_PATH, handle_human_notification_counts)
+    app.router.add_get(_HUMAN_NOTIFICATION_EVENTS_PATH, handle_human_notification_event_stream)
+    app.router.add_post(_HUMAN_NOTIFICATION_BULK_READ_PATH, handle_human_notification_bulk_read)
+    app.router.add_post(_HUMAN_NOTIFICATION_READ_PATH, handle_human_notification_read)
+    app.router.add_post(_HUMAN_NOTIFICATION_UNREAD_PATH, handle_human_notification_unread)
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
     app.router.add_post(_CHANNEL_ARCHIVAL_PATH, handle_channel_archival)
     app.router.add_post(_CHANNEL_RESTORATION_PATH, handle_channel_restoration)

@@ -1659,6 +1659,78 @@ def workshop_human_handle_status(db_path: Path) -> str:
     )
 
 
+def workshop_human_notification_status(db_path: Path) -> str:
+    """Report canonical human-notification projection and replay integrity."""
+    prefix = "Workshop human notifications:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical notification schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            required = {
+                "channels",
+                "event_log",
+                "human_notifications",
+                "messages",
+                "principals",
+            }
+            if not tables >= required:
+                return f"{prefix} pending; canonical notification schema unavailable"
+            totals = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END), "
+                "COUNT(DISTINCT recipient_principal_id) FROM human_notifications"
+            ).fetchone()
+            integrity_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM human_notifications n "
+                "LEFT JOIN messages m ON m.id = n.source_message_id "
+                "LEFT JOIN principals p ON p.id = n.recipient_principal_id "
+                "LEFT JOIN event_log created ON created.position = n.created_event_position "
+                "WHERE m.id IS NULL OR m.channel_id != n.source_channel_id "
+                "OR p.kind IS NULL OR p.kind != 'human' OR n.kind != 'mention' "
+                "OR NOT EXISTS (SELECT 1 FROM json_each(m.mentions_json) mention "
+                "WHERE json_extract(mention.value, '$.kind') = 'human' "
+                "AND json_extract(mention.value, '$.principal_id') = n.recipient_principal_id) "
+                "OR COALESCE(m.thread_root_id, '') != COALESCE(n.source_thread_root_id, '') "
+                "OR created.event_type IS NULL "
+                "OR created.event_type != 'human_notification.created' "
+                "OR created.aggregate_id != n.id "
+                "OR (n.read_at IS NULL) != (n.read_event_position IS NULL)",
+            )
+            replay_gaps = _scalar(
+                connection,
+                "WITH notification_events AS ("
+                "SELECT aggregate_id, MIN(CASE WHEN event_type = 'human_notification.created' "
+                "THEN position END) AS created_position, MAX(position) AS last_position "
+                "FROM event_log WHERE event_type IN ('human_notification.created', "
+                "'human_notification.read', 'human_notification.unread') GROUP BY aggregate_id) "
+                "SELECT COUNT(*) FROM notification_events e "
+                "LEFT JOIN human_notifications n ON n.id = e.aggregate_id "
+                "WHERE n.id IS NULL OR n.created_event_position != e.created_position "
+                "OR n.last_event_position != e.last_position",
+            )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    total = int(totals[0] or 0) if totals is not None else 0
+    unread = int(totals[1] or 0) if totals is not None else 0
+    recipients = int(totals[2] or 0) if totals is not None else 0
+    state = "active" if integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; notifications={total}, unread={unread}, "
+        f"read={total - unread}, recipients={recipients}, integrity gaps={integrity_gaps}, "
+        f"replay gaps={replay_gaps}; authority=canonical"
+    )
+
+
 def _classified_legacy_archive(
     connection: sqlite3.Connection,
     replayed: _ReplayState,

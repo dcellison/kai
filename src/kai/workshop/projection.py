@@ -28,6 +28,7 @@ from kai.workshop.domain import (
     AgentEnablementId,
     AgentId,
     ChannelId,
+    HumanNotificationId,
     MessageId,
     PrincipalId,
     RunAttemptId,
@@ -1096,7 +1097,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent definitions project durable draft, active, and archived lifecycle state.
-    version = 18
+    version = 19
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1118,6 +1119,7 @@ class CanonicalConversationProjection:
             "run_attempts",
             "runs",
             "message_reactions",
+            "human_notifications",
             "messages",
             "principal_agent_enablements",
             "channel_agent_dismissals",
@@ -1986,6 +1988,93 @@ class CanonicalConversationProjection:
                     "UPDATE messages SET thread_root_id = ? WHERE id = ?",
                     (thread_root, envelope.aggregate_id),
                 )
+        elif envelope.event_type == WorkshopEventType.HUMAN_NOTIFICATION_CREATED:
+            if not isinstance(envelope.aggregate_id, HumanNotificationId):
+                raise ValueError("Workshop human notification requires a typed notification aggregate")
+            _require_exact_payload(
+                payload,
+                {
+                    "recipient_principal_id",
+                    "source_message_id",
+                    "source_channel_id",
+                    "source_thread_root_id",
+                    "kind",
+                },
+            )
+            recipient_id = PrincipalId(_required_text(payload, "recipient_principal_id"))
+            source_message_id = MessageId(_required_text(payload, "source_message_id"))
+            source_channel_id = ChannelId(_required_text(payload, "source_channel_id"))
+            source_thread_root_id = payload.get("source_thread_root_id")
+            if source_thread_root_id is not None:
+                source_thread_root_id = MessageId(str(source_thread_root_id))
+            if _required_text(payload, "kind") != "mention":
+                raise ValueError("Unsupported Workshop human notification kind")
+            async with connection.execute(
+                "SELECT m.author_principal_id, m.thread_root_id, p.kind, "
+                "EXISTS(SELECT 1 FROM json_each(m.mentions_json) mention "
+                "WHERE json_extract(mention.value, '$.kind') = 'human' "
+                "AND json_extract(mention.value, '$.principal_id') = ?) "
+                "FROM messages m JOIN principals p ON p.id = ? "
+                "WHERE m.id = ? AND m.channel_id = ?",
+                (recipient_id, recipient_id, source_message_id, source_channel_id),
+            ) as cursor:
+                notification_source = await cursor.fetchone()
+            if (
+                notification_source is None
+                or (MessageId(str(notification_source[1])) if notification_source[1] is not None else None)
+                != source_thread_root_id
+                or str(notification_source[2]) != "human"
+                or not bool(notification_source[3])
+                or envelope.actor_principal_id != PrincipalId(str(notification_source[0]))
+            ):
+                raise ValueError("Workshop human notification source does not contain its canonical mention")
+            await connection.execute(
+                "INSERT INTO human_notifications "
+                "(id, workshop_id, recipient_principal_id, kind, source_message_id, "
+                "source_channel_id, source_thread_root_id, created_at, "
+                "created_event_position, last_event_position) "
+                "VALUES (?, ?, ?, 'mention', ?, ?, ?, ?, ?, ?)",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    recipient_id,
+                    source_message_id,
+                    source_channel_id,
+                    source_thread_root_id,
+                    occurred_at,
+                    event.position,
+                    event.position,
+                ),
+            )
+        elif envelope.event_type in {
+            WorkshopEventType.HUMAN_NOTIFICATION_READ,
+            WorkshopEventType.HUMAN_NOTIFICATION_UNREAD,
+        }:
+            if not isinstance(envelope.aggregate_id, HumanNotificationId):
+                raise ValueError("Workshop human notification state requires a typed notification aggregate")
+            _require_exact_payload(payload, {"recipient_principal_id", "expected_state_version"})
+            recipient_id = PrincipalId(_required_text(payload, "recipient_principal_id"))
+            expected_version = payload.get("expected_state_version")
+            if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
+                raise ValueError("Workshop human notification state version is invalid")
+            if envelope.actor_principal_id != recipient_id:
+                raise ValueError("Workshop human notification state actor must be its recipient")
+            read = envelope.event_type == WorkshopEventType.HUMAN_NOTIFICATION_READ
+            cursor = await connection.execute(
+                "UPDATE human_notifications SET read_at = ?, read_event_position = ?, "
+                "state_version = state_version + 1, last_event_position = ? "
+                "WHERE id = ? AND recipient_principal_id = ? AND state_version = ?",
+                (
+                    occurred_at if read else None,
+                    event.position if read else None,
+                    event.position,
+                    envelope.aggregate_id,
+                    recipient_id,
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop human notification state revision is stale or unauthorized")
         elif envelope.event_type in {
             WorkshopEventType.MESSAGE_REACTION_ADDED,
             WorkshopEventType.MESSAGE_REACTION_REMOVED,

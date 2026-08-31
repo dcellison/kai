@@ -48,6 +48,9 @@ class WorkshopEventType(StrEnum):
     MESSAGE_CREATED = "message.created"
     MESSAGE_REACTION_ADDED = "message.reaction_added"
     MESSAGE_REACTION_REMOVED = "message.reaction_removed"
+    HUMAN_NOTIFICATION_CREATED = "human_notification.created"
+    HUMAN_NOTIFICATION_READ = "human_notification.read"
+    HUMAN_NOTIFICATION_UNREAD = "human_notification.unread"
     ARTIFACT_CREATED = "artifact.created"
     DELIVERY_REQUESTED = "delivery.requested"
     DELIVERY_SUCCEEDED = "delivery.succeeded"
@@ -172,6 +175,10 @@ class MessageId(OpaqueId):
     prefix = "msg"
 
 
+class HumanNotificationId(OpaqueId):
+    prefix = "ntf"
+
+
 @dataclass(frozen=True, slots=True)
 class MessageMention:
     """One principal mention resolved when a canonical message is accepted."""
@@ -265,6 +272,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         ChannelAgentId,
         RuntimeAssignmentId,
         MessageId,
+        HumanNotificationId,
         ArtifactId,
         DeliveryId,
         DeliveryAttemptId,
