@@ -4939,6 +4939,92 @@ class TestHandleNotifications:
         service.inspect.assert_not_awaited()
         assert "<github|generic>" in update.message.reply_text.call_args[0][0]
 
+    @pytest.mark.asyncio
+    async def test_lists_and_changes_canonical_channel_notification_policy(self):
+        update = _make_update(text="/notifications channel 1 muted")
+        ctx, _integration_service = self._context(["channel", "1", "muted"])
+        service = MagicMock()
+        authority = object()
+        service.authority_for_principal_profile.return_value = authority
+        channel = SimpleNamespace(
+            channel_id=ChannelId("chn_00000000000000000000000000000001"),
+            channel_name="General",
+            level="mentions_replies",
+        )
+        snapshot = SimpleNamespace(
+            channels=(channel,),
+            muted_mentions_notify=True,
+            do_not_disturb=SimpleNamespace(
+                enabled=False,
+                timezone="America/Toronto",
+                start="22:00",
+                end="07:00",
+            ),
+            revision="cnp_current",
+        )
+        service.inspect = AsyncMock(return_value=snapshot)
+        service.set_channel_level = AsyncMock(
+            return_value=SimpleNamespace(
+                channels=(SimpleNamespace(channel_name="General", level="muted"),),
+            )
+        )
+        ctx.application.core_services.channel_notification_policy = service
+
+        await handle_notifications(update, ctx)
+
+        service.set_channel_level.assert_awaited_once_with(
+            authority,
+            channel.channel_id,
+            "muted",
+            expected_revision="cnp_current",
+        )
+        assert update.message.reply_text.call_args[0][0] == "General: muted."
+
+    @pytest.mark.asyncio
+    async def test_configures_canonical_do_not_disturb_schedule(self):
+        update = _make_update(text="/notifications dnd on America/Toronto 22:00 07:00")
+        ctx, _integration_service = self._context(["dnd", "on", "America/Toronto", "22:00", "07:00"])
+        service = MagicMock()
+        authority = object()
+        service.authority_for_principal_profile.return_value = authority
+        dnd = SimpleNamespace(
+            enabled=False,
+            timezone="UTC",
+            start="22:00",
+            end="07:00",
+        )
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                channels=(),
+                muted_mentions_notify=True,
+                do_not_disturb=dnd,
+                revision="cnp_current",
+            )
+        )
+        service.set_do_not_disturb = AsyncMock(
+            return_value=SimpleNamespace(
+                do_not_disturb=SimpleNamespace(
+                    enabled=True,
+                    timezone="America/Toronto",
+                    start="22:00",
+                    end="07:00",
+                )
+            )
+        )
+        ctx.application.core_services.channel_notification_policy = service
+
+        await handle_notifications(update, ctx)
+
+        service.set_do_not_disturb.assert_awaited_once_with(
+            authority,
+            enabled=True,
+            timezone="America/Toronto",
+            start="22:00",
+            end="07:00",
+            expected_revision="cnp_current",
+        )
+        assert "22:00-07:00 America/Toronto" in update.message.reply_text.call_args[0][0]
+
 
 # ── /preferences command ────────────────────────────────────────────
 

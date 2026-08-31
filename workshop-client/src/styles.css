@@ -3448,6 +3448,32 @@ button:disabled {
   width: 100%;
 }
 
+.settings-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.settings-checkbox-row input {
+  width: auto;
+  margin: 0;
+}
+
+.settings-inline-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.settings-inline-fields label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.settings-dnd-card > input {
+  width: 100%;
+}
+
 .notification-routing-summary {
   color: var(--color-text-muted);
   font-size: 0.82rem;

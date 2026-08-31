@@ -1991,6 +1991,8 @@ class CanonicalConversationProjection:
         elif envelope.event_type == WorkshopEventType.HUMAN_NOTIFICATION_CREATED:
             if not isinstance(envelope.aggregate_id, HumanNotificationId):
                 raise ValueError("Workshop human notification requires a typed notification aggregate")
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop human notification event version")
             _require_exact_payload(
                 payload,
                 {
@@ -2007,16 +2009,22 @@ class CanonicalConversationProjection:
             source_thread_root_id = payload.get("source_thread_root_id")
             if source_thread_root_id is not None:
                 source_thread_root_id = MessageId(str(source_thread_root_id))
-            if _required_text(payload, "kind") != "mention":
+            kind = _required_text(payload, "kind")
+            if kind not in {"mention", "reply", "message"} or (envelope.event_version == 1 and kind != "mention"):
                 raise ValueError("Unsupported Workshop human notification kind")
             async with connection.execute(
                 "SELECT m.author_principal_id, m.thread_root_id, p.kind, "
                 "EXISTS(SELECT 1 FROM json_each(m.mentions_json) mention "
                 "WHERE json_extract(mention.value, '$.kind') = 'human' "
-                "AND json_extract(mention.value, '$.principal_id') = ?) "
+                "AND json_extract(mention.value, '$.principal_id') = ?), "
+                "(SELECT replied.author_principal_id FROM messages replied "
+                "WHERE replied.id = m.reply_to_message_id), "
+                "(SELECT root.author_principal_id FROM messages root WHERE root.id = m.thread_root_id), "
+                "EXISTS(SELECT 1 FROM channel_memberships cm "
+                "WHERE cm.channel_id = m.channel_id AND cm.principal_id = ?) "
                 "FROM messages m JOIN principals p ON p.id = ? "
                 "WHERE m.id = ? AND m.channel_id = ?",
-                (recipient_id, recipient_id, source_message_id, source_channel_id),
+                (recipient_id, recipient_id, recipient_id, source_message_id, source_channel_id),
             ) as cursor:
                 notification_source = await cursor.fetchone()
             if (
@@ -2024,20 +2032,29 @@ class CanonicalConversationProjection:
                 or (MessageId(str(notification_source[1])) if notification_source[1] is not None else None)
                 != source_thread_root_id
                 or str(notification_source[2]) != "human"
-                or not bool(notification_source[3])
+                or not bool(notification_source[6])
                 or envelope.actor_principal_id != PrincipalId(str(notification_source[0]))
             ):
-                raise ValueError("Workshop human notification source does not contain its canonical mention")
+                raise ValueError("Workshop human notification source is not canonical")
+            if kind == "mention" and not bool(notification_source[3]):
+                raise ValueError("Workshop human mention notification has no canonical mention")
+            if kind == "reply":
+                reply_target = notification_source[4]
+                if reply_target is None:
+                    reply_target = notification_source[5]
+                if reply_target is None or PrincipalId(str(reply_target)) != recipient_id:
+                    raise ValueError("Workshop human reply notification has no canonical reply target")
             await connection.execute(
                 "INSERT INTO human_notifications "
                 "(id, workshop_id, recipient_principal_id, kind, source_message_id, "
                 "source_channel_id, source_thread_root_id, created_at, "
                 "created_event_position, last_event_position) "
-                "VALUES (?, ?, ?, 'mention', ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     envelope.aggregate_id,
                     envelope.workshop_id,
                     recipient_id,
+                    kind,
                     source_message_id,
                     source_channel_id,
                     source_thread_root_id,

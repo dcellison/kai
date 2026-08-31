@@ -8,6 +8,7 @@ import {
   loadAppearancePreferences,
   loadGitHubSettings,
   loadNotificationPreferences,
+  loadChannelNotificationPolicy,
   loadClientPreferences,
   loadModelCatalogue,
   loadPreferenceDocument,
@@ -23,6 +24,7 @@ import {
   upsertOperatorModel,
   updateGitHubSettings,
   updateNotificationPreference,
+  updateChannelNotificationPolicy,
   updateClientPreference,
   updateAppearancePreference,
   updateRuntimeSettings,
@@ -35,6 +37,7 @@ import type {
   WorkshopGitHubSettings,
   WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
+  WorkshopChannelNotificationPolicy,
   WorkshopClientPreferences,
   WorkshopAppearancePreferences,
   WorkshopSettingsWorkspace,
@@ -48,6 +51,7 @@ vi.mock("./api", async (importOriginal) => {
     loadPreferenceDocument: vi.fn(),
     loadGitHubSettings: vi.fn(),
     loadNotificationPreferences: vi.fn(),
+    loadChannelNotificationPolicy: vi.fn(),
     loadClientPreferences: vi.fn(),
     loadModelCatalogue: vi.fn(),
     loadAppearancePreferences: vi.fn(),
@@ -63,6 +67,7 @@ vi.mock("./api", async (importOriginal) => {
     deactivateOperatorModel: vi.fn(),
     updateGitHubSettings: vi.fn(),
     updateNotificationPreference: vi.fn(),
+    updateChannelNotificationPolicy: vi.fn(),
     updateClientPreference: vi.fn(),
     updateAppearancePreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
@@ -289,6 +294,27 @@ const notificationPreferences: WorkshopNotificationPreferences = {
   revision: "nps_current",
 };
 
+const channelNotificationPolicy: WorkshopChannelNotificationPolicy = {
+  channels: [
+    {
+      channelId: "chn_00000000000000000000000000000001",
+      channelName: "General",
+      level: "mentions_replies",
+      source: "default",
+    },
+  ],
+  doNotDisturb: {
+    enabled: false,
+    timezone: "America/Toronto",
+    start: "22:00",
+    end: "07:00",
+  },
+  levels: ["all", "mentions_replies", "muted"],
+  mutedMentionsNotify: true,
+  mutation: null,
+  revision: "cnp_current",
+};
+
 const clientPreferences: WorkshopClientPreferences = {
   mutation: null,
   revision: "cvp_current",
@@ -381,6 +407,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
+    vi.mocked(loadChannelNotificationPolicy).mockResolvedValue(channelNotificationPolicy);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
     vi.mocked(loadAppearancePreferences).mockResolvedValue(appearancePreferences);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
@@ -403,6 +430,7 @@ describe("Settings workspace", () => {
     vi.mocked(updateRuntimeSettings).mockResolvedValue(runtime);
     vi.mocked(updateGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(updateNotificationPreference).mockResolvedValue(notificationPreferences);
+    vi.mocked(updateChannelNotificationPolicy).mockResolvedValue(channelNotificationPolicy);
     vi.mocked(updateClientPreference).mockResolvedValue(clientPreferences);
     vi.mocked(updateAppearancePreference).mockResolvedValue(appearancePreferences);
     vi.mocked(updateWorkspaceConfig).mockResolvedValue(workspaceConfig);
@@ -914,6 +942,42 @@ describe("Settings workspace", () => {
     ).toHaveTextContent(
       "Effective: Home · personal override",
     ));
+  });
+
+  it("edits channel notification level and do-not-disturb policy", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateChannelNotificationPolicy).mockImplementation(async (_session, _revision, change) => ({
+      ...channelNotificationPolicy,
+      channels: change.field === "channel"
+        ? [{ ...channelNotificationPolicy.channels[0], level: change.level }]
+        : channelNotificationPolicy.channels,
+      doNotDisturb: change.field === "do_not_disturb"
+        ? {
+            enabled: change.enabled,
+            timezone: change.timezone,
+            start: change.start,
+            end: change.end,
+          }
+        : channelNotificationPolicy.doNotDisturb,
+      mutation: { changed: true, operation: `set_${change.field}` },
+      revision: "cnp_changed",
+    }));
+    renderSettings();
+
+    const channel = await screen.findByLabelText("General");
+    await user.selectOptions(channel, "muted");
+    expect(updateChannelNotificationPolicy).toHaveBeenCalledWith(
+      session,
+      "cnp_current",
+      {
+        field: "channel",
+        channelId: "chn_00000000000000000000000000000001",
+        level: "muted",
+      },
+    );
+    expect(channel).toHaveValue("muted");
+    expect(screen.getByLabelText("Direct mentions override muted channels")).toBeChecked();
+    expect(screen.getByLabelText("Timezone")).toHaveValue("America/Toronto");
   });
 
   it("edits voice output for the authenticated client binding", async () => {

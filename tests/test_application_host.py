@@ -230,6 +230,20 @@ class _FakeNotificationPreferences:
         self.events.append("notification-preferences:close")
 
 
+class _FakeChannelNotificationPolicy:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    @classmethod
+    async def open(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("channel-notification-policy:open")
+        return cls(events)
+
+    async def close(self) -> None:
+        self.events.append("channel-notification-policy:close")
+
+
 class _FakeClientPreferences:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -351,6 +365,11 @@ def host_dependencies(monkeypatch):
         host_module,
         "WorkshopNotificationPreferenceService",
         _FakeNotificationPreferences,
+    )
+    monkeypatch.setattr(
+        host_module,
+        "WorkshopChannelNotificationPolicyService",
+        _FakeChannelNotificationPolicy,
     )
     monkeypatch.setattr(
         host_module,
@@ -480,6 +499,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "scheduler:start",
         "github-settings:open",
         "notification-preferences:open",
+        "channel-notification-policy:open",
         "client-preferences:open",
         "appearance-preferences:open",
         "integrations:open",
@@ -491,7 +511,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-19:] == [
+    assert host_dependencies[-20:] == [
         "execution:wait",
         "scheduler:wait",
         "github-automation:wait",
@@ -502,6 +522,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "integrations:close",
         "github-settings:close",
         "notification-preferences:close",
+        "channel-notification-policy:close",
         "client-preferences:close",
         "appearance-preferences:close",
         "model-catalogue:close",

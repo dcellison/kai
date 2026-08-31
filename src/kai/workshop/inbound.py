@@ -471,7 +471,8 @@ async def record_inbound_message_in_transaction(
             event_version=existing.envelope.event_version if existing is not None else 2,
         )
     )
-    await append_human_mention_notifications_in_transaction(store, result.event)
+    if result.inserted:
+        await append_human_mention_notifications_in_transaction(store, result.event)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -500,7 +501,8 @@ async def record_client_inbound_message_in_transaction(
         event_version=existing.envelope.event_version if existing is not None else 2,
     )
     result = await store.append_in_transaction(envelope)
-    await append_human_mention_notifications_in_transaction(store, result.event)
+    if result.inserted:
+        await append_human_mention_notifications_in_transaction(store, result.event)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -529,7 +531,8 @@ async def record_scheduled_inbound_message_in_transaction(
         event_version=existing.envelope.event_version if existing is not None else 2,
     )
     result = await store.append_in_transaction(envelope)
-    await append_human_mention_notifications_in_transaction(store, result.event)
+    if result.inserted:
+        await append_human_mention_notifications_in_transaction(store, result.event)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -556,7 +559,8 @@ async def record_inbound_message(store: WorkshopEventStore, message: InboundMess
                 event_version=existing.envelope.event_version if existing is not None else 2,
             )
         )
-        await append_human_mention_notifications_in_transaction(store, result.event)
+        if result.inserted:
+            await append_human_mention_notifications_in_transaction(store, result.event)
         await store.project_pending_in_transaction(CanonicalConversationProjection())
         await store.connection.commit()
         return result

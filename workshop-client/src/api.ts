@@ -29,6 +29,8 @@ import type {
   WorkshopGitHubSettingsChange,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
+  WorkshopChannelNotificationPolicy,
+  WorkshopChannelNotificationPolicyChange,
   WorkshopClientPreferences,
   WorkshopClientPreferenceChange,
   WorkshopAppearancePreferences,
@@ -1884,6 +1886,64 @@ function parseNotificationPreferences(
   };
 }
 
+function parseChannelNotificationPolicy(payload: unknown): WorkshopChannelNotificationPolicy {
+  const validLevel = (value: unknown): value is "all" | "mentions_replies" | "muted" =>
+    value === "all" || value === "mentions_replies" || value === "muted";
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !Array.isArray(payload.levels) ||
+    payload.levels.some((level) => !validLevel(level)) ||
+    !Array.isArray(payload.channels) ||
+    typeof payload.muted_mentions_notify !== "boolean" ||
+    !isRecord(payload.do_not_disturb) ||
+    typeof payload.do_not_disturb.enabled !== "boolean" ||
+    typeof payload.do_not_disturb.timezone !== "string" ||
+    typeof payload.do_not_disturb.start !== "string" ||
+    typeof payload.do_not_disturb.end !== "string" ||
+    typeof payload.revision !== "string" ||
+    (payload.mutation !== null &&
+      (!isRecord(payload.mutation) ||
+        typeof payload.mutation.operation !== "string" ||
+        typeof payload.mutation.changed !== "boolean"))
+  ) {
+    throw new Error("Kai returned unsupported channel notification policy.");
+  }
+  const channels = payload.channels.map((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.channel_id !== "string" ||
+      typeof value.channel_name !== "string" ||
+      !validLevel(value.level) ||
+      typeof value.source !== "string"
+    ) {
+      throw new Error("Kai returned an unsupported channel notification setting.");
+    }
+    return {
+      channelId: value.channel_id,
+      channelName: value.channel_name,
+      level: value.level,
+      source: value.source,
+    };
+  });
+  return {
+    channels,
+    doNotDisturb: {
+      enabled: payload.do_not_disturb.enabled,
+      timezone: payload.do_not_disturb.timezone,
+      start: payload.do_not_disturb.start,
+      end: payload.do_not_disturb.end,
+    },
+    levels: payload.levels,
+    mutedMentionsNotify: payload.muted_mentions_notify,
+    mutation: payload.mutation === null ? null : {
+      changed: payload.mutation.changed as boolean,
+      operation: payload.mutation.operation as string,
+    },
+    revision: payload.revision,
+  };
+}
+
 function parseClientPreferences(payload: unknown): WorkshopClientPreferences {
   if (
     !isRecord(payload) ||
@@ -2922,6 +2982,51 @@ export async function updateNotificationPreference(
     throw new Error(safeErrorMessage(payload, "Could not update notification preferences."));
   }
   return parseNotificationPreferences(payload);
+}
+
+export async function loadChannelNotificationPolicy(
+  session: WorkshopSession,
+): Promise<WorkshopChannelNotificationPolicy> {
+  const response = await authorizedFetch(session, "/v1/settings/channel-notifications");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load channel notification policy."));
+  }
+  return parseChannelNotificationPolicy(payload);
+}
+
+export async function updateChannelNotificationPolicy(
+  session: WorkshopSession,
+  revision: string,
+  change: WorkshopChannelNotificationPolicyChange,
+): Promise<WorkshopChannelNotificationPolicy> {
+  const operation = change.field === "channel"
+    ? { channel: { channel_id: change.channelId, level: change.level } }
+    : change.field === "muted_mentions_notify"
+      ? { muted_mentions_notify: change.enabled }
+      : {
+          do_not_disturb: {
+            enabled: change.enabled,
+            timezone: change.timezone,
+            start: change.start,
+            end: change.end,
+          },
+        };
+  const response = await authorizedFetch(session, "/v1/settings/channel-notifications", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision, ...operation }),
+  });
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Channel notification policy changed since it was loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update channel notification policy."));
+  }
+  return parseChannelNotificationPolicy(payload);
 }
 
 export async function loadClientPreferences(

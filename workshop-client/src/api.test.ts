@@ -36,6 +36,7 @@ import {
   loadNavigation,
   loadGitHubSettings,
   loadNotificationPreferences,
+  loadChannelNotificationPolicy,
   loadClientPreferences,
   loadPreferenceDocument,
   loadPreferenceHistory,
@@ -66,6 +67,7 @@ import {
   updateRoutingPolicy,
   updateGitHubSettings,
   updateNotificationPreference,
+  updateChannelNotificationPolicy,
   updateClientPreference,
   updateAppearancePreference,
   updateWorkspaceConfig,
@@ -432,6 +434,33 @@ function notificationPreferencesPayload(
       },
     ],
     revision: "nps_current",
+    mutation: null,
+    ...overrides,
+  };
+}
+
+function channelNotificationPolicyPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    levels: ["all", "mentions_replies", "muted"],
+    channels: [
+      {
+        channel_id: "chn_00000000000000000000000000000001",
+        channel_name: "General",
+        level: "mentions_replies",
+        source: "default",
+      },
+    ],
+    muted_mentions_notify: true,
+    do_not_disturb: {
+      enabled: false,
+      timezone: "America/Toronto",
+      start: "22:00",
+      end: "07:00",
+    },
+    revision: "cnp_current",
     mutation: null,
     ...overrides,
   };
@@ -1085,6 +1114,36 @@ describe("Workshop client API", () => {
       integration_class: "github",
     });
     expect(JSON.stringify(loaded)).not.toContain("telegram");
+  });
+
+  it("loads and mutates canonical channel notification policy", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(channelNotificationPolicyPayload()))
+      .mockResolvedValueOnce(Response.json(channelNotificationPolicyPayload({
+        mutation: { operation: "set_channel_level", changed: true },
+      })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadChannelNotificationPolicy(session)).resolves.toMatchObject({
+      channels: [{ channelName: "General", level: "mentions_replies" }],
+      mutedMentionsNotify: true,
+      doNotDisturb: { timezone: "America/Toronto" },
+    });
+    await expect(updateChannelNotificationPolicy(session, "cnp_current", {
+      field: "channel",
+      channelId: "chn_00000000000000000000000000000001",
+      level: "muted",
+    })).resolves.toMatchObject({
+      mutation: { operation: "set_channel_level", changed: true },
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/settings/channel-notifications");
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "cnp_current",
+      channel: {
+        channel_id: "chn_00000000000000000000000000000001",
+        level: "muted",
+      },
+    });
   });
 
   it("loads and mutates opaque client-binding voice preferences", async () => {

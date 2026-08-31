@@ -110,6 +110,8 @@ class TestOutboundMessage:
             assert row[4] == "agent"
             assert result.event.envelope.actor_principal_id == row[2]
             assert result.event.envelope.payload["channel_id"] == row[1]
+            async with store.connection.execute("SELECT COUNT(*) FROM human_notifications") as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
         finally:
             await store.close()
 
