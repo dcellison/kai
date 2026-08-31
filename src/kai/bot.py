@@ -3617,7 +3617,14 @@ async def handle_notifications(
     assert update.message is not None
     args = context.args or []
     channel_policy = _canonical_channel_notification_policy_authority(context, _chat_id(update))
-    if args and args[0].strip().lower() in {"channels", "channel", "muted-mentions", "dnd"}:
+    if args and args[0].strip().lower() in {
+        "adapters",
+        "adapter",
+        "channels",
+        "channel",
+        "muted-mentions",
+        "dnd",
+    }:
         if channel_policy is None:
             await update.message.reply_text("Canonical channel notification policy is unavailable.")
             return
@@ -3625,6 +3632,45 @@ async def handle_notifications(
         try:
             snapshot = await service.inspect(authority)
             action = args[0].strip().lower()
+            if action == "adapters" or (action == "adapter" and len(args) == 1):
+                lines = ["Adapter alerts:"]
+                lines.extend(
+                    f"{index}. {item.display_name}: {'on' if item.enabled else 'off'} ({item.source})"
+                    for index, item in enumerate(snapshot.adapter_deliveries, start=1)
+                )
+                if snapshot.adapter_deliveries:
+                    lines.extend(
+                        [
+                            "",
+                            "Use /notifications adapter <number> <on|off>.",
+                            "Turning alerts off does not disable conversations in that adapter.",
+                        ]
+                    )
+                else:
+                    lines.append("No notification adapters are bound to this account.")
+                await update.message.reply_text("\n".join(lines))
+                return
+            if action == "adapter":
+                if len(args) != 3 or args[2].strip().lower() not in {"on", "off"}:
+                    await update.message.reply_text("Usage: /notifications adapter <number> <on|off>")
+                    return
+                try:
+                    index = int(args[1])
+                except ValueError:
+                    index = 0
+                if index < 1 or index > len(snapshot.adapter_deliveries):
+                    await update.message.reply_text("Adapter must be a number from /notifications adapters.")
+                    return
+                selected = snapshot.adapter_deliveries[index - 1]
+                enabled = args[2].strip().lower() == "on"
+                await service.set_adapter_delivery(
+                    authority,
+                    selected.transport,
+                    enabled,
+                    expected_revision=snapshot.revision,
+                )
+                await update.message.reply_text(f"{selected.display_name} alerts are {'on' if enabled else 'off'}.")
+                return
             if action == "channels" or (action == "channel" and len(args) == 1):
                 lines = ["Channel notifications:"]
                 lines.extend(
@@ -3734,6 +3780,7 @@ async def handle_notifications(
                 "Use /notifications generic to view generic-webhook destinations.",
                 "Use /notifications channels to view channel policy.",
                 "Use /notifications dnd to view do-not-disturb.",
+                "Use /notifications adapters to control adapter alerts.",
             ]
         )
         await update.message.reply_text("\n".join(lines))
@@ -3746,7 +3793,7 @@ async def handle_notifications(
     }:
         await update.message.reply_text(
             "Usage: /notifications <github|generic> [number|reset]\n"
-            "Or: /notifications <channels|channel|muted-mentions|dnd>"
+            "Or: /notifications <adapters|adapter|channels|channel|muted-mentions|dnd>"
         )
         return
     await _handle_notification_destination(

@@ -38,6 +38,7 @@ class CanonicalDeliveryIntent:
     max_attempts: int = 5
     human_notification_id: HumanNotificationId | None = None
     workshop_id: WorkshopId | None = None
+    eligible_transports: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.message_id, MessageId):
@@ -62,6 +63,13 @@ class CanonicalDeliveryIntent:
                 raise ValueError("human notification delivery requires a recipient principal")
         elif self.workshop_id is not None:
             raise ValueError("workshop_id is only accepted for human notification delivery")
+        if self.eligible_transports is not None:
+            if self.human_notification_id is None:
+                raise ValueError("eligible_transports is only accepted for human notification delivery")
+            if not isinstance(self.eligible_transports, frozenset) or any(
+                not isinstance(transport, str) or not transport for transport in self.eligible_transports
+            ):
+                raise ValueError("eligible_transports must contain adapter identifiers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +118,7 @@ class WorkshopDeliveryPlanner:
                 (intent.content_kind == "text" and binding.capabilities.final_text)
                 or (intent.content_kind == "attachment" and binding.capabilities.attachments)
             )
+            and (intent.eligible_transports is None or binding.transport in intent.eligible_transports)
         )
         needs_streaming_authority = any(
             intent.purpose == CONVERSATION_REPLY_PURPOSE

@@ -1894,6 +1894,7 @@ function parseChannelNotificationPolicy(payload: unknown): WorkshopChannelNotifi
     payload.version !== 1 ||
     !Array.isArray(payload.levels) ||
     payload.levels.some((level) => !validLevel(level)) ||
+    !Array.isArray(payload.adapter_deliveries) ||
     !Array.isArray(payload.channels) ||
     typeof payload.muted_mentions_notify !== "boolean" ||
     !isRecord(payload.do_not_disturb) ||
@@ -1926,7 +1927,25 @@ function parseChannelNotificationPolicy(payload: unknown): WorkshopChannelNotifi
       source: value.source,
     };
   });
+  const adapterDeliveries = payload.adapter_deliveries.map((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.transport !== "string" ||
+      typeof value.display_name !== "string" ||
+      typeof value.enabled !== "boolean" ||
+      typeof value.source !== "string"
+    ) {
+      throw new Error("Kai returned an unsupported adapter notification setting.");
+    }
+    return {
+      displayName: value.display_name,
+      enabled: value.enabled,
+      source: value.source,
+      transport: value.transport,
+    };
+  });
   return {
+    adapterDeliveries,
     channels,
     doNotDisturb: {
       enabled: payload.do_not_disturb.enabled,
@@ -3004,6 +3023,13 @@ export async function updateChannelNotificationPolicy(
     ? { channel: { channel_id: change.channelId, level: change.level } }
     : change.field === "muted_mentions_notify"
       ? { muted_mentions_notify: change.enabled }
+      : change.field === "adapter_delivery"
+        ? {
+            adapter_delivery: {
+              transport: change.transport,
+              enabled: change.enabled,
+            },
+          }
       : {
           do_not_disturb: {
             enabled: change.enabled,

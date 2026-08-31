@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 55
+WORKSHOP_SCHEMA_VERSION = 56
 
 
 @dataclass(frozen=True, slots=True)
@@ -2563,6 +2563,48 @@ _HUMAN_NOTIFICATION_PUBLICATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_HUMAN_NOTIFICATION_ADAPTER_PREFERENCE_SCHEMA = SchemaMigration(
+    version=56,
+    name="principal_human_notification_adapter_preference",
+    statements=(
+        """
+        CREATE TABLE principal_human_notification_adapter_preferences (
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            transport TEXT NOT NULL CHECK (
+                length(transport) BETWEEN 1 AND 32
+                AND transport NOT GLOB '*[^a-z0-9_]*'
+                AND transport GLOB '[a-z]*'
+            ),
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (principal_id, transport)
+        )
+        """,
+        "CREATE INDEX principal_human_notification_adapter_preferences_transport_idx "
+        "ON principal_human_notification_adapter_preferences (transport, enabled, principal_id)",
+        """
+        CREATE TABLE human_notification_adapter_delivery_decisions (
+            notification_id TEXT NOT NULL
+                REFERENCES human_notification_publications(notification_id) ON DELETE CASCADE,
+            transport TEXT NOT NULL CHECK (
+                length(transport) BETWEEN 1 AND 32
+                AND transport NOT GLOB '*[^a-z0-9_]*'
+                AND transport GLOB '[a-z]*'
+            ),
+            policy_result TEXT NOT NULL CHECK (
+                policy_result IN ('eligible', 'suppressed_preference')
+            ),
+            created_event_position INTEGER NOT NULL
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (notification_id, transport)
+        )
+        """,
+        "CREATE INDEX human_notification_adapter_delivery_decisions_policy_idx "
+        "ON human_notification_adapter_delivery_decisions "
+        "(transport, policy_result, created_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2619,6 +2661,7 @@ _MIGRATIONS = (
     _CANONICAL_HUMAN_NOTIFICATION_SCHEMA,
     _CHANNEL_NOTIFICATION_POLICY_SCHEMA,
     _HUMAN_NOTIFICATION_PUBLICATION_SCHEMA,
+    _HUMAN_NOTIFICATION_ADAPTER_PREFERENCE_SCHEMA,
 )
 
 

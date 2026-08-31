@@ -422,6 +422,12 @@ export type WorkshopNotificationPreferenceChange =
 export type WorkshopChannelNotificationLevel = "all" | "mentions_replies" | "muted";
 
 export interface WorkshopChannelNotificationPolicy {
+  adapterDeliveries: {
+    displayName: string;
+    enabled: boolean;
+    source: string;
+    transport: string;
+  }[];
   channels: {
     channelId: string;
     channelName: string;
@@ -443,6 +449,7 @@ export interface WorkshopChannelNotificationPolicy {
 export type WorkshopChannelNotificationPolicyChange =
   | { field: "channel"; channelId: string; level: WorkshopChannelNotificationLevel }
   | { field: "muted_mentions_notify"; enabled: boolean }
+  | { field: "adapter_delivery"; transport: string; enabled: boolean }
   | {
       field: "do_not_disturb";
       enabled: boolean;

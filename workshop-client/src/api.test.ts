@@ -445,6 +445,14 @@ function channelNotificationPolicyPayload(
   return {
     version: 1,
     levels: ["all", "mentions_replies", "muted"],
+    adapter_deliveries: [
+      {
+        transport: "telegram",
+        display_name: "Telegram",
+        enabled: true,
+        source: "default",
+      },
+    ],
     channels: [
       {
         channel_id: "chn_00000000000000000000000000000001",
@@ -1125,6 +1133,7 @@ describe("Workshop client API", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(loadChannelNotificationPolicy(session)).resolves.toMatchObject({
+      adapterDeliveries: [{ transport: "telegram", enabled: true }],
       channels: [{ channelName: "General", level: "mentions_replies" }],
       mutedMentionsNotify: true,
       doNotDisturb: { timezone: "America/Toronto" },
@@ -1143,6 +1152,24 @@ describe("Workshop client API", () => {
         channel_id: "chn_00000000000000000000000000000001",
         level: "muted",
       },
+    });
+  });
+
+  it("mutates canonical adapter alert preferences without exposing adapter identity", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(Response.json(channelNotificationPolicyPayload({
+      mutation: { operation: "set_telegram_notification_delivery", changed: true },
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await updateChannelNotificationPolicy(session, "cnp_current", {
+      field: "adapter_delivery",
+      transport: "telegram",
+      enabled: false,
+    });
+
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      revision: "cnp_current",
+      adapter_delivery: { transport: "telegram", enabled: false },
     });
   });
 

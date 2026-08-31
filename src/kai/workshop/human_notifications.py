@@ -207,6 +207,33 @@ async def _external_delivery_policy_result(
     return "suppressed_dnd" if inside else "eligible"
 
 
+async def _adapter_delivery_decisions(
+    store: WorkshopEventStore,
+    delivery_policy: WorkshopDeliveryBindingPolicy,
+    workshop_id: WorkshopId,
+    principal_id: PrincipalId,
+) -> tuple[dict[str, object], ...]:
+    """Resolve adapter eligibility from canonical recipient-owned preferences."""
+    bindings = await delivery_policy.principal_bindings(store, workshop_id, principal_id)
+    transports = sorted({binding.transport for binding in bindings})
+    decisions: list[dict[str, object]] = []
+    for transport in transports:
+        async with store.connection.execute(
+            "SELECT enabled FROM principal_human_notification_adapter_preferences "
+            "WHERE principal_id = ? AND transport = ?",
+            (principal_id, transport),
+        ) as cursor:
+            preference = await cursor.fetchone()
+        enabled = preference is None or bool(preference[0])
+        decisions.append(
+            {
+                "transport": transport,
+                "policy_result": "eligible" if enabled else "suppressed_preference",
+            }
+        )
+    return tuple(decisions)
+
+
 async def _publication_body(
     store: WorkshopEventStore,
     *,
@@ -284,6 +311,8 @@ async def append_human_notifications_in_transaction(
     async with store.connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' "
         "AND name IN ('human_notifications', 'human_notification_publications', "
+        "'human_notification_adapter_delivery_decisions', "
+        "'principal_human_notification_adapter_preferences', "
         "'principal_channel_notification_policies', 'principal_human_notification_policies')"
     ) as cursor:
         notification_tables = {str(row[0]) for row in await cursor.fetchall()}
@@ -294,6 +323,10 @@ async def append_human_notifications_in_transaction(
         "principal_human_notification_policies",
     } <= notification_tables
     publication_available = "human_notification_publications" in notification_tables
+    adapter_decisions_available = {
+        "human_notification_adapter_delivery_decisions",
+        "principal_human_notification_adapter_preferences",
+    } <= notification_tables
 
     reply_recipient: PrincipalId | None = None
     reply_target = envelope.payload.get("reply_to_message_id") or source_thread_root
@@ -341,6 +374,7 @@ async def append_human_notifications_in_transaction(
             f"human-mention:{envelope.aggregate_id}:{recipient_id}",
         )
         publication: dict[str, object] | None = None
+        adapter_decisions: tuple[dict[str, object], ...] = ()
         if publication_available:
             policy_result = await _external_delivery_policy_result(
                 store,
@@ -359,9 +393,26 @@ async def append_human_notifications_in_transaction(
                 ),
                 "deep_link": delivery_policy.notification_deep_link if delivery_policy is not None else None,
             }
+            if adapter_decisions_available and delivery_policy is not None:
+                adapter_decisions = await _adapter_delivery_decisions(
+                    store,
+                    delivery_policy,
+                    envelope.workshop_id,
+                    recipient_id,
+                )
+            if adapter_decisions_available:
+                publication["adapter_decisions"] = list(adapter_decisions)
         notification = EventEnvelope.create(
             event_type=WorkshopEventType.HUMAN_NOTIFICATION_CREATED,
-            event_version=3 if publication is not None else 2 if policy_available else 1,
+            event_version=(
+                4
+                if publication is not None and adapter_decisions_available
+                else 3
+                if publication is not None
+                else 2
+                if policy_available
+                else 1
+            ),
             workshop_id=envelope.workshop_id,
             aggregate_type="human_notification",
             aggregate_id=notification_id,
@@ -394,6 +445,13 @@ async def append_human_notifications_in_transaction(
                         recipient_principal_id=recipient_id,
                         human_notification_id=notification_id,
                         workshop_id=envelope.workshop_id,
+                        eligible_transports=frozenset(
+                            str(decision["transport"])
+                            for decision in adapter_decisions
+                            if decision["policy_result"] == "eligible"
+                        )
+                        if adapter_decisions_available
+                        else None,
                     )
                 )
     return tuple(results)

@@ -331,7 +331,7 @@ _MAX_GITHUB_SETTINGS_BODY_BYTES = 10_240
 _NOTIFICATION_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "integration_class", "destination_choice_id", "reset"})
 _MAX_NOTIFICATION_PREFERENCE_BODY_BYTES = 2_048
 _CHANNEL_NOTIFICATION_POLICY_REQUEST_FIELDS = frozenset(
-    {"revision", "channel", "muted_mentions_notify", "do_not_disturb"}
+    {"revision", "channel", "muted_mentions_notify", "do_not_disturb", "adapter_delivery"}
 )
 _MAX_CHANNEL_NOTIFICATION_POLICY_BODY_BYTES = 4_096
 _CLIENT_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "binding_choice_id", "mode", "voice"})
@@ -644,6 +644,15 @@ def _serialize_channel_notification_policy(
             "start": snapshot.do_not_disturb.start,
             "end": snapshot.do_not_disturb.end,
         },
+        "adapter_deliveries": [
+            {
+                "transport": item.transport,
+                "display_name": item.display_name,
+                "enabled": item.enabled,
+                "source": item.source,
+            }
+            for item in snapshot.adapter_deliveries
+        ],
         "revision": snapshot.revision,
         "mutation": (
             {
@@ -2109,7 +2118,9 @@ async def _handle_channel_notification_policy_update(
         revision = payload.get("revision")
         if not isinstance(revision, str):
             raise WorkshopChannelNotificationPolicyValidationError("Notification policy revision is required")
-        operations = sum(field in payload for field in ("channel", "muted_mentions_notify", "do_not_disturb"))
+        operations = sum(
+            field in payload for field in ("channel", "muted_mentions_notify", "do_not_disturb", "adapter_delivery")
+        )
         if operations != 1 or len(payload) != 2:
             raise WorkshopChannelNotificationPolicyValidationError(
                 "Change exactly one notification policy setting at a time"
@@ -2137,7 +2148,7 @@ async def _handle_channel_notification_policy_update(
                 enabled,
                 expected_revision=revision,
             )
-        else:
+        elif "do_not_disturb" in payload:
             dnd = payload["do_not_disturb"]
             if not isinstance(dnd, dict) or set(dnd) != {"enabled", "timezone", "start", "end"}:
                 raise WorkshopChannelNotificationPolicyValidationError("Invalid DND policy")
@@ -2150,6 +2161,19 @@ async def _handle_channel_notification_policy_update(
                 timezone=dnd.get("timezone"),
                 start=dnd.get("start"),
                 end=dnd.get("end"),
+                expected_revision=revision,
+            )
+        else:
+            adapter = payload["adapter_delivery"]
+            if not isinstance(adapter, dict) or set(adapter) != {"transport", "enabled"}:
+                raise WorkshopChannelNotificationPolicyValidationError("Invalid adapter notification policy")
+            enabled = adapter.get("enabled")
+            if not isinstance(enabled, bool):
+                raise WorkshopChannelNotificationPolicyValidationError("Adapter delivery must be true or false")
+            snapshot = await service.set_adapter_delivery(
+                authority,
+                adapter.get("transport"),
+                enabled,
                 expected_revision=revision,
             )
     except WorkshopChannelNotificationPolicyError as exc:

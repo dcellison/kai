@@ -646,11 +646,23 @@ class WorkshopTelegramDeliveryWorker:
         if claim is None:
             return TelegramWorkResult(outcome=TelegramWorkOutcome.IDLE)
 
-        if claim.human_notification_id is not None and not claim.recipient_binding_current:
+        recipient_binding_current = claim.recipient_binding_current
+        recipient_delivery_enabled = claim.recipient_delivery_enabled
+        if claim.human_notification_id is not None:
+            recipient_binding_current, recipient_delivery_enabled = await self._outbox.notification_recipient_state(
+                claim
+            )
+        if claim.human_notification_id is not None and not recipient_binding_current:
             return await self._settle_failure(
                 claim,
                 None,
                 TelegramDeliveryContractError("notification_recipient_binding_revoked"),
+            )
+        if claim.human_notification_id is not None and not recipient_delivery_enabled:
+            return await self._settle_failure(
+                claim,
+                None,
+                TelegramDeliveryContractError("notification_recipient_delivery_disabled"),
             )
 
         try:
