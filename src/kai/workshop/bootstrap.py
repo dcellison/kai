@@ -28,6 +28,12 @@ from kai.workshop.domain import (
     WorkshopId,
     WorkshopMembershipId,
 )
+from kai.workshop.human_handles import (
+    derive_human_handle,
+    human_handle_schema_supported,
+    normalize_human_handle,
+    reconcile_human_handles,
+)
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import StoredEvent, WorkshopEventStore
 
@@ -43,6 +49,7 @@ class BootstrapHuman:
     external_subject: str
     external_channel_id: str
     runtime_profile_id: RuntimeProfileId | None = None
+    handle: str | None = None
 
     def __post_init__(self) -> None:
         if not self.display_name.strip():
@@ -57,6 +64,14 @@ class BootstrapHuman:
             raise ValueError("external_channel_id must be non-empty")
         if self.runtime_profile_id is not None and not isinstance(self.runtime_profile_id, RuntimeProfileId):
             raise ValueError("runtime_profile_id must be an opaque RuntimeProfileId")
+        if self.handle is not None:
+            normalize_human_handle(self.handle)
+
+    @property
+    def resolved_handle(self) -> str:
+        return (
+            normalize_human_handle(self.handle) if self.handle is not None else derive_human_handle(self.display_name)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +134,7 @@ async def _ensure_event(
     aggregate_id: OpaqueId,
     occurred_at: datetime,
     payload: dict[str, Any],
+    event_version: int = 1,
 ) -> tuple[StoredEvent, bool]:
     existing = await store.event_by_idempotency_key(idempotency_key)
     if existing is not None:
@@ -126,7 +142,7 @@ async def _ensure_event(
     result = await store.append(
         EventEnvelope.create(
             event_type=event_type,
-            event_version=1,
+            event_version=event_version,
             workshop_id=workshop_id,
             aggregate_type=aggregate_type,
             aggregate_id=aggregate_id,
@@ -155,6 +171,9 @@ async def bootstrap_default_workshop(
     seen_identities: set[tuple[str, str]] = set()
     seen_channels: set[tuple[str, str]] = set()
     existing_identity_principals: dict[tuple[str, str], PrincipalId] = {}
+    resolved_handles = [human.resolved_handle for human in ordered_humans]
+    if len({handle.casefold() for handle in resolved_handles}) != len(resolved_handles):
+        raise ValueError("Bootstrap human handles must be unique within the Workshop")
     for human in ordered_humans:
         identity = (human.transport, human.external_subject)
         channel = (human.transport, human.external_channel_id)
@@ -253,6 +272,7 @@ async def bootstrap_default_workshop(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'principal_agent_enablements'"
     ) as cursor:
         enablements_supported = await cursor.fetchone() is not None
+    handles_supported = await human_handle_schema_supported(store)
     definition_id = AgentDefinitionId.derived(agent_id, "definition")
     # Historical-schema migration tests exercise bootstrap at the simulated
     # old version. The current installer opens/migrates to the latest schema
@@ -352,7 +372,12 @@ async def bootstrap_default_workshop(
             event_type=WorkshopEventType.PRINCIPAL_CREATED,
             aggregate_type="principal",
             aggregate_id=principal_id,
-            payload={"kind": "human", "display_name": human.display_name.strip()},
+            payload={
+                "kind": "human",
+                "display_name": human.display_name.strip(),
+                **({"handle": human.resolved_handle} if handles_supported else {}),
+            },
+            event_version=2 if handles_supported else 1,
         )
         await ensure(
             idempotency_key=_idempotency_key("external-identity", token),
@@ -557,6 +582,8 @@ async def bootstrap_default_workshop(
         )
 
     await store.rebuild_projection(CanonicalConversationProjection())
+    if handles_supported:
+        await reconcile_human_handles(store)
     return BootstrapResult(
         workshop_id=workshop_id,
         agent_id=agent_id,

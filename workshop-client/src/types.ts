@@ -8,6 +8,7 @@ export const RUNTIME_PROFILE_PATTERN = /^rtp_[0-9a-f]{32}$/;
 export const WORKSHOP_PATTERN = /^wsp_[0-9a-f]{32}$/;
 export const ARTIFACT_PATTERN = /^art_[0-9a-f]{32}$/;
 export const MESSAGE_PATTERN = /^msg_[0-9a-f]{32}$/;
+export const HUMAN_HANDLE_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
 
 export interface WorkshopSession {
   channelId: string;
@@ -19,6 +20,7 @@ export interface WorkshopAgentSummary {
   available: boolean;
   engaged: boolean;
   engagedUntil: string | null;
+  handle: string;
   memoryScope: "private" | "shared_channel";
   name: string;
   principalId: string;
@@ -29,6 +31,7 @@ export interface WorkshopAgentSummary {
 
 export interface WorkshopParticipantSummary {
   displayName: string;
+  handle: string | null;
   kind: string;
   principalId: string;
 }
@@ -57,6 +60,7 @@ export interface WorkshopSummary {
 export interface WorkshopNavigation {
   principal: {
     displayName: string;
+    handle: string | null;
     principalId: string;
   };
   workshops: WorkshopSummary[];

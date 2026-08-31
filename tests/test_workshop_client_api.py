@@ -1253,6 +1253,7 @@ class TestWorkshopNavigationHTTPContract:
             assert payload["principal"] == {
                 "principal_id": alice_id,
                 "display_name": "Alice",
+                "handle": "alice",
             }
             assert len(payload["workshops"]) == 1
             workshop = payload["workshops"][0]
@@ -1275,6 +1276,7 @@ class TestWorkshopNavigationHTTPContract:
                         "agent_id": direct["agents"][0]["agent_id"],
                         "principal_id": direct["agents"][0]["principal_id"],
                         "name": "Kai",
+                        "handle": "kai",
                         "engaged": False,
                         "engaged_until": None,
                         "sponsor_principal_id": alice_id,
@@ -1289,6 +1291,7 @@ class TestWorkshopNavigationHTTPContract:
                         "principal_id": direct["participants"][0]["principal_id"],
                         "kind": "agent",
                         "display_name": "Kai",
+                        "handle": "kai",
                     }
                 ],
                 "can_submit_commands": True,
@@ -1361,6 +1364,7 @@ class TestWorkshopNavigationHTTPContract:
                     "principal_id": bob_id,
                     "kind": "human",
                     "display_name": "Bob",
+                    "handle": "bob",
                 }
             ]
             assert direct["agents"] == []
@@ -2192,6 +2196,7 @@ class TestWorkshopChannelLifecycleHTTPContract:
                     "agent_id": agent_id,
                     "principal_id": visible["agents"][0]["principal_id"],
                     "name": "Kai",
+                    "handle": "kai",
                     "engaged": False,
                     "engaged_until": None,
                     "sponsor_principal_id": alice_id,

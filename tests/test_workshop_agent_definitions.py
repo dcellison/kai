@@ -13,7 +13,10 @@ from kai.workshop.agent_definitions import (
     load_agent_definition_revision,
     render_agent_definition_context,
 )
-from kai.workshop.agent_lifecycle import WorkshopAgentLifecycleService
+from kai.workshop.agent_lifecycle import (
+    WorkshopAgentLifecycleConflict,
+    WorkshopAgentLifecycleService,
+)
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.diagnostics import workshop_agent_authority_status
 from kai.workshop.domain import (
@@ -74,6 +77,30 @@ async def _record(store: WorkshopEventStore, number: int) -> MessageId:
 
 
 class TestAgentDefinitionBootstrap:
+    async def test_agent_handle_cannot_collide_with_a_human_handle(self, tmp_path: Path):
+        store, _ = await _open(tmp_path / "kai.db")
+        try:
+            async with store.connection.execute(
+                "SELECT principal_id FROM external_identities "
+                "WHERE provider = 'desktop' AND external_subject = 'human-1'"
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            with pytest.raises(WorkshopAgentLifecycleConflict, match="used by a human"):
+                await WorkshopAgentLifecycleService(store).create_draft(
+                    PrincipalId(str(row[0])),
+                    idempotency_key="human-handle-collision",
+                    handle="workshop_human",
+                    display_name="Collision",
+                    description="Must not be created.",
+                    presentation={"avatar": "C"},
+                    purpose="Test shared namespace.",
+                    instructions="Do nothing.",
+                    capabilities=["text_generation"],
+                )
+        finally:
+            await store.close()
+
     async def test_bootstrap_creates_one_active_kai_revision_and_replays(self, tmp_path: Path):
         store, agent_id = await _open(tmp_path / "kai.db")
         try:

@@ -3055,7 +3055,11 @@ async def _handle_client_navigation(
         )
 
     async with store.connection.execute(
-        "SELECT display_name FROM principals WHERE id = ? AND kind = 'human'",
+        "SELECT p.display_name, CASE WHEN COUNT(DISTINCT hh.handle) = 1 "
+        "THEN MIN(hh.handle) ELSE NULL END "
+        "FROM principals p "
+        "LEFT JOIN human_handles hh ON hh.principal_id = p.id "
+        "WHERE p.id = ? AND p.kind = 'human' GROUP BY p.id, p.display_name",
         (principal_id,),
     ) as cursor:
         principal_row = await cursor.fetchone()
@@ -3072,7 +3076,7 @@ async def _handle_client_navigation(
     async with store.connection.execute(
         "SELECT c.workshop_id, c.id, c.kind, c.name, cm.role, c.archived_at, "
         "c.lifecycle_event_position, a.id, "
-        "a.principal_id, a.name, "
+        "a.principal_id, a.name, ad.handle, "
         "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END, pae.lifecycle_state, "
         "ca.sponsor_principal_id, sponsor.display_name, "
         "ca.sponsored_runtime_profile_id, "
@@ -3083,6 +3087,7 @@ async def _handle_client_navigation(
         "AND wm.principal_id = cm.principal_id "
         "LEFT JOIN channel_agents ca ON ca.channel_id = c.id AND ca.detached_at IS NULL "
         "LEFT JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
+        "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id "
         "LEFT JOIN channel_agent_runtime_assignments cara "
         "ON cara.channel_id = c.id AND cara.agent_id = a.id "
         "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
@@ -3100,7 +3105,8 @@ async def _handle_client_navigation(
     ) as cursor:
         channel_rows = list(await cursor.fetchall())
     async with store.connection.execute(
-        "SELECT c.workshop_id, c.id, peer.id, peer.kind, peer.display_name "
+        "SELECT c.workshop_id, c.id, peer.id, peer.kind, peer.display_name, "
+        "CASE peer.kind WHEN 'human' THEN hh.handle ELSE ad.handle END "
         "FROM channel_memberships own_cm "
         "JOIN channels c ON c.id = own_cm.channel_id "
         "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
@@ -3108,7 +3114,10 @@ async def _handle_client_navigation(
         "JOIN channel_memberships peer_cm ON peer_cm.channel_id = c.id "
         "AND peer_cm.principal_id != own_cm.principal_id "
         "JOIN principals peer ON peer.id = peer_cm.principal_id "
+        "LEFT JOIN human_handles hh ON hh.workshop_id = c.workshop_id "
+        "AND hh.principal_id = peer.id "
         "LEFT JOIN agents peer_agent ON peer_agent.principal_id = peer.id "
+        "LEFT JOIN agent_definitions ad ON ad.agent_id = peer_agent.id "
         "LEFT JOIN channel_agents active_agent ON active_agent.channel_id = c.id "
         "AND active_agent.agent_id = peer_agent.id AND active_agent.detached_at IS NULL "
         "WHERE own_cm.principal_id = ? "
@@ -3135,7 +3144,7 @@ async def _handle_client_navigation(
                 "agents": [],
                 "participants": [],
                 "_runtime_assignments": [],
-                "_agent_enablement": str(row[11]) if row[11] is not None else None,
+                "_agent_enablement": str(row[12]) if row[12] is not None else None,
             },
         )
         if row[7] is not None:
@@ -3148,16 +3157,17 @@ async def _handle_client_navigation(
                     "agent_id": str(row[7]),
                     "principal_id": str(row[8]),
                     "name": str(row[9]),
+                    "handle": str(row[10]),
                     "engaged": False,
                     "engaged_until": None,
-                    "sponsor_principal_id": str(row[12]) if row[12] is not None else None,
-                    "sponsor_display_name": str(row[13]) if row[13] is not None else None,
-                    "runtime_profile_id": str(row[14]) if row[14] is not None else None,
-                    "available": bool(row[15]),
+                    "sponsor_principal_id": str(row[13]) if row[13] is not None else None,
+                    "sponsor_display_name": str(row[14]) if row[14] is not None else None,
+                    "runtime_profile_id": str(row[15]) if row[15] is not None else None,
+                    "available": bool(row[16]),
                     "memory_scope": "private" if str(row[2]) == "direct" else "shared_channel",
                 }
             )
-            assignments.append(bool(row[10]))
+            assignments.append(bool(row[11]))
 
     for row in participant_rows:
         workshop_channels = channels_by_workshop.get(str(row[0]))
@@ -3172,6 +3182,7 @@ async def _handle_client_navigation(
                 "principal_id": str(row[2]),
                 "kind": str(row[3]),
                 "display_name": str(row[4]),
+                "handle": str(row[5]) if row[5] is not None else None,
             }
         )
 
@@ -3225,6 +3236,7 @@ async def _handle_client_navigation(
             "principal": {
                 "principal_id": str(principal_id),
                 "display_name": str(principal_row[0]),
+                "handle": str(principal_row[1]) if principal_row[1] is not None else None,
             },
             "workshops": workshops,
         },

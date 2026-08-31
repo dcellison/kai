@@ -1112,6 +1112,7 @@ interface ChannelCreationRequest {
 
 interface MentionCandidate {
   displayName: string;
+  handle: string;
   kind: "agent" | "human";
   principalId: string;
 }
@@ -2019,6 +2020,7 @@ function WorkshopView({
     for (const agent of channel.agents) {
       members.set(agent.principalId, {
         displayName: agent.name,
+        handle: agent.handle,
         kind: "agent",
         principalId: agent.principalId,
       });
@@ -2026,12 +2028,14 @@ function WorkshopView({
     for (const participant of channel.participants) {
       if (
         participant.principalId === navigation.principal.principalId ||
+        participant.handle === null ||
         (participant.kind !== "agent" && participant.kind !== "human")
       ) {
         continue;
       }
       members.set(participant.principalId, {
         displayName: participant.displayName,
+        handle: participant.handle,
         kind: participant.kind,
         principalId: participant.principalId,
       });
@@ -2040,9 +2044,11 @@ function WorkshopView({
     return Array.from(members.values())
       .filter(
         (candidate) =>
-          !query || candidate.displayName.toLocaleLowerCase().startsWith(query),
+          !query ||
+          candidate.handle.toLocaleLowerCase().startsWith(query) ||
+          candidate.displayName.toLocaleLowerCase().startsWith(query),
       )
-      .sort((left, right) => left.displayName.localeCompare(right.displayName));
+      .sort((left, right) => left.handle.localeCompare(right.handle));
   }, [channel, mentionTrigger, navigation.principal.principalId]);
 
   useEffect(() => {
@@ -2237,7 +2243,7 @@ function WorkshopView({
     if (!mentionTrigger) {
       return;
     }
-    const insertion = `@${candidate.displayName} `;
+    const insertion = `@${candidate.handle} `;
     const nextDraft =
       draft.slice(0, mentionTrigger.start) +
       insertion +
@@ -3266,14 +3272,14 @@ function WorkshopView({
                       className={index === mentionSelection ? "selected" : ""}
                       type="button"
                       role="option"
-                      aria-label={`@${candidate.displayName} — ${candidate.kind}`}
+                      aria-label={`@${candidate.handle} — ${candidate.displayName} — ${candidate.kind}`}
                       aria-selected={index === mentionSelection}
                       key={candidate.principalId}
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => insertMention(candidate)}
                     >
-                      <strong>@{candidate.displayName}</strong>
-                      <span>{candidate.kind}</span>
+                      <strong>@{candidate.handle}</strong>
+                      <span>{candidate.displayName} · {candidate.kind}</span>
                     </button>
                   ))}
                 </div>

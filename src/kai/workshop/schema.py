@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 50
+WORKSHOP_SCHEMA_VERSION = 51
 
 
 @dataclass(frozen=True, slots=True)
@@ -2389,6 +2389,30 @@ _REVERSIBLE_CHANNEL_ARCHIVAL_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_HUMAN_HANDLE_SCHEMA = SchemaMigration(
+    version=51,
+    name="canonical_human_handles",
+    statements=(
+        """
+        CREATE TABLE human_handles (
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            handle TEXT NOT NULL COLLATE NOCASE CHECK (
+                length(handle) BETWEEN 1 AND 32
+                AND handle NOT GLOB '*[^a-z0-9_]*'
+                AND substr(handle, 1, 1) GLOB '[a-z]'
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (workshop_id, principal_id),
+            UNIQUE (workshop_id, handle)
+        )
+        """,
+        "CREATE INDEX human_handles_principal_idx ON human_handles (principal_id, workshop_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2440,6 +2464,7 @@ _MIGRATIONS = (
     _CHANNEL_AGENT_ATTACHMENT_LIFECYCLE_SCHEMA,
     _BOUNDED_AGENT_DELEGATION_SCHEMA,
     _REVERSIBLE_CHANNEL_ARCHIVAL_SCHEMA,
+    _CANONICAL_HUMAN_HANDLE_SCHEMA,
 )
 
 

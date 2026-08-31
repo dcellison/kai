@@ -21,6 +21,11 @@ from kai.workshop.domain import (
     WorkshopId,
     parse_opaque_id,
 )
+from kai.workshop.human_handles import (
+    HUMAN_HANDLE_PATTERN,
+    WorkshopHumanHandleError,
+    derive_human_handle,
+)
 
 _REQUIRED_TABLES = {
     "workshops",
@@ -966,24 +971,26 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
         if (
             envelope.event_type
             in {
-                WorkshopEventType.PRINCIPAL_CREATED,
                 WorkshopEventType.CHANNEL_CREATED,
                 WorkshopEventType.WORKSHOP_MEMBER_ADDED,
                 WorkshopEventType.CHANNEL_MEMBER_ADDED,
                 WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
                 WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
-                WorkshopEventType.MESSAGE_CREATED,
             }
             and envelope.event_version != 1
         ):
             raise ValueError("Workshop event replay encountered an unsupported event version")
         if envelope.event_type == WorkshopEventType.PRINCIPAL_CREATED:
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Workshop event replay encountered an unsupported principal version")
             _insert_replayed_fact(
                 principal_kinds,
                 aggregate_id,
                 _required_payload_text(payload, "kind"),
             )
             continue
+        if envelope.event_type == WorkshopEventType.MESSAGE_CREATED and envelope.event_version not in {1, 2}:
+            raise ValueError("Workshop event replay encountered an unsupported message version")
         if envelope.event_type == WorkshopEventType.CHANNEL_CREATED:
             _insert_replayed_fact(
                 channel_kinds,
@@ -1567,6 +1574,88 @@ def workshop_appearance_preference_status(db_path: Path) -> str:
     return (
         f"{prefix} {state}; principals={principals}, explicit={explicit}, "
         f"defaulted={defaulted}, invalid={invalid}; authority=canonical"
+    )
+
+
+def workshop_human_handle_status(db_path: Path) -> str:
+    """Report canonical human-handle coverage and shared-namespace integrity."""
+    prefix = "Workshop human handles:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical human-handle schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            required = {
+                "agent_definitions",
+                "event_log",
+                "human_handles",
+                "principals",
+                "workshop_memberships",
+            }
+            if not tables >= required:
+                return f"{prefix} pending; canonical human-handle schema unavailable"
+            eligible = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_memberships wm "
+                "JOIN principals p ON p.id = wm.principal_id AND p.kind = 'human'",
+            )
+            assigned = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM human_handles hh "
+                "JOIN workshop_memberships wm ON wm.workshop_id = hh.workshop_id "
+                "AND wm.principal_id = hh.principal_id "
+                "JOIN principals p ON p.id = hh.principal_id AND p.kind = 'human'",
+            )
+            rows = connection.execute("SELECT handle FROM human_handles").fetchall()
+            invalid = sum(not HUMAN_HANDLE_PATTERN.fullmatch(str(row[0])) for row in rows)
+            conflicting = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM human_handles hh JOIN agent_definitions ad "
+                "ON ad.workshop_id = hh.workshop_id AND ad.handle = hh.handle COLLATE NOCASE",
+            )
+            reserved = {
+                (str(row[0]), str(row[1]).casefold())
+                for row in connection.execute(
+                    "SELECT workshop_id, handle FROM human_handles UNION ALL "
+                    "SELECT workshop_id, handle FROM agent_definitions"
+                ).fetchall()
+            }
+            unresolved: dict[tuple[str, str], int] = {}
+            for row in connection.execute(
+                "SELECT wm.workshop_id, p.display_name FROM workshop_memberships wm "
+                "JOIN principals p ON p.id = wm.principal_id AND p.kind = 'human' "
+                "LEFT JOIN human_handles hh ON hh.workshop_id = wm.workshop_id "
+                "AND hh.principal_id = p.id WHERE hh.principal_id IS NULL"
+            ).fetchall():
+                try:
+                    candidate = derive_human_handle(str(row[1]))
+                except WorkshopHumanHandleError:
+                    invalid += 1
+                    continue
+                key = (str(row[0]), candidate.casefold())
+                unresolved[key] = unresolved.get(key, 0) + 1
+            conflicting += sum(count for key, count in unresolved.items() if count > 1 or key in reserved)
+            orphaned = _scalar(connection, "SELECT COUNT(*) FROM human_handles") - assigned
+            migrations = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM event_log WHERE event_type = 'principal.handle_assigned'",
+            )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    missing = max(0, eligible - assigned)
+    state = "active" if missing == 0 and invalid == 0 and conflicting == 0 and orphaned == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; eligible={eligible}, assigned={assigned}, missing={missing}, "
+        f"invalid={invalid}, conflicting={conflicting}, orphaned={orphaned}, "
+        f"migration rows={migrations}; authority=canonical"
     )
 
 

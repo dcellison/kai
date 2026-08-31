@@ -145,22 +145,30 @@ async def resolve_message_mentions(
     channel_id: ChannelId,
     body: str,
 ) -> tuple[MessageMention, ...]:
-    """Resolve channel-member display names against one accepted message body."""
+    """Resolve canonical channel-member handles against one accepted message body."""
     async with store.connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_definitions'"
     ) as cursor:
         definitions_supported = await cursor.fetchone() is not None
+    async with store.connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'human_handles'"
+    ) as cursor:
+        human_handles_supported = await cursor.fetchone() is not None
     member_query = (
-        "SELECT p.id, p.kind, COALESCE(ad.handle, p.display_name) "
+        "SELECT p.id, p.kind, CASE p.kind WHEN 'human' THEN hh.handle ELSE ad.handle END "
         "FROM channel_memberships cm "
+        "JOIN channels c ON c.id = cm.channel_id "
         "JOIN principals p ON p.id = cm.principal_id "
+        "LEFT JOIN human_handles hh ON hh.workshop_id = c.workshop_id "
+        "AND hh.principal_id = p.id "
         "LEFT JOIN agents a ON a.principal_id = p.id "
         "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id "
         "WHERE cm.channel_id = ? "
         "AND p.kind IN ('human', 'agent') "
-        "ORDER BY length(COALESCE(ad.handle, p.display_name)) DESC, "
-        "COALESCE(ad.handle, p.display_name), p.id"
-        if definitions_supported
+        "AND CASE p.kind WHEN 'human' THEN hh.handle ELSE ad.handle END IS NOT NULL "
+        "ORDER BY length(CASE p.kind WHEN 'human' THEN hh.handle ELSE ad.handle END) DESC, "
+        "CASE p.kind WHEN 'human' THEN hh.handle ELSE ad.handle END, p.id"
+        if definitions_supported and human_handles_supported
         else "SELECT p.id, p.kind, p.display_name FROM channel_memberships cm "
         "JOIN principals p ON p.id = cm.principal_id "
         "WHERE cm.channel_id = ? AND p.kind IN ('human', 'agent') "
@@ -172,7 +180,7 @@ async def resolve_message_mentions(
     ) as cursor:
         rows = list(await cursor.fetchall())
 
-    # A duplicated case-insensitive display name is ambiguous and therefore
+    # A duplicated case-insensitive legacy name is ambiguous and therefore
     # cannot safely identify either principal.
     candidates: list[tuple[PrincipalId, str, str]] = []
     grouped: dict[str, list[tuple[PrincipalId, str, str]]] = {}
@@ -194,11 +202,11 @@ async def resolve_message_mentions(
             cursor_position = start + 1
             continue
         matched: MessageMention | None = None
-        for principal_id, kind, display_name in candidates:
-            end = start + 1 + len(display_name)
+        for principal_id, kind, handle in candidates:
+            end = start + 1 + len(handle)
             if end > len(body):
                 continue
-            if body[start + 1 : end].casefold() != display_name.casefold():
+            if body[start + 1 : end].casefold() != handle.casefold():
                 continue
             if end < len(body) and (body[end].isalnum() or body[end] == "_"):
                 continue
@@ -287,12 +295,14 @@ def _inbound_envelope(
     binding: _ResolvedInboundBinding,
     message: InboundMessage,
     mentions: tuple[MessageMention, ...] | None,
+    *,
+    event_version: int = 2,
 ) -> EventEnvelope:
     token = _stable_token(message)
     return EventEnvelope.create(
         event_id=EventId.derived(binding.workshop_id, f"inbound-message-event:{token}"),
         event_type=WorkshopEventType.MESSAGE_CREATED,
-        event_version=1,
+        event_version=event_version,
         workshop_id=binding.workshop_id,
         aggregate_type="message",
         aggregate_id=MessageId.derived(binding.workshop_id, f"inbound-message:{token}"),
@@ -368,6 +378,8 @@ def _client_inbound_envelope(
     binding: _ResolvedInboundBinding,
     message: ClientInboundMessage,
     mentions: tuple[MessageMention, ...] | None,
+    *,
+    event_version: int = 2,
 ) -> EventEnvelope:
     stable_name = f"client-message:{message.principal_id}:{message.channel_id}:{message.client_message_id}"
     message_id = MessageId.derived(binding.workshop_id, stable_name)
@@ -382,7 +394,7 @@ def _client_inbound_envelope(
     return EventEnvelope.create(
         event_id=EventId.derived(binding.workshop_id, f"client-message-event:{message_id}"),
         event_type=WorkshopEventType.MESSAGE_CREATED,
-        event_version=1,
+        event_version=event_version,
         workshop_id=binding.workshop_id,
         aggregate_type="message",
         aggregate_id=message_id,
@@ -404,13 +416,15 @@ def _scheduled_inbound_envelope(
     binding: _ResolvedInboundBinding,
     message: ScheduledInboundMessage,
     mentions: tuple[MessageMention, ...] | None,
+    *,
+    event_version: int = 2,
 ) -> EventEnvelope:
     stable_name = f"scheduled-job:{message.job_id}:{message.occurrence_id}"
     message_id = MessageId.derived(binding.workshop_id, stable_name)
     return EventEnvelope.create(
         event_id=EventId.derived(binding.workshop_id, f"scheduled-job-event:{message_id}"),
         event_type=WorkshopEventType.MESSAGE_CREATED,
-        event_version=1,
+        event_version=event_version,
         workshop_id=binding.workshop_id,
         aggregate_type="message",
         aggregate_id=message_id,
@@ -448,7 +462,14 @@ async def record_inbound_message_in_transaction(
     else:
         mentions = _existing_mentions(existing.envelope)
         message = replace(message, occurred_at=existing.envelope.occurred_at)
-    result = await store.append_in_transaction(_inbound_envelope(binding, message, mentions))
+    result = await store.append_in_transaction(
+        _inbound_envelope(
+            binding,
+            message,
+            mentions,
+            event_version=existing.envelope.event_version if existing is not None else 2,
+        )
+    )
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -470,7 +491,12 @@ async def record_client_inbound_message_in_transaction(
     else:
         mentions = _existing_mentions(existing.envelope)
         message = replace(message, occurred_at=existing.envelope.occurred_at)
-    envelope = _client_inbound_envelope(binding, message, mentions)
+    envelope = _client_inbound_envelope(
+        binding,
+        message,
+        mentions,
+        event_version=existing.envelope.event_version if existing is not None else 2,
+    )
     result = await store.append_in_transaction(envelope)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
@@ -493,7 +519,12 @@ async def record_scheduled_inbound_message_in_transaction(
     else:
         mentions = _existing_mentions(existing.envelope)
         message = replace(message, occurred_at=existing.envelope.occurred_at)
-    envelope = _scheduled_inbound_envelope(binding, message, mentions)
+    envelope = _scheduled_inbound_envelope(
+        binding,
+        message,
+        mentions,
+        event_version=existing.envelope.event_version if existing is not None else 2,
+    )
     result = await store.append_in_transaction(envelope)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
@@ -511,6 +542,13 @@ async def record_inbound_message(store: WorkshopEventStore, message: InboundMess
     else:
         mentions = _existing_mentions(existing.envelope)
         message = replace(message, occurred_at=existing.envelope.occurred_at)
-    result = await store.append(_inbound_envelope(binding, message, mentions))
+    result = await store.append(
+        _inbound_envelope(
+            binding,
+            message,
+            mentions,
+            event_version=existing.envelope.event_version if existing is not None else 2,
+        )
+    )
     await store.project_pending(CanonicalConversationProjection())
     return result
