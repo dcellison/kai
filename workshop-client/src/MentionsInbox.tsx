@@ -21,6 +21,7 @@ export function MentionsInbox({
   inbox: HumanNotificationState & {
     loadMore: () => void;
     markAllRead: () => Promise<void>;
+    markVisibleRead: (messageId: string) => Promise<void>;
     setRead: (notification: WorkshopHumanNotification, read: boolean) => Promise<void>;
   };
   onClose: () => void;
@@ -87,9 +88,6 @@ export function MentionsInbox({
                       "You no longer have access to that mention's source channel.",
                     );
                     return;
-                  }
-                  if (!notification.read) {
-                    void inbox.setRead(notification, true);
                   }
                 }}
               >

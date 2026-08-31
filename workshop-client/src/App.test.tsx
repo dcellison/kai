@@ -418,6 +418,39 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
 type StreamHandlers = Parameters<typeof streamTimeline>[2];
 type HumanNotificationStreamHandlers = Parameters<typeof streamHumanNotifications>[2];
 
+function observeMessagesAsVisible(): void {
+  class TestIntersectionObserver {
+    readonly root = null;
+    readonly rootMargin = "-15% 0px -35% 0px";
+    readonly thresholds = [0];
+
+    constructor(private readonly callback: IntersectionObserverCallback) {}
+
+    disconnect(): void {}
+
+    observe(target: Element): void {
+      const bounds = target.getBoundingClientRect();
+      this.callback([{
+        boundingClientRect: bounds,
+        intersectionRatio: 1,
+        intersectionRect: bounds,
+        isIntersecting: true,
+        rootBounds: null,
+        target,
+        time: 0,
+      }], this as unknown as IntersectionObserver);
+    }
+
+    takeRecords(): IntersectionObserverEntry[] {
+      return [];
+    }
+
+    unobserve(): void {}
+  }
+
+  vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+}
+
 describe("Workshop React client", () => {
   let handlers: StreamHandlers | null;
   let humanNotificationHandlers: HumanNotificationStreamHandlers | null;
@@ -782,6 +815,7 @@ describe("Workshop React client", () => {
 
   it("shows principal-private mentions and opens the exact source thread", async () => {
     const user = userEvent.setup();
+    observeMessagesAsVisible();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "session-secret" }),
@@ -884,13 +918,132 @@ describe("Workshop React client", () => {
       "session-secret",
       mention.notificationId,
       0,
-      expect.stringMatching(/^mention-read-/),
+      expect.stringMatching(/^mention-viewed-/),
     );
     expect(window.location.search).toContain(`message=${sourceReply.messageId}`);
     expect(window.location.search).toContain(`thread=${sourceRoot.messageId}`);
     const context = await screen.findByLabelText("Channel context");
     const focused = await within(context).findByText(sourceReply.body);
     expect(focused.closest("li")).toHaveClass("focused-message");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Mentions" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Wake policy qualification" })).not.toHaveTextContent("1");
+    });
+  });
+
+  it("marks an unread mention read when its source message enters the active timeline", async () => {
+    observeMessagesAsVisible();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    const mention: WorkshopHumanNotification = {
+      channelName: "Conversation",
+      createdAt: "2026-08-31T15:00:00Z",
+      createdEventPosition: historyMessage.eventPosition,
+      kind: "mention",
+      lastEventPosition: historyMessage.eventPosition,
+      notificationId: "ntf_00000000000000000000000000000002",
+      read: false,
+      readAt: null,
+      sourceAuthorDisplayName: "Kai",
+      sourceAuthorPrincipalId: historyMessage.authorPrincipalId,
+      sourceChannelId: channelId,
+      sourceMessageId: historyMessage.messageId,
+      sourceThreadRootId: null,
+      stateVersion: 0,
+    };
+    vi.mocked(loadHumanNotifications).mockResolvedValue({
+      counts: {
+        read: 0,
+        total: 1,
+        unread: 1,
+        unreadByChannel: { [channelId]: 1 },
+      },
+      nextCursor: null,
+      notifications: [mention],
+      throughPosition: historyMessage.eventPosition,
+    });
+    vi.mocked(loadHumanNotificationCounts).mockResolvedValue({
+      read: 1,
+      total: 1,
+      unread: 0,
+      unreadByChannel: {},
+    });
+    vi.mocked(markHumanNotificationRead).mockResolvedValue({
+      changed: true,
+      notification: {
+        ...mention,
+        read: true,
+        readAt: "2026-08-31T15:01:00Z",
+        stateVersion: 1,
+      },
+      replayed: false,
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(historyMessage.body)).toBeVisible();
+    await waitFor(() => expect(markHumanNotificationRead).toHaveBeenCalledWith(
+      "session-secret",
+      mention.notificationId,
+      0,
+      expect.stringMatching(/^mention-viewed-/),
+    ));
+    await waitFor(() => expect(
+      screen.getByRole("button", { name: "Mentions" }),
+    ).toBeVisible());
+  });
+
+  it("keeps an unread mention when its source message cannot be displayed", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    const mention: WorkshopHumanNotification = {
+      channelName: "Wake policy qualification",
+      createdAt: "2026-08-31T15:00:00Z",
+      createdEventPosition: 41,
+      kind: "mention",
+      lastEventPosition: 41,
+      notificationId: "ntf_00000000000000000000000000000003",
+      read: false,
+      readAt: null,
+      sourceAuthorDisplayName: "Scott",
+      sourceAuthorPrincipalId: "prn_00000000000000000000000000000003",
+      sourceChannelId: secondChannelId,
+      sourceMessageId: "msg_00000000000000000000000000000043",
+      sourceThreadRootId: null,
+      stateVersion: 0,
+    };
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadHumanNotifications).mockResolvedValue({
+      counts: {
+        read: 0,
+        total: 1,
+        unread: 1,
+        unreadByChannel: { [secondChannelId]: 1 },
+      },
+      nextCursor: null,
+      notifications: [mention],
+      throughPosition: 41,
+    });
+    vi.mocked(loadChannelMessage).mockRejectedValue(new Error("Source message unavailable"));
+    vi.mocked(loadTimeline).mockImplementation(async (activeSession) => ({
+      messages: activeSession.channelId === secondChannelId ? [] : [historyMessage],
+      previousCursor: null,
+      throughPosition: 41,
+    }));
+
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Mentions, 1 unread" }));
+    await user.click(screen.getByRole("button", { name: /Scott mentioned you/ }));
+
+    expect(await screen.findByText(/Source message unavailable/)).toBeVisible();
+    expect(markHumanNotificationRead).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Mentions, 1 unread" })).toBeVisible();
   });
 
   it("updates mention and channel badges from the live notification stream without duplicates", async () => {

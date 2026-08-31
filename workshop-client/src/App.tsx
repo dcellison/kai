@@ -801,6 +801,7 @@ function MessageItem({
   notification = false,
   onDownloadArtifact,
   onLoadArtifact,
+  onMessageVisible,
   onOpenThread,
   onSetReaction,
 }: {
@@ -809,6 +810,7 @@ function MessageItem({
   notification?: boolean;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
+  onMessageVisible?: (messageId: string) => void;
   onOpenThread?: (messageId: string) => void;
   onSetReaction?: (
     messageId: string,
@@ -819,9 +821,26 @@ function MessageItem({
   const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
   const [reactionPending, setReactionPending] = useState<WorkshopReaction | null>(null);
   const [reactionError, setReactionError] = useState<string | null>(null);
+  const rowRef = useRef<HTMLLIElement | null>(null);
   const isAgent = message.authorKind === "agent";
   const displayName = message.authorDisplayName || "Unknown author";
   const reactions = message.reactions ?? [];
+  useEffect(() => {
+    const row = rowRef.current;
+    if (!row || !onMessageVisible || !("IntersectionObserver" in window)) {
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        onMessageVisible(message.messageId);
+      }
+    }, {
+      rootMargin: "-15% 0px -35% 0px",
+      threshold: 0,
+    });
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [message.messageId, onMessageVisible]);
   const setReaction = async (
     reaction: WorkshopReaction,
     active: boolean,
@@ -844,7 +863,7 @@ function MessageItem({
   };
   if (notification) {
     return (
-      <li className={`notification-row ${highlighted ? "focused-message" : ""}`} data-message-id={message.messageId}>
+      <li ref={rowRef} className={`notification-row ${highlighted ? "focused-message" : ""}`} data-message-id={message.messageId}>
         <span className="notification-source" aria-hidden="true">GH</span>
         <article>
           <header className="message-meta">
@@ -868,6 +887,7 @@ function MessageItem({
   }
   return (
     <li
+      ref={rowRef}
       className={`message-row ${isAgent ? "agent" : "human"} ${highlighted ? "focused-message" : ""}`}
       data-message-id={message.messageId}
     >
@@ -1712,6 +1732,7 @@ function ThreadPane({
   onDownloadArtifact,
   onLoadArtifact,
   onLoadThread,
+  onMessageVisible,
   onSetReaction,
   onSubmitCommand,
   reactionUpdates,
@@ -1726,6 +1747,7 @@ function ThreadPane({
   onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadThread: (rootMessageId: string, cursor: string | null, signal?: AbortSignal) => Promise<ThreadTimelineSnapshot>;
+  onMessageVisible: (messageId: string) => void;
   onSetReaction: (
     messageId: string,
     reaction: WorkshopReaction,
@@ -1793,7 +1815,7 @@ function ThreadPane({
     const frame = window.requestAnimationFrame(() => {
       document
         .querySelector(`[data-message-id="${focusedMessage.messageId}"]`)
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        ?.scrollIntoView?.({ behavior: "smooth", block: "center" });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [focusedMessage, replies.length]);
@@ -1869,6 +1891,7 @@ function ThreadPane({
             })()}
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
+            onMessageVisible={onMessageVisible}
             onSetReaction={readOnly ? undefined : onSetReaction}
           />
           {replies.map((message) => (
@@ -1881,6 +1904,7 @@ function ThreadPane({
               }}
               onDownloadArtifact={onDownloadArtifact}
               onLoadArtifact={onLoadArtifact}
+              onMessageVisible={onMessageVisible}
               onSetReaction={readOnly ? undefined : onSetReaction}
             />
           ))}
@@ -2145,6 +2169,9 @@ function WorkshopView({
   const profileMenuRef = useRef<HTMLElement | null>(null);
   const sidebarResizeStartRef = useRef({ pointerX: 0, width: 0 });
   const contextResizeStartRef = useRef({ pointerX: 0, width: 0 });
+  const markVisibleMentionRead = useCallback((messageId: string): void => {
+    void inbox.markVisibleRead(messageId);
+  }, [inbox.markVisibleRead]);
   const timelineChannelRef = useRef(channelId);
   const timelineInitializedRef = useRef(false);
   const timelineFollowRef = useRef(true);
@@ -2199,7 +2226,7 @@ function WorkshopView({
     const frame = window.requestAnimationFrame(() => {
       timelineRef.current
         ?.querySelector(`[data-message-id="${focusedMessage.messageId}"]`)
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        ?.scrollIntoView?.({ behavior: "smooth", block: "center" });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [displayedMessages.length, focusedMessage]);
@@ -3412,6 +3439,7 @@ function WorkshopView({
                   notification={channel.kind === "notification"}
                   onDownloadArtifact={onDownloadArtifact}
                   onLoadArtifact={onLoadArtifact}
+                  onMessageVisible={markVisibleMentionRead}
                   onSetReaction={!channelIsArchived(channel) ? onSetReaction : undefined}
                   onOpenThread={
                     channel.kind === "group" && !channelIsArchived(channel)
@@ -3669,6 +3697,7 @@ function WorkshopView({
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
             onLoadThread={onLoadThread}
+            onMessageVisible={markVisibleMentionRead}
             onSetReaction={onSetReaction}
             onSubmitCommand={onSubmitCommand}
             reactionUpdates={reactionUpdates}
