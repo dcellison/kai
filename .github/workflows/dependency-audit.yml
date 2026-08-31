@@ -19,13 +19,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Select dependency-audit scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "schedule" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            python3 scripts/ci_change_scope.py --force-full
+          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git diff --name-only "$PR_BASE_SHA" "$PR_HEAD_SHA" |
+              python3 scripts/ci_change_scope.py
+          elif [[ -z "$PUSH_BASE_SHA" || "$PUSH_BASE_SHA" =~ ^0+$ ]]; then
+            python3 scripts/ci_change_scope.py --force-full
+          else
+            git diff --name-only "$PUSH_BASE_SHA" "$PUSH_HEAD_SHA" |
+              python3 scripts/ci_change_scope.py
+          fi
 
       - uses: actions/setup-python@v7
+        if: steps.scope.outputs.dependency == 'true'
         with:
           python-version: "3.13"
           cache: pip
 
       - name: Install dependencies
+        if: steps.scope.outputs.dependency == 'true'
         run: |
           python -m pip install --upgrade \
             --constraint requirements/constraints.txt pip setuptools
@@ -33,4 +58,9 @@ jobs:
             --constraint requirements/constraints.txt -e '.[dev,memory,telegram,totp,tts]'
 
       - name: Run dependency audit
+        if: steps.scope.outputs.dependency == 'true'
         run: make BIN= audit-deps
+
+      - name: Confirm dependency-audit fast path
+        if: steps.scope.outputs.dependency != 'true'
+        run: echo "Python dependency inputs are unchanged; scheduled audit remains authoritative."

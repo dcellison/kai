@@ -5,7 +5,9 @@ Personal AI assistant accessed via Telegram. Python package at src/kai/.
 ## Development
 
 - Run: `make run` or `python -m kai`
-- Test: `make test` (pytest, ~1200 tests)
+- Full backend/integration test: `make test` (pytest, more than 6000 tests)
+- Workshop-only validation: `make client-check`
+- Workshop live preview: `make workshop-dev` (foreground only; stop after review)
 - Lint: `make check` (ruff check + ruff format)
 - Config wizard: `make config`
 - Install: `make install` (the Makefile invokes `sudo`; never prefix this command with `sudo`)

@@ -222,12 +222,27 @@ make format     # Format with ruff
 make check      # Lint and format check
 make typecheck  # Run Pyright on the maintained typed baseline
 make client-check # Type-check/test React and verify its packaged assets
+make workshop-dev # Serve Workshop with hot reload and proxy the installed API
 make audit-deps # Report known vulnerabilities in installed dependencies
 make check-install-constraints # Dry-run install dependency resolution with constraints
 make module-sizes # Report large Python modules for decomposition planning
 make test       # Run pytest
 make run        # Start Kai locally
 ```
+
+For rapid Workshop UI iteration, leave the installed Kai service running and
+start `make workshop-dev` in the foreground. Open
+`http://<kai-host>:5173/workshop/` and enroll that development origin once.
+Vite serves only the Workshop client and proxies `/v1` to
+`http://127.0.0.1:8080`; browser credentials remain isolated from the installed
+Workshop origin. The server binds to the LAN only while this command is running.
+Stop it with Control-C immediately after visual review and verify that no Vite
+process remains.
+
+Client-only pull requests run the client typecheck, tests, build, and generated
+asset verification. Backend or mixed changes retain the complete Python and
+client validation, and every push to `main` runs the full suite. Unknown paths
+fail closed to the full lane.
 
 Pull requests are currently restricted to collaborators while the architecture is moving quickly. Issues, bug reports, design feedback, and focused proposals are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 

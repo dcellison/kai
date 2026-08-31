@@ -9,6 +9,7 @@
   "scripts": {
     "build": "vite build",
     "check": "npm run typecheck && npm run test && npm run verify-generated",
+    "dev": "vite",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "verify-generated": "npm run build && git diff --exit-code -- ../src/kai/workshop/static"
