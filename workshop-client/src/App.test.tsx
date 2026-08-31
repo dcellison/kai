@@ -19,6 +19,9 @@ import {
   loadEarlierTimeline,
   loadArtifactBlob,
   loadChannelMembers,
+  loadChannelMessage,
+  loadHumanNotificationCounts,
+  loadHumanNotifications,
   loadNavigation,
   loadNotificationPreferences,
   loadMemoryDetail,
@@ -35,8 +38,12 @@ import {
   loadWorkspaceConfig,
   redeemEnrollment,
   restoreChannel,
+  markHumanNotificationRead,
+  markHumanNotificationUnread,
+  markHumanNotificationsRead,
   streamTimeline,
   streamAgentChanges,
+  streamHumanNotifications,
   setMessageReaction,
   submitCommand,
   switchWorkspace,
@@ -50,6 +57,7 @@ import type {
   WorkshopNavigation,
   WorkshopRun,
   WorkshopSettingsWorkspace,
+  WorkshopHumanNotification,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -66,6 +74,9 @@ vi.mock("./api", async (importOriginal) => {
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
     loadChannelMembers: vi.fn(),
+    loadChannelMessage: vi.fn(),
+    loadHumanNotificationCounts: vi.fn(),
+    loadHumanNotifications: vi.fn(),
     loadAppearancePreferences: vi.fn(),
     loadAgentDefinitions: vi.fn(),
     loadAgentEnablements: vi.fn(),
@@ -85,8 +96,12 @@ vi.mock("./api", async (importOriginal) => {
     loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
     restoreChannel: vi.fn(),
+    markHumanNotificationRead: vi.fn(),
+    markHumanNotificationUnread: vi.fn(),
+    markHumanNotificationsRead: vi.fn(),
     streamTimeline: vi.fn(),
     streamAgentChanges: vi.fn(),
+    streamHumanNotifications: vi.fn(),
     setMessageReaction: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
@@ -401,9 +416,11 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
 };
 
 type StreamHandlers = Parameters<typeof streamTimeline>[2];
+type HumanNotificationStreamHandlers = Parameters<typeof streamHumanNotifications>[2];
 
 describe("Workshop React client", () => {
   let handlers: StreamHandlers | null;
+  let humanNotificationHandlers: HumanNotificationStreamHandlers | null;
   let failStream: ((reason: Error) => void) | null;
 
   beforeEach(() => {
@@ -412,6 +429,7 @@ describe("Workshop React client", () => {
     sessionStorage.clear();
     window.history.replaceState(null, "", "/workshop/");
     handlers = null;
+    humanNotificationHandlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(attachChannelAgent).mockResolvedValue(undefined);
@@ -465,6 +483,20 @@ describe("Workshop React client", () => {
       throughPosition: 25,
       previousCursor: null,
     });
+    vi.mocked(loadChannelMessage).mockResolvedValue(historyMessage);
+    vi.mocked(loadHumanNotificationCounts).mockResolvedValue({
+      read: 0,
+      total: 0,
+      unread: 0,
+      unreadByChannel: {},
+    });
+    vi.mocked(loadHumanNotifications).mockResolvedValue({
+      counts: { read: 0, total: 0, unread: 0, unreadByChannel: {} },
+      nextCursor: null,
+      notifications: [],
+      throughPosition: 25,
+    });
+    vi.mocked(markHumanNotificationsRead).mockResolvedValue([]);
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
@@ -579,6 +611,15 @@ describe("Workshop React client", () => {
     );
     vi.mocked(streamAgentChanges).mockImplementation(
       async (_token, _position, streamHandlers, signal) => {
+        streamHandlers.onConnected();
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    );
+    vi.mocked(streamHumanNotifications).mockImplementation(
+      async (_token, _position, streamHandlers, signal) => {
+        humanNotificationHandlers = streamHandlers;
         streamHandlers.onConnected();
         await new Promise<void>((resolve) => {
           signal.addEventListener("abort", () => resolve(), { once: true });
@@ -737,6 +778,166 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("button", { name: "Memory" }));
     expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
     expect(window.location.search).toContain("view=memory");
+  });
+
+  it("shows principal-private mentions and opens the exact source thread", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    const sourceRoot: TimelineMessage = {
+      ...historyMessage,
+      body: "Thread root",
+      channelId: secondChannelId,
+      messageId: "msg_00000000000000000000000000000040",
+    };
+    const sourceReply: TimelineMessage = {
+      ...historyMessage,
+      body: "@daniel please review this reply",
+      channelId: secondChannelId,
+      eventPosition: 41,
+      messageId: "msg_00000000000000000000000000000041",
+      replyToMessageId: sourceRoot.messageId,
+      threadRootId: sourceRoot.messageId,
+    };
+    const mention: WorkshopHumanNotification = {
+      channelName: "Wake policy qualification",
+      createdAt: "2026-08-31T15:00:00Z",
+      createdEventPosition: 41,
+      kind: "mention",
+      lastEventPosition: 42,
+      notificationId: "ntf_00000000000000000000000000000001",
+      read: false,
+      readAt: null,
+      sourceAuthorDisplayName: "Scott",
+      sourceAuthorPrincipalId: "prn_00000000000000000000000000000003",
+      sourceChannelId: secondChannelId,
+      sourceMessageId: sourceReply.messageId,
+      sourceThreadRootId: sourceRoot.messageId,
+      stateVersion: 0,
+    };
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadHumanNotifications).mockResolvedValue({
+      counts: {
+        read: 0,
+        total: 1,
+        unread: 1,
+        unreadByChannel: { [secondChannelId]: 1 },
+      },
+      nextCursor: null,
+      notifications: [mention],
+      throughPosition: 42,
+    });
+    vi.mocked(loadHumanNotificationCounts).mockResolvedValue({
+      read: 1,
+      total: 1,
+      unread: 0,
+      unreadByChannel: {},
+    });
+    vi.mocked(markHumanNotificationRead).mockResolvedValue({
+      changed: true,
+      notification: { ...mention, read: true, readAt: "2026-08-31T15:01:00Z", stateVersion: 1 },
+      replayed: false,
+    });
+    vi.mocked(loadChannelMessage).mockImplementation(async (_session, messageId) => {
+      if (messageId === sourceReply.messageId) return sourceReply;
+      if (messageId === sourceRoot.messageId) return sourceRoot;
+      throw new Error("Source message not found");
+    });
+    vi.mocked(loadTimeline).mockImplementation(async (activeSession) => ({
+      messages: activeSession.channelId === secondChannelId ? [] : [historyMessage],
+      previousCursor: null,
+      throughPosition: 41,
+    }));
+    vi.mocked(loadThreadTimeline).mockResolvedValue({
+      messages: [],
+      nextCursor: null,
+      root: sourceRoot,
+      throughPosition: 41,
+    });
+
+    render(<App />);
+
+    const mentionsButton = await screen.findByRole("button", {
+      name: "Mentions, 1 unread",
+    });
+    expect(mentionsButton).toBeVisible();
+    expect(screen.getByRole("button", { name: /Wake policy qualification/ })).toHaveTextContent("1");
+    await user.click(mentionsButton);
+    expect(await screen.findByRole("heading", { name: "Mentions" })).toBeVisible();
+    const sourceButton = screen.getByRole("button", { name: /Scott mentioned you/ });
+    expect(sourceButton).toBeVisible();
+    await user.click(sourceButton);
+
+    await waitFor(() => expect(loadChannelMessage).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "session-secret" },
+      sourceReply.messageId,
+      expect.any(AbortSignal),
+    ));
+    await waitFor(() => expect(loadChannelMessage).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "session-secret" },
+      sourceRoot.messageId,
+      expect.any(AbortSignal),
+    ));
+    expect(markHumanNotificationRead).toHaveBeenCalledWith(
+      "session-secret",
+      mention.notificationId,
+      0,
+      expect.stringMatching(/^mention-read-/),
+    );
+    expect(window.location.search).toContain(`message=${sourceReply.messageId}`);
+    expect(window.location.search).toContain(`thread=${sourceRoot.messageId}`);
+    const context = await screen.findByLabelText("Channel context");
+    const focused = await within(context).findByText(sourceReply.body);
+    expect(focused.closest("li")).toHaveClass("focused-message");
+  });
+
+  it("updates mention and channel badges from the live notification stream without duplicates", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadHumanNotificationCounts).mockResolvedValue({
+      read: 0,
+      total: 1,
+      unread: 1,
+      unreadByChannel: { [secondChannelId]: 1 },
+    });
+    render(<App />);
+    await waitFor(() => expect(streamHumanNotifications).toHaveBeenCalled());
+    const mention: WorkshopHumanNotification = {
+      channelName: "Wake policy qualification",
+      createdAt: "2026-08-31T15:00:00Z",
+      createdEventPosition: 41,
+      kind: "mention",
+      lastEventPosition: 41,
+      notificationId: "ntf_00000000000000000000000000000002",
+      read: false,
+      readAt: null,
+      sourceAuthorDisplayName: "Scott",
+      sourceAuthorPrincipalId: "prn_00000000000000000000000000000003",
+      sourceChannelId: secondChannelId,
+      sourceMessageId: "msg_00000000000000000000000000000041",
+      sourceThreadRootId: null,
+      stateVersion: 0,
+    };
+    act(() => {
+      humanNotificationHandlers?.onChanged(
+        { eventPosition: 41, notification: mention, transition: "human_notification.created" },
+        "41",
+      );
+      humanNotificationHandlers?.onChanged(
+        { eventPosition: 41, notification: mention, transition: "human_notification.created" },
+        "41",
+      );
+    });
+
+    expect(await screen.findByRole("button", { name: "Mentions, 1 unread" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Mentions, 1 unread" }));
+    expect(screen.getAllByRole("button", { name: /Scott mentioned you/ })).toHaveLength(1);
   });
 
   it("opens the personal Settings workspace from the profile menu", async () => {

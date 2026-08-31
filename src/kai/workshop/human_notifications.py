@@ -63,6 +63,7 @@ class HumanNotificationCounts:
     total: int
     unread: int
     read: int
+    unread_by_channel: tuple[tuple[ChannelId, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +71,7 @@ class HumanNotificationPage:
     notifications: tuple[HumanNotification, ...]
     counts: HumanNotificationCounts
     next_cursor: str | None
+    through_position: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +247,21 @@ class WorkshopHumanNotificationService:
             row = await cursor.fetchone()
         total = int(row[0] or 0) if row is not None else 0
         unread = int(row[1] or 0) if row is not None else 0
-        return HumanNotificationCounts(total, unread, total - unread)
+        async with self._store.connection.execute(
+            "SELECT n.source_channel_id, COUNT(*) FROM human_notifications n "
+            "JOIN channel_memberships cm ON cm.channel_id = n.source_channel_id "
+            "AND cm.principal_id = ? WHERE n.recipient_principal_id = ? "
+            "AND n.read_at IS NULL GROUP BY n.source_channel_id "
+            "ORDER BY n.source_channel_id",
+            (principal_id, principal_id),
+        ) as cursor:
+            channel_rows = list(await cursor.fetchall())
+        return HumanNotificationCounts(
+            total,
+            unread,
+            total - unread,
+            tuple((ChannelId(str(channel_id)), int(count)) for channel_id, count in channel_rows),
+        )
 
     async def list(
         self,
@@ -262,8 +278,11 @@ class WorkshopHumanNotificationService:
             )
         if not isinstance(unread_only, bool):
             raise WorkshopHumanNotificationValidationError("unread_only must be a boolean")
+        async with self._store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as tip_cursor:
+            tip_row = await tip_cursor.fetchone()
+        through_position = int(tip_row[0]) if tip_row is not None else 0
         cursor_clause = ""
-        parameters: list[object] = [principal_id, principal_id]
+        parameters: list[object] = [principal_id, principal_id, through_position]
         if cursor is not None:
             position, notification_id = _decode_cursor(cursor)
             cursor_clause = "AND (n.created_event_position < ? OR (n.created_event_position = ? AND n.id < ?)) "
@@ -276,7 +295,7 @@ class WorkshopHumanNotificationService:
             "AND cm.principal_id = ? JOIN messages m ON m.id = n.source_message_id "
             "JOIN principals p ON p.id = m.author_principal_id "
             "JOIN channels c ON c.id = n.source_channel_id "
-            "WHERE n.recipient_principal_id = ? "
+            "WHERE n.recipient_principal_id = ? AND n.created_event_position <= ? "
             + unread_clause
             + cursor_clause
             + "ORDER BY n.created_event_position DESC, n.id DESC LIMIT ?",
@@ -290,7 +309,12 @@ class WorkshopHumanNotificationService:
         if has_more and notifications:
             last = notifications[-1]
             next_cursor = _encode_cursor(last.created_event_position, last.notification_id)
-        return HumanNotificationPage(notifications, await self.counts(principal_id), next_cursor)
+        return HumanNotificationPage(
+            notifications,
+            await self.counts(principal_id),
+            next_cursor,
+            through_position,
+        )
 
     async def set_read_state(
         self,

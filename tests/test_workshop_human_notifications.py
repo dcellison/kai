@@ -195,6 +195,7 @@ class TestHumanNotificationAuthority:
             scott_page = await service.list(scott_id)
             assert scott_page.counts.total == 2
             assert scott_page.counts.unread == 2
+            assert scott_page.counts.unread_by_channel == ((channel_id, 2),)
             assert {item.source_message_id for item in scott_page.notifications} == {
                 human_only,
                 mixed,
@@ -242,6 +243,7 @@ class TestHumanNotificationAuthority:
                 )
             first_page = await service.list(scott_id, limit=2)
             assert len(first_page.notifications) == 2
+            assert first_page.through_position > 0
             assert first_page.next_cursor is not None
             second_page = await service.list(scott_id, limit=2, cursor=first_page.next_cursor)
             assert len(second_page.notifications) == 1
@@ -373,11 +375,24 @@ class TestHumanNotificationApi:
             )
             assert response.status == 200
             payload = await response.json()
-            assert payload["counts"] == {"total": 1, "unread": 1, "read": 0}
+            assert payload["counts"] == {
+                "total": 1,
+                "unread": 1,
+                "read": 0,
+                "unread_by_channel": {str(channel_id): 1},
+            }
+            assert payload["through_position"] > 0
             notification = payload["notifications"][0]
             assert notification["source_channel_id"] == channel_id
             assert "body" not in notification
             notification_id = HumanNotificationId(notification["notification_id"])
+            source_response = await client.get(
+                f"/v1/channels/{channel_id}/messages/{notification['source_message_id']}",
+                headers={"Authorization": "Bearer scott"},
+            )
+            assert source_response.status == 200
+            source_payload = await source_response.json()
+            assert source_payload["message"]["body"] == "@scott API notification"
 
             daniel_response = await client.get(
                 "/v1/client/notifications",
@@ -429,7 +444,13 @@ class TestHumanNotificationApi:
                 "/v1/client/notifications/counts",
                 headers={"Authorization": "Bearer scott"},
             )
-            assert await counts.json() == {"version": 1, "total": 1, "unread": 0, "read": 1}
+            assert await counts.json() == {
+                "version": 1,
+                "total": 1,
+                "unread": 0,
+                "read": 1,
+                "unread_by_channel": {},
+            }
             stream.close()
         finally:
             await client.close()

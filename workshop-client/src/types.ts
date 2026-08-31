@@ -8,6 +8,7 @@ export const RUNTIME_PROFILE_PATTERN = /^rtp_[0-9a-f]{32}$/;
 export const WORKSHOP_PATTERN = /^wsp_[0-9a-f]{32}$/;
 export const ARTIFACT_PATTERN = /^art_[0-9a-f]{32}$/;
 export const MESSAGE_PATTERN = /^msg_[0-9a-f]{32}$/;
+export const HUMAN_NOTIFICATION_PATTERN = /^ntf_[0-9a-f]{32}$/;
 export const HUMAN_HANDLE_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
 
 export interface WorkshopSession {
@@ -81,6 +82,52 @@ export interface WorkshopNavigation {
     principalId: string;
   };
   workshops: WorkshopSummary[];
+}
+
+export interface WorkshopHumanNotificationCounts {
+  read: number;
+  total: number;
+  unread: number;
+  unreadByChannel: Record<string, number>;
+}
+
+export interface WorkshopHumanNotification {
+  channelName: string | null;
+  createdAt: string;
+  createdEventPosition: number;
+  kind: "mention";
+  lastEventPosition: number;
+  notificationId: string;
+  read: boolean;
+  readAt: string | null;
+  sourceAuthorDisplayName: string;
+  sourceAuthorPrincipalId: string;
+  sourceChannelId: string;
+  sourceMessageId: string;
+  sourceThreadRootId: string | null;
+  stateVersion: number;
+}
+
+export interface WorkshopHumanNotificationPage {
+  counts: WorkshopHumanNotificationCounts;
+  nextCursor: string | null;
+  notifications: WorkshopHumanNotification[];
+  throughPosition: number;
+}
+
+export interface WorkshopHumanNotificationMutation {
+  changed: boolean;
+  notification: WorkshopHumanNotification;
+  replayed: boolean;
+}
+
+export interface WorkshopHumanNotificationSignal {
+  eventPosition: number;
+  notification: WorkshopHumanNotification;
+  transition:
+    | "human_notification.created"
+    | "human_notification.read"
+    | "human_notification.unread";
 }
 
 export type WorkshopAgentCapability =

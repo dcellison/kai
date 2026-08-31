@@ -606,6 +606,7 @@ button:disabled {
 }
 
 .channel-link {
+  position: relative;
   grid-template-columns: 1.25rem 1fr auto;
   gap: 0.38rem;
   padding: 0.55rem 0.65rem;
@@ -629,6 +630,23 @@ button:disabled {
 
 .channel-link.notification > span:first-child {
   color: var(--color-warning);
+}
+
+.mentions-link > span:first-child {
+  color: var(--color-accent);
+  font-weight: 750;
+}
+
+.mention-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.3rem;
+  min-height: 1.3rem;
+  border-radius: 999px;
+  padding: 0 0.3rem;
+  background: var(--color-accent);
+  color: var(--color-canvas);
+  font: 750 0.58rem var(--sans);
 }
 
 .live-pip {
@@ -815,6 +833,17 @@ button:disabled {
 
 .channel-sidebar.collapsed .channel-link > span:first-child {
   font-size: 0.92rem;
+}
+
+.channel-sidebar.collapsed .channel-link .mention-count {
+  position: absolute;
+  top: 0.18rem;
+  right: 0.08rem;
+  min-width: 0.48rem;
+  min-height: 0.48rem;
+  padding: 0;
+  color: transparent;
+  font-size: 0;
 }
 
 .channel-sidebar.collapsed .agent-link {
@@ -2225,7 +2254,8 @@ button:disabled {
 
 /* Read-only memory workspace */
 
-.workshop-app.memory-open {
+.workshop-app.memory-open,
+.workshop-app.mentions-open {
   grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(0, 1fr);
 }
 
@@ -2236,6 +2266,217 @@ button:disabled {
 
 .agent-manager-link.active {
   background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+}
+
+/* Principal-private canonical Mentions inbox */
+
+.mentions-workspace {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--color-canvas);
+}
+
+.mentions-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-height: 4.55rem;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.mentions-header h1,
+.mentions-header p {
+  margin: 0;
+}
+
+.mentions-header h1 {
+  margin-top: 0.15rem;
+  color: var(--color-text-strong);
+  font: 560 1.35rem var(--serif);
+}
+
+.mentions-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.mentions-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  padding: 0.8rem 1.25rem;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: 0.72rem;
+}
+
+.mentions-summary strong {
+  color: var(--color-accent);
+  font-size: 1rem;
+}
+
+.mentions-list {
+  min-height: 0;
+  margin: 0;
+  overflow-y: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.mentions-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.mentions-list li.unread {
+  background: color-mix(in srgb, var(--color-accent) 7%, transparent);
+  box-shadow: inset 3px 0 var(--color-accent);
+}
+
+.mention-source-link {
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.8rem;
+  min-width: 0;
+  border: 0;
+  padding: 0.95rem 1.25rem;
+  background: transparent;
+  color: var(--color-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.mention-source-link:hover,
+.mention-source-link:focus-visible {
+  background: color-mix(in srgb, var(--color-text) 5%, transparent);
+  outline: none;
+}
+
+.mention-avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.35rem;
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  color: var(--color-accent);
+  font-weight: 720;
+}
+
+.mention-copy,
+.mention-copy > span,
+.mention-copy small {
+  display: block;
+  min-width: 0;
+}
+
+.mention-copy {
+  overflow: hidden;
+  font-size: 0.78rem;
+}
+
+.mention-copy > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-copy strong,
+.mention-copy b {
+  color: var(--color-text-strong);
+}
+
+.mention-copy b {
+  font-weight: 620;
+}
+
+.mention-copy small {
+  margin-top: 0.25rem;
+  color: var(--color-text-muted);
+  font-size: 0.65rem;
+}
+
+.mention-state-button {
+  width: 2rem;
+  height: 2rem;
+  margin-right: 1rem;
+  border: 0;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: var(--color-accent);
+  cursor: pointer;
+}
+
+.mention-state-button:hover,
+.mention-state-button:focus-visible {
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  outline: none;
+}
+
+.mentions-empty,
+.mentions-error {
+  margin: 0;
+  padding: 2rem 1.25rem;
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.mentions-notices:empty {
+  min-height: 0;
+}
+
+.mentions-empty > span {
+  display: block;
+  margin-bottom: 0.5rem;
+  color: var(--color-accent);
+  font: 600 1.5rem var(--mono);
+}
+
+.mentions-error,
+.source-navigation-error {
+  color: var(--color-danger);
+}
+
+.mentions-load-more {
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  padding: 0.8rem;
+  background: var(--color-panel);
+  color: var(--color-accent);
+  font: 680 0.7rem var(--sans);
+  cursor: pointer;
+}
+
+.source-navigation-error {
+  max-width: 48rem;
+  margin: 1rem auto;
+  padding: 0.8rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--color-danger) 45%, var(--color-border));
+  border-radius: 0.4rem;
+  font-size: 0.72rem;
+}
+
+.focused-message {
+  animation: mention-source-highlight 2.8s ease-out;
+}
+
+@keyframes mention-source-highlight {
+  0%, 35% {
+    background: color-mix(in srgb, var(--color-accent) 18%, var(--color-canvas));
+    box-shadow: inset 3px 0 var(--color-accent);
+  }
+  100% {
+    box-shadow: inset 3px 0 transparent;
+  }
 }
 
 /* Agent catalogue and principal bindings */
@@ -4468,7 +4709,8 @@ button:disabled {
       min(var(--context-pane-width, 34rem), 36vw);
   }
 
-  .workshop-app.memory-open {
+  .workshop-app.memory-open,
+  .workshop-app.mentions-open {
     grid-template-columns: var(--channel-sidebar-width, 15rem) minmax(0, 1fr);
   }
 
@@ -4528,7 +4770,8 @@ button:disabled {
       min(var(--context-pane-width, 34rem), 44vw);
   }
 
-  .workshop-app.memory-open {
+  .workshop-app.memory-open,
+  .workshop-app.mentions-open {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -4542,6 +4785,7 @@ button:disabled {
   }
 
   .agent-workspace,
+  .mentions-workspace,
   .memory-workspace,
   .settings-workspace {
     grid-column: 1;

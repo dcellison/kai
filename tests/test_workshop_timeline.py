@@ -30,6 +30,7 @@ from kai.workshop.store import WorkshopEventStore
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
     TimelineCursorError,
+    read_channel_message,
     read_channel_timeline,
     read_thread_timeline,
 )
@@ -164,6 +165,48 @@ async def _record_client_message(
 
 
 class TestThreadTimelineQuery:
+    async def test_exact_message_read_is_authorized_visible_and_includes_details(self, tmp_path: Path):
+        store, principal_id, direct_channel, other_principal, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            channel_id = await _create_group_channel(store, principal_id, direct_channel)
+            message_id = await _record_client_message(
+                store,
+                principal_id,
+                channel_id,
+                "exact-message",
+                "Exact source",
+            )
+            authorizer = _Authorizer({(principal_id, channel_id)})
+            message = await read_channel_message(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                authorizer=authorizer,
+            )
+            assert message.message_id == message_id
+            assert message.body == "Exact source"
+            assert authorizer.calls == [(principal_id, channel_id)]
+
+            with pytest.raises(TimelineAccessDeniedError):
+                await read_channel_message(
+                    store,
+                    principal_id=other_principal,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    authorizer=authorizer,
+                )
+            with pytest.raises(TimelineAccessDeniedError):
+                await read_channel_message(
+                    store,
+                    principal_id=principal_id,
+                    channel_id=channel_id,
+                    message_id=MessageId("msg_00000000000000000000000000000000"),
+                    authorizer=authorizer,
+                )
+        finally:
+            await store.close()
+
     async def test_channel_summary_and_thread_pages_preserve_structure_and_order(self, tmp_path: Path):
         store, principal_id, direct_channel, _, _ = await _open_store(tmp_path / "kai.db")
         try:

@@ -878,6 +878,7 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/members/{principal_id}/add",
                 "/v1/channels/{channel_id}/members/{principal_id}/remove",
                 "/v1/channels/{channel_id}/timeline",
+                "/v1/channels/{channel_id}/messages/{message_id}",
                 "/v1/channels/{channel_id}/threads/{root_message_id}",
                 "/v1/channels/{channel_id}/events",
                 "/v1/channels/{channel_id}/messages/{message_id}/reactions",
