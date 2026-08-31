@@ -295,6 +295,14 @@ const notificationPreferences: WorkshopNotificationPreferences = {
 };
 
 const channelNotificationPolicy: WorkshopChannelNotificationPolicy = {
+  adapterDeliveries: [
+    {
+      displayName: "Telegram",
+      enabled: true,
+      source: "default",
+      transport: "telegram",
+    },
+  ],
   channels: [
     {
       channelId: "chn_00000000000000000000000000000001",
@@ -978,6 +986,31 @@ describe("Settings workspace", () => {
     expect(channel).toHaveValue("muted");
     expect(screen.getByLabelText("Direct mentions override muted channels")).toBeChecked();
     expect(screen.getByLabelText("Timezone")).toHaveValue("America/Toronto");
+  });
+
+  it("turns adapter alerts off without suggesting that the adapter is disconnected", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateChannelNotificationPolicy).mockImplementation(async (_session, _revision, change) => ({
+      ...channelNotificationPolicy,
+      adapterDeliveries: change.field === "adapter_delivery"
+        ? [{ ...channelNotificationPolicy.adapterDeliveries[0], enabled: change.enabled }]
+        : channelNotificationPolicy.adapterDeliveries,
+      mutation: { changed: true, operation: `set_${change.field}` },
+      revision: "cnp_changed",
+    }));
+    renderSettings();
+
+    const telegram = await screen.findByLabelText("Telegram alerts");
+    expect(telegram).toBeChecked();
+    expect(screen.getByText(/Conversations remain available when alerts are off/)).toBeVisible();
+    await user.click(telegram);
+
+    expect(updateChannelNotificationPolicy).toHaveBeenCalledWith(
+      session,
+      "cnp_current",
+      { field: "adapter_delivery", transport: "telegram", enabled: false },
+    );
+    expect(telegram).not.toBeChecked();
   });
 
   it("keeps notification controls together and saves validated DND drafts", async () => {

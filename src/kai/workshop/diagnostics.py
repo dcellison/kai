@@ -1678,6 +1678,7 @@ def workshop_human_notification_status(db_path: Path) -> str:
                 "channels",
                 "event_log",
                 "human_notifications",
+                "human_notification_adapter_delivery_decisions",
                 "human_notification_publications",
                 "delivery_outbox",
                 "messages",
@@ -1742,6 +1743,22 @@ def workshop_human_notification_status(db_path: Path) -> str:
                 "OR p.policy_result NOT IN ('eligible', 'suppressed_dnd') "
                 "OR e.event_type != 'human_notification.created' OR e.aggregate_id != p.notification_id",
             )
+            adapter_decision_totals = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN policy_result = 'eligible' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN policy_result = 'suppressed_preference' THEN 1 ELSE 0 END) "
+                "FROM human_notification_adapter_delivery_decisions"
+            ).fetchone()
+            adapter_decision_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM human_notification_adapter_delivery_decisions d "
+                "LEFT JOIN human_notification_publications p ON p.notification_id = d.notification_id "
+                "LEFT JOIN event_log e ON e.position = d.created_event_position "
+                "WHERE p.notification_id IS NULL "
+                "OR d.policy_result NOT IN ('eligible', 'suppressed_preference') "
+                "OR e.event_type != 'human_notification.created' "
+                "OR e.aggregate_id != d.notification_id",
+            )
             delivery_totals = connection.execute(
                 "SELECT COUNT(*), "
                 "SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), "
@@ -1769,13 +1786,24 @@ def workshop_human_notification_status(db_path: Path) -> str:
     publications = int(publication_totals[0] or 0) if publication_totals is not None else 0
     eligible = int(publication_totals[1] or 0) if publication_totals is not None else 0
     suppressed = int(publication_totals[2] or 0) if publication_totals is not None else 0
+    adapter_decisions = (
+        tuple(int(value or 0) for value in adapter_decision_totals)
+        if adapter_decision_totals is not None
+        else (0, 0, 0)
+    )
     deliveries = tuple(int(value or 0) for value in delivery_totals) if delivery_totals is not None else (0,) * 6
-    state = "active" if integrity_gaps == 0 and replay_gaps == 0 and publication_gaps == 0 else "INCOMPLETE"
+    state = (
+        "active"
+        if integrity_gaps == 0 and replay_gaps == 0 and publication_gaps == 0 and adapter_decision_gaps == 0
+        else "INCOMPLETE"
+    )
     return (
         f"{prefix} {state}; notifications={total}, unread={unread}, "
         f"read={total - unread}, recipients={recipients}, integrity gaps={integrity_gaps}, "
         f"replay gaps={replay_gaps}; publications={publications} "
         f"(eligible={eligible}, DND suppressed={suppressed}, integrity gaps={publication_gaps}), "
+        f"adapter decisions={adapter_decisions[0]} (eligible={adapter_decisions[1]}, "
+        f"preference suppressed={adapter_decisions[2]}, integrity gaps={adapter_decision_gaps}), "
         f"adapter deliveries={deliveries[0]} (pending={deliveries[1]}, executing={deliveries[2]}, "
         f"retrying={deliveries[3]}, succeeded={deliveries[4]}, failed={deliveries[5]}), "
         f"failure classes={','.join(failure_classes) if failure_classes else 'none'}; authority=canonical"
@@ -1796,8 +1824,14 @@ def workshop_channel_notification_policy_status(db_path: Path) -> str:
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
             }
             required = {
+                "channel_bindings",
+                "channel_memberships",
+                "channels",
+                "external_identities",
                 "principal_human_notification_policies",
+                "principal_human_notification_adapter_preferences",
                 "principal_channel_notification_policies",
+                "principals",
             }
             if not tables >= required:
                 return f"{prefix} pending; canonical policy schema unavailable"
@@ -1826,14 +1860,51 @@ def workshop_channel_notification_policy_status(db_path: Path) -> str:
                     ZoneInfo(str(row[0]))
                 except ZoneInfoNotFoundError:
                     invalid += 1
+            adapter_totals = connection.execute(
+                "WITH bound AS ("
+                "SELECT DISTINCT ei.principal_id, cb.transport FROM external_identities ei "
+                "JOIN principals p ON p.id = ei.principal_id AND p.kind = 'human' "
+                "JOIN channel_bindings cb ON cb.transport = ei.provider "
+                "AND cb.external_channel_id = ei.external_subject "
+                "JOIN channels c ON c.id = cb.channel_id AND c.kind = 'direct' "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id "
+                "AND cm.principal_id = ei.principal_id) "
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN preference.enabled IS NULL OR preference.enabled = 1 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN preference.enabled = 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN preference.enabled IS NOT NULL THEN 1 ELSE 0 END) "
+                "FROM bound LEFT JOIN principal_human_notification_adapter_preferences preference "
+                "ON preference.principal_id = bound.principal_id "
+                "AND preference.transport = bound.transport"
+            ).fetchone()
+            stale_adapter_preferences = _scalar(
+                connection,
+                "WITH bound AS ("
+                "SELECT DISTINCT ei.principal_id, cb.transport FROM external_identities ei "
+                "JOIN channel_bindings cb ON cb.transport = ei.provider "
+                "AND cb.external_channel_id = ei.external_subject "
+                "JOIN channels c ON c.id = cb.channel_id AND c.kind = 'direct' "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id "
+                "AND cm.principal_id = ei.principal_id) "
+                "SELECT COUNT(*) FROM principal_human_notification_adapter_preferences preference "
+                "LEFT JOIN bound ON bound.principal_id = preference.principal_id "
+                "AND bound.transport = preference.transport "
+                "WHERE bound.principal_id IS NULL",
+            )
         finally:
             connection.close()
     except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
     state = "active" if invalid == 0 else "INCOMPLETE"
+    adapter_bindings = (
+        tuple(int(value or 0) for value in adapter_totals) if adapter_totals is not None else (0, 0, 0, 0)
+    )
     return (
         f"{prefix} {state}; principals={principals}, channel overrides={channel_overrides}, "
-        f"DND enabled={dnd_enabled}, invalid={invalid}; authority=canonical, Workshop=in-app immediate"
+        f"DND enabled={dnd_enabled}, adapter bindings={adapter_bindings[0]} "
+        f"(enabled={adapter_bindings[1]}, disabled={adapter_bindings[2]}, "
+        f"explicit={adapter_bindings[3]}, stale={stale_adapter_preferences}), "
+        f"invalid={invalid}; authority=canonical, Workshop=in-app immediate"
     )
 
 

@@ -687,9 +687,40 @@ class TestWorkshopTelegramDeliveryWorker:
                 ClientInboundMessage(
                     daniel_id,
                     group.channel_id,
+                    "human-delivery-disabled-after-publication",
+                    "@alex queued before opt out",
+                    _NOW + timedelta(seconds=1),
+                ),
+                delivery_policy=TELEGRAM_DELIVERY_POLICY,
+            )
+            await store.connection.commit()
+            await store.connection.execute(
+                "INSERT INTO principal_human_notification_adapter_preferences "
+                "(principal_id, transport, enabled) VALUES (?, 'telegram', 0)",
+                (alex_id,),
+            )
+            await store.connection.commit()
+
+            disabled = await worker.run_once()
+            assert disabled.outcome == TelegramWorkOutcome.FAILED
+            assert disabled.error_code == "notification_recipient_delivery_disabled"
+            assert len(bot.send_message.await_args_list) == 2
+
+            await store.connection.execute(
+                "UPDATE principal_human_notification_adapter_preferences SET enabled = 1 "
+                "WHERE principal_id = ? AND transport = 'telegram'",
+                (alex_id,),
+            )
+            await store.connection.commit()
+            await store.connection.execute("BEGIN IMMEDIATE")
+            await record_client_inbound_message_in_transaction(
+                store,
+                ClientInboundMessage(
+                    daniel_id,
+                    group.channel_id,
                     "human-delivery-revoked-after-publication",
                     "@alex queued before revocation",
-                    _NOW + timedelta(seconds=1),
+                    _NOW + timedelta(seconds=2),
                 ),
                 delivery_policy=TELEGRAM_DELIVERY_POLICY,
             )

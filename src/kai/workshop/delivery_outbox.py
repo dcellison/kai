@@ -161,6 +161,7 @@ class DeliveryClaim:
     lease_expires_at: datetime
     human_notification_id: HumanNotificationId | None = None
     recipient_binding_current: bool = True
+    recipient_delivery_enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +449,7 @@ class WorkshopDeliveryOutbox:
         try:
             await connection.execute("BEGIN IMMEDIATE")
             has_human_notification_column = await self._has_human_notification_column()
+            has_adapter_preference_table = await self._has_adapter_preference_table()
             await self._recover_expired_in_transaction(
                 now,
                 purposes=purposes,
@@ -528,11 +530,21 @@ class WorkshopDeliveryOutbox:
                 if has_human_notification_column
                 else "1"
             )
+            delivery_enabled = (
+                "CASE WHEN o.human_notification_id IS NULL THEN 1 ELSE NOT EXISTS ("
+                "SELECT 1 FROM human_notification_publications preference_np "
+                "JOIN principal_human_notification_adapter_preferences preference "
+                "ON preference.principal_id = preference_np.recipient_principal_id "
+                "AND preference.transport = o.transport AND preference.enabled = 0 "
+                "WHERE preference_np.notification_id = o.human_notification_id) END"
+                if has_human_notification_column and has_adapter_preference_table
+                else "1"
+            )
             async with connection.execute(
                 "SELECT o.id, o.workshop_id, o.channel_id, o.channel_binding_id, o.message_id, "
                 "o.transport, o.mode, o.purpose, o.execution_contract, o.authority_epoch_id, o.attempt_count, "
                 f"{publication_body}, cb.external_channel_id, p.display_name, {notification_identity}, "
-                f"{binding_current} "
+                f"{binding_current}, {delivery_enabled} "
                 "FROM delivery_outbox o "
                 "JOIN messages m ON m.id = o.message_id AND m.channel_id = o.channel_id "
                 "JOIN principals p ON p.id = m.author_principal_id "
@@ -592,6 +604,7 @@ class WorkshopDeliveryOutbox:
                 authority_epoch_id=(DeliveryAuthorityEpochId(str(row[9])) if row[9] is not None else None),
                 human_notification_id=(HumanNotificationId(str(row[14])) if row[14] is not None else None),
                 recipient_binding_current=bool(row[15]),
+                recipient_delivery_enabled=bool(row[16]),
                 author_display_name=str(row[13]),
                 body=str(row[11]),
                 external_channel_id=str(row[12]),
@@ -603,6 +616,36 @@ class WorkshopDeliveryOutbox:
 
     async def mark_succeeded(self, claim: DeliveryClaim) -> DeliveryState:
         return await self._complete(claim, succeeded=True, retryable=False, error_code=None)
+
+    async def notification_recipient_state(
+        self,
+        claim: DeliveryClaim,
+    ) -> tuple[bool, bool]:
+        """Recheck binding and preference immediately before adapter delivery."""
+        if claim.human_notification_id is None:
+            return True, True
+        async with self._store.connection.execute(
+            "SELECT EXISTS("
+            "SELECT 1 FROM external_identities ei "
+            "JOIN channel_bindings cb ON cb.id = ? AND cb.transport = ei.provider "
+            "AND cb.external_channel_id = ei.external_subject "
+            "JOIN channels c ON c.id = cb.channel_id AND c.kind = 'direct' "
+            "AND c.workshop_id = np.workshop_id "
+            "JOIN channel_memberships cm ON cm.channel_id = c.id "
+            "AND cm.principal_id = np.recipient_principal_id "
+            "WHERE ei.principal_id = np.recipient_principal_id), "
+            "NOT EXISTS(SELECT 1 FROM principal_human_notification_adapter_preferences preference "
+            "WHERE preference.principal_id = np.recipient_principal_id "
+            "AND preference.transport = ? AND preference.enabled = 0) "
+            "FROM human_notification_publications np WHERE np.notification_id = ?",
+            (
+                claim.channel_binding_id,
+                claim.transport,
+                claim.human_notification_id,
+            ),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return (False, False) if row is None else (bool(row[0]), bool(row[1]))
 
     async def mark_failed(
         self,
@@ -1039,6 +1082,13 @@ class WorkshopDeliveryOutbox:
     async def _has_human_notification_column(self) -> bool:
         async with self._store.connection.execute(
             "SELECT 1 FROM pragma_table_info('delivery_outbox') WHERE name = 'human_notification_id'"
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _has_adapter_preference_table(self) -> bool:
+        async with self._store.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'principal_human_notification_adapter_preferences'"
         ) as cursor:
             return await cursor.fetchone() is not None
 

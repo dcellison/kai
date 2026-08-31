@@ -5025,6 +5025,75 @@ class TestHandleNotifications:
         )
         assert "22:00-07:00 America/Toronto" in update.message.reply_text.call_args[0][0]
 
+    @pytest.mark.asyncio
+    async def test_lists_and_changes_canonical_adapter_alert_preferences(self):
+        update = _make_update(text="/notifications adapter 1 off")
+        ctx, _integration_service = self._context(["adapter", "1", "off"])
+        service = MagicMock()
+        authority = object()
+        service.authority_for_principal_profile.return_value = authority
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                adapter_deliveries=(
+                    SimpleNamespace(
+                        transport="telegram",
+                        display_name="Telegram",
+                        enabled=True,
+                        source="default",
+                    ),
+                ),
+                channels=(),
+                muted_mentions_notify=True,
+                do_not_disturb=SimpleNamespace(
+                    enabled=False,
+                    timezone="UTC",
+                    start="22:00",
+                    end="07:00",
+                ),
+                revision="cnp_current",
+            )
+        )
+        service.set_adapter_delivery = AsyncMock()
+        ctx.application.core_services.channel_notification_policy = service
+
+        await handle_notifications(update, ctx)
+
+        service.set_adapter_delivery.assert_awaited_once_with(
+            authority,
+            "telegram",
+            False,
+            expected_revision="cnp_current",
+        )
+        assert update.message.reply_text.call_args[0][0] == "Telegram alerts are off."
+
+    @pytest.mark.asyncio
+    async def test_lists_adapter_alerts_without_exposing_external_identity(self):
+        update = _make_update(text="/notifications adapters")
+        ctx, _integration_service = self._context(["adapters"])
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = object()
+        service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                adapter_deliveries=(
+                    SimpleNamespace(
+                        transport="telegram",
+                        display_name="Telegram",
+                        enabled=False,
+                        source="personal override",
+                    ),
+                ),
+                revision="cnp_current",
+            )
+        )
+        ctx.application.core_services.channel_notification_policy = service
+
+        await handle_notifications(update, ctx)
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert "1. Telegram: off (personal override)" in reply
+        assert "12345" not in reply
+        assert "does not disable conversations" in reply
+
 
 # ── /preferences command ────────────────────────────────────────────
 

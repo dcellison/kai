@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 
 DEFAULT_CHANNEL_LEVEL = "mentions_replies"
 CHANNEL_NOTIFICATION_LEVELS = ("all", DEFAULT_CHANNEL_LEVEL, "muted")
+_ADAPTER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 
 class WorkshopChannelNotificationPolicyError(RuntimeError):
@@ -62,6 +64,14 @@ class DoNotDisturbSetting:
 
 
 @dataclass(frozen=True, slots=True)
+class AdapterNotificationDeliverySetting:
+    transport: str
+    display_name: str
+    enabled: bool
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChannelNotificationPolicyMutation:
     operation: str
     changed: bool
@@ -74,6 +84,7 @@ class ChannelNotificationPolicySnapshot:
     do_not_disturb: DoNotDisturbSetting
     revision: str
     mutation: ChannelNotificationPolicyMutation | None = None
+    adapter_deliveries: tuple[AdapterNotificationDeliverySetting, ...] = ()
 
 
 def _format_minute(value: int) -> str:
@@ -236,6 +247,7 @@ class WorkshopChannelNotificationPolicyService:
                 snapshot.do_not_disturb,
                 snapshot.revision,
                 ChannelNotificationPolicyMutation("set_channel_level", existing.level != normalized_level),
+                snapshot.adapter_deliveries,
             )
 
     async def set_muted_mentions_notify(
@@ -264,6 +276,7 @@ class WorkshopChannelNotificationPolicyService:
                     "set_muted_mentions_notify",
                     current.muted_mentions_notify != enabled,
                 ),
+                snapshot.adapter_deliveries,
             )
 
     async def set_do_not_disturb(
@@ -303,6 +316,56 @@ class WorkshopChannelNotificationPolicyService:
                 snapshot.do_not_disturb,
                 snapshot.revision,
                 ChannelNotificationPolicyMutation("set_do_not_disturb", current.do_not_disturb != dnd),
+                snapshot.adapter_deliveries,
+            )
+
+    async def set_adapter_delivery(
+        self,
+        authority: ChannelNotificationPolicyAuthority,
+        transport: object,
+        enabled: bool,
+        *,
+        expected_revision: str,
+    ) -> ChannelNotificationPolicySnapshot:
+        if not isinstance(transport, str) or not _ADAPTER_PATTERN.fullmatch(transport):
+            raise WorkshopChannelNotificationPolicyValidationError("Notification adapter is invalid")
+        if not isinstance(enabled, bool):
+            raise WorkshopChannelNotificationPolicyValidationError("Adapter delivery must be true or false")
+        async with self._lock:
+            current = await self._checked_snapshot_locked(authority, expected_revision)
+            existing = next(
+                (item for item in current.adapter_deliveries if item.transport == transport),
+                None,
+            )
+            if existing is None:
+                raise WorkshopChannelNotificationPolicyAccessDenied(
+                    "The notification adapter is not bound to this principal"
+                )
+            try:
+                await self._connection.execute("BEGIN IMMEDIATE")
+                await self._connection.execute(
+                    "INSERT INTO principal_human_notification_adapter_preferences "
+                    "(principal_id, transport, enabled) VALUES (?, ?, ?) "
+                    "ON CONFLICT(principal_id, transport) DO UPDATE SET "
+                    "enabled = excluded.enabled, "
+                    "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                    (authority.principal_id, transport, int(enabled)),
+                )
+                await self._connection.commit()
+            except Exception:
+                await self._connection.rollback()
+                raise
+            snapshot = await self._snapshot_locked(authority)
+            return ChannelNotificationPolicySnapshot(
+                snapshot.channels,
+                snapshot.muted_mentions_notify,
+                snapshot.do_not_disturb,
+                snapshot.revision,
+                ChannelNotificationPolicyMutation(
+                    f"set_{transport}_notification_delivery",
+                    existing.enabled != enabled,
+                ),
+                snapshot.adapter_deliveries,
             )
 
     def _validate_authority(self, authority: ChannelNotificationPolicyAuthority) -> None:
@@ -393,15 +456,48 @@ class WorkshopChannelNotificationPolicyService:
             "22:00" if policy is None else _format_minute(int(policy[3])),
             "07:00" if policy is None else _format_minute(int(policy[4])),
         )
+        async with self._connection.execute(
+            "SELECT bound.transport, preference.enabled FROM ("
+            "SELECT DISTINCT cb.transport FROM external_identities ei "
+            "JOIN channel_bindings cb ON cb.transport = ei.provider "
+            "AND cb.external_channel_id = ei.external_subject "
+            "JOIN channels c ON c.id = cb.channel_id AND c.kind = 'direct' "
+            "JOIN channel_memberships cm ON cm.channel_id = c.id "
+            "AND cm.principal_id = ei.principal_id "
+            "WHERE ei.principal_id = ? "
+            "UNION SELECT transport FROM principal_human_notification_adapter_preferences "
+            "WHERE principal_id = ?) bound "
+            "LEFT JOIN principal_human_notification_adapter_preferences preference "
+            "ON preference.principal_id = ? AND preference.transport = bound.transport "
+            "ORDER BY bound.transport",
+            (authority.principal_id, authority.principal_id, authority.principal_id),
+        ) as cursor:
+            adapter_rows = tuple(await cursor.fetchall())
+        adapter_deliveries = tuple(
+            AdapterNotificationDeliverySetting(
+                transport=str(row[0]),
+                display_name=str(row[0]).replace("_", " ").title(),
+                enabled=True if row[1] is None else bool(row[1]),
+                source="default" if row[1] is None else "personal override",
+            )
+            for row in adapter_rows
+        )
         encoded = json.dumps(
             {
                 "principal_id": str(authority.principal_id),
                 "channels": [[str(item.channel_id), item.level] for item in channels],
                 "muted_mentions_notify": muted_mentions_notify,
                 "dnd": [dnd.enabled, dnd.timezone, dnd.start, dnd.end],
+                "adapter_deliveries": [[item.transport, item.enabled] for item in adapter_deliveries],
             },
             sort_keys=True,
             separators=(",", ":"),
         )
         revision = "cnp_" + hashlib.sha256(encoded.encode()).hexdigest()[:32]
-        return ChannelNotificationPolicySnapshot(channels, muted_mentions_notify, dnd, revision)
+        return ChannelNotificationPolicySnapshot(
+            channels,
+            muted_mentions_notify,
+            dnd,
+            revision,
+            adapter_deliveries=adapter_deliveries,
+        )

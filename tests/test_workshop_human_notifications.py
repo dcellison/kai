@@ -235,6 +235,7 @@ class TestHumanNotificationAuthority:
             assert (await WorkshopHumanNotificationService(reopened).counts(scott_id)).total == 1
             status = workshop_human_notification_status(path)
             assert "publications=1 (eligible=1, DND suppressed=0, integrity gaps=0)" in status
+            assert "adapter decisions=1 (eligible=1, preference suppressed=0, integrity gaps=0)" in status
             assert "adapter deliveries=1 (pending=1" in status
             assert "failure classes=none" in status
         finally:
@@ -318,7 +319,7 @@ class TestHumanNotificationAuthority:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 55
+            assert await upgraded.schema_version() == 56
             async with upgraded.connection.execute(
                 "SELECT kind FROM human_notifications WHERE recipient_principal_id = ?",
                 (scott_id,),
@@ -372,6 +373,14 @@ class TestHumanNotificationAuthority:
             )
             assert scott_response.status == 200
             scott = await scott_response.json()
+            assert scott["adapter_deliveries"] == [
+                {
+                    "transport": "desktop",
+                    "display_name": "Desktop",
+                    "enabled": True,
+                    "source": "default",
+                }
+            ]
             assert scott["channels"] == [
                 {
                     "channel_id": channel_id,
@@ -380,12 +389,23 @@ class TestHumanNotificationAuthority:
                     "source": "default",
                 }
             ]
+            scott_changed_response = await client.patch(
+                "/v1/settings/channel-notifications",
+                headers={"Authorization": "Bearer scott"},
+                json={
+                    "revision": scott["revision"],
+                    "adapter_delivery": {"transport": "desktop", "enabled": False},
+                },
+            )
+            assert scott_changed_response.status == 200
+            assert (await scott_changed_response.json())["adapter_deliveries"][0]["enabled"] is False
 
             daniel_response = await client.get(
                 "/v1/settings/channel-notifications",
                 headers={"Authorization": "Bearer daniel"},
             )
             daniel = await daniel_response.json()
+            assert daniel["adapter_deliveries"][0]["enabled"] is True
             changed_response = await client.patch(
                 "/v1/settings/channel-notifications",
                 headers={"Authorization": "Bearer daniel"},
@@ -402,6 +422,16 @@ class TestHumanNotificationAuthority:
             )
             unchanged = await unchanged_response.json()
             assert unchanged["channels"][0]["level"] == "mentions_replies"
+            assert unchanged["adapter_deliveries"][0]["enabled"] is False
+            forged_adapter_response = await client.patch(
+                "/v1/settings/channel-notifications",
+                headers={"Authorization": "Bearer scott"},
+                json={
+                    "revision": unchanged["revision"],
+                    "adapter_delivery": {"transport": "whatsapp", "enabled": False},
+                },
+            )
+            assert forged_adapter_response.status == 403
 
             stale_response = await client.patch(
                 "/v1/settings/channel-notifications",
@@ -415,6 +445,92 @@ class TestHumanNotificationAuthority:
         finally:
             await client.close()
             await policy.close()
+            await store.close()
+
+    async def test_adapter_opt_out_survives_restart_and_reenable_does_not_replay(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "kai.db"
+        store, daniel_id, scott_id, channel_id, _agent_id = await _notification_context(path)
+        registry = await WorkshopExecutionStateRegistry.from_store(store, profile_registry(101, 202))
+        policy = await WorkshopChannelNotificationPolicyService.open(path, registry)
+        delivery_policy = WorkshopDeliveryBindingPolicy(
+            frozenset({"desktop"}),
+            (DeliveryAdapterCapabilities("desktop"),),
+        )
+        authority = policy.authority_for_principal(scott_id)
+        initial = await policy.inspect(authority)
+        assert [(item.transport, item.enabled, item.source) for item in initial.adapter_deliveries] == [
+            ("desktop", True, "default")
+        ]
+        disabled = await policy.set_adapter_delivery(
+            authority,
+            "desktop",
+            False,
+            expected_revision=initial.revision,
+        )
+        assert disabled.adapter_deliveries[0].enabled is False
+        await policy.close()
+
+        reopened = await WorkshopChannelNotificationPolicyService.open(path, registry)
+        try:
+            restarted = await reopened.inspect(reopened.authority_for_principal(scott_id))
+            assert restarted.adapter_deliveries[0].enabled is False
+            first_message = await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "adapter-disabled",
+                "@scott inbox only",
+                delivery_policy=delivery_policy,
+            )
+            assert (await WorkshopHumanNotificationService(store).counts(scott_id)).total == 1
+            async with store.connection.execute(
+                "SELECT d.policy_result FROM human_notification_adapter_delivery_decisions d "
+                "JOIN human_notification_publications p ON p.notification_id = d.notification_id "
+                "WHERE p.source_message_id = ?",
+                (first_message,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("suppressed_preference",)
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM delivery_outbox WHERE human_notification_id IS NOT NULL"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+
+            enabled = await reopened.set_adapter_delivery(
+                reopened.authority_for_principal(scott_id),
+                "desktop",
+                True,
+                expected_revision=restarted.revision,
+            )
+            assert enabled.adapter_deliveries[0].enabled is True
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM delivery_outbox WHERE human_notification_id IS NOT NULL"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            second_message = await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "adapter-reenabled",
+                "@scott adapter alert",
+                occurred_at=_NOW + timedelta(seconds=1),
+                delivery_policy=delivery_policy,
+            )
+            async with store.connection.execute(
+                "SELECT d.policy_result FROM human_notification_adapter_delivery_decisions d "
+                "JOIN human_notification_publications p ON p.notification_id = d.notification_id "
+                "WHERE p.source_message_id = ?",
+                (second_message,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("eligible",)
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM delivery_outbox WHERE human_notification_id IS NOT NULL"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
+        finally:
+            await reopened.close()
             await store.close()
 
     async def test_channel_policy_controls_ordinary_reply_and_muted_mentions(
@@ -517,7 +633,8 @@ class TestHumanNotificationAuthority:
         assert saved.do_not_disturb.enabled is True
         assert workshop_channel_notification_policy_status(path) == (
             "Workshop channel notification policy: active; principals=1, channel overrides=0, "
-            "DND enabled=1, invalid=0; authority=canonical, Workshop=in-app immediate"
+            "DND enabled=1, adapter bindings=2 (enabled=2, disabled=0, explicit=0, stale=0), "
+            "invalid=0; authority=canonical, Workshop=in-app immediate"
         )
         assert (
             await policy.external_delivery_allowed(

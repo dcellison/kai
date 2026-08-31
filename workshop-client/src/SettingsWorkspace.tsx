@@ -1821,6 +1821,28 @@ function SettingsWorkspaceContent({
           )}
           {(channelNotifications || notifications) && (
             <div className="settings-card-grid notification-preference-grid">
+              {channelNotifications?.adapterDeliveries.map((adapter) => (
+                <article className="settings-card" key={`adapter-${adapter.transport}`}>
+                  <label className="settings-checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={adapter.enabled}
+                      disabled={channelNotificationBusy}
+                      onChange={(event) => void mutateChannelNotificationPolicy({
+                        field: "adapter_delivery",
+                        transport: adapter.transport,
+                        enabled: event.target.checked,
+                      })}
+                    />
+                    <span>{adapter.displayName} alerts</span>
+                  </label>
+                  <p>
+                    Send human mention and reply alerts through {adapter.displayName}.
+                    Conversations remain available when alerts are off.
+                  </p>
+                  <p>{adapter.source}</p>
+                </article>
+              ))}
               {channelNotifications?.channels.map((channel) => (
                 <article className="settings-card" key={channel.channelId}>
                   <label htmlFor={`channel-notification-${channel.channelId}`}>

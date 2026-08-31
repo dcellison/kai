@@ -1096,8 +1096,8 @@ class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
-    # Agent definitions project durable draft, active, and archived lifecycle state.
-    version = 19
+    # Human-notification adapter decisions project from versioned creation events.
+    version = 20
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1119,6 +1119,7 @@ class CanonicalConversationProjection:
             "run_attempts",
             "runs",
             "message_reactions",
+            "human_notification_adapter_delivery_decisions",
             "human_notification_publications",
             "human_notifications",
             "messages",
@@ -1992,7 +1993,7 @@ class CanonicalConversationProjection:
         elif envelope.event_type == WorkshopEventType.HUMAN_NOTIFICATION_CREATED:
             if not isinstance(envelope.aggregate_id, HumanNotificationId):
                 raise ValueError("Workshop human notification requires a typed notification aggregate")
-            if envelope.event_version not in {1, 2, 3}:
+            if envelope.event_version not in {1, 2, 3, 4}:
                 raise ValueError("Unsupported Workshop human notification event version")
             expected_payload = {
                 "recipient_principal_id",
@@ -2001,7 +2002,7 @@ class CanonicalConversationProjection:
                 "source_thread_root_id",
                 "kind",
             }
-            if envelope.event_version == 3:
+            if envelope.event_version in {3, 4}:
                 expected_payload.add("publication")
             _require_exact_payload(payload, expected_payload)
             recipient_id = PrincipalId(_required_text(payload, "recipient_principal_id"))
@@ -2064,11 +2065,14 @@ class CanonicalConversationProjection:
                     event.position,
                 ),
             )
-            if envelope.event_version == 3:
+            if envelope.event_version in {3, 4}:
                 publication = payload.get("publication")
                 if not isinstance(publication, dict):
                     raise ValueError("Workshop human notification publication is malformed")
-                _require_exact_payload(publication, {"policy_result", "alert_body", "deep_link"})
+                publication_keys = {"policy_result", "alert_body", "deep_link"}
+                if envelope.event_version == 4:
+                    publication_keys.add("adapter_decisions")
+                _require_exact_payload(publication, publication_keys)
                 policy_result = _required_text(publication, "policy_result")
                 if policy_result not in {"eligible", "suppressed_dnd"}:
                     raise ValueError("Workshop human notification publication policy is invalid")
@@ -2101,6 +2105,37 @@ class CanonicalConversationProjection:
                         event.position,
                     ),
                 )
+                if envelope.event_version == 4:
+                    adapter_decisions = publication.get("adapter_decisions")
+                    if not isinstance(adapter_decisions, list):
+                        raise ValueError("Workshop notification adapter decisions are malformed")
+                    seen_transports: set[str] = set()
+                    for decision in adapter_decisions:
+                        if not isinstance(decision, dict):
+                            raise ValueError("Workshop notification adapter decision is malformed")
+                        _require_exact_payload(decision, {"transport", "policy_result"})
+                        transport = _required_text(decision, "transport")
+                        if (
+                            len(transport) > 32
+                            or not _IDENTIFIER_PATTERN.fullmatch(transport)
+                            or transport in seen_transports
+                        ):
+                            raise ValueError("Workshop notification adapter transport is invalid")
+                        seen_transports.add(transport)
+                        adapter_result = _required_text(decision, "policy_result")
+                        if adapter_result not in {"eligible", "suppressed_preference"}:
+                            raise ValueError("Workshop notification adapter policy is invalid")
+                        await connection.execute(
+                            "INSERT INTO human_notification_adapter_delivery_decisions "
+                            "(notification_id, transport, policy_result, created_event_position) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                envelope.aggregate_id,
+                                transport,
+                                adapter_result,
+                                event.position,
+                            ),
+                        )
         elif envelope.event_type in {
             WorkshopEventType.HUMAN_NOTIFICATION_READ,
             WorkshopEventType.HUMAN_NOTIFICATION_UNREAD,
