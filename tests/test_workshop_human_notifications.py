@@ -19,6 +19,7 @@ from kai.workshop.channel_notification_policy import (
     WorkshopChannelNotificationPolicyValidationError,
 )
 from kai.workshop.client_api import register_workshop_read_routes
+from kai.workshop.delivery_policy import DeliveryAdapterCapabilities, WorkshopDeliveryBindingPolicy
 from kai.workshop.diagnostics import (
     workshop_channel_notification_policy_status,
     workshop_human_notification_status,
@@ -26,6 +27,7 @@ from kai.workshop.diagnostics import (
 from kai.workshop.domain import AgentId, ChannelId, HumanNotificationId, MessageId, PrincipalId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.human_notifications import (
+    HUMAN_NOTIFICATION_DELIVERY_MODE,
     HumanNotificationStateRequest,
     WorkshopHumanNotificationAccessDenied,
     WorkshopHumanNotificationConflict,
@@ -106,6 +108,7 @@ async def _record(
     *,
     occurred_at: datetime = _NOW,
     thread_root_id: MessageId | None = None,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
 ) -> MessageId:
     try:
         await store.connection.execute("BEGIN IMMEDIATE")
@@ -119,6 +122,7 @@ async def _record(
                 occurred_at,
                 thread_root_id=thread_root_id,
             ),
+            delivery_policy=delivery_policy,
         )
         await store.connection.commit()
     except Exception:
@@ -165,6 +169,137 @@ async def _next_sse_event(response) -> dict[str, object]:
 
 
 class TestHumanNotificationAuthority:
+    async def test_publication_is_safe_recipient_routed_idempotent_and_replayable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "kai.db"
+        store, daniel_id, scott_id, channel_id, _agent_id = await _notification_context(path)
+        capabilities = DeliveryAdapterCapabilities("desktop")
+        policy = WorkshopDeliveryBindingPolicy(
+            frozenset({"desktop"}),
+            (capabilities,),
+            "http://workshop.example/workshop/",
+        )
+        secret_body = "@scott private source content must not leave Workshop"
+        try:
+            message_id = await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "publication-safe",
+                secret_body,
+                delivery_policy=policy,
+            )
+            await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "publication-safe",
+                secret_body,
+                delivery_policy=policy,
+            )
+            async with store.connection.execute(
+                "SELECT p.notification_id, p.recipient_principal_id, p.policy_result, "
+                "p.alert_body, p.deep_link, o.mode, o.transport, o.status "
+                "FROM human_notification_publications p "
+                "JOIN delivery_outbox o ON o.human_notification_id = p.notification_id "
+                "WHERE p.source_message_id = ?",
+                (message_id,),
+            ) as cursor:
+                rows = tuple(await cursor.fetchall())
+            assert len(rows) == 1
+            row = rows[0]
+            assert str(row[1]) == scott_id
+            assert tuple(str(value) for value in row[2:]) == (
+                "eligible",
+                "Daniel mentioned you in #Human notifications.\nOpen Workshop: http://workshop.example/workshop/",
+                "http://workshop.example/workshop/",
+                HUMAN_NOTIFICATION_DELIVERY_MODE,
+                "desktop",
+                "pending",
+            )
+            assert "private source content" not in str(row[3])
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM human_notification_publications WHERE source_message_id = ?",
+                (message_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
+        finally:
+            await store.close()
+
+        reopened = await WorkshopEventStore.open(path)
+        try:
+            assert (await WorkshopHumanNotificationService(reopened).counts(scott_id)).total == 1
+            status = workshop_human_notification_status(path)
+            assert "publications=1 (eligible=1, DND suppressed=0, integrity gaps=0)" in status
+            assert "adapter deliveries=1 (pending=1" in status
+            assert "failure classes=none" in status
+        finally:
+            await reopened.close()
+
+    async def test_adapter_suppression_never_removes_the_canonical_inbox(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, daniel_id, scott_id, channel_id, _agent_id = await _notification_context(tmp_path / "kai.db")
+        capabilities = DeliveryAdapterCapabilities("desktop")
+        enabled = WorkshopDeliveryBindingPolicy(frozenset({"desktop"}), (capabilities,))
+        try:
+            await store.connection.execute(
+                "INSERT INTO principal_human_notification_policies "
+                "(principal_id, muted_mentions_notify, dnd_enabled, dnd_timezone, "
+                "dnd_start_minute, dnd_end_minute) VALUES (?, 1, 1, 'UTC', 660, 780)",
+                (scott_id,),
+            )
+            await store.connection.commit()
+            await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "publication-dnd",
+                "@scott DND still keeps the inbox",
+                delivery_policy=enabled,
+            )
+            assert (await WorkshopHumanNotificationService(store).counts(scott_id)).total == 1
+            async with store.connection.execute("SELECT policy_result FROM human_notification_publications") as cursor:
+                assert tuple(await cursor.fetchone()) == ("suppressed_dnd",)
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM delivery_outbox WHERE human_notification_id IS NOT NULL"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+
+            await store.connection.execute(
+                "UPDATE principal_human_notification_policies SET dnd_enabled = 0 WHERE principal_id = ?",
+                (scott_id,),
+            )
+            await store.connection.execute(
+                "DELETE FROM external_identities WHERE principal_id = ? AND provider = 'desktop'",
+                (scott_id,),
+            )
+            await store.connection.commit()
+            await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "publication-revoked",
+                "@scott revoked adapter still keeps the inbox",
+                delivery_policy=enabled,
+            )
+            assert (await WorkshopHumanNotificationService(store).counts(scott_id)).total == 2
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM human_notification_publications WHERE policy_result = 'eligible'"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 1
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM delivery_outbox WHERE human_notification_id IS NOT NULL"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+        finally:
+            await store.close()
+
     async def test_version_fifty_three_notification_rows_upgrade_without_loss(
         self,
         tmp_path: Path,
@@ -183,7 +318,7 @@ class TestHumanNotificationAuthority:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 54
+            assert await upgraded.schema_version() == 55
             async with upgraded.connection.execute(
                 "SELECT kind FROM human_notifications WHERE recipient_principal_id = ?",
                 (scott_id,),

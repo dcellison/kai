@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 
+from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import (
     ChannelId,
     EventEnvelope,
@@ -449,6 +450,8 @@ def _scheduled_inbound_envelope(
 async def record_inbound_message_in_transaction(
     store: WorkshopEventStore,
     message: InboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
 ) -> AppendResult:
     """Append and project one inbound message inside a caller-owned transaction."""
     if not store.connection.in_transaction:
@@ -472,7 +475,11 @@ async def record_inbound_message_in_transaction(
         )
     )
     if result.inserted:
-        await append_human_mention_notifications_in_transaction(store, result.event)
+        await append_human_mention_notifications_in_transaction(
+            store,
+            result.event,
+            delivery_policy=delivery_policy,
+        )
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -480,6 +487,8 @@ async def record_inbound_message_in_transaction(
 async def record_client_inbound_message_in_transaction(
     store: WorkshopEventStore,
     message: ClientInboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
 ) -> AppendResult:
     """Append an authenticated client message inside a caller-owned transaction."""
     if not store.connection.in_transaction:
@@ -502,7 +511,11 @@ async def record_client_inbound_message_in_transaction(
     )
     result = await store.append_in_transaction(envelope)
     if result.inserted:
-        await append_human_mention_notifications_in_transaction(store, result.event)
+        await append_human_mention_notifications_in_transaction(
+            store,
+            result.event,
+            delivery_policy=delivery_policy,
+        )
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -510,6 +523,8 @@ async def record_client_inbound_message_in_transaction(
 async def record_scheduled_inbound_message_in_transaction(
     store: WorkshopEventStore,
     message: ScheduledInboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
 ) -> AppendResult:
     """Append one core-owned scheduled command inside a caller transaction."""
     if not store.connection.in_transaction:
@@ -532,12 +547,21 @@ async def record_scheduled_inbound_message_in_transaction(
     )
     result = await store.append_in_transaction(envelope)
     if result.inserted:
-        await append_human_mention_notifications_in_transaction(store, result.event)
+        await append_human_mention_notifications_in_transaction(
+            store,
+            result.event,
+            delivery_policy=delivery_policy,
+        )
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
 
-async def record_inbound_message(store: WorkshopEventStore, message: InboundMessage) -> AppendResult:
+async def record_inbound_message(
+    store: WorkshopEventStore,
+    message: InboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
+) -> AppendResult:
     """Append and project one authenticated inbound transport message."""
     binding = await _resolve_binding(store, message)
     candidate = _inbound_envelope(binding, message, ())
@@ -560,7 +584,11 @@ async def record_inbound_message(store: WorkshopEventStore, message: InboundMess
             )
         )
         if result.inserted:
-            await append_human_mention_notifications_in_transaction(store, result.event)
+            await append_human_mention_notifications_in_transaction(
+                store,
+                result.event,
+                delivery_policy=delivery_policy,
+            )
         await store.project_pending_in_transaction(CanonicalConversationProjection())
         await store.connection.commit()
         return result

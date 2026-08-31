@@ -231,7 +231,12 @@ async def _existing_outbound(
     return AppendResult(event=existing, inserted=False)
 
 
-async def record_outbound_message(store: WorkshopEventStore, message: OutboundMessage) -> AppendResult:
+async def record_outbound_message(
+    store: WorkshopEventStore,
+    message: OutboundMessage,
+    *,
+    delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
+) -> AppendResult:
     """Append one canonical assistant reply to an existing inbound message."""
     try:
         await store.connection.execute("BEGIN IMMEDIATE")
@@ -242,7 +247,11 @@ async def record_outbound_message(store: WorkshopEventStore, message: OutboundMe
         projection = CanonicalConversationProjection()
         await store.project_pending_in_transaction(projection)
         if result.inserted:
-            await append_human_notifications_in_transaction(store, result.event)
+            await append_human_notifications_in_transaction(
+                store,
+                result.event,
+                delivery_policy=delivery_policy,
+            )
         await store.project_pending_in_transaction(projection)
         await store.connection.commit()
         return result
@@ -273,7 +282,11 @@ async def record_outbound_message_with_delivery(
         projection = CanonicalConversationProjection()
         await store.project_pending_in_transaction(projection)
         if message_result.inserted:
-            await append_human_notifications_in_transaction(store, message_result.event)
+            await append_human_notifications_in_transaction(
+                store,
+                message_result.event,
+                delivery_policy=delivery_policy,
+            )
         message_id = message_result.event.envelope.aggregate_id
         if not isinstance(message_id, MessageId):
             raise RuntimeError("Canonical outbound event did not identify a message")
@@ -347,7 +360,11 @@ async def record_outbound_message_with_streaming_finalization_in_transaction(
     projection = CanonicalConversationProjection()
     await store.project_pending_in_transaction(projection)
     if message_result.inserted:
-        await append_human_notifications_in_transaction(store, message_result.event)
+        await append_human_notifications_in_transaction(
+            store,
+            message_result.event,
+            delivery_policy=delivery_policy,
+        )
     message_id = message_result.event.envelope.aggregate_id
     if not isinstance(message_id, MessageId):
         raise RuntimeError("Canonical outbound event did not identify a message")

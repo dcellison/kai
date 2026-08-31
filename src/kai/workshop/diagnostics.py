@@ -1678,6 +1678,8 @@ def workshop_human_notification_status(db_path: Path) -> str:
                 "channels",
                 "event_log",
                 "human_notifications",
+                "human_notification_publications",
+                "delivery_outbox",
                 "messages",
                 "principals",
             }
@@ -1721,6 +1723,42 @@ def workshop_human_notification_status(db_path: Path) -> str:
                 "WHERE n.id IS NULL OR n.created_event_position != e.created_position "
                 "OR n.last_event_position != e.last_position",
             )
+            publication_totals = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN policy_result = 'eligible' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN policy_result = 'suppressed_dnd' THEN 1 ELSE 0 END) "
+                "FROM human_notification_publications"
+            ).fetchone()
+            publication_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM human_notification_publications p "
+                "LEFT JOIN human_notifications n ON n.id = p.notification_id "
+                "LEFT JOIN event_log e ON e.position = p.created_event_position "
+                "WHERE n.id IS NULL OR p.workshop_id != n.workshop_id "
+                "OR p.recipient_principal_id != n.recipient_principal_id "
+                "OR p.source_message_id != n.source_message_id "
+                "OR p.source_channel_id != n.source_channel_id "
+                "OR COALESCE(p.source_thread_root_id, '') != COALESCE(n.source_thread_root_id, '') "
+                "OR p.policy_result NOT IN ('eligible', 'suppressed_dnd') "
+                "OR e.event_type != 'human_notification.created' OR e.aggregate_id != p.notification_id",
+            )
+            delivery_totals = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'retry_wait' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) "
+                "FROM delivery_outbox WHERE human_notification_id IS NOT NULL"
+            ).fetchone()
+            failure_classes = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT last_error_code FROM delivery_outbox "
+                    "WHERE human_notification_id IS NOT NULL AND last_error_code IS NOT NULL "
+                    "ORDER BY last_error_code"
+                ).fetchall()
+            )
         finally:
             connection.close()
     except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
@@ -1728,11 +1766,19 @@ def workshop_human_notification_status(db_path: Path) -> str:
     total = int(totals[0] or 0) if totals is not None else 0
     unread = int(totals[1] or 0) if totals is not None else 0
     recipients = int(totals[2] or 0) if totals is not None else 0
-    state = "active" if integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    publications = int(publication_totals[0] or 0) if publication_totals is not None else 0
+    eligible = int(publication_totals[1] or 0) if publication_totals is not None else 0
+    suppressed = int(publication_totals[2] or 0) if publication_totals is not None else 0
+    deliveries = tuple(int(value or 0) for value in delivery_totals) if delivery_totals is not None else (0,) * 6
+    state = "active" if integrity_gaps == 0 and replay_gaps == 0 and publication_gaps == 0 else "INCOMPLETE"
     return (
         f"{prefix} {state}; notifications={total}, unread={unread}, "
         f"read={total - unread}, recipients={recipients}, integrity gaps={integrity_gaps}, "
-        f"replay gaps={replay_gaps}; authority=canonical"
+        f"replay gaps={replay_gaps}; publications={publications} "
+        f"(eligible={eligible}, DND suppressed={suppressed}, integrity gaps={publication_gaps}), "
+        f"adapter deliveries={deliveries[0]} (pending={deliveries[1]}, executing={deliveries[2]}, "
+        f"retrying={deliveries[3]}, succeeded={deliveries[4]}, failed={deliveries[5]}), "
+        f"failure classes={','.join(failure_classes) if failure_classes else 'none'}; authority=canonical"
     )
 
 

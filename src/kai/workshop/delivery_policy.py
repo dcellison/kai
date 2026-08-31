@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from kai.workshop.domain import ChannelBindingId, ChannelId, PrincipalId
+from kai.workshop.domain import ChannelBindingId, ChannelId, PrincipalId, WorkshopId
 from kai.workshop.store import WorkshopEventStore
 
 _TRANSPORT_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -59,6 +59,7 @@ class WorkshopDeliveryBindingPolicy:
 
     enabled_transports: frozenset[str]
     adapter_capabilities: tuple[DeliveryAdapterCapabilities, ...] = ()
+    notification_deep_link: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled_transports, frozenset):
@@ -80,6 +81,12 @@ class WorkshopDeliveryBindingPolicy:
             raise ValueError("adapter_capabilities cannot describe a disabled transport")
         if self.enabled_transports - declared:
             raise ValueError("every enabled transport must declare adapter capabilities")
+        if self.notification_deep_link is not None and (
+            not isinstance(self.notification_deep_link, str)
+            or not self.notification_deep_link.startswith(("http://", "https://"))
+            or len(self.notification_deep_link) > 1000
+        ):
+            raise ValueError("notification_deep_link must be a bounded HTTP(S) URL when supplied")
 
     @classmethod
     def disabled(cls) -> WorkshopDeliveryBindingPolicy:
@@ -159,3 +166,51 @@ class WorkshopDeliveryBindingPolicy:
             raise ValueError("channel_id must be a ChannelId")
         bindings = await self.bindings(store, channel_id)
         return tuple(binding.binding_id for binding in bindings if transport is None or binding.transport == transport)
+
+    async def principal_bindings(
+        self,
+        store: WorkshopEventStore,
+        workshop_id: WorkshopId,
+        principal_id: PrincipalId,
+    ) -> tuple[EligibleDeliveryBinding, ...]:
+        """Resolve enabled adapter destinations from a canonical recipient.
+
+        The caller supplies no transport identity. A destination is eligible
+        only while the principal's current external identity, direct channel
+        binding, and channel membership all agree.
+        """
+        if not isinstance(workshop_id, WorkshopId):
+            raise ValueError("workshop_id must be a WorkshopId")
+        if not isinstance(principal_id, PrincipalId):
+            raise ValueError("principal_id must be a PrincipalId")
+        if not self.enabled_transports:
+            return ()
+        placeholders = ", ".join("?" for _ in self.enabled_transports)
+        async with store.connection.execute(
+            "SELECT DISTINCT cb.id, cb.transport FROM external_identities ei "
+            "JOIN channel_bindings cb ON cb.transport = ei.provider "
+            "AND cb.external_channel_id = ei.external_subject "
+            "JOIN channels c ON c.id = cb.channel_id AND c.kind = 'direct' "
+            "AND c.workshop_id = ? "
+            "JOIN channel_memberships cm ON cm.channel_id = c.id "
+            "AND cm.principal_id = ei.principal_id "
+            "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
+            "AND wm.principal_id = ei.principal_id "
+            f"WHERE ei.principal_id = ? AND cb.transport IN ({placeholders}) "
+            "ORDER BY cb.transport, cb.id",
+            (workshop_id, principal_id, *sorted(self.enabled_transports)),
+        ) as cursor:
+            rows = tuple(await cursor.fetchall())
+        bindings: list[EligibleDeliveryBinding] = []
+        for row in rows:
+            transport = str(row[1])
+            capabilities = self.capabilities_for(transport)
+            assert capabilities is not None
+            bindings.append(
+                EligibleDeliveryBinding(
+                    binding_id=ChannelBindingId(str(row[0])),
+                    transport=transport,
+                    capabilities=capabilities,
+                )
+            )
+        return tuple(bindings)

@@ -17,7 +17,7 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import ChannelId, MessageId, PrincipalId
+from kai.workshop.domain import ChannelId, HumanNotificationId, MessageId, PrincipalId, WorkshopId
 from kai.workshop.store import WorkshopEventStore
 
 DeliveryContentKind = Literal["text", "attachment"]
@@ -36,6 +36,8 @@ class CanonicalDeliveryIntent:
     recipient_principal_id: PrincipalId | None = None
     preview_eligible: bool = False
     max_attempts: int = 5
+    human_notification_id: HumanNotificationId | None = None
+    workshop_id: WorkshopId | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.message_id, MessageId):
@@ -51,6 +53,15 @@ class CanonicalDeliveryIntent:
             raise ValueError("recipient_principal_id must be a PrincipalId when supplied")
         if not isinstance(self.preview_eligible, bool):
             raise ValueError("preview_eligible must be a boolean")
+        if self.human_notification_id is not None:
+            if not isinstance(self.human_notification_id, HumanNotificationId):
+                raise ValueError("human_notification_id must be a HumanNotificationId when supplied")
+            if not isinstance(self.workshop_id, WorkshopId):
+                raise ValueError("human notification delivery requires a WorkshopId")
+            if self.recipient_principal_id is None:
+                raise ValueError("human notification delivery requires a recipient principal")
+        elif self.workshop_id is not None:
+            raise ValueError("workshop_id is only accepted for human notification delivery")
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,11 +89,20 @@ class WorkshopDeliveryPlanner:
     ) -> DeliveryPlanningResult:
         if not self._store.connection.in_transaction:
             raise RuntimeError("plan_in_transaction requires an active transaction")
-        bindings = await self._policy.bindings(
-            self._store,
-            intent.channel_id,
-            principal_id=intent.recipient_principal_id,
-        )
+        if intent.human_notification_id is not None:
+            assert intent.workshop_id is not None
+            assert intent.recipient_principal_id is not None
+            bindings = await self._policy.principal_bindings(
+                self._store,
+                intent.workshop_id,
+                intent.recipient_principal_id,
+            )
+        else:
+            bindings = await self._policy.bindings(
+                self._store,
+                intent.channel_id,
+                principal_id=intent.recipient_principal_id,
+            )
         selected = tuple(
             binding
             for binding in bindings
@@ -120,6 +140,7 @@ class WorkshopDeliveryPlanner:
                         occurred_at=intent.occurred_at,
                         execution_contract=(STREAMING_FINALIZATION_CONTRACT if streaming else SEND_FRAGMENTS_CONTRACT),
                         authority_epoch_id=authority_epoch_id if streaming else None,
+                        human_notification_id=intent.human_notification_id,
                         max_attempts=intent.max_attempts,
                     )
                 )

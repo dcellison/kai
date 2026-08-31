@@ -18,6 +18,7 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.domain import DeliveryAuthorityEpochId
+from kai.workshop.human_notifications import HUMAN_NOTIFICATION_DELIVERY_MODE
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.telegram_delivery import (
     WORKSHOP_CLIENT_TEXT_MODE,
@@ -364,7 +365,7 @@ class WorkshopTelegramNotificationService:
                 WorkshopTelegramDeliveryAdapter(cast(TelegramTextBot, bot)),
                 worker_id=worker_id,
                 purpose=NOTIFICATION_PURPOSE,
-                modes=("text",),
+                modes=("text", HUMAN_NOTIFICATION_DELIVERY_MODE),
             )
             runtime = WorkshopTelegramDeliveryRuntime(worker, worker)
             await runtime.start()

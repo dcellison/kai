@@ -50,6 +50,7 @@ from kai.workshop.delivery_outbox import (
     WorkshopDeliveryOutbox,
 )
 from kai.workshop.domain import DeliveryAuthorityEpochId, DeliveryId
+from kai.workshop.human_notifications import HUMAN_NOTIFICATION_DELIVERY_MODE
 from kai.workshop.proactive_publication import PROACTIVE_ARTIFACT_MODE
 from kai.workshop.store import WorkshopEventStore
 
@@ -222,6 +223,10 @@ def _telegram_fragments(body: str) -> tuple[str, ...]:
 def _telegram_delivery_body(claim: DeliveryClaim) -> str:
     if claim.mode == "text":
         return claim.body
+    if claim.mode == HUMAN_NOTIFICATION_DELIVERY_MODE:
+        if claim.human_notification_id is None:
+            raise TelegramDeliveryContractError("telegram_notification_identity_missing")
+        return claim.body
     if claim.mode == WORKSHOP_CLIENT_TEXT_MODE:
         display_name = claim.author_display_name.strip()
         if not display_name or len(display_name) > 200:
@@ -263,8 +268,10 @@ class WorkshopTelegramDeliveryAdapter:
             raise ValueError("fragment must belong to the claimed delivery")
         if claim.transport != "telegram":
             raise TelegramDeliveryContractError("telegram_transport_mismatch")
-        if claim.mode not in {"text", WORKSHOP_CLIENT_TEXT_MODE}:
+        if claim.mode not in {"text", WORKSHOP_CLIENT_TEXT_MODE, HUMAN_NOTIFICATION_DELIVERY_MODE}:
             raise TelegramDeliveryContractError("telegram_mode_unsupported")
+        if claim.mode == HUMAN_NOTIFICATION_DELIVERY_MODE and claim.human_notification_id is None:
+            raise TelegramDeliveryContractError("telegram_notification_identity_missing")
         if fragment.operation != "send" or fragment.target_external_message_id is not None:
             raise TelegramDeliveryContractError("telegram_operation_unsupported")
         if not fragment.body or len(fragment.body) > _TELEGRAM_TEXT_LIMIT:
@@ -272,7 +279,7 @@ class WorkshopTelegramDeliveryAdapter:
 
         target = _telegram_target(claim.external_channel_id)
         try:
-            if claim.mode == WORKSHOP_CLIENT_TEXT_MODE:
+            if claim.mode in {WORKSHOP_CLIENT_TEXT_MODE, HUMAN_NOTIFICATION_DELIVERY_MODE}:
                 sent = await self._bot.send_message(chat_id=target, text=fragment.body)
             else:
                 sent = await self._bot.send_message(
@@ -638,6 +645,13 @@ class WorkshopTelegramDeliveryWorker:
     async def _run_claim(self, claim: DeliveryClaim | None) -> TelegramWorkResult:
         if claim is None:
             return TelegramWorkResult(outcome=TelegramWorkOutcome.IDLE)
+
+        if claim.human_notification_id is not None and not claim.recipient_binding_current:
+            return await self._settle_failure(
+                claim,
+                None,
+                TelegramDeliveryContractError("notification_recipient_binding_revoked"),
+            )
 
         try:
             bodies = _telegram_fragments(_telegram_delivery_body(claim))

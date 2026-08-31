@@ -163,6 +163,7 @@ def _delivery_policy(config, telegram_adapter_module: ModuleType | None) -> Work
     return WorkshopDeliveryBindingPolicy(
         frozenset(item.transport for item in capabilities),
         capabilities,
+        (f"http://{config.workshop_lan_host}:{config.webhook_port}/workshop/" if config.workshop_lan_host else None),
     )
 
 
