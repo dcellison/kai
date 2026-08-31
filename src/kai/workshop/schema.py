@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 52
+WORKSHOP_SCHEMA_VERSION = 53
 
 
 @dataclass(frozen=True, slots=True)
@@ -2422,6 +2422,44 @@ _MULTI_HUMAN_CHANNEL_MEMBERSHIP_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_HUMAN_NOTIFICATION_SCHEMA = SchemaMigration(
+    version=53,
+    name="canonical_human_notifications",
+    statements=(
+        """
+        CREATE TABLE human_notifications (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            recipient_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind = 'mention'),
+            source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            source_channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            source_thread_root_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            read_at TEXT,
+            read_event_position INTEGER REFERENCES event_log(position) ON DELETE RESTRICT,
+            state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+            last_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (recipient_principal_id, source_message_id, kind),
+            CHECK (
+                (read_at IS NULL AND read_event_position IS NULL)
+                OR (read_at IS NOT NULL AND read_event_position IS NOT NULL)
+            )
+        )
+        """,
+        "CREATE INDEX human_notifications_recipient_inbox_idx "
+        "ON human_notifications (recipient_principal_id, created_event_position DESC, id DESC)",
+        "CREATE INDEX human_notifications_recipient_unread_idx "
+        "ON human_notifications (recipient_principal_id, created_event_position DESC) "
+        "WHERE read_at IS NULL",
+        "CREATE INDEX human_notifications_channel_idx "
+        "ON human_notifications (source_channel_id, recipient_principal_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2475,6 +2513,7 @@ _MIGRATIONS = (
     _REVERSIBLE_CHANNEL_ARCHIVAL_SCHEMA,
     _CANONICAL_HUMAN_HANDLE_SCHEMA,
     _MULTI_HUMAN_CHANNEL_MEMBERSHIP_SCHEMA,
+    _CANONICAL_HUMAN_NOTIFICATION_SCHEMA,
 )
 
 

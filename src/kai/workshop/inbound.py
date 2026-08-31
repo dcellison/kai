@@ -17,6 +17,7 @@ from kai.workshop.domain import (
     WorkshopEventType,
     WorkshopId,
 )
+from kai.workshop.human_notifications import append_human_mention_notifications_in_transaction
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import AppendResult, WorkshopEventStore
 
@@ -470,6 +471,7 @@ async def record_inbound_message_in_transaction(
             event_version=existing.envelope.event_version if existing is not None else 2,
         )
     )
+    await append_human_mention_notifications_in_transaction(store, result.event)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -498,6 +500,7 @@ async def record_client_inbound_message_in_transaction(
         event_version=existing.envelope.event_version if existing is not None else 2,
     )
     result = await store.append_in_transaction(envelope)
+    await append_human_mention_notifications_in_transaction(store, result.event)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -526,6 +529,7 @@ async def record_scheduled_inbound_message_in_transaction(
         event_version=existing.envelope.event_version if existing is not None else 2,
     )
     result = await store.append_in_transaction(envelope)
+    await append_human_mention_notifications_in_transaction(store, result.event)
     await store.project_pending_in_transaction(CanonicalConversationProjection())
     return result
 
@@ -542,13 +546,20 @@ async def record_inbound_message(store: WorkshopEventStore, message: InboundMess
     else:
         mentions = _existing_mentions(existing.envelope)
         message = replace(message, occurred_at=existing.envelope.occurred_at)
-    result = await store.append(
-        _inbound_envelope(
-            binding,
-            message,
-            mentions,
-            event_version=existing.envelope.event_version if existing is not None else 2,
+    try:
+        await store.connection.execute("BEGIN IMMEDIATE")
+        result = await store.append_in_transaction(
+            _inbound_envelope(
+                binding,
+                message,
+                mentions,
+                event_version=existing.envelope.event_version if existing is not None else 2,
+            )
         )
-    )
-    await store.project_pending(CanonicalConversationProjection())
-    return result
+        await append_human_mention_notifications_in_transaction(store, result.event)
+        await store.project_pending_in_transaction(CanonicalConversationProjection())
+        await store.connection.commit()
+        return result
+    except Exception:
+        await store.connection.rollback()
+        raise
