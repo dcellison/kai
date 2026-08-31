@@ -9,6 +9,7 @@ import {
   loadPreferenceHistory,
   loadGitHubSettings,
   loadNotificationPreferences,
+  loadChannelNotificationPolicy,
   loadClientPreferences,
   loadModelCatalogue,
   loadSettingsWorkspace,
@@ -24,6 +25,7 @@ import {
   updateRuntimeSettings,
   updateGitHubSettings,
   updateNotificationPreference,
+  updateChannelNotificationPolicy,
   updateClientPreference,
   updateAppearancePreference,
   updateWorkspaceConfig,
@@ -37,6 +39,8 @@ import type {
   WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
+  WorkshopChannelNotificationPolicy,
+  WorkshopChannelNotificationPolicyChange,
   WorkshopClientPreferences,
   WorkshopClientPreferenceChange,
   WorkshopAppearancePreferences,
@@ -209,6 +213,15 @@ function SettingsWorkspaceContent({
   const [notificationBusy, setNotificationBusy] = useState(false);
   const [notificationError, setNotificationError] = useState<string | null>(null);
   const [notificationNotice, setNotificationNotice] = useState<string | null>(null);
+  const [channelNotifications, setChannelNotifications] =
+    useState<WorkshopChannelNotificationPolicy | null>(null);
+  const [channelNotificationLoading, setChannelNotificationLoading] = useState(true);
+  const [channelNotificationBusy, setChannelNotificationBusy] = useState(false);
+  const [channelNotificationError, setChannelNotificationError] = useState<string | null>(null);
+  const [channelNotificationNotice, setChannelNotificationNotice] = useState<string | null>(null);
+  const [dndTimezone, setDndTimezone] = useState("UTC");
+  const [dndStart, setDndStart] = useState("22:00");
+  const [dndEnd, setDndEnd] = useState("07:00");
 
   const [clients, setClients] = useState<WorkshopClientPreferences | null>(null);
   const [clientLoading, setClientLoading] = useState(true);
@@ -506,6 +519,24 @@ function SettingsWorkspaceContent({
     }
   }, [handleAccessFailure, session]);
 
+  const refreshChannelNotifications = useCallback(async (): Promise<void> => {
+    setChannelNotificationLoading(true);
+    setChannelNotificationError(null);
+    try {
+      const snapshot = await loadChannelNotificationPolicy(session);
+      setChannelNotifications(snapshot);
+      setDndTimezone(snapshot.doNotDisturb.timezone);
+      setDndStart(snapshot.doNotDisturb.start);
+      setDndEnd(snapshot.doNotDisturb.end);
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setChannelNotificationError(errorText(caught, "Could not load channel notification policy."));
+      }
+    } finally {
+      setChannelNotificationLoading(false);
+    }
+  }, [handleAccessFailure, session]);
+
   const refreshClients = useCallback(async (): Promise<void> => {
     setClientLoading(true);
     setClientError(null);
@@ -544,6 +575,7 @@ function SettingsWorkspaceContent({
       void refreshPreferences();
       void refreshGitHub();
       void refreshNotifications();
+      void refreshChannelNotifications();
       void refreshClients();
       void refreshAppearance();
     }
@@ -552,6 +584,7 @@ function SettingsWorkspaceContent({
     refreshAppearance,
     refreshClients,
     refreshGitHub,
+    refreshChannelNotifications,
     refreshNotifications,
     refreshPreferences,
     refreshRuntime,
@@ -772,6 +805,42 @@ function SettingsWorkspaceContent({
       }
     } finally {
       setNotificationBusy(false);
+    }
+  };
+
+  const mutateChannelNotificationPolicy = async (
+    change: WorkshopChannelNotificationPolicyChange,
+  ): Promise<void> => {
+    if (!channelNotifications) {
+      return;
+    }
+    setChannelNotificationBusy(true);
+    setChannelNotificationError(null);
+    setChannelNotificationNotice(null);
+    try {
+      const changed = await updateChannelNotificationPolicy(
+        session,
+        channelNotifications.revision,
+        change,
+      );
+      setChannelNotifications(changed);
+      setDndTimezone(changed.doNotDisturb.timezone);
+      setDndStart(changed.doNotDisturb.start);
+      setDndEnd(changed.doNotDisturb.end);
+      setChannelNotificationNotice(
+        changed.mutation?.changed ? "Channel notification policy saved." : "No change was needed.",
+      );
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshChannelNotifications();
+        setChannelNotificationError(
+          "Channel notification policy changed elsewhere. The latest values have been reloaded.",
+        );
+      } else if (!handleAccessFailure(caught)) {
+        setChannelNotificationError(errorText(caught, "Could not update channel notification policy."));
+      }
+    } finally {
+      setChannelNotificationBusy(false);
     }
   };
 
@@ -1672,10 +1741,133 @@ function SettingsWorkspaceContent({
             <p className="section-number">03</p>
             <h2>Notification delivery</h2>
             <p>
-              Choose where personal integration notifications appear. Only
-              canonical destinations authorized for your Workshop identity are listed.
+              Choose which channel activity reaches your inbox, when adapter delivery
+              should pause, and where personal integration notifications appear.
             </p>
           </div>
+          {channelNotificationLoading ? (
+            <p role="status">Loading channel notification policy…</p>
+          ) : channelNotifications ? (
+            <div className="settings-card-grid notification-preference-grid">
+              {channelNotifications.channels.map((channel) => (
+                <article className="settings-card" key={channel.channelId}>
+                  <label htmlFor={`channel-notification-${channel.channelId}`}>
+                    {channel.channelName}
+                  </label>
+                  <select
+                    id={`channel-notification-${channel.channelId}`}
+                    value={channel.level}
+                    disabled={channelNotificationBusy}
+                    onChange={(event) => void mutateChannelNotificationPolicy({
+                      field: "channel",
+                      channelId: channel.channelId,
+                      level: event.target.value as "all" | "mentions_replies" | "muted",
+                    })}
+                  >
+                    <option value="all">All messages</option>
+                    <option value="mentions_replies">Mentions and replies</option>
+                    <option value="muted">Muted</option>
+                  </select>
+                  <p>{channel.source}</p>
+                </article>
+              ))}
+              <article className="settings-card">
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={channelNotifications.mutedMentionsNotify}
+                    disabled={channelNotificationBusy}
+                    onChange={(event) => void mutateChannelNotificationPolicy({
+                      field: "muted_mentions_notify",
+                      enabled: event.target.checked,
+                    })}
+                  />
+                  Direct mentions override muted channels
+                </label>
+                <p>A direct @mention can still create an in-app notification.</p>
+              </article>
+              <article className="settings-card settings-dnd-card">
+                <h3>Do not disturb</h3>
+                <label className="settings-checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={channelNotifications.doNotDisturb.enabled}
+                    disabled={channelNotificationBusy}
+                    onChange={(event) => void mutateChannelNotificationPolicy({
+                      field: "do_not_disturb",
+                      enabled: event.target.checked,
+                      timezone: dndTimezone,
+                      start: dndStart,
+                      end: dndEnd,
+                    })}
+                  />
+                  Pause external delivery on this schedule
+                </label>
+                <label htmlFor="dnd-timezone">Timezone</label>
+                <input
+                  id="dnd-timezone"
+                  value={dndTimezone}
+                  disabled={channelNotificationBusy}
+                  onChange={(event) => setDndTimezone(event.target.value)}
+                  placeholder="America/Toronto"
+                />
+                <div className="settings-inline-fields">
+                  <label htmlFor="dnd-start">
+                    Start
+                    <input
+                      id="dnd-start"
+                      type="time"
+                      value={dndStart}
+                      disabled={channelNotificationBusy}
+                      onChange={(event) => setDndStart(event.target.value)}
+                    />
+                  </label>
+                  <label htmlFor="dnd-end">
+                    End
+                    <input
+                      id="dnd-end"
+                      type="time"
+                      value={dndEnd}
+                      disabled={channelNotificationBusy}
+                      onChange={(event) => setDndEnd(event.target.value)}
+                    />
+                  </label>
+                </div>
+                <div className="settings-actions">
+                  <button
+                    className="quiet-button"
+                    type="button"
+                    disabled={channelNotificationBusy}
+                    onClick={() => void mutateChannelNotificationPolicy({
+                      field: "do_not_disturb",
+                      enabled: channelNotifications.doNotDisturb.enabled,
+                      timezone: dndTimezone,
+                      start: dndStart,
+                      end: dndEnd,
+                    })}
+                  >
+                    Save schedule
+                  </button>
+                </div>
+                <p>Workshop notifications remain immediate. Adapter delivery uses this policy.</p>
+              </article>
+            </div>
+          ) : (
+            <div className="settings-failure">
+              <p role="alert">
+                {channelNotificationError ?? "Channel notification policy is unavailable."}
+              </p>
+              <button className="quiet-button" type="button" onClick={() => void refreshChannelNotifications()}>
+                Retry
+              </button>
+            </div>
+          )}
+          {channelNotificationNotice && (
+            <p className="settings-notice" role="status">{channelNotificationNotice}</p>
+          )}
+          {channelNotificationError && channelNotifications && (
+            <p className="settings-error" role="alert">{channelNotificationError}</p>
+          )}
           {notificationLoading ? (
             <p role="status">Loading notification destinations…</p>
           ) : notifications ? (

@@ -419,6 +419,38 @@ export type WorkshopNotificationPreferenceChange =
       integrationClass: "generic" | "github";
     };
 
+export type WorkshopChannelNotificationLevel = "all" | "mentions_replies" | "muted";
+
+export interface WorkshopChannelNotificationPolicy {
+  channels: {
+    channelId: string;
+    channelName: string;
+    level: WorkshopChannelNotificationLevel;
+    source: string;
+  }[];
+  doNotDisturb: {
+    enabled: boolean;
+    timezone: string;
+    start: string;
+    end: string;
+  };
+  levels: WorkshopChannelNotificationLevel[];
+  mutedMentionsNotify: boolean;
+  mutation: { changed: boolean; operation: string } | null;
+  revision: string;
+}
+
+export type WorkshopChannelNotificationPolicyChange =
+  | { field: "channel"; channelId: string; level: WorkshopChannelNotificationLevel }
+  | { field: "muted_mentions_notify"; enabled: boolean }
+  | {
+      field: "do_not_disturb";
+      enabled: boolean;
+      timezone: string;
+      start: string;
+      end: string;
+    };
+
 export interface WorkshopClientPreferences {
   mutation: { changed: boolean; operation: string } | null;
   revision: string;

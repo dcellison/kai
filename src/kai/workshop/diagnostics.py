@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from kai.workshop.appearance_preferences import WORKSHOP_APPEARANCE_THEMES
 from kai.workshop.domain import (
@@ -1694,10 +1695,14 @@ def workshop_human_notification_status(db_path: Path) -> str:
                 "LEFT JOIN principals p ON p.id = n.recipient_principal_id "
                 "LEFT JOIN event_log created ON created.position = n.created_event_position "
                 "WHERE m.id IS NULL OR m.channel_id != n.source_channel_id "
-                "OR p.kind IS NULL OR p.kind != 'human' OR n.kind != 'mention' "
-                "OR NOT EXISTS (SELECT 1 FROM json_each(m.mentions_json) mention "
+                "OR p.kind IS NULL OR p.kind != 'human' "
+                "OR n.kind NOT IN ('mention', 'reply', 'message') "
+                "OR (n.kind = 'mention' AND NOT EXISTS (SELECT 1 FROM json_each(m.mentions_json) mention "
                 "WHERE json_extract(mention.value, '$.kind') = 'human' "
-                "AND json_extract(mention.value, '$.principal_id') = n.recipient_principal_id) "
+                "AND json_extract(mention.value, '$.principal_id') = n.recipient_principal_id)) "
+                "OR (n.kind = 'reply' AND NOT EXISTS (SELECT 1 FROM messages target "
+                "WHERE target.id = COALESCE(m.reply_to_message_id, m.thread_root_id) "
+                "AND target.author_principal_id = n.recipient_principal_id)) "
                 "OR COALESCE(m.thread_root_id, '') != COALESCE(n.source_thread_root_id, '') "
                 "OR created.event_type IS NULL "
                 "OR created.event_type != 'human_notification.created' "
@@ -1728,6 +1733,61 @@ def workshop_human_notification_status(db_path: Path) -> str:
         f"{prefix} {state}; notifications={total}, unread={unread}, "
         f"read={total - unread}, recipients={recipients}, integrity gaps={integrity_gaps}, "
         f"replay gaps={replay_gaps}; authority=canonical"
+    )
+
+
+def workshop_channel_notification_policy_status(db_path: Path) -> str:
+    """Report canonical principal/channel notification-policy integrity."""
+    prefix = "Workshop channel notification policy:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical policy schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            required = {
+                "principal_human_notification_policies",
+                "principal_channel_notification_policies",
+            }
+            if not tables >= required:
+                return f"{prefix} pending; canonical policy schema unavailable"
+            principals = _scalar(connection, "SELECT COUNT(*) FROM principal_human_notification_policies")
+            channel_overrides = _scalar(connection, "SELECT COUNT(*) FROM principal_channel_notification_policies")
+            dnd_enabled = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_human_notification_policies WHERE dnd_enabled = 1",
+            )
+            invalid = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_channel_notification_policies p "
+                "LEFT JOIN principals owner ON owner.id = p.principal_id "
+                "LEFT JOIN channels c ON c.id = p.channel_id "
+                "LEFT JOIN channel_memberships cm ON cm.principal_id = p.principal_id "
+                "AND cm.channel_id = p.channel_id "
+                "WHERE owner.kind IS NULL OR owner.kind != 'human' OR c.kind IS NULL "
+                "OR c.kind != 'group' OR cm.principal_id IS NULL "
+                "OR p.level NOT IN ('all', 'mentions_replies', 'muted')",
+            )
+            timezone_rows = connection.execute(
+                "SELECT dnd_timezone FROM principal_human_notification_policies"
+            ).fetchall()
+            for row in timezone_rows:
+                try:
+                    ZoneInfo(str(row[0]))
+                except ZoneInfoNotFoundError:
+                    invalid += 1
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if invalid == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; principals={principals}, channel overrides={channel_overrides}, "
+        f"DND enabled={dnd_enabled}, invalid={invalid}; authority=canonical, Workshop=in-app immediate"
     )
 
 

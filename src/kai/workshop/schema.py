@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 53
+WORKSHOP_SCHEMA_VERSION = 54
 
 
 @dataclass(frozen=True, slots=True)
@@ -2460,6 +2460,73 @@ _CANONICAL_HUMAN_NOTIFICATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_CHANNEL_NOTIFICATION_POLICY_SCHEMA = SchemaMigration(
+    version=54,
+    name="principal_channel_notification_policy",
+    statements=(
+        """
+        CREATE TABLE principal_human_notification_policies (
+            principal_id TEXT PRIMARY KEY REFERENCES principals(id) ON DELETE CASCADE,
+            muted_mentions_notify INTEGER NOT NULL DEFAULT 1
+                CHECK (muted_mentions_notify IN (0, 1)),
+            dnd_enabled INTEGER NOT NULL DEFAULT 0 CHECK (dnd_enabled IN (0, 1)),
+            dnd_timezone TEXT NOT NULL DEFAULT 'UTC' CHECK (length(dnd_timezone) BETWEEN 1 AND 100),
+            dnd_start_minute INTEGER NOT NULL DEFAULT 1320
+                CHECK (dnd_start_minute BETWEEN 0 AND 1439),
+            dnd_end_minute INTEGER NOT NULL DEFAULT 420
+                CHECK (dnd_end_minute BETWEEN 0 AND 1439),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            CHECK (dnd_start_minute != dnd_end_minute)
+        )
+        """,
+        """
+        CREATE TABLE principal_channel_notification_policies (
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            level TEXT NOT NULL CHECK (level IN ('all', 'mentions_replies', 'muted')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (principal_id, channel_id)
+        )
+        """,
+        "CREATE INDEX principal_channel_notification_policies_channel_idx "
+        "ON principal_channel_notification_policies (channel_id, principal_id)",
+        "ALTER TABLE human_notifications RENAME TO human_notifications_v53",
+        """
+        CREATE TABLE human_notifications (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            recipient_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('mention', 'reply', 'message')),
+            source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            source_channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            source_thread_root_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            read_at TEXT,
+            read_event_position INTEGER REFERENCES event_log(position) ON DELETE RESTRICT,
+            state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+            last_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (recipient_principal_id, source_message_id),
+            CHECK (
+                (read_at IS NULL AND read_event_position IS NULL)
+                OR (read_at IS NOT NULL AND read_event_position IS NOT NULL)
+            )
+        )
+        """,
+        "INSERT INTO human_notifications SELECT * FROM human_notifications_v53",
+        "DROP TABLE human_notifications_v53",
+        "CREATE INDEX human_notifications_recipient_inbox_idx "
+        "ON human_notifications (recipient_principal_id, created_event_position DESC, id DESC)",
+        "CREATE INDEX human_notifications_recipient_unread_idx "
+        "ON human_notifications (recipient_principal_id, created_event_position DESC) "
+        "WHERE read_at IS NULL",
+        "CREATE INDEX human_notifications_channel_idx "
+        "ON human_notifications (source_channel_id, recipient_principal_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2514,6 +2581,7 @@ _MIGRATIONS = (
     _CANONICAL_HUMAN_HANDLE_SCHEMA,
     _MULTI_HUMAN_CHANNEL_MEMBERSHIP_SCHEMA,
     _CANONICAL_HUMAN_NOTIFICATION_SCHEMA,
+    _CHANNEL_NOTIFICATION_POLICY_SCHEMA,
 )
 
 

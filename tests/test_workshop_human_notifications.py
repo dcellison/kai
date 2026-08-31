@@ -14,9 +14,17 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
+from kai.workshop.channel_notification_policy import (
+    WorkshopChannelNotificationPolicyService,
+    WorkshopChannelNotificationPolicyValidationError,
+)
 from kai.workshop.client_api import register_workshop_read_routes
-from kai.workshop.diagnostics import workshop_human_notification_status
+from kai.workshop.diagnostics import (
+    workshop_channel_notification_policy_status,
+    workshop_human_notification_status,
+)
 from kai.workshop.domain import AgentId, ChannelId, HumanNotificationId, MessageId, PrincipalId
+from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.human_notifications import (
     HumanNotificationStateRequest,
     WorkshopHumanNotificationAccessDenied,
@@ -24,10 +32,11 @@ from kai.workshop.human_notifications import (
     WorkshopHumanNotificationService,
 )
 from kai.workshop.inbound import ClientInboundMessage, record_client_inbound_message_in_transaction
+from kai.workshop.outbound import OutboundMessage, record_outbound_message
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.wake_policy import resolve_message_wake_targets
-from tests.workshop_profiles import profile_id
+from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
 
@@ -121,6 +130,8 @@ async def _record(
 async def _open_client(
     store: WorkshopEventStore,
     authenticator: _Authenticator,
+    *,
+    channel_notification_policy: WorkshopChannelNotificationPolicyService | None = None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -131,6 +142,7 @@ async def _open_client(
         event_poll_interval=0.01,
         event_heartbeat_interval=0.05,
         event_authentication_recheck_interval=0.01,
+        channel_notification_policy=channel_notification_policy,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -153,6 +165,251 @@ async def _next_sse_event(response) -> dict[str, object]:
 
 
 class TestHumanNotificationAuthority:
+    async def test_version_fifty_three_notification_rows_upgrade_without_loss(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        from kai.workshop import schema
+
+        path = tmp_path / "kai.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 53)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:53])
+            store, daniel_id, scott_id, channel_id, _agent_id = await _notification_context(path)
+            await _record(store, daniel_id, channel_id, "pre-policy-mention", "@scott preserved")
+            assert (await WorkshopHumanNotificationService(store).counts(scott_id)).total == 1
+            await store.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 54
+            async with upgraded.connection.execute(
+                "SELECT kind FROM human_notifications WHERE recipient_principal_id = ?",
+                (scott_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("mention",)
+            assert workshop_human_notification_status(path).startswith(
+                "Workshop human notifications: active; notifications=1"
+            )
+        finally:
+            await upgraded.close()
+
+    async def test_agent_group_reply_notifies_replied_to_human_without_direct_message_noise(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, daniel_id, _scott_id, channel_id, agent_id = await _notification_context(tmp_path / "kai.db")
+        inbox = WorkshopHumanNotificationService(store)
+        try:
+            inbound_id = await _record(store, daniel_id, channel_id, "agent-reply-source", "@kai reply")
+            await record_outbound_message(
+                store,
+                OutboundMessage(
+                    in_reply_to_message_id=inbound_id,
+                    body="Agent group reply",
+                    occurred_at=_NOW + timedelta(seconds=1),
+                    agent_id=agent_id,
+                ),
+            )
+            page = await inbox.list(daniel_id)
+            assert [item.kind for item in page.notifications] == ["reply"]
+        finally:
+            await store.close()
+
+    async def test_authenticated_policy_api_is_principal_isolated_and_conflict_safe(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "kai.db"
+        store, daniel_id, scott_id, channel_id, _agent_id = await _notification_context(path)
+        registry = await WorkshopExecutionStateRegistry.from_store(store, profile_registry(101, 202))
+        policy = await WorkshopChannelNotificationPolicyService.open(path, registry)
+        client = await _open_client(
+            store,
+            _Authenticator({"daniel": daniel_id, "scott": scott_id}),
+            channel_notification_policy=policy,
+        )
+        try:
+            scott_response = await client.get(
+                "/v1/settings/channel-notifications",
+                headers={"Authorization": "Bearer scott"},
+            )
+            assert scott_response.status == 200
+            scott = await scott_response.json()
+            assert scott["channels"] == [
+                {
+                    "channel_id": channel_id,
+                    "channel_name": "Human notifications",
+                    "level": "mentions_replies",
+                    "source": "default",
+                }
+            ]
+
+            daniel_response = await client.get(
+                "/v1/settings/channel-notifications",
+                headers={"Authorization": "Bearer daniel"},
+            )
+            daniel = await daniel_response.json()
+            changed_response = await client.patch(
+                "/v1/settings/channel-notifications",
+                headers={"Authorization": "Bearer daniel"},
+                json={
+                    "revision": daniel["revision"],
+                    "channel": {"channel_id": channel_id, "level": "all"},
+                },
+            )
+            assert changed_response.status == 200
+
+            unchanged_response = await client.get(
+                "/v1/settings/channel-notifications",
+                headers={"Authorization": "Bearer scott"},
+            )
+            unchanged = await unchanged_response.json()
+            assert unchanged["channels"][0]["level"] == "mentions_replies"
+
+            stale_response = await client.patch(
+                "/v1/settings/channel-notifications",
+                headers={"Authorization": "Bearer daniel"},
+                json={
+                    "revision": daniel["revision"],
+                    "muted_mentions_notify": False,
+                },
+            )
+            assert stale_response.status == 409
+        finally:
+            await client.close()
+            await policy.close()
+            await store.close()
+
+    async def test_channel_policy_controls_ordinary_reply_and_muted_mentions(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "kai.db"
+        store, daniel_id, scott_id, channel_id, _agent_id = await _notification_context(path)
+        registry = await WorkshopExecutionStateRegistry.from_store(store, profile_registry(101, 202))
+        policy = await WorkshopChannelNotificationPolicyService.open(path, registry)
+        inbox = WorkshopHumanNotificationService(store)
+        authority = policy.authority_for_principal(scott_id)
+        try:
+            await _record(store, daniel_id, channel_id, "ordinary-default", "Ordinary default")
+            assert (await inbox.counts(scott_id)).total == 0
+
+            root_id = await _record(store, scott_id, channel_id, "scott-root", "Scott root")
+            await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "reply-default",
+                "Reply to Scott",
+                thread_root_id=root_id,
+            )
+            page = await inbox.list(scott_id)
+            assert [item.kind for item in page.notifications] == ["reply"]
+            await _record(
+                store,
+                scott_id,
+                channel_id,
+                "self-reply",
+                "Scott self reply",
+                thread_root_id=root_id,
+            )
+            assert (await inbox.counts(scott_id)).total == 1
+
+            initial = await policy.inspect(authority)
+            all_messages = await policy.set_channel_level(
+                authority,
+                channel_id,
+                "all",
+                expected_revision=initial.revision,
+            )
+            await _record(store, daniel_id, channel_id, "ordinary-all", "Ordinary all")
+            page = await inbox.list(scott_id)
+            assert [item.kind for item in page.notifications[:2]] == ["message", "reply"]
+
+            muted = await policy.set_channel_level(
+                authority,
+                channel_id,
+                "muted",
+                expected_revision=all_messages.revision,
+            )
+            suppressed = await policy.set_muted_mentions_notify(
+                authority,
+                False,
+                expected_revision=muted.revision,
+            )
+            await _record(store, daniel_id, channel_id, "muted-suppressed", "@scott suppressed")
+            assert (await inbox.counts(scott_id)).total == 2
+
+            await policy.set_muted_mentions_notify(
+                authority,
+                True,
+                expected_revision=suppressed.revision,
+            )
+            await _record(store, daniel_id, channel_id, "muted-override", "@scott override")
+            page = await inbox.list(scott_id)
+            assert page.notifications[0].kind == "mention"
+            assert page.counts.total == 3
+        finally:
+            await policy.close()
+            await store.close()
+
+    async def test_dnd_policy_is_validated_and_survives_restart(self, tmp_path: Path) -> None:
+        path = tmp_path / "kai.db"
+        store, _daniel_id, scott_id, _channel_id, _agent_id = await _notification_context(path)
+        registry = await WorkshopExecutionStateRegistry.from_store(store, profile_registry(101, 202))
+        policy = await WorkshopChannelNotificationPolicyService.open(path, registry)
+        authority = policy.authority_for_principal(scott_id)
+        initial = await policy.inspect(authority)
+        with pytest.raises(WorkshopChannelNotificationPolicyValidationError):
+            await policy.set_do_not_disturb(
+                authority,
+                enabled=True,
+                timezone="Not/A_Zone",
+                start="22:00",
+                end="07:00",
+                expected_revision=initial.revision,
+            )
+        saved = await policy.set_do_not_disturb(
+            authority,
+            enabled=True,
+            timezone="America/Toronto",
+            start="22:30",
+            end="06:45",
+            expected_revision=initial.revision,
+        )
+        assert saved.do_not_disturb.enabled is True
+        assert workshop_channel_notification_policy_status(path) == (
+            "Workshop channel notification policy: active; principals=1, channel overrides=0, "
+            "DND enabled=1, invalid=0; authority=canonical, Workshop=in-app immediate"
+        )
+        assert (
+            await policy.external_delivery_allowed(
+                scott_id,
+                datetime(2026, 8, 31, 3, 0, tzinfo=UTC),
+            )
+            is False
+        )
+        assert (
+            await policy.external_delivery_allowed(
+                scott_id,
+                datetime(2026, 8, 31, 16, 0, tzinfo=UTC),
+            )
+            is True
+        )
+        await policy.close()
+
+        reopened = await WorkshopChannelNotificationPolicyService.open(path, registry)
+        try:
+            restarted = await reopened.inspect(reopened.authority_for_principal(scott_id))
+            assert restarted.do_not_disturb.timezone == "America/Toronto"
+            assert restarted.do_not_disturb.start == "22:30"
+            assert restarted.do_not_disturb.end == "06:45"
+        finally:
+            await reopened.close()
+            await store.close()
+
     async def test_resolved_human_mentions_create_one_private_replayable_notification(
         self,
         tmp_path: Path,

@@ -71,6 +71,16 @@ from kai.workshop.channel_lifecycle import (
     WorkshopHumanMembershipMutation,
     WorkshopHumanMembershipSnapshot,
 )
+from kai.workshop.channel_notification_policy import (
+    ChannelNotificationPolicyAuthority,
+    ChannelNotificationPolicySnapshot,
+    WorkshopChannelNotificationPolicyAccessDenied,
+    WorkshopChannelNotificationPolicyConflict,
+    WorkshopChannelNotificationPolicyError,
+    WorkshopChannelNotificationPolicyService,
+    WorkshopChannelNotificationPolicyStorageError,
+    WorkshopChannelNotificationPolicyValidationError,
+)
 from kai.workshop.client_commands import (
     ClientCommandExecutorUnavailableError,
     ClientCommandSubmission,
@@ -276,6 +286,7 @@ _PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
 _PREFERENCE_RESTORE_PATH = "/v1/preferences/revisions/{preference_revision}/restore"
 _GITHUB_SETTINGS_PATH = "/v1/settings/github"
 _NOTIFICATION_PREFERENCES_PATH = "/v1/settings/notifications"
+_CHANNEL_NOTIFICATION_POLICY_PATH = "/v1/settings/channel-notifications"
 _CLIENT_PREFERENCES_PATH = "/v1/settings/clients"
 _APPEARANCE_PREFERENCES_PATH = "/v1/settings/appearance"
 _HUMAN_NOTIFICATIONS_PATH = "/v1/client/notifications"
@@ -319,6 +330,10 @@ _GITHUB_TOGGLE_FIELDS = frozenset({"field", "enabled"})
 _MAX_GITHUB_SETTINGS_BODY_BYTES = 10_240
 _NOTIFICATION_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "integration_class", "destination_choice_id", "reset"})
 _MAX_NOTIFICATION_PREFERENCE_BODY_BYTES = 2_048
+_CHANNEL_NOTIFICATION_POLICY_REQUEST_FIELDS = frozenset(
+    {"revision", "channel", "muted_mentions_notify", "do_not_disturb"}
+)
+_MAX_CHANNEL_NOTIFICATION_POLICY_BODY_BYTES = 4_096
 _CLIENT_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "binding_choice_id", "mode", "voice"})
 _MAX_CLIENT_PREFERENCE_BODY_BYTES = 2_048
 _APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
@@ -595,6 +610,40 @@ def _serialize_notification_preferences(
             }
             for item in snapshot.preferences
         ],
+        "revision": snapshot.revision,
+        "mutation": (
+            {
+                "operation": snapshot.mutation.operation,
+                "changed": snapshot.mutation.changed,
+            }
+            if snapshot.mutation is not None
+            else None
+        ),
+    }
+
+
+def _serialize_channel_notification_policy(
+    snapshot: ChannelNotificationPolicySnapshot,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "levels": ["all", "mentions_replies", "muted"],
+        "channels": [
+            {
+                "channel_id": str(item.channel_id),
+                "channel_name": item.channel_name,
+                "level": item.level,
+                "source": item.source,
+            }
+            for item in snapshot.channels
+        ],
+        "muted_mentions_notify": snapshot.muted_mentions_notify,
+        "do_not_disturb": {
+            "enabled": snapshot.do_not_disturb.enabled,
+            "timezone": snapshot.do_not_disturb.timezone,
+            "start": snapshot.do_not_disturb.start,
+            "end": snapshot.do_not_disturb.end,
+        },
         "revision": snapshot.revision,
         "mutation": (
             {
@@ -1956,6 +2005,156 @@ async def _handle_notification_preference_update(
     except WorkshopNotificationPreferenceError as exc:
         return _notification_preference_error_response(exc)
     return _json_response(_serialize_notification_preferences(snapshot), status=200)
+
+
+async def _authenticate_channel_notification_policy_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelNotificationPolicyService,
+) -> tuple[ChannelNotificationPolicyAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopChannelNotificationPolicyAccessDenied:
+        return None, _error_response(status=403, code="access_denied", message="Access denied")
+
+
+def _channel_notification_policy_error_response(
+    exc: WorkshopChannelNotificationPolicyError,
+) -> web.Response:
+    if isinstance(exc, WorkshopChannelNotificationPolicyConflict):
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    if isinstance(exc, WorkshopChannelNotificationPolicyValidationError):
+        return _error_response(status=400, code="invalid_setting", message=str(exc))
+    if isinstance(exc, WorkshopChannelNotificationPolicyAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopChannelNotificationPolicyStorageError):
+        return _error_response(
+            status=503,
+            code="channel_notification_policy_unavailable",
+            message="Channel notification policy is temporarily unavailable",
+        )
+    return _error_response(
+        status=503,
+        code="channel_notification_policy_unavailable",
+        message="Channel notification policy is temporarily unavailable",
+    )
+
+
+async def _channel_notification_policy_json_object(request: web.Request) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopChannelNotificationPolicyValidationError("Content-Type must be application/json")
+    if request.content_length is not None and request.content_length > _MAX_CHANNEL_NOTIFICATION_POLICY_BODY_BYTES:
+        raise WorkshopChannelNotificationPolicyValidationError("Notification policy request is too large")
+    raw = await request.content.read(_MAX_CHANNEL_NOTIFICATION_POLICY_BODY_BYTES + 1)
+    if len(raw) > _MAX_CHANNEL_NOTIFICATION_POLICY_BODY_BYTES:
+        raise WorkshopChannelNotificationPolicyValidationError("Notification policy request is too large")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopChannelNotificationPolicyValidationError("Invalid JSON request") from exc
+    if not isinstance(payload, dict):
+        raise WorkshopChannelNotificationPolicyValidationError("Invalid notification policy request")
+    return payload
+
+
+async def _handle_channel_notification_policy(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelNotificationPolicyService,
+) -> web.Response:
+    authority, error = await _authenticate_channel_notification_policy_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid notification policy request")
+    try:
+        snapshot = await service.inspect(authority)
+    except WorkshopChannelNotificationPolicyError as exc:
+        return _channel_notification_policy_error_response(exc)
+    return _json_response(_serialize_channel_notification_policy(snapshot), status=200)
+
+
+async def _handle_channel_notification_policy_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopChannelNotificationPolicyService,
+) -> web.Response:
+    authority, error = await _authenticate_channel_notification_policy_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid notification policy request")
+    try:
+        payload = await _channel_notification_policy_json_object(request)
+        if not set(payload).issubset(_CHANNEL_NOTIFICATION_POLICY_REQUEST_FIELDS):
+            raise WorkshopChannelNotificationPolicyValidationError("Invalid notification policy request")
+        revision = payload.get("revision")
+        if not isinstance(revision, str):
+            raise WorkshopChannelNotificationPolicyValidationError("Notification policy revision is required")
+        operations = sum(field in payload for field in ("channel", "muted_mentions_notify", "do_not_disturb"))
+        if operations != 1 or len(payload) != 2:
+            raise WorkshopChannelNotificationPolicyValidationError(
+                "Change exactly one notification policy setting at a time"
+            )
+        if "channel" in payload:
+            channel = payload["channel"]
+            if not isinstance(channel, dict) or set(channel) != {"channel_id", "level"}:
+                raise WorkshopChannelNotificationPolicyValidationError("Invalid channel notification policy")
+            channel_id = channel.get("channel_id")
+            level = channel.get("level")
+            if not isinstance(channel_id, str) or not isinstance(level, str):
+                raise WorkshopChannelNotificationPolicyValidationError("Invalid channel notification policy")
+            snapshot = await service.set_channel_level(
+                authority,
+                channel_id,
+                level,
+                expected_revision=revision,
+            )
+        elif "muted_mentions_notify" in payload:
+            enabled = payload["muted_mentions_notify"]
+            if not isinstance(enabled, bool):
+                raise WorkshopChannelNotificationPolicyValidationError("Muted mention override must be true or false")
+            snapshot = await service.set_muted_mentions_notify(
+                authority,
+                enabled,
+                expected_revision=revision,
+            )
+        else:
+            dnd = payload["do_not_disturb"]
+            if not isinstance(dnd, dict) or set(dnd) != {"enabled", "timezone", "start", "end"}:
+                raise WorkshopChannelNotificationPolicyValidationError("Invalid DND policy")
+            dnd_enabled = dnd.get("enabled")
+            if not isinstance(dnd_enabled, bool):
+                raise WorkshopChannelNotificationPolicyValidationError("DND enabled must be true or false")
+            snapshot = await service.set_do_not_disturb(
+                authority,
+                enabled=dnd_enabled,
+                timezone=dnd.get("timezone"),
+                start=dnd.get("start"),
+                end=dnd.get("end"),
+                expected_revision=revision,
+            )
+    except WorkshopChannelNotificationPolicyError as exc:
+        return _channel_notification_policy_error_response(exc)
+    return _json_response(_serialize_channel_notification_policy(snapshot), status=200)
 
 
 async def _authenticate_client_preference_authority(
@@ -5615,6 +5814,7 @@ def register_workshop_read_routes(
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
+    channel_notification_policy: WorkshopChannelNotificationPolicyService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
@@ -6026,6 +6226,29 @@ def register_workshop_read_routes(
         app.router.add_patch(
             _NOTIFICATION_PREFERENCES_PATH,
             handle_notification_preference_update,
+        )
+    if channel_notification_policy is not None:
+
+        async def handle_channel_notification_policy(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_channel_notification_policy(
+                    request,
+                    authenticator=authenticator,
+                    service=channel_notification_policy,
+                )
+
+        async def handle_channel_notification_policy_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_channel_notification_policy_update(
+                    request,
+                    authenticator=authenticator,
+                    service=channel_notification_policy,
+                )
+
+        app.router.add_get(_CHANNEL_NOTIFICATION_POLICY_PATH, handle_channel_notification_policy)
+        app.router.add_patch(
+            _CHANNEL_NOTIFICATION_POLICY_PATH,
+            handle_channel_notification_policy_update,
         )
     if client_preferences is not None:
 

@@ -71,6 +71,7 @@ from kai.workshop.agent_delegation import (
 from kai.workshop.agent_enablement import WorkshopAgentEnablementService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import MAX_ARTIFACT_BYTES, WorkshopArtifactService
+from kai.workshop.channel_notification_policy import WorkshopChannelNotificationPolicyService
 from kai.workshop.client_api import (
     WorkshopClientCommandSubmitter,
     WorkshopEnrollmentRateLimiter,
@@ -1894,6 +1895,7 @@ async def _register_workshop_client_api(
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
+    channel_notification_policy: WorkshopChannelNotificationPolicyService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
@@ -1936,6 +1938,7 @@ async def _register_workshop_client_api(
             preference_documents=preference_documents,
             github_settings=github_settings,
             notification_preferences=notification_preferences,
+            channel_notification_policy=channel_notification_policy,
             client_preferences=client_preferences,
             appearance_preferences=appearance_preferences,
             agent_enablement=agent_enablement,
@@ -2022,6 +2025,7 @@ async def start(
             preference_documents=core_services.preference_documents,
             github_settings=getattr(core_services, "github_settings", None),
             notification_preferences=getattr(core_services, "notification_preferences", None),
+            channel_notification_policy=getattr(core_services, "channel_notification_policy", None),
             client_preferences=getattr(core_services, "client_preferences", None),
             appearance_preferences=getattr(core_services, "appearance_preferences", None),
             agent_enablement=getattr(core_services, "agent_enablement", None),

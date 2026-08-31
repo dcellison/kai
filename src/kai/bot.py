@@ -61,6 +61,11 @@ from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 from kai.workshop.artifacts import StagedArtifact
+from kai.workshop.channel_notification_policy import (
+    ChannelNotificationPolicyAuthority,
+    WorkshopChannelNotificationPolicyError,
+    WorkshopChannelNotificationPolicyService,
+)
 from kai.workshop.client_preferences import (
     VOICE_MODE_OFF,
     VOICE_MODE_TEXT_AND_VOICE,
@@ -353,6 +358,25 @@ def _canonical_notification_preference_authority(
     """Resolve a Telegram binding to principal-owned delivery preferences."""
     services = _get_core_services(context)
     service = getattr(services, "notification_preferences", None)
+    if service is None:
+        return None
+    try:
+        storage = services.principal_storage.for_runtime_config_id(runtime_config_id)
+    except WorkshopStorageNamespaceError:
+        return None
+    return service, service.authority_for_principal_profile(
+        storage.principal_id,
+        storage.runtime_profile_id,
+    )
+
+
+def _canonical_channel_notification_policy_authority(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime_config_id: int,
+) -> tuple[WorkshopChannelNotificationPolicyService, ChannelNotificationPolicyAuthority] | None:
+    """Resolve a Telegram binding to principal-owned channel notification policy."""
+    services = _get_core_services(context)
+    service = getattr(services, "channel_notification_policy", None)
     if service is None:
         return None
     try:
@@ -3589,8 +3613,107 @@ async def handle_notifications(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Show or change canonical personal integration destinations."""
+    """Show or change canonical personal notification policy."""
     assert update.message is not None
+    args = context.args or []
+    channel_policy = _canonical_channel_notification_policy_authority(context, _chat_id(update))
+    if args and args[0].strip().lower() in {"channels", "channel", "muted-mentions", "dnd"}:
+        if channel_policy is None:
+            await update.message.reply_text("Canonical channel notification policy is unavailable.")
+            return
+        service, authority = channel_policy
+        try:
+            snapshot = await service.inspect(authority)
+            action = args[0].strip().lower()
+            if action == "channels" or (action == "channel" and len(args) == 1):
+                lines = ["Channel notifications:"]
+                lines.extend(
+                    f"{index}. {item.channel_name}: {item.level.replace('_', ' ')}"
+                    for index, item in enumerate(snapshot.channels, start=1)
+                )
+                lines.extend(
+                    [
+                        "",
+                        "Use /notifications channel <number> <all|mentions|muted>.",
+                        "Direct mentions in muted channels: "
+                        + ("notify" if snapshot.muted_mentions_notify else "suppress"),
+                    ]
+                )
+                await update.message.reply_text("\n".join(lines))
+                return
+            if action == "channel":
+                if len(args) != 3:
+                    await update.message.reply_text("Usage: /notifications channel <number> <all|mentions|muted>")
+                    return
+                try:
+                    index = int(args[1])
+                except ValueError:
+                    index = 0
+                if index < 1 or index > len(snapshot.channels):
+                    await update.message.reply_text("Channel must be a number from /notifications channels.")
+                    return
+                level = args[2].strip().lower()
+                level = "mentions_replies" if level == "mentions" else level
+                changed = await service.set_channel_level(
+                    authority,
+                    snapshot.channels[index - 1].channel_id,
+                    level,
+                    expected_revision=snapshot.revision,
+                )
+                selected = changed.channels[index - 1]
+                await update.message.reply_text(f"{selected.channel_name}: {selected.level.replace('_', ' ')}.")
+                return
+            if action == "muted-mentions":
+                if len(args) != 2 or args[1].strip().lower() not in {"on", "off"}:
+                    await update.message.reply_text("Usage: /notifications muted-mentions <on|off>")
+                    return
+                enabled = args[1].strip().lower() == "on"
+                await service.set_muted_mentions_notify(
+                    authority,
+                    enabled,
+                    expected_revision=snapshot.revision,
+                )
+                await update.message.reply_text(
+                    "Direct mentions in muted channels will " + ("notify." if enabled else "be suppressed.")
+                )
+                return
+            dnd = snapshot.do_not_disturb
+            if len(args) == 1:
+                state = "on" if dnd.enabled else "off"
+                await update.message.reply_text(
+                    f"Do not disturb: {state}\nSchedule: {dnd.start}-{dnd.end} {dnd.timezone}\n\n"
+                    "Use /notifications dnd off or "
+                    "/notifications dnd on <timezone> <HH:MM> <HH:MM>."
+                )
+                return
+            if len(args) == 2 and args[1].strip().lower() == "off":
+                await service.set_do_not_disturb(
+                    authority,
+                    enabled=False,
+                    timezone=dnd.timezone,
+                    start=dnd.start,
+                    end=dnd.end,
+                    expected_revision=snapshot.revision,
+                )
+                await update.message.reply_text("Do not disturb is off.")
+                return
+            if len(args) == 5 and args[1].strip().lower() == "on":
+                changed = await service.set_do_not_disturb(
+                    authority,
+                    enabled=True,
+                    timezone=args[2],
+                    start=args[3],
+                    end=args[4],
+                    expected_revision=snapshot.revision,
+                )
+                dnd = changed.do_not_disturb
+                await update.message.reply_text(f"Do not disturb: {dnd.start}-{dnd.end} {dnd.timezone}.")
+                return
+            await update.message.reply_text("Usage: /notifications dnd [off|on <timezone> <HH:MM> <HH:MM>]")
+        except WorkshopChannelNotificationPolicyError as exc:
+            await update.message.reply_text(str(exc))
+        return
+
     canonical = _canonical_notification_preference_authority(
         context,
         _chat_id(update),
@@ -3599,7 +3722,6 @@ async def handle_notifications(
         await update.message.reply_text("Canonical notification destinations are unavailable.")
         return
 
-    args = context.args or []
     if not args:
         service, authority = canonical
         snapshot = await service.inspect(authority)
@@ -3610,6 +3732,8 @@ async def handle_notifications(
                 "",
                 "Use /notifications github to view GitHub destinations.",
                 "Use /notifications generic to view generic-webhook destinations.",
+                "Use /notifications channels to view channel policy.",
+                "Use /notifications dnd to view do-not-disturb.",
             ]
         )
         await update.message.reply_text("\n".join(lines))
@@ -3620,7 +3744,10 @@ async def handle_notifications(
         GITHUB_INTEGRATION_CLASS,
         GENERIC_INTEGRATION_CLASS,
     }:
-        await update.message.reply_text("Usage: /notifications <github|generic> [number|reset]")
+        await update.message.reply_text(
+            "Usage: /notifications <github|generic> [number|reset]\n"
+            "Or: /notifications <channels|channel|muted-mentions|dnd>"
+        )
         return
     await _handle_notification_destination(
         update,

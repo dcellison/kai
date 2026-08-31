@@ -313,7 +313,7 @@ class TestWorkshopClientSecurityStateIsolation:
             await upgraded.rebuild_projection(CanonicalConversationProjection())
             after = {table: await security_rows(table) for table in before}
 
-            assert await upgraded.schema_version() == 53
+            assert await upgraded.schema_version() == schema.WORKSHOP_SCHEMA_VERSION
             assert after == before
             async with upgraded.connection.execute("PRAGMA foreign_key_check") as cursor:
                 assert await cursor.fetchall() == []

@@ -23,6 +23,7 @@ from kai.workshop.agent_delegation import WorkshopAgentDelegationService
 from kai.workshop.agent_enablement import WorkshopAgentEnablementService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import WorkshopArtifactService
+from kai.workshop.channel_notification_policy import WorkshopChannelNotificationPolicyService
 from kai.workshop.claude_model_discovery import ClaudeModelDiscoveryAdapter
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
 from kai.workshop.client_preferences import (
@@ -197,6 +198,7 @@ class KaiCoreServices:
     preference_documents: WorkshopPreferenceService
     github_settings: WorkshopGitHubSettingsService
     notification_preferences: WorkshopNotificationPreferenceService
+    channel_notification_policy: WorkshopChannelNotificationPolicyService
     client_preferences: WorkshopClientPreferenceService
     appearance_preferences: WorkshopAppearancePreferenceService
     agent_enablement: WorkshopAgentEnablementService
@@ -284,6 +286,7 @@ class KaiApplicationHost:
         post_run_effects: WorkshopPostRunEffectService | None = None
         github_settings: WorkshopGitHubSettingsService | None = None
         notification_preferences: WorkshopNotificationPreferenceService | None = None
+        channel_notification_policy: WorkshopChannelNotificationPolicyService | None = None
         client_preferences: WorkshopClientPreferenceService | None = None
         appearance_preferences: WorkshopAppearancePreferenceService | None = None
         model_catalogue: WorkshopModelCatalogueService | None = None
@@ -416,6 +419,10 @@ class KaiApplicationHost:
                 Path(self._config.session_db_path),
                 self._execution_state,
             )
+            channel_notification_policy = await WorkshopChannelNotificationPolicyService.open(
+                Path(self._config.session_db_path),
+                self._execution_state,
+            )
             client_preferences = await WorkshopClientPreferenceService.open(
                 Path(self._config.session_db_path),
                 self._client_voice_capabilities,
@@ -482,6 +489,7 @@ class KaiApplicationHost:
                 preference_documents=preference_documents,
                 github_settings=github_settings,
                 notification_preferences=notification_preferences,
+                channel_notification_policy=channel_notification_policy,
                 client_preferences=client_preferences,
                 appearance_preferences=appearance_preferences,
                 agent_enablement=agent_enablement,
@@ -506,6 +514,8 @@ class KaiApplicationHost:
                 await github_settings.close()
             if notification_preferences is not None:
                 await notification_preferences.close()
+            if channel_notification_policy is not None:
+                await channel_notification_policy.close()
             if client_preferences is not None:
                 await client_preferences.close()
             if appearance_preferences is not None:
@@ -579,6 +589,7 @@ class KaiApplicationHost:
             services.integration_notifications.close,
             services.github_settings.close,
             services.notification_preferences.close,
+            services.channel_notification_policy.close,
             services.client_preferences.close,
             services.appearance_preferences.close,
             services.model_catalogue.close,

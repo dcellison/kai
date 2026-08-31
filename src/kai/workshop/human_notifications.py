@@ -172,11 +172,11 @@ def _decode_cursor(value: object) -> tuple[int, HumanNotificationId]:
         raise WorkshopHumanNotificationValidationError("Invalid notification cursor") from exc
 
 
-async def append_human_mention_notifications_in_transaction(
+async def append_human_notifications_in_transaction(
     store: WorkshopEventStore,
     message_event: StoredEvent,
 ) -> tuple[AppendResult, ...]:
-    """Append notification facts from resolved mentions on one message event."""
+    """Append policy-qualified notification facts for one canonical message."""
     if not store.connection.in_transaction:
         raise RuntimeError("Notification creation requires an active transaction")
     envelope = message_event.envelope
@@ -189,27 +189,87 @@ async def append_human_mention_notifications_in_transaction(
     if not isinstance(raw_mentions, list):
         raise RuntimeError("Canonical message mentions are malformed")
     source_channel_id = ChannelId(str(envelope.payload["channel_id"]))
+    async with store.connection.execute(
+        "SELECT kind FROM channels WHERE id = ?",
+        (source_channel_id,),
+    ) as cursor:
+        source_channel = await cursor.fetchone()
+    if source_channel is None or str(source_channel[0]) != "group":
+        return ()
     source_thread_root = envelope.payload.get("thread_root_id")
     if source_thread_root is not None:
         source_thread_root = MessageId(str(source_thread_root))
     author_principal_id = PrincipalId(str(envelope.payload["author_principal_id"]))
-    recipients: set[PrincipalId] = set()
+    mentioned_recipients: set[PrincipalId] = set()
     for raw in raw_mentions:
         if not isinstance(raw, dict) or raw.get("kind") != "human":
             continue
         try:
-            recipients.add(PrincipalId(str(raw["principal_id"])))
+            mentioned_recipients.add(PrincipalId(str(raw["principal_id"])))
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("Canonical human mention is malformed") from exc
+
+    async with store.connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('human_notifications', 'principal_channel_notification_policies', "
+        "'principal_human_notification_policies')"
+    ) as cursor:
+        notification_tables = {str(row[0]) for row in await cursor.fetchall()}
+    if "human_notifications" not in notification_tables:
+        return ()
+    policy_available = {
+        "principal_channel_notification_policies",
+        "principal_human_notification_policies",
+    } <= notification_tables
+
+    reply_recipient: PrincipalId | None = None
+    reply_target = envelope.payload.get("reply_to_message_id") or source_thread_root
+    if reply_target is not None:
+        async with store.connection.execute(
+            "SELECT author_principal_id FROM messages WHERE id = ? AND channel_id = ?",
+            (reply_target, source_channel_id),
+        ) as cursor:
+            root = await cursor.fetchone()
+        if root is not None:
+            reply_recipient = PrincipalId(str(root[0]))
+
+    if policy_available:
+        async with store.connection.execute(
+            "SELECT p.id, COALESCE(cp.level, 'mentions_replies'), "
+            "COALESCE(pp.muted_mentions_notify, 1) FROM channel_memberships cm "
+            "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+            "LEFT JOIN principal_channel_notification_policies cp "
+            "ON cp.principal_id = p.id AND cp.channel_id = cm.channel_id "
+            "LEFT JOIN principal_human_notification_policies pp ON pp.principal_id = p.id "
+            "WHERE cm.channel_id = ? AND p.id != ? ORDER BY p.id",
+            (source_channel_id, author_principal_id),
+        ) as cursor:
+            policy_rows = tuple(await cursor.fetchall())
+    else:
+        policy_rows = tuple((recipient_id, "mentions_replies", 1) for recipient_id in mentioned_recipients)
+
+    recipients: list[tuple[PrincipalId, str]] = []
+    for row in policy_rows:
+        recipient_id = PrincipalId(str(row[0]))
+        level = str(row[1])
+        is_mention = recipient_id in mentioned_recipients
+        is_reply = recipient_id == reply_recipient
+        notify = (
+            level == "all"
+            or (level == "mentions_replies" and (is_mention or is_reply))
+            or (level == "muted" and is_mention and bool(row[2]))
+        )
+        if notify:
+            recipients.append((recipient_id, "mention" if is_mention else "reply" if is_reply else "message"))
     results: list[AppendResult] = []
-    for recipient_id in sorted(recipients):
+    for recipient_id, kind in recipients:
         notification_id = HumanNotificationId.derived(
             envelope.workshop_id,
             f"human-mention:{envelope.aggregate_id}:{recipient_id}",
         )
         notification = EventEnvelope.create(
             event_type=WorkshopEventType.HUMAN_NOTIFICATION_CREATED,
-            event_version=1,
+            event_version=2 if policy_available else 1,
             workshop_id=envelope.workshop_id,
             aggregate_type="human_notification",
             aggregate_id=notification_id,
@@ -221,12 +281,20 @@ async def append_human_mention_notifications_in_transaction(
                 "source_message_id": envelope.aggregate_id,
                 "source_channel_id": source_channel_id,
                 "source_thread_root_id": source_thread_root,
-                "kind": "mention",
+                "kind": kind,
             },
-            metadata={"source": "canonical_message_mention"},
+            metadata={"source": "canonical_message_notification_policy"},
         )
         results.append(await store.append_in_transaction(notification))
     return tuple(results)
+
+
+async def append_human_mention_notifications_in_transaction(
+    store: WorkshopEventStore,
+    message_event: StoredEvent,
+) -> tuple[AppendResult, ...]:
+    """Compatibility name for canonical policy-qualified notification creation."""
+    return await append_human_notifications_in_transaction(store, message_event)
 
 
 class WorkshopHumanNotificationService:
