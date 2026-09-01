@@ -28,6 +28,7 @@ from kai.workshop.domain import (
     AgentEnablementId,
     AgentId,
     ChannelId,
+    ChannelReadPositionId,
     HumanNotificationId,
     MessageId,
     PrincipalId,
@@ -1104,7 +1105,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 21
+    version = 22
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1129,6 +1130,7 @@ class CanonicalConversationProjection:
             "human_notification_adapter_delivery_decisions",
             "human_notification_publications",
             "human_notifications",
+            "channel_read_positions",
             "messages",
             "principal_agent_enablements",
             "channel_agent_dismissals",
@@ -1347,6 +1349,35 @@ class CanonicalConversationProjection:
                     occurred_at,
                 ),
             )
+            if await _table_has_column(connection, "channel_read_positions", "principal_id"):
+                async with connection.execute(
+                    "SELECT kind FROM principals WHERE id = ?",
+                    (principal_id,),
+                ) as cursor:
+                    principal_row = await cursor.fetchone()
+                if principal_row is not None and str(principal_row[0]) == "human":
+                    async with connection.execute(
+                        "SELECT baseline_event_position FROM channel_unread_migration_baselines "
+                        "WHERE principal_id = ? AND channel_id = ?",
+                        (principal_id, channel_id),
+                    ) as cursor:
+                        cutover_row = await cursor.fetchone()
+                    baseline = max(
+                        event.position,
+                        int(cutover_row[0]) if cutover_row is not None else 0,
+                    )
+                    await connection.execute(
+                        "INSERT INTO channel_read_positions "
+                        "(principal_id, channel_id, membership_baseline_event_position, "
+                        "read_through_event_position, read_through_message_id, state_version, "
+                        "last_event_position, updated_at) VALUES (?, ?, ?, ?, NULL, 0, ?, ?) "
+                        "ON CONFLICT(principal_id, channel_id) DO UPDATE SET "
+                        "membership_baseline_event_position = excluded.membership_baseline_event_position, "
+                        "read_through_event_position = excluded.read_through_event_position, "
+                        "read_through_message_id = NULL, state_version = 0, "
+                        "last_event_position = excluded.last_event_position, updated_at = excluded.updated_at",
+                        (principal_id, channel_id, baseline, baseline, event.position, occurred_at),
+                    )
             if envelope.event_version == 2:
                 await connection.execute(
                     "UPDATE channels SET membership_event_position = ? WHERE id = ?",
@@ -2366,6 +2397,59 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop human notification state revision is stale or unauthorized")
+        elif envelope.event_type == WorkshopEventType.CHANNEL_READ_POSITION_ADVANCED:
+            if not isinstance(envelope.aggregate_id, ChannelReadPositionId):
+                raise ValueError("Workshop channel read position requires a typed aggregate")
+            _require_exact_payload(
+                payload,
+                {"principal_id", "channel_id", "message_id", "expected_state_version"},
+            )
+            principal_id = PrincipalId(_required_text(payload, "principal_id"))
+            channel_id = ChannelId(_required_text(payload, "channel_id"))
+            message_id = MessageId(_required_text(payload, "message_id"))
+            expected_version = payload.get("expected_state_version")
+            if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
+                raise ValueError("Workshop channel read position state version is invalid")
+            if envelope.actor_principal_id != principal_id:
+                raise ValueError("Workshop channel read position actor must match its principal")
+            async with connection.execute(
+                "SELECT m.created_event_position, m.thread_root_id, p.kind, e.metadata_json, "
+                "rp.read_through_event_position FROM channel_read_positions rp "
+                "JOIN channel_memberships cm ON cm.channel_id = rp.channel_id "
+                "AND cm.principal_id = rp.principal_id "
+                "JOIN messages m ON m.id = ? AND m.channel_id = rp.channel_id "
+                "JOIN principals p ON p.id = m.author_principal_id "
+                "JOIN event_log e ON e.position = m.created_event_position "
+                "WHERE rp.principal_id = ? AND rp.channel_id = ? AND rp.state_version = ?",
+                (message_id, principal_id, channel_id, expected_version),
+            ) as cursor:
+                source = await cursor.fetchone()
+            if (
+                source is None
+                or source[1] is not None
+                or (str(source[2]) == "human" and json.loads(str(source[3])).get("source") == "scheduled_job")
+                or int(source[0]) <= int(source[4])
+            ):
+                raise ValueError("Workshop channel read position boundary is stale or unauthorized")
+            cursor = await connection.execute(
+                "UPDATE channel_read_positions SET read_through_event_position = ?, "
+                "read_through_message_id = ?, state_version = state_version + 1, "
+                "last_event_position = ?, updated_at = ? "
+                "WHERE principal_id = ? AND channel_id = ? AND state_version = ? "
+                "AND read_through_event_position < ?",
+                (
+                    int(source[0]),
+                    message_id,
+                    event.position,
+                    occurred_at,
+                    principal_id,
+                    channel_id,
+                    expected_version,
+                    int(source[0]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop channel read position revision is stale or unauthorized")
         elif envelope.event_type in {
             WorkshopEventType.MESSAGE_REACTION_ADDED,
             WorkshopEventType.MESSAGE_REACTION_REMOVED,

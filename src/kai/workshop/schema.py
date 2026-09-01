@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 59
+WORKSHOP_SCHEMA_VERSION = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -2688,6 +2688,55 @@ _OWNER_RUNTIME_SESSION_RECONCILIATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_CHANNEL_READ_POSITION_SCHEMA = SchemaMigration(
+    version=60,
+    name="canonical_channel_read_positions",
+    statements=(
+        # This cutover receipt deliberately survives projection rebuilds.  It
+        # prevents pre-authority history from becoming unread when the event
+        # projection is replayed from position zero.
+        """
+        CREATE TABLE channel_unread_migration_baselines (
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            baseline_event_position INTEGER NOT NULL CHECK (baseline_event_position >= 0),
+            captured_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, channel_id)
+        )
+        """,
+        "INSERT INTO channel_unread_migration_baselines "
+        "(principal_id, channel_id, baseline_event_position, captured_at) "
+        "SELECT cm.principal_id, cm.channel_id, "
+        "(SELECT COALESCE(MAX(position), 0) FROM event_log), "
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+        "FROM channel_memberships cm JOIN principals p ON p.id = cm.principal_id "
+        "AND p.kind = 'human'",
+        """
+        CREATE TABLE channel_read_positions (
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            membership_baseline_event_position INTEGER NOT NULL
+                CHECK (membership_baseline_event_position >= 0),
+            read_through_event_position INTEGER NOT NULL CHECK (read_through_event_position >= 0),
+            read_through_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+            last_event_position INTEGER NOT NULL CHECK (last_event_position >= 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, channel_id),
+            CHECK (read_through_event_position >= membership_baseline_event_position)
+        )
+        """,
+        "CREATE INDEX channel_read_positions_channel_idx ON channel_read_positions (channel_id, principal_id)",
+        "INSERT INTO channel_read_positions "
+        "(principal_id, channel_id, membership_baseline_event_position, "
+        "read_through_event_position, read_through_message_id, state_version, "
+        "last_event_position, updated_at) "
+        "SELECT principal_id, channel_id, baseline_event_position, "
+        "baseline_event_position, NULL, 0, baseline_event_position, captured_at "
+        "FROM channel_unread_migration_baselines",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2748,6 +2797,7 @@ _MIGRATIONS = (
     _SINGLE_OWNER_AGENT_AUTHORITY_SCHEMA,
     _EXPLICIT_AGENT_CONVERSATION_SCHEMA,
     _OWNER_RUNTIME_SESSION_RECONCILIATION_SCHEMA,
+    _CANONICAL_CHANNEL_READ_POSITION_SCHEMA,
 )
 
 
