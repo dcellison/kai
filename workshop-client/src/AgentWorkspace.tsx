@@ -432,7 +432,7 @@ export function AgentWorkspace({
       if (candidate && nextDefinitions.some((item) => item.definitionId === candidate)) {
         return candidate;
       }
-      return nextDefinitions[0]?.definitionId ?? null;
+      return null;
     });
   }, [initialDefinitionId, token]);
 
@@ -556,11 +556,6 @@ export function AgentWorkspace({
     }, 0);
     return () => window.clearTimeout(scroll);
   }, [initialSection, runtimeSession]);
-
-  const selectAgent = (definitionId: string): void => {
-    setSelectedDefinitionId(definitionId);
-    onSelectAgent(definitionId);
-  };
 
   const runMutation = async (
     operation: () => Promise<void>,
@@ -702,59 +697,6 @@ export function AgentWorkspace({
       </header>
 
       <div className="agent-workspace-body">
-        <aside className="agent-catalogue" aria-label="Agent catalogue">
-          {loading ? (
-            <p className="agent-state-copy">Loading agents…</p>
-          ) : definitions.length === 0 ? (
-            <p className="agent-state-copy">No agents are available.</p>
-          ) : (
-            <ul>
-              {definitions.map((definition) => {
-                const itemEnablement = enablements.find(
-                  (item) => item.definitionId === definition.definitionId,
-                );
-                return (
-                  <li key={definition.definitionId}>
-                    <button
-                      type="button"
-                      className={
-                        !creating && definition.definitionId === selectedDefinitionId
-                          ? "active"
-                          : ""
-                      }
-                      aria-current={
-                        !creating && definition.definitionId === selectedDefinitionId
-                          ? "page"
-                          : undefined
-                      }
-                      onClick={() => selectAgent(definition.definitionId)}
-                    >
-                      <span className="agent-catalogue-avatar" aria-hidden="true">
-                        {definition.presentation.avatar ||
-                          definition.displayName.slice(0, 1).toUpperCase()}
-                      </span>
-                      <span>
-                        <strong>{definition.displayName}</strong>
-                        <small>@{definition.handle}</small>
-                      </span>
-                      <span className={`agent-status ${definition.lifecycleState}`}>
-                        {definition.lifecycleState !== "active"
-                          ? definition.lifecycleState
-                          : itemEnablement?.canManage
-                            ? "owner"
-                            : itemEnablement?.lifecycleState === "enabled" &&
-                                itemEnablement.directChannelId
-                              ? "conversation started"
-                              : "available"}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </aside>
-
         <section className="agent-detail" aria-live="polite">
           {creating ? (
             <AgentCreationForm
@@ -1011,7 +953,7 @@ export function AgentWorkspace({
             <div className="agent-empty-detail">
               <span aria-hidden="true">@</span>
               <h2>No agent selected</h2>
-              <p>Choose an agent to inspect its definition and your runtime binding.</p>
+              <p>Choose an active agent from the sidebar or open the agent archive.</p>
             </div>
           )}
           {error && <p className="agent-workspace-error" role="alert">{error}</p>}

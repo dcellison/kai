@@ -2515,7 +2515,7 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
   });
 
-  it("lists every visible agent separately from started direct conversations", async () => {
+  it("uses the sidebar as the active agent catalogue and archives as the historical catalogue", async () => {
     const user = userEvent.setup();
     const qualificationDefinition: WorkshopAgentDefinition = {
       ...agentDefinition,
@@ -2543,9 +2543,23 @@ describe("Workshop React client", () => {
       runtimeProfileId: null,
       stateVersion: null,
     };
+    const archivedDefinition: WorkshopAgentDefinition = {
+      ...qualificationDefinition,
+      activeRevisionId: "adr_66666666666666666666666666666666",
+      agentId: "agt_66666666666666666666666666666666",
+      definitionId: "adf_66666666666666666666666666666666",
+      displayName: "Archived specialist",
+      handle: "archived_specialist",
+      lifecycleState: "archived",
+      revisions: qualificationDefinition.revisions.map((revision) => ({
+        ...revision,
+        revisionId: "adr_66666666666666666666666666666666",
+      })),
+    };
     vi.mocked(loadAgentDefinitions).mockResolvedValue([
       agentDefinition,
       qualificationDefinition,
+      archivedDefinition,
     ]);
     vi.mocked(loadAgentEnablements).mockResolvedValue([
       { ...agentEnablement, canManage: false },
@@ -2565,8 +2579,11 @@ describe("Workshop React client", () => {
     expect(
       sidebar.getByRole("button", { name: "Manage Qualification agent" }),
     ).toBeVisible();
-    expect(sidebar.getByText("conversation started")).toBeVisible();
-    expect(sidebar.getByText("available")).toBeVisible();
+    expect(sidebar.queryByText("conversation started")).toBeNull();
+    expect(sidebar.queryByText("available")).toBeNull();
+    expect(
+      sidebar.queryByRole("button", { name: "Manage Archived specialist" }),
+    ).toBeNull();
 
     await user.click(
       sidebar.getByRole("button", { name: "Manage Qualification agent" }),
@@ -2574,7 +2591,22 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
     ).toBeVisible();
+    expect(screen.queryByLabelText("Agent catalogue")).toBeNull();
     expect(screen.getByText("Conversation available")).toBeVisible();
+
+    await user.click(sidebar.getByRole("button", { name: "Archived agents" }));
+    const archive = await screen.findByRole("dialog", { name: "Archive" });
+    expect(within(archive).getByText("Archived specialist")).toBeVisible();
+    expect(within(archive).getByText("@archived_specialist")).toBeVisible();
+    await user.click(
+      within(archive).getByRole("button", {
+        name: "View archived agent Archived specialist",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Archived specialist", level: 2 }),
+    ).toBeVisible();
+    expect(screen.getByText(/This definition is archived/)).toBeVisible();
   });
 
   it("shows one shared agent definition without owner controls to another principal", async () => {
