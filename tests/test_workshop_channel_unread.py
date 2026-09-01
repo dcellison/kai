@@ -366,6 +366,7 @@ class TestChannelUnreadAuthority:
             await store.connection.execute("DROP TABLE channel_read_positions")
             await store.connection.execute("DROP TABLE channel_unread_migration_baselines")
             await store.connection.execute("DELETE FROM workshop_schema_migrations WHERE version = 60")
+            await store.connection.execute("DELETE FROM workshop_schema_migrations WHERE version = 61")
             await store.connection.commit()
             await migrate_workshop_schema(store.connection)
             state = await WorkshopChannelUnreadService(store).channel(scott_id, channel_id)
@@ -374,6 +375,25 @@ class TestChannelUnreadAuthority:
             assert state.last_event_position == state.membership_baseline_event_position
             await store.rebuild_projection(CanonicalConversationProjection())
             assert await WorkshopChannelUnreadService(store).channel(scott_id, channel_id) == state
+        finally:
+            await store.close()
+
+    async def test_version_sixty_one_repairs_an_installed_rebuild_boundary(self, tmp_path: Path) -> None:
+        store, _daniel_id, scott_id, channel_id, _agent_id = await _context(tmp_path / "kai.db")
+        try:
+            state = await WorkshopChannelUnreadService(store).channel(scott_id, channel_id)
+            assert state.membership_baseline_event_position > 0
+            await store.connection.execute(
+                "UPDATE channel_read_positions SET last_event_position = ? WHERE principal_id = ? AND channel_id = ?",
+                (state.membership_baseline_event_position - 1, scott_id, channel_id),
+            )
+            await store.connection.execute("DELETE FROM workshop_schema_migrations WHERE version = 61")
+            await store.connection.commit()
+
+            await migrate_workshop_schema(store.connection)
+
+            repaired = await WorkshopChannelUnreadService(store).channel(scott_id, channel_id)
+            assert repaired.last_event_position == repaired.membership_baseline_event_position
         finally:
             await store.close()
 

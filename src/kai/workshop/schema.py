@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 60
+WORKSHOP_SCHEMA_VERSION = 61
 
 
 @dataclass(frozen=True, slots=True)
@@ -2737,6 +2737,17 @@ _CANONICAL_CHANNEL_READ_POSITION_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_CHANNEL_READ_POSITION_BOUNDARY_REPAIR_SCHEMA = SchemaMigration(
+    version=61,
+    name="canonical_channel_read_position_boundary_repair",
+    statements=(
+        "UPDATE channel_read_positions SET "
+        "last_event_position = membership_baseline_event_position, "
+        "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+        "WHERE last_event_position < membership_baseline_event_position",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2798,6 +2809,7 @@ _MIGRATIONS = (
     _EXPLICIT_AGENT_CONVERSATION_SCHEMA,
     _OWNER_RUNTIME_SESSION_RECONCILIATION_SCHEMA,
     _CANONICAL_CHANNEL_READ_POSITION_SCHEMA,
+    _CANONICAL_CHANNEL_READ_POSITION_BOUNDARY_REPAIR_SCHEMA,
 )
 
 
