@@ -526,7 +526,7 @@ describe("Settings workspace", () => {
     expect(screen.queryByLabelText("Operator-managed model ID")).toBeNull();
   });
 
-  it("groups compact agent runtime controls into explicit paired rows", async () => {
+  it("uses compact agent headings and explicit natural-height card stacks", async () => {
     renderAgentRuntime();
 
     expect(await screen.findByRole("heading", { name: "Runtime settings" })).toBeVisible();
@@ -534,29 +534,35 @@ describe("Settings workspace", () => {
     expect(controls).toHaveClass("agent-runtime-controls");
     expect(controls).not.toHaveClass("settings-workspace");
     expect(controls?.querySelector(".settings-scroll")).toBeNull();
-    expect(screen.getByText("01")).toBeVisible();
+    expect(screen.queryByText("Your runtime")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Runtime and workspace" })).toBeNull();
+    expect(screen.queryByText("01")).toBeNull();
     expect(screen.getByRole("heading", { name: "Workspace settings" })).toBeVisible();
-    expect(screen.getByText("02")).toBeVisible();
+    expect(screen.queryByText("02")).toBeNull();
 
-    const backendPair = screen.getByLabelText("Backend").closest(".settings-card-pair");
-    expect(backendPair).not.toBeNull();
-    expect(within(backendPair as HTMLElement).getByText("Policy-controlled")).toBeVisible();
+    const backendColumn = screen.getByLabelText("Backend").closest(".settings-card-column");
+    expect(backendColumn).not.toBeNull();
+    expect(within(backendColumn as HTMLElement).getByLabelText("Runtime model")).toBeVisible();
+    expect(within(backendColumn as HTMLElement).queryByText("Policy-controlled")).toBeNull();
 
-    const runtimePair = screen.getByLabelText("Runtime model").closest(".settings-card-pair");
-    expect(runtimePair).not.toBeNull();
-    expect(within(runtimePair as HTMLElement).getByLabelText("Response timeout")).toBeVisible();
+    const policyColumn = screen.getByText("Policy-controlled").closest(".settings-card-column");
+    expect(policyColumn).not.toBeNull();
+    expect(within(policyColumn as HTMLElement).getByLabelText("Response timeout")).toBeVisible();
 
-    const workspacePair = screen
+    const workspaceColumn = screen
       .getByLabelText("Workspace model override")
-      .closest(".settings-card-pair");
-    expect(workspacePair).not.toBeNull();
+      .closest(".settings-card-column");
+    expect(workspaceColumn).not.toBeNull();
     expect(
-      within(workspacePair as HTMLElement).getByLabelText("Workspace timeout override"),
+      within(workspaceColumn as HTMLElement).getByLabelText("Workspace system prompt"),
     ).toBeVisible();
+    expect(
+      within(workspaceColumn as HTMLElement).queryByLabelText("Workspace timeout override"),
+    ).toBeNull();
 
     const prompt = screen.getByLabelText("Workspace system prompt");
     expect(prompt.closest(".settings-card-stack")).not.toBeNull();
-    expect(prompt.closest(".settings-card-pair")).toBeNull();
+    expect(prompt.closest(".settings-card-column")).toBe(workspaceColumn);
   });
 
   it("refreshes one catalogue or every context without changing runtime settings", async () => {
@@ -1036,11 +1042,22 @@ describe("Settings workspace", () => {
     expect(section).not.toBeNull();
     expect(content).not.toBeNull();
     expect(section?.children).toHaveLength(2);
-    const channelGrid = screen.getByLabelText("General").closest(".settings-card-grid");
-    const githubGrid = screen.getByLabelText("GitHub").closest(".settings-card-grid");
+    const channelGrid = screen.getByLabelText("General").closest(".settings-card-columns");
+    const githubGrid = screen.getByLabelText("GitHub").closest(".settings-card-columns");
     expect(content).toContainElement(screen.getByLabelText("GitHub").closest("article"));
     expect(content?.querySelectorAll(".notification-preference-grid")).toHaveLength(1);
     expect(githubGrid).toBe(channelGrid);
+    expect(channelGrid?.querySelectorAll(":scope > .settings-card-column")).toHaveLength(2);
+    expect(document.querySelector(".settings-card-grid")).toBeNull();
+    expect(
+      document.querySelector(".github-settings-grid")?.querySelectorAll(
+        ":scope > .settings-card-column",
+      ),
+    ).toHaveLength(2);
+    expect(
+      document.querySelector(".settings-client-preferences .settings-card-columns")
+        ?.querySelectorAll(":scope > .settings-card-column"),
+    ).toHaveLength(2);
 
     const timezone = screen.getByLabelText("Timezone");
     expect(timezone.tagName).toBe("SELECT");
