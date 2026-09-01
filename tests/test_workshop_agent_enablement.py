@@ -24,7 +24,7 @@ from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_api import _read_agent_lifecycle_events
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.diagnostics import workshop_agent_authority_status
-from kai.workshop.domain import AgentDefinitionId, AgentEnablementId, ChannelId, MessageId, PrincipalId
+from kai.workshop.domain import AgentDefinitionId, AgentEnablementId, ChannelId, MessageId, PrincipalId, RunId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.internal_api_contexts import (
@@ -32,6 +32,13 @@ from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIExecutionContext,
 )
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.run_execution_authority import RunExecutionSelection
+from kai.workshop.runtime_sessions import (
+    RuntimeSessionSettlement,
+    RuntimeSessionStateConflictError,
+    load_runtime_session,
+    settle_runtime_session_in_transaction,
+)
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -181,6 +188,54 @@ async def test_two_principals_share_one_owner_runtime_in_isolated_direct_lanes(t
         }
         assert {resolution.sponsor_principal_id for resolution in resolutions} == {daniel}
         assert {resolution.runtime_profile_id for resolution in resolutions} == {profile_id(101)}
+
+        async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
+            context_position = int((await cursor.fetchone())[0])
+        owner_settlement = RuntimeSessionSettlement(
+            channel_id=scott_enabled.direct_channel_id,
+            agent_id=scott_enabled.agent_id,
+            runtime_profile_id=profile_id(101),
+            selection=RunExecutionSelection("codex", "gpt-5.6-sol", "openai"),
+            workspace="/private/tmp/kai-owner-runtime",
+            provider_session_id="owner-provider-session",
+            run_id=RunId.new(),
+        )
+        await store.connection.execute("BEGIN IMMEDIATE")
+        settled = await settle_runtime_session_in_transaction(
+            store,
+            owner_settlement,
+            result_message_id=MessageId.new(),
+            context_through_event_position=context_position,
+            occurred_at=datetime.now(UTC),
+        )
+        await store.connection.commit()
+        assert settled.session.runtime_profile_id == profile_id(101)
+        assert (
+            await load_runtime_session(
+                store,
+                scott_enabled.direct_channel_id,
+                scott_enabled.agent_id,
+            )
+        ) == settled.session
+
+        await store.connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(RuntimeSessionStateConflictError, match="canonical authority"):
+            await settle_runtime_session_in_transaction(
+                store,
+                RuntimeSessionSettlement(
+                    channel_id=scott_enabled.direct_channel_id,
+                    agent_id=scott_enabled.agent_id,
+                    runtime_profile_id=profile_id(202),
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol", "openai"),
+                    workspace="/private/tmp/kai-access-runtime",
+                    provider_session_id="access-provider-session",
+                    run_id=RunId.new(),
+                ),
+                result_message_id=MessageId.new(),
+                context_through_event_position=context_position + 1,
+                occurred_at=datetime.now(UTC),
+            )
+        await store.connection.rollback()
     finally:
         await store.close()
 

@@ -562,6 +562,14 @@ class TestAtomicTerminalTransactions:
                 "WHERE channel_id = ? AND agent_id = ?",
                 (profile_id(202), run.channel_id, run.agent_id),
             )
+            await store.connection.execute(
+                "UPDATE agent_definitions SET owner_runtime_profile_id = ? WHERE agent_id = ?",
+                (profile_id(202), run.agent_id),
+            )
+            await store.connection.execute(
+                "UPDATE channel_agents SET sponsored_runtime_profile_id = ? WHERE channel_id = ? AND agent_id = ?",
+                (profile_id(202), run.channel_id, run.agent_id),
+            )
             await store.connection.commit()
 
             result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
