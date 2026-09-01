@@ -2709,10 +2709,10 @@ describe("Workshop React client", () => {
     expect(
       screen.getByText(/Your policy-bounded controls for Qualification agent/),
     ).toBeVisible();
-    expect(loadSettingsWorkspace).toHaveBeenCalledWith({
+    await waitFor(() => expect(loadSettingsWorkspace).toHaveBeenCalledWith({
       channelId: qualificationChannelId,
       token: "existing-session",
-    });
+    }));
     expect(window.location.search).toBe(
       `?view=agents&agent=${qualificationDefinition.definitionId}`,
     );
@@ -2737,10 +2737,10 @@ describe("Workshop React client", () => {
     expect(
       screen.getByRole("heading", { name: "Qualification agent", level: 2 }),
     ).toBeVisible();
-    expect(loadSettingsWorkspace).toHaveBeenCalledWith({
+    await waitFor(() => expect(loadSettingsWorkspace).toHaveBeenCalledWith({
       channelId: qualificationChannelId,
       token: "existing-session",
-    });
+    }));
 
     unmount();
     window.history.replaceState(
@@ -2760,12 +2760,10 @@ describe("Workshop React client", () => {
     expect(
       screen.getByRole("heading", { name: "Qualification agent", level: 2 }),
     ).toBeVisible();
-    await waitFor(() => {
-      expect(loadSettingsWorkspace).toHaveBeenCalledWith({
-        channelId: qualificationChannelId,
-        token: "existing-session",
-      });
-    });
+    await waitFor(() => expect(loadSettingsWorkspace).toHaveBeenCalledWith({
+      channelId: qualificationChannelId,
+      token: "existing-session",
+    }));
   });
 
   it("collapses the navigation to labeled icons and restores its layout", async () => {
