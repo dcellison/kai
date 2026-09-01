@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 58
+WORKSHOP_SCHEMA_VERSION = 59
 
 
 @dataclass(frozen=True, slots=True)
@@ -2664,6 +2664,30 @@ _EXPLICIT_AGENT_CONVERSATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_OWNER_RUNTIME_SESSION_RECONCILIATION_SCHEMA = SchemaMigration(
+    version=59,
+    name="owner_runtime_session_reconciliation",
+    statements=(
+        # Provider sessions are resumable only under the runtime authority that
+        # created them.  The single-owner cutover changed that authority for
+        # non-owner direct lanes, so retire any historical session that no
+        # longer matches the effective owner/sponsored/assignment profile.
+        "DELETE FROM channel_agent_runtime_sessions AS s WHERE NOT EXISTS ("
+        "SELECT 1 FROM channel_agents ca "
+        "JOIN channels c ON c.id = ca.channel_id "
+        "JOIN agent_definitions d ON d.agent_id = ca.agent_id "
+        "LEFT JOIN channel_agent_runtime_assignments a ON a.channel_id = ca.channel_id "
+        "AND a.agent_id = ca.agent_id "
+        "LEFT JOIN principal_agent_enablements e ON e.direct_channel_id = ca.channel_id "
+        "AND e.agent_id = ca.agent_id "
+        "WHERE ca.channel_id = s.channel_id AND ca.agent_id = s.agent_id "
+        "AND ca.detached_at IS NULL AND d.lifecycle_state = 'active' "
+        "AND (c.kind != 'direct' OR e.id IS NULL OR e.lifecycle_state = 'enabled') "
+        "AND COALESCE(d.owner_runtime_profile_id, ca.sponsored_runtime_profile_id, "
+        "a.runtime_profile_id) = s.runtime_profile_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2723,6 +2747,7 @@ _MIGRATIONS = (
     _HUMAN_NOTIFICATION_ADAPTER_PREFERENCE_SCHEMA,
     _SINGLE_OWNER_AGENT_AUTHORITY_SCHEMA,
     _EXPLICIT_AGENT_CONVERSATION_SCHEMA,
+    _OWNER_RUNTIME_SESSION_RECONCILIATION_SCHEMA,
 )
 
 
