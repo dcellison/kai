@@ -2544,6 +2544,7 @@ describe("Workshop React client", () => {
     expect(screen.queryByText("Runtime active")).toBeNull();
     expect(screen.queryByLabelText("Authorized runtime")).toBeNull();
     expect(screen.queryByRole("button", { name: "New revision" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Disable" })).toBeNull();
   });
 
   it("opens runtime settings for the exact enabled agent lane", async () => {

@@ -8,7 +8,6 @@ import {
   addAgentRevision,
   archiveAgentDefinition,
   createAgentDefinition,
-  disableAgentDefinition,
   enableAgentDefinition,
   loadAgentDefinitions,
   loadAgentEnablements,
@@ -655,27 +654,6 @@ export function AgentWorkspace({
     }, "Could not enable this agent.");
   };
 
-  const disable = async (): Promise<void> => {
-    if (
-      !selected ||
-      !enablement ||
-      enablement.stateVersion === null ||
-      !await confirm(
-        `Disable @${selected.handle}? Its direct conversation and history will remain available.`,
-      )
-    ) {
-      return;
-    }
-    await runMutation(async () => {
-      await disableAgentDefinition(token, selected.definitionId, {
-        expectedVersion: enablement.stateVersion as number,
-        idempotencyKey: operationKey("disable"),
-      });
-      await refresh();
-      await onNavigationChanged();
-    }, "Could not disable this agent.");
-  };
-
   const counts = useMemo(() => ({
     active: definitions.filter((item) => item.lifecycleState === "active").length,
     enabled: enablements.filter((item) => item.lifecycleState === "enabled").length,
@@ -824,9 +802,9 @@ export function AgentWorkspace({
                     <h3>
                       {enablement.lifecycleState === "enabled"
                         ? enablement.canManage ? "Runtime active" : "Available to you"
-                        : enablement.lifecycleState === "disabled"
-                          ? "Disabled for you"
-                          : "Available to enable"}
+                        : enablement.canManage
+                          ? "Available to enable"
+                          : "Conversation available"}
                     </h3>
                   </div>
                   {enablement.canManage && enablement.eligibleRuntimes.length > 0 ? (
@@ -910,16 +888,6 @@ export function AgentWorkspace({
                               : "Enable agent"}
                         </button>
                       )}
-                    {!enablement.canManage && enablement.lifecycleState === "enabled" && (
-                      <button
-                        className="danger-button"
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void disable()}
-                      >
-                        Disable
-                      </button>
-                    )}
                   </div>
                 </section>
               )}

@@ -997,21 +997,6 @@ export async function enableAgentDefinition(
   );
 }
 
-export async function disableAgentDefinition(
-  token: string,
-  definitionId: string,
-  input: { expectedVersion: number; idempotencyKey: string },
-): Promise<WorkshopAgentEnablement> {
-  return enablementMutation(
-    token,
-    `/v1/client/agents/${encodeURIComponent(definitionId)}/disable`,
-    {
-      expected_version: input.expectedVersion,
-      idempotency_key: input.idempotencyKey,
-    },
-  );
-}
-
 export async function createChannel(
   token: string,
   input: {
