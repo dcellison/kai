@@ -6,6 +6,7 @@ import {
   PreferenceRevisionConflictError,
   SettingsRevisionConflictError,
   attachChannelAgent,
+  advanceChannelReadPosition,
   cancelRun,
   changeChannelMember,
   activateAgentRevision,
@@ -23,6 +24,7 @@ import {
   enableAgentDefinition,
   loadArtifactBlob,
   loadChannelMembers,
+  loadChannelUnread,
   loadAgentDefinitions,
   loadAgentEnablements,
   loadAppearancePreferences,
@@ -62,6 +64,7 @@ import {
   streamTimeline,
   streamAgentChanges,
   streamHumanNotifications,
+  streamChannelUnread,
   markHumanNotificationRead,
   updateRuntimeSettings,
   updateRoutingPolicy,
@@ -578,6 +581,33 @@ describe("Workshop client API", () => {
     expect(new Headers(options.headers).get("Authorization")).toBe(
       "Bearer session-secret",
     );
+  });
+
+  it("loads a bidirectional timeline window from the first unread message", async () => {
+    const firstUnread = "msg_00000000000000000000000000000010";
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        channel_id: channelId,
+        messages: [message(10), message(20)],
+        next_cursor: "newer-page",
+        previous_cursor: "earlier-page",
+        through_position: 30,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const snapshot = await loadTimeline(
+      session,
+      new AbortController().signal,
+      firstUnread,
+    );
+
+    expect(snapshot.nextCursor).toBe("newer-page");
+    expect(snapshot.previousCursor).toBe("earlier-page");
+    const [path] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toContain(`start_message_id=${firstUnread}`);
+    expect(path).not.toContain("tail=1");
   });
 
   it("loads a root-bound thread page and submits a canonical thread reply", async () => {
@@ -2387,6 +2417,98 @@ describe("Workshop client API", () => {
     const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
     expect(headers.get("Last-Event-ID")).toBe("79");
     expect(headers.get("X-Kai-Stream-ID")).toMatch(/:mentions$/);
+  });
+
+  it("loads, advances, and streams canonical channel unread state", async () => {
+    const unread = {
+      archived: false,
+      channel_id: channelId,
+      channel_kind: "group",
+      channel_name: "General",
+      first_unread_event_position: 80,
+      first_unread_message_id: "msg_00000000000000000000000000000080",
+      last_event_position: 80,
+      membership_baseline_event_position: 70,
+      read_through_event_position: 70,
+      read_through_message_id: null,
+      state_version: 0,
+      unread_count: 1,
+      unread_count_capped: false,
+    };
+    const changed = {
+      ...unread,
+      first_unread_event_position: null,
+      first_unread_message_id: null,
+      last_event_position: 81,
+      read_through_event_position: 80,
+      read_through_message_id: unread.first_unread_message_id,
+      state_version: 1,
+      unread_count: 0,
+    };
+    const frame = [
+      "id: 81",
+      "event: channel_unread.changed",
+      `data: ${JSON.stringify({ event_position: 81, state: changed, version: 1 })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({
+        channels: [unread],
+        through_position: 80,
+        total_unread: 1,
+        total_unread_capped: false,
+        version: 1,
+      }))
+      .mockResolvedValueOnce(Response.json({
+        replayed: false,
+        state: changed,
+        version: 1,
+      }))
+      .mockResolvedValueOnce(new Response(stream, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const snapshot = await loadChannelUnread("session-secret");
+    const mutation = await advanceChannelReadPosition(
+      session,
+      unread.first_unread_message_id,
+      0,
+      "read-visible",
+    );
+    const onChanged = vi.fn();
+    await streamChannelUnread(
+      "session-secret",
+      "80",
+      { onChanged, onConnected: vi.fn() },
+      new AbortController().signal,
+    );
+
+    expect(snapshot.channels[0]).toMatchObject({
+      channelId,
+      firstUnreadMessageId: unread.first_unread_message_id,
+      unreadCount: 1,
+    });
+    expect(mutation.state.unreadCount).toBe(0);
+    expect(onChanged).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventPosition: 81,
+        state: expect.objectContaining({ channelId, unreadCount: 0 }),
+      }),
+      "81",
+    );
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/v1/client/unread",
+      `/v1/channels/${channelId}/read-position`,
+      "/v1/client/unread/events?after_position=80",
+    ]);
+    const headers = fetchMock.mock.calls[2][1]?.headers as Headers;
+    expect(headers.get("X-Kai-Stream-ID")).toMatch(/:unread$/);
   });
 
   it("loads one exact authorized channel message", async () => {

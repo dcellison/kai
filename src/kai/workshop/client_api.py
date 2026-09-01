@@ -241,6 +241,7 @@ from kai.workshop.timeline import (
     TimelineResumeError,
     read_channel_message,
     read_channel_timeline,
+    read_channel_timeline_from_message,
     read_thread_timeline,
 )
 from kai.workshop.wake_policy import (
@@ -318,7 +319,7 @@ _MEMORY_SOURCE_PATH = "/v1/memory/records/{memory_id}/source"
 _MEMORY_SCOPE_PATH = "/v1/memory/records/{memory_id}/scope"
 _MEMORY_BULK_SCOPE_PATH = "/v1/memory/actions/scope"
 _MEMORY_BULK_DELETE_PATH = "/v1/memory/actions/delete"
-_ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail"})
+_ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail", "start_message_id"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
 _ALLOWED_MEMORY_FILTERS = frozenset({"kind", "source", "memory_type", "tag", "scope", "project_id"})
 _ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", "order"}
@@ -3124,7 +3125,9 @@ def _single_query_value(request: web.Request, name: str) -> str | None:
     return values[0] if values else None
 
 
-def _parse_timeline_request(request: web.Request) -> tuple[ChannelId, str | None, int, bool]:
+def _parse_timeline_request(
+    request: web.Request,
+) -> tuple[ChannelId, str | None, int, bool, MessageId | None]:
     if not set(request.query).issubset(_ALLOWED_TIMELINE_QUERY_PARAMETERS):
         raise ValueError("Unsupported query parameter")
 
@@ -3144,11 +3147,13 @@ def _parse_timeline_request(request: web.Request) -> tuple[ChannelId, str | None
         raise ValueError("Invalid tail flag")
     else:
         tail = True
+    start_value = _single_query_value(request, "start_message_id")
+    start_message_id = MessageId(start_value) if start_value is not None else None
     # A cursor already encodes its direction; combining the two would make
     # the request ambiguous, so it is rejected rather than resolved.
-    if tail and cursor is not None:
-        raise ValueError("tail requests must not carry a cursor")
-    return channel_id, cursor, limit, tail
+    if sum((tail, cursor is not None, start_message_id is not None)) > 1:
+        raise ValueError("timeline positions are mutually exclusive")
+    return channel_id, cursor, limit, tail, start_message_id
 
 
 def _parse_event_stream_request(request: web.Request) -> tuple[ChannelId, int | None]:
@@ -4398,16 +4403,27 @@ async def _handle_channel_timeline(
         return response
 
     try:
-        channel_id, cursor, limit, tail = _parse_timeline_request(request)
-        page = await read_channel_timeline(
-            store,
-            principal_id=principal_id,
-            channel_id=channel_id,
-            authorizer=CanonicalChannelAuthorizer(store),
-            cursor=cursor,
-            limit=limit,
-            tail=tail,
-        )
+        channel_id, cursor, limit, tail, start_message_id = _parse_timeline_request(request)
+        authorizer = CanonicalChannelAuthorizer(store)
+        if start_message_id is None:
+            page = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                cursor=cursor,
+                limit=limit,
+                tail=tail,
+            )
+        else:
+            page = await read_channel_timeline_from_message(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                message_id=start_message_id,
+                authorizer=authorizer,
+                limit=limit,
+            )
     except TimelineAccessDeniedError:
         return _error_response(status=403, code="access_denied", message="Access denied")
     except (TimelineCursorError, TypeError, ValueError):

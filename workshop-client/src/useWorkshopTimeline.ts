@@ -82,6 +82,12 @@ export interface EarlierHistoryState {
   error: string | null;
 }
 
+export interface LaterHistoryState {
+  available: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
 // Everything a loadEarlier call needs from the snapshot it extends. Held
 // in a ref so the callback's identity survives snapshot reloads, with the
 // generation stamp guarding against a fetch outliving its snapshot.
@@ -95,6 +101,7 @@ interface EarlierFetchContext {
 export function useWorkshopTimeline(
   session: WorkshopSession | null,
   active: boolean,
+  startMessageId: string | null,
   onAuthenticationFailure: (message: string) => void,
   onChannelAccessFailure: (message: string) => void,
 ): {
@@ -106,7 +113,10 @@ export function useWorkshopTimeline(
   runPreview: WorkshopRunPreview | null;
   runTrace: WorkshopRunTraceSignal | null;
   earlier: EarlierHistoryState;
+  later: LaterHistoryState;
   loadEarlier: () => void;
+  loadLater: () => void;
+  jumpLatest: () => void;
   updateReactions: (
     messageId: string,
     reactions: WorkshopMessageReaction[],
@@ -129,10 +139,26 @@ export function useWorkshopTimeline(
     loading: false,
     error: null,
   });
+  const [later, setLater] = useState<LaterHistoryState>({
+    available: false,
+    loading: false,
+    error: null,
+  });
   const earlierContextRef = useRef<EarlierFetchContext | null>(null);
   const earlierCursorRef = useRef<string | null>(null);
   const earlierLoadingRef = useRef(false);
+  const laterContextRef = useRef<EarlierFetchContext | null>(null);
+  const laterCursorRef = useRef<string | null>(null);
+  const laterLoadingRef = useRef(false);
   const generationRef = useRef(0);
+  const forceTailChannelRef = useRef<string | null>(null);
+  const [reloadVersion, setReloadVersion] = useState(0);
+
+  const jumpLatest = useCallback((): void => {
+    if (!session) return;
+    forceTailChannelRef.current = session.channelId;
+    setReloadVersion((version) => version + 1);
+  }, [session]);
 
   const updateReactions = useCallback(
     (messageId: string, reactions: WorkshopMessageReaction[]): void => {
@@ -184,13 +210,52 @@ export function useWorkshopTimeline(
     );
   }, []);
 
+  const loadLater = useCallback((): void => {
+    const context = laterContextRef.current;
+    const cursor = laterCursorRef.current;
+    if (!context || context.signal.aborted || laterLoadingRef.current || cursor === null) {
+      return;
+    }
+    laterLoadingRef.current = true;
+    setLater({ available: true, loading: true, error: null });
+    void loadEarlierTimeline(context.session, cursor, context.throughPosition, context.signal).then(
+      (page) => {
+        if (context.signal.aborted || generationRef.current !== context.generation) return;
+        laterLoadingRef.current = false;
+        laterCursorRef.current = page.nextCursor ?? null;
+        setMessages((current) => {
+          const next = current;
+          return page.messages.reduce(appendUnique, next);
+        });
+        setLater({
+          available: laterCursorRef.current !== null,
+          loading: false,
+          error: null,
+        });
+      },
+      (caught: unknown) => {
+        if (context.signal.aborted || generationRef.current !== context.generation) return;
+        laterLoadingRef.current = false;
+        setLater({
+          available: true,
+          loading: false,
+          error: caught instanceof Error ? caught.message : "Could not load newer messages.",
+        });
+      },
+    );
+  }, []);
+
   useEffect(() => {
     if (!active || !session) {
       generationRef.current += 1;
       earlierContextRef.current = null;
       earlierCursorRef.current = null;
       earlierLoadingRef.current = false;
+      laterContextRef.current = null;
+      laterCursorRef.current = null;
+      laterLoadingRef.current = false;
       setEarlier({ available: false, loading: false, error: null });
+      setLater({ available: false, loading: false, error: null });
       setMessages([]);
       setThreadMessages([]);
       setReactionUpdates({});
@@ -218,7 +283,14 @@ export function useWorkshopTimeline(
         try {
           if (needsSnapshot) {
             setConnection({ label: "Loading history", tone: "connecting" });
-            const snapshot = await loadTimeline(session, signal);
+            const forceTail = forceTailChannelRef.current === session.channelId;
+            const effectiveStartMessageId = forceTail ? null : startMessageId;
+            if (forceTail) {
+              forceTailChannelRef.current = null;
+            }
+            const snapshot = effectiveStartMessageId === null
+              ? await loadTimeline(session, signal)
+              : await loadTimeline(session, signal, effectiveStartMessageId);
             if (signal.aborted) {
               return;
             }
@@ -240,10 +312,18 @@ export function useWorkshopTimeline(
               throughPosition: snapshot.throughPosition,
               generation: generationRef.current,
             };
+            laterContextRef.current = earlierContextRef.current;
             earlierCursorRef.current = snapshot.previousCursor;
+            laterCursorRef.current = snapshot.nextCursor ?? null;
             earlierLoadingRef.current = false;
+            laterLoadingRef.current = false;
             setEarlier({
               available: snapshot.previousCursor !== null,
+              loading: false,
+              error: null,
+            });
+            setLater({
+              available: laterCursorRef.current !== null,
               loading: false,
               error: null,
             });
@@ -352,7 +432,9 @@ export function useWorkshopTimeline(
     active,
     onAuthenticationFailure,
     onChannelAccessFailure,
+    reloadVersion,
     session,
+    startMessageId,
     updateReactions,
   ]);
 
@@ -365,7 +447,10 @@ export function useWorkshopTimeline(
     runPreview,
     runTrace,
     earlier,
+    later,
     loadEarlier,
+    loadLater,
+    jumpLatest,
     updateReactions,
   };
 }

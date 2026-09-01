@@ -280,14 +280,20 @@ class WorkshopChannelUnreadService:
             "FROM event_log e JOIN channel_read_positions rp "
             "ON rp.principal_id = ? AND rp.channel_id = json_extract(e.payload_json, '$.channel_id') "
             "JOIN channel_memberships cm ON cm.principal_id = rp.principal_id "
-            "AND cm.channel_id = rp.channel_id "
-            "WHERE e.event_type = ? AND e.actor_principal_id = ? AND e.position > ? "
+            "AND cm.channel_id = rp.channel_id JOIN channels c ON c.id = rp.channel_id "
+            "WHERE c.archived_at IS NULL AND e.position > ? AND ((e.event_type = ? "
+            "AND e.actor_principal_id = ?) OR (e.event_type = ? "
+            "AND e.actor_principal_id != ? "
+            "AND json_extract(e.payload_json, '$.thread_root_id') IS NULL "
+            "AND coalesce(json_extract(e.metadata_json, '$.source'), '') != 'scheduled_job')) "
             "ORDER BY e.position LIMIT ?",
             (
                 principal_id,
+                after_position,
                 WorkshopEventType.CHANNEL_READ_POSITION_ADVANCED.value,
                 principal_id,
-                after_position,
+                WorkshopEventType.MESSAGE_CREATED.value,
+                principal_id,
                 limit,
             ),
         ) as cursor:

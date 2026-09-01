@@ -628,6 +628,11 @@ button:disabled {
   color: var(--color-text-strong);
 }
 
+.channel-link.unread > span:nth-child(2) {
+  color: var(--color-text-strong);
+  font-weight: 720;
+}
+
 .channel-link.notification > span:first-child {
   color: var(--color-warning);
 }
@@ -655,6 +660,14 @@ button:disabled {
   align-items: center;
   justify-self: end;
   gap: 0.3rem;
+}
+
+.unread-pip {
+  width: 0.38rem;
+  height: 0.38rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-accent);
 }
 
 .live-pip {
@@ -852,6 +865,12 @@ button:disabled {
   padding: 0;
   color: transparent;
   font-size: 0;
+}
+
+.channel-sidebar.collapsed .channel-link .unread-pip {
+  position: absolute;
+  right: 0.16rem;
+  bottom: 0.2rem;
 }
 
 .channel-sidebar.collapsed .channel-link-status {
@@ -1552,6 +1571,33 @@ button:disabled {
 .timeline-earlier {
   padding: 0.5rem 1.25rem 0;
   text-align: center;
+}
+
+.timeline-later {
+  display: grid;
+  justify-items: center;
+  gap: 0.45rem;
+  padding: 0.7rem 0 1rem;
+}
+
+.first-unread-divider {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 0.65rem;
+  margin: 0.35rem 0;
+  color: var(--color-accent);
+  font-size: 0.67rem;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.first-unread-divider::before,
+.first-unread-divider::after {
+  height: 1px;
+  background: color-mix(in srgb, var(--color-accent) 55%, var(--color-border));
+  content: "";
 }
 
 .timeline-earlier-button {

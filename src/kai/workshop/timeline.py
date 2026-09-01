@@ -508,6 +508,76 @@ async def read_channel_timeline(
     )
 
 
+async def read_channel_timeline_from_message(
+    store: WorkshopEventStore,
+    *,
+    principal_id: PrincipalId,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    authorizer: ChannelTimelineAuthorizer,
+    limit: int = 50,
+) -> TimelinePage:
+    """Read a stable forward window beginning at one authorized root message.
+
+    The returned page can move in both directions: ``next_cursor`` continues
+    toward the snapshot tip, while ``previous_cursor`` walks history before
+    the anchor. This is the bounded primitive the Workshop client needs to
+    open at a canonical first-unread boundary without stitching an isolated
+    message into an unrelated tail page.
+    """
+    _validate_request(principal_id, channel_id, limit)
+    if not isinstance(message_id, MessageId):
+        raise ValueError("message_id must be a MessageId")
+    await _authorize(authorizer, principal_id, channel_id)
+    if not await _channel_exists(store, channel_id):
+        raise TimelineAccessDeniedError("Timeline access denied")
+
+    async with store.connection.execute(
+        "SELECT m.created_event_position FROM messages m "
+        "JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
+        "WHERE m.id = ? AND m.channel_id = ? AND m.thread_root_id IS NULL "
+        f"AND {_VISIBLE_MESSAGE_PREDICATE}",
+        (message_id, channel_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        raise TimelineAccessDeniedError("Timeline access denied")
+
+    anchor_position = int(row[0])
+    through_position = await _latest_message_position(store, channel_id)
+    async with store.connection.execute(
+        "SELECT 1 FROM messages m JOIN principals p ON p.id = m.author_principal_id "
+        "JOIN event_log e ON e.position = m.created_event_position "
+        "WHERE m.channel_id = ? AND m.thread_root_id IS NULL "
+        "AND m.created_event_position < ? "
+        f"AND {_VISIBLE_MESSAGE_PREDICATE} LIMIT 1",
+        (channel_id, anchor_position),
+    ) as cursor:
+        has_earlier = await cursor.fetchone() is not None
+    page = await _read_forward_page(
+        store,
+        channel_id,
+        _CursorState(channel_id, anchor_position - 1, through_position),
+        limit,
+        principal_id,
+    )
+    return replace(
+        page,
+        previous_cursor=(
+            _encode_tail_cursor(
+                _TailCursorState(
+                    channel_id=channel_id,
+                    before_position=anchor_position,
+                    through_position=through_position,
+                )
+            )
+            if has_earlier
+            else None
+        ),
+    )
+
+
 async def read_channel_message(
     store: WorkshopEventStore,
     *,

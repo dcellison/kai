@@ -32,6 +32,7 @@ from kai.workshop.timeline import (
     TimelineCursorError,
     read_channel_message,
     read_channel_timeline,
+    read_channel_timeline_from_message,
     read_thread_timeline,
 )
 from tests.workshop_profiles import profile_id
@@ -314,6 +315,54 @@ class TestThreadTimelineQuery:
 
 
 class TestCanonicalTimelineQuery:
+    async def test_anchored_window_pages_both_directions_under_one_snapshot(self, tmp_path: Path):
+        store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
+        try:
+            for ordinal in range(1, 6):
+                await _record_user_message(store, ordinal=ordinal, body=f"Message {ordinal}")
+            authorizer = _Authorizer({(principal_id, channel_id)})
+            complete = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                limit=10,
+            )
+
+            anchored = await read_channel_timeline_from_message(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                message_id=complete.messages[2].message_id,
+                authorizer=authorizer,
+                limit=2,
+            )
+
+            assert [message.body for message in anchored.messages] == ["Message 3", "Message 4"]
+            assert anchored.previous_cursor is not None
+            assert anchored.next_cursor is not None
+            earlier = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                cursor=anchored.previous_cursor,
+                limit=10,
+            )
+            later = await read_channel_timeline(
+                store,
+                principal_id=principal_id,
+                channel_id=channel_id,
+                authorizer=authorizer,
+                cursor=anchored.next_cursor,
+                limit=10,
+            )
+            assert [message.body for message in earlier.messages] == ["Message 1", "Message 2"]
+            assert [message.body for message in later.messages] == ["Message 5"]
+            assert earlier.through_position == anchored.through_position == later.through_position
+        finally:
+            await store.close()
+
     async def test_returns_server_resolved_mentions_without_client_reparsing(self, tmp_path: Path):
         store, principal_id, channel_id, _, _ = await _open_store(tmp_path / "kai.db")
         try:
