@@ -24,6 +24,7 @@ import {
   loadAppearancePreferences,
   loadChannelMembers,
   loadChannelMessage,
+  loadAgentDefinitions,
   loadAgentEnablements,
   loadNavigation,
   loadNotificationPreferences,
@@ -58,6 +59,7 @@ import type {
   WorkshopSummary,
   WorkshopArtifactSummary,
   WorkshopAgentSummary,
+  WorkshopAgentDefinition,
   WorkshopAgentEnablement,
   WorkshopAppearancePreferences,
   WorkshopHumanMembership,
@@ -1593,6 +1595,68 @@ function ArchivedChannelsDialog({
   );
 }
 
+function ArchivedAgentsDialog({
+  agents,
+  onClose,
+  onView,
+}: {
+  agents: WorkshopAgentDefinition[];
+  onClose: () => void;
+  onView: (definitionId: string) => void;
+}): React.JSX.Element {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        className="channel-creation-dialog channel-archive-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="agent-archive-title"
+      >
+        <header className="channel-archive-header">
+          <div>
+            <p className="overline">Agents</p>
+            <h2 id="agent-archive-title">Archive</h2>
+          </div>
+          <button
+            className="panel-icon-button"
+            type="button"
+            aria-label="Close agent archive"
+            title="Close agent archive"
+            onClick={onClose}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        {agents.length === 0 ? (
+          <p className="channel-archive-empty">No archived agents.</p>
+        ) : (
+          <ul className="channel-archive-list">
+            {agents.map((agent) => (
+              <li key={agent.definitionId}>
+                <span>
+                  <strong>{agent.displayName}</strong>
+                  <small>@{agent.handle}</small>
+                </span>
+                <span className="channel-archive-actions">
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label={`View archived agent ${agent.displayName}`}
+                    title="View archived agent"
+                    onClick={() => onView(agent.definitionId)}
+                  >
+                    <ViewIcon />
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function PaperclipIcon(): React.JSX.Element {
   return (
     <svg
@@ -2151,8 +2215,10 @@ function WorkshopView({
     originName: string | null;
   } | null>(null);
   const [archivedChannelsOpen, setArchivedChannelsOpen] = useState(false);
+  const [archivedAgentsOpen, setArchivedAgentsOpen] = useState(false);
   const [channelLifecycleBusy, setChannelLifecycleBusy] = useState<string | null>(null);
   const [agentCatalogue, setAgentCatalogue] = useState<WorkshopAgentEnablement[]>([]);
+  const [agentDefinitions, setAgentDefinitions] = useState<WorkshopAgentDefinition[]>([]);
   const [agentManagement, setAgentManagement] = useState<WorkshopAgentEnablement[] | null>(null);
   const [agentManagementLoading, setAgentManagementLoading] = useState(false);
   const [memberManagement, setMemberManagement] = useState<WorkshopHumanMembership | null>(null);
@@ -2391,7 +2457,12 @@ function WorkshopView({
 
   const refreshAgentCatalogue = useCallback(async (): Promise<void> => {
     try {
-      setAgentCatalogue(await loadAgentEnablements(agentToken));
+      const [definitions, enablements] = await Promise.all([
+        loadAgentDefinitions(agentToken),
+        loadAgentEnablements(agentToken),
+      ]);
+      setAgentDefinitions(definitions);
+      setAgentCatalogue(enablements);
     } catch (caught) {
       if (caught instanceof AuthenticationError) {
         onMemoryAuthenticationFailure(caught.message);
@@ -3208,34 +3279,34 @@ function WorkshopView({
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
               <p className="nav-heading">Agents</p>
-              {workshop.role === "admin" && (
+              <div className="nav-heading-actions">
                 <button
-                  className="nav-add-button"
+                  className="nav-tool-button"
                   type="button"
-                  aria-label="Create agent"
-                  title="Create agent"
-                  onClick={onCreateAgent}
+                  aria-label="Archived agents"
+                  title="Archived agents"
+                  onClick={() => setArchivedAgentsOpen(true)}
                 >
-                  <span aria-hidden="true" />
+                  <ArchiveIcon />
                 </button>
-              )}
+                {workshop.role === "admin" && (
+                  <button
+                    className="nav-add-button"
+                    type="button"
+                    aria-label="Create agent"
+                    title="Create agent"
+                    onClick={onCreateAgent}
+                  >
+                    <span aria-hidden="true" />
+                  </button>
+                )}
+              </div>
             </div>
           )}
           {visibleAgents.map((agent) => {
             const engaged = engagedAgents.some(
               (candidate) => candidate.agentId === agent.agentId,
             );
-            const conversationStarted =
-              agent.lifecycleState === "enabled" && agent.directChannelId !== null;
-            const status = engaged
-              ? agent.canManage
-                ? "owner · awake"
-                : "conversation · awake"
-              : agent.canManage
-                ? "owner"
-                : conversationStarted
-                  ? "conversation started"
-                  : "available";
             return (
               <button
                 className={`agent-link ${engaged ? "engaged" : ""}`}
@@ -3250,7 +3321,6 @@ function WorkshopView({
                 </span>
                 <span>
                   <strong>{agent.displayName}</strong>
-                  <small>{status}</small>
                 </span>
               </button>
             );
@@ -3996,6 +4066,18 @@ function WorkshopView({
         />
       )}
         </>
+      )}
+      {archivedAgentsOpen && (
+        <ArchivedAgentsDialog
+          agents={agentDefinitions
+            .filter((agent) => agent.lifecycleState === "archived")
+            .sort((left, right) => left.displayName.localeCompare(right.displayName))}
+          onClose={() => setArchivedAgentsOpen(false)}
+          onView={(definitionId) => {
+            setArchivedAgentsOpen(false);
+            void onOpenAgentDefinition(definitionId);
+          }}
+        />
       )}
     </main>
   );
