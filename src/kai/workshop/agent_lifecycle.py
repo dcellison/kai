@@ -127,11 +127,11 @@ class WorkshopAgentLifecycleService:
         return AgentLifecycleAuthority(principal_id, workshop_id, role)
 
     async def list_visible(self, principal_id: PrincipalId) -> tuple[AgentDefinitionSnapshot, ...]:
-        workshop_id, role = await self._authority(principal_id)
-        lifecycle_clause = "" if role == "admin" else "AND d.lifecycle_state = 'active'"
+        workshop_id, _role = await self._authority(principal_id)
         async with self._store.connection.execute(
-            f"SELECT d.id FROM agent_definitions d WHERE d.workshop_id = ? {lifecycle_clause} ORDER BY d.handle",
-            (workshop_id,),
+            "SELECT d.id FROM agent_definitions d WHERE d.workshop_id = ? "
+            "AND (d.lifecycle_state = 'active' OR d.owner_principal_id = ?) ORDER BY d.handle",
+            (workshop_id, principal_id),
         ) as cursor:
             rows = list(await cursor.fetchall())
         snapshots: list[AgentDefinitionSnapshot] = []
@@ -144,9 +144,9 @@ class WorkshopAgentLifecycleService:
         principal_id: PrincipalId,
         definition_id: AgentDefinitionId,
     ) -> AgentDefinitionSnapshot:
-        workshop_id, role = await self._authority(principal_id)
+        workshop_id, _role = await self._authority(principal_id)
         snapshot = await self._snapshot_or_denied(definition_id, workshop_id)
-        if role != "admin" and snapshot.lifecycle_state != "active":
+        if snapshot.lifecycle_state != "active" and snapshot.owner_principal_id != principal_id:
             raise WorkshopAgentLifecycleAccessDenied("Access denied")
         return snapshot
 
@@ -530,12 +530,6 @@ class WorkshopAgentLifecycleService:
         if len(rows) != 1:
             raise WorkshopAgentLifecycleAccessDenied("Access denied")
         return WorkshopId(str(rows[0][0])), str(rows[0][1])
-
-    async def _admin_workshop(self, principal_id: PrincipalId) -> WorkshopId:
-        workshop_id, role = await self._authority(principal_id)
-        if role != "admin":
-            raise WorkshopAgentLifecycleAccessDenied("Administrator access required")
-        return workshop_id
 
     async def _snapshot_or_denied(
         self,

@@ -2515,6 +2515,32 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
   });
 
+  it("offers principal-owned agent creation to Workshop members", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      workshops: navigation.workshops.map((workshop) => ({
+        ...workshop,
+        role: "member",
+      })),
+    });
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    const sidebar = within(screen.getByLabelText("Workshop navigation"));
+    const createAgent = sidebar.getByRole("button", { name: "Create agent" });
+    expect(createAgent).toBeVisible();
+
+    await user.click(createAgent);
+    expect(
+      await screen.findByRole("heading", { name: "Create agent", level: 2 }),
+    ).toBeVisible();
+  });
+
   it("uses the sidebar as the active agent catalogue and archives as the historical catalogue", async () => {
     const user = userEvent.setup();
     const qualificationDefinition: WorkshopAgentDefinition = {

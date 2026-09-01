@@ -3289,17 +3289,15 @@ function WorkshopView({
                 >
                   <ArchiveIcon />
                 </button>
-                {workshop.role === "admin" && (
-                  <button
-                    className="nav-add-button"
-                    type="button"
-                    aria-label="Create agent"
-                    title="Create agent"
-                    onClick={onCreateAgent}
-                  >
-                    <span aria-hidden="true" />
-                  </button>
-                )}
+                <button
+                  className="nav-add-button"
+                  type="button"
+                  aria-label="Create agent"
+                  title="Create agent"
+                  onClick={onCreateAgent}
+                >
+                  <span aria-hidden="true" />
+                </button>
               </div>
             </div>
           )}
