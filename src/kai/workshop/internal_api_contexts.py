@@ -96,6 +96,9 @@ class WorkshopInternalAPIContextRegistry:
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
             "JOIN workshop_memberships wm ON wm.principal_id = p.id "
             "AND wm.workshop_id = c.workshop_id "
+            "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
+            "AND pae.agent_id = ra.agent_id "
+            "WHERE pae.id IS NULL OR pae.lifecycle_state = 'enabled' "
             "ORDER BY ra.runtime_profile_id, ra.created_event_position, cm.principal_id"
         ) as cursor:
             rows = list(await cursor.fetchall())
@@ -171,6 +174,17 @@ class WorkshopInternalAPIContextRegistry:
             raise WorkshopInternalAPIContextError("Replacement runtime profile is not owned by the principal")
         self._by_lane[key] = replacement
         self._contexts[self._contexts.index(prior)] = replacement
+
+    def unregister_context(self, context: WorkshopInternalAPIExecutionContext) -> None:
+        """Remove one non-primary internal API lane after authority retirement."""
+        key = (context.principal_id, context.channel_id, context.agent_id)
+        existing = self._by_lane.get(key)
+        if existing is None:
+            return
+        if existing != context or self._by_profile.get(context.runtime_profile_id) == context:
+            raise WorkshopInternalAPIContextError("Canonical internal API context cannot be retired")
+        self._by_lane.pop(key)
+        self._contexts.remove(context)
 
     def for_runtime_profile(
         self,

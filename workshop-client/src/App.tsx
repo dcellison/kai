@@ -1326,6 +1326,7 @@ function ChannelAgentManagementDialog({
           runtimeProfileId: agent.runtimeProfileId,
           stateVersion: null,
           canManage: false,
+          conversationStarted: false,
           ownerPrincipalId: null,
           ownerRuntimeProfileId: agent.runtimeProfileId,
         });

@@ -746,6 +746,7 @@ function parseAgentEnablement(value: unknown): WorkshopAgentEnablement | null {
         (value.state_version as number) < 1)) ||
     !Array.isArray(value.eligible_runtimes) ||
     typeof value.can_manage !== "boolean" ||
+    typeof value.conversation_started !== "boolean" ||
     (value.owner_principal_id !== null &&
       (typeof value.owner_principal_id !== "string" ||
         !PRINCIPAL_PATTERN.test(value.owner_principal_id))) ||
@@ -787,6 +788,7 @@ function parseAgentEnablement(value: unknown): WorkshopAgentEnablement | null {
     runtimeProfileId: value.runtime_profile_id,
     stateVersion: value.state_version as number | null,
     canManage: value.can_manage,
+    conversationStarted: value.conversation_started,
     ownerPrincipalId: value.owner_principal_id,
     ownerRuntimeProfileId: value.owner_runtime_profile_id,
   };
@@ -993,6 +995,21 @@ export async function enableAgentDefinition(
         : { expected_version: input.expectedVersion }),
       idempotency_key: input.idempotencyKey,
       runtime_profile_id: input.runtimeProfileId,
+    },
+  );
+}
+
+export async function startAgentConversation(
+  token: string,
+  definitionId: string,
+  input: { expectedVersion: number; idempotencyKey: string },
+): Promise<WorkshopAgentEnablement> {
+  return enablementMutation(
+    token,
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/conversation`,
+    {
+      expected_version: input.expectedVersion,
+      idempotency_key: input.idempotencyKey,
     },
   );
 }

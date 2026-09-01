@@ -45,6 +45,7 @@ import {
   streamAgentChanges,
   streamHumanNotifications,
   setMessageReaction,
+  startAgentConversation,
   submitCommand,
   switchWorkspace,
 } from "./api";
@@ -103,6 +104,7 @@ vi.mock("./api", async (importOriginal) => {
     streamAgentChanges: vi.fn(),
     streamHumanNotifications: vi.fn(),
     setMessageReaction: vi.fn(),
+    startAgentConversation: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
   };
@@ -307,6 +309,7 @@ const agentEnablement: WorkshopAgentEnablement = {
   runtimeProfileId,
   stateVersion: 3,
   canManage: true,
+  conversationStarted: false,
   ownerPrincipalId: "prn_00000000000000000000000000000001",
   ownerRuntimeProfileId: runtimeProfileId,
 };
@@ -533,6 +536,11 @@ describe("Workshop React client", () => {
     });
     vi.mocked(loadAgentDefinitions).mockResolvedValue([agentDefinition]);
     vi.mocked(loadAgentEnablements).mockResolvedValue([agentEnablement]);
+    vi.mocked(startAgentConversation).mockResolvedValue({
+      ...agentEnablement,
+      conversationStarted: true,
+      stateVersion: 4,
+    });
     vi.mocked(loadNotificationPreferences).mockResolvedValue({
       destinations: [
         {

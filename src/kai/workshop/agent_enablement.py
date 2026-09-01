@@ -80,6 +80,7 @@ class PrincipalAgentEnablement:
     owner_principal_id: PrincipalId | None
     owner_runtime_profile_id: RuntimeProfileId | None
     can_manage: bool
+    conversation_started: bool = False
 
 
 class WorkshopAgentEnablementService:
@@ -312,8 +313,115 @@ class WorkshopAgentEnablementService:
             self._internal_api_contexts.register_context(new_context)
             self._runtime_pool.register_canonical_lane(new_context)
         else:
+            self._execution_state.register_lane(namespace)
+            self._internal_api_contexts.register_context(new_context)
             self._runtime_pool.register_canonical_lane(new_context)
         return result
+
+    async def start_conversation(
+        self,
+        principal_id: PrincipalId,
+        definition_id: AgentDefinitionId,
+        *,
+        idempotency_key: object,
+        expected_version: object,
+    ) -> PrincipalAgentEnablement:
+        """Durably expose one already-enabled direct conversation."""
+        key = self._key(idempotency_key)
+        workshop_id = await self._workshop_for(principal_id)
+        fingerprint = self._fingerprint(
+            "start_conversation",
+            definition_id,
+            expected_version=expected_version,
+        )
+        operation_key = self._operation_key(workshop_id, principal_id, key)
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            replay = await self._replayed(operation_key, fingerprint, principal_id, definition_id)
+            if replay is not None:
+                await connection.commit()
+                return replay
+            current = await self._snapshot(principal_id, definition_id)
+            self._check_version(current, expected_version)
+            if current.enablement_id is None or current.lifecycle_state != "enabled":
+                raise WorkshopAgentEnablementConflict("Agent is not enabled")
+            if current.conversation_started:
+                await connection.commit()
+                return current
+            event = EventEnvelope.create(
+                event_type=WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED,
+                event_version=1,
+                workshop_id=workshop_id,
+                aggregate_type="agent_enablement",
+                aggregate_id=current.enablement_id,
+                actor_principal_id=principal_id,
+                occurred_at=datetime.now(UTC),
+                idempotency_key=operation_key,
+                payload={},
+                metadata={
+                    "source": "workshop_client",
+                    "operation": "start_conversation",
+                    "operation_hash": fingerprint,
+                    "definition_id": str(definition_id),
+                },
+            )
+            await self._store.append_in_transaction(event)
+            await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            result = await self._snapshot(principal_id, definition_id)
+            await connection.commit()
+            return result
+        except WorkshopAgentEnablementError:
+            await connection.rollback()
+            raise
+        except IdempotencyConflictError as exc:
+            await connection.rollback()
+            raise WorkshopAgentEnablementConflict("Idempotency key conflicts with another request") from exc
+        except Exception as exc:
+            await connection.rollback()
+            raise WorkshopAgentEnablementStorageError("Agent conversation could not be started") from exc
+
+    async def suspend_archived_definition(
+        self,
+        principal_id: PrincipalId,
+        definition_id: AgentDefinitionId,
+    ) -> None:
+        """Revoke every runtime credential retired by one canonical archival."""
+        workshop_id = await self._workshop_for(principal_id)
+        async with self._store.connection.execute(
+            "SELECT owner_principal_id, lifecycle_state FROM agent_definitions WHERE id = ? AND workshop_id = ?",
+            (definition_id, workshop_id),
+        ) as cursor:
+            definition = await cursor.fetchone()
+        if (
+            definition is None
+            or definition[0] is None
+            or PrincipalId(str(definition[0])) != principal_id
+            or str(definition[1]) != "archived"
+        ):
+            raise WorkshopAgentEnablementAccessDenied("Access denied")
+        async with self._store.connection.execute(
+            "SELECT principal_id, direct_channel_id, agent_id, runtime_profile_id "
+            "FROM principal_agent_enablements WHERE agent_definition_id = ? "
+            "AND lifecycle_state = 'disabled'",
+            (definition_id,),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        for row in rows:
+            context = WorkshopInternalAPIExecutionContext(
+                PrincipalId(str(row[0])),
+                ChannelId(str(row[1])),
+                AgentId(str(row[2])),
+                RuntimeProfileId(str(row[3])),
+            )
+            await self._runtime_pool.suspend_canonical_lane(context)
+            namespace = self._execution_state.maybe_for_principal_channel(
+                context.principal_id,
+                context.channel_id,
+            )
+            if namespace is not None:
+                self._execution_state.unregister_lane(namespace)
+            self._internal_api_contexts.unregister_context(context)
 
     async def disable(
         self,
@@ -374,14 +482,20 @@ class WorkshopAgentEnablementService:
             raise WorkshopAgentEnablementStorageError("Agent disablement could not be persisted") from exc
         assert current.direct_channel_id is not None
         assert current.runtime_profile_id is not None
-        await self._runtime_pool.suspend_canonical_lane(
-            WorkshopInternalAPIExecutionContext(
-                principal_id,
-                current.direct_channel_id,
-                current.agent_id,
-                current.runtime_profile_id,
-            )
+        context = WorkshopInternalAPIExecutionContext(
+            principal_id,
+            current.direct_channel_id,
+            current.agent_id,
+            current.runtime_profile_id,
         )
+        await self._runtime_pool.suspend_canonical_lane(context)
+        namespace = self._execution_state.maybe_for_principal_channel(
+            principal_id,
+            current.direct_channel_id,
+        )
+        if namespace is not None:
+            self._execution_state.unregister_lane(namespace)
+        self._internal_api_contexts.unregister_context(context)
         return result
 
     async def _workshop_for(self, principal_id: PrincipalId) -> WorkshopId:
@@ -471,7 +585,8 @@ class WorkshopAgentEnablementService:
         async with self._store.connection.execute(
             "SELECT d.agent_id, d.handle, d.display_name, d.lifecycle_state, e.id, "
             "e.direct_channel_id, e.runtime_profile_id, e.lifecycle_state, e.last_event_position, "
-            "d.owner_principal_id, d.owner_runtime_profile_id "
+            "d.owner_principal_id, d.owner_runtime_profile_id, "
+            "e.conversation_started_at "
             "FROM agent_definitions d LEFT JOIN principal_agent_enablements e "
             "ON e.agent_definition_id = d.id AND e.principal_id = ? "
             "WHERE d.id = ? AND d.workshop_id = ?",
@@ -496,6 +611,7 @@ class WorkshopAgentEnablementService:
             owner_principal_id,
             RuntimeProfileId(str(row[10])) if row[10] is not None else None,
             can_manage,
+            row[11] is not None,
         )
 
     def _creation_events(

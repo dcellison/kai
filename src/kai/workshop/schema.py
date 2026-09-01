@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 57
+WORKSHOP_SCHEMA_VERSION = 58
 
 
 @dataclass(frozen=True, slots=True)
@@ -2638,6 +2638,32 @@ _SINGLE_OWNER_AGENT_AUTHORITY_SCHEMA = SchemaMigration(
     ),
 )
 
+_EXPLICIT_AGENT_CONVERSATION_SCHEMA = SchemaMigration(
+    version=58,
+    name="explicit_agent_conversation",
+    statements=(
+        "ALTER TABLE principal_agent_enablements ADD COLUMN conversation_started_at TEXT",
+        "ALTER TABLE principal_agent_enablements ADD COLUMN conversation_started_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "UPDATE principal_agent_enablements SET "
+        "conversation_started_at = (SELECT MIN(m.created_at) FROM messages m "
+        "WHERE m.channel_id = principal_agent_enablements.direct_channel_id), "
+        "conversation_started_event_position = (SELECT MIN(m.created_event_position) FROM messages m "
+        "WHERE m.channel_id = principal_agent_enablements.direct_channel_id) "
+        "WHERE EXISTS (SELECT 1 FROM messages m "
+        "WHERE m.channel_id = principal_agent_enablements.direct_channel_id)",
+        "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled', "
+        "updated_at = COALESCE((SELECT occurred_at FROM event_log e "
+        "WHERE e.aggregate_id = principal_agent_enablements.agent_definition_id "
+        "AND e.event_type = 'agent_definition.archived' ORDER BY e.position DESC LIMIT 1), updated_at) "
+        "WHERE lifecycle_state = 'enabled' AND EXISTS (SELECT 1 FROM agent_definitions d "
+        "WHERE d.id = principal_agent_enablements.agent_definition_id "
+        "AND d.lifecycle_state = 'archived')",
+        "CREATE INDEX principal_agent_enablements_conversation_idx "
+        "ON principal_agent_enablements (principal_id, conversation_started_at, direct_channel_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2696,6 +2722,7 @@ _MIGRATIONS = (
     _HUMAN_NOTIFICATION_PUBLICATION_SCHEMA,
     _HUMAN_NOTIFICATION_ADAPTER_PREFERENCE_SCHEMA,
     _SINGLE_OWNER_AGENT_AUTHORITY_SCHEMA,
+    _EXPLICIT_AGENT_CONVERSATION_SCHEMA,
 )
 
 
