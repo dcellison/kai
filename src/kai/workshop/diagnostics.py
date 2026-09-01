@@ -63,6 +63,22 @@ _RUNTIME_SESSION_TABLES = {
     "runs",
     "workshop_continuity_cutover",
 }
+_CURRENT_AUTHORITY_COMPLETED_LANES_SQL = (
+    "SELECT DISTINCT r.channel_id, r.agent_id FROM runs r "
+    "JOIN messages m ON m.id = r.result_message_id "
+    "JOIN channel_agents ca ON ca.channel_id = r.channel_id AND ca.agent_id = r.agent_id "
+    "JOIN channels c ON c.id = ca.channel_id "
+    "JOIN agent_definitions d ON d.agent_id = ca.agent_id "
+    "LEFT JOIN channel_agent_runtime_assignments a ON a.channel_id = ca.channel_id "
+    "AND a.agent_id = ca.agent_id "
+    "LEFT JOIN principal_agent_enablements e ON e.direct_channel_id = ca.channel_id "
+    "AND e.agent_id = ca.agent_id "
+    "WHERE r.status = 'completed' AND m.created_event_position > ? "
+    "AND ca.detached_at IS NULL AND d.lifecycle_state = 'active' "
+    "AND (c.kind != 'direct' OR e.id IS NULL OR e.lifecycle_state = 'enabled') "
+    "AND r.runtime_profile_id = COALESCE(d.owner_runtime_profile_id, "
+    "ca.sponsored_runtime_profile_id, a.runtime_profile_id)"
+)
 _EXECUTION_STATE_TABLES = {
     "channel_agent_execution_settings",
     "channel_agent_runtime_assignments",
@@ -658,17 +674,7 @@ def workshop_runtime_session_status(db_path: Path) -> str:
             cutover = int(cutover_row[0])
             successful_lanes = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM (SELECT DISTINCT r.channel_id, r.agent_id FROM runs r "
-                "JOIN messages m ON m.id = r.result_message_id "
-                "WHERE r.status = 'completed' AND m.created_event_position > ? "
-                "AND EXISTS (SELECT 1 FROM channel_agents ca "
-                "JOIN channels c ON c.id = ca.channel_id "
-                "JOIN agent_definitions d ON d.agent_id = ca.agent_id "
-                "LEFT JOIN principal_agent_enablements e ON e.direct_channel_id = ca.channel_id "
-                "AND e.agent_id = ca.agent_id "
-                "WHERE ca.channel_id = r.channel_id AND ca.agent_id = r.agent_id "
-                "AND ca.detached_at IS NULL AND d.lifecycle_state = 'active' "
-                "AND (c.kind != 'direct' OR e.id IS NULL OR e.lifecycle_state = 'enabled')))",
+                f"SELECT COUNT(*) FROM ({_CURRENT_AUTHORITY_COMPLETED_LANES_SQL})",
                 (cutover,),
             )
             sessions = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_runtime_sessions")
@@ -678,17 +684,7 @@ def workshop_runtime_session_status(db_path: Path) -> str:
             )
             missing = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM (SELECT DISTINCT r.channel_id, r.agent_id FROM runs r "
-                "JOIN messages m ON m.id = r.result_message_id "
-                "WHERE r.status = 'completed' AND m.created_event_position > ? "
-                "AND EXISTS (SELECT 1 FROM channel_agents ca "
-                "JOIN channels c ON c.id = ca.channel_id "
-                "JOIN agent_definitions d ON d.agent_id = ca.agent_id "
-                "LEFT JOIN principal_agent_enablements e ON e.direct_channel_id = ca.channel_id "
-                "AND e.agent_id = ca.agent_id "
-                "WHERE ca.channel_id = r.channel_id AND ca.agent_id = r.agent_id "
-                "AND ca.detached_at IS NULL AND d.lifecycle_state = 'active' "
-                "AND (c.kind != 'direct' OR e.id IS NULL OR e.lifecycle_state = 'enabled'))) lanes "
+                f"SELECT COUNT(*) FROM ({_CURRENT_AUTHORITY_COMPLETED_LANES_SQL}) lanes "
                 "WHERE NOT EXISTS ("
                 "SELECT 1 FROM channel_agent_runtime_sessions s "
                 "WHERE s.channel_id = lanes.channel_id AND s.agent_id = lanes.agent_id)",

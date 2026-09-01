@@ -7,6 +7,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from kai.agent_failure import AgentFailureKind
 from kai.backend import AgentResponse, StreamEvent, TraceEntry
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
@@ -250,6 +252,76 @@ class TestCanonicalExecutionCoordinator:
             )
         finally:
             await store.close()
+
+    async def test_version_fifty_nine_retires_a_pre_owner_runtime_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kai.workshop import schema
+
+        path = tmp_path / "kai.db"
+        replacement_profile = RuntimeProfileId.new()
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 58)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:58])
+            legacy, run = await _accepted(path)
+            try:
+                result = await _coordinator(legacy, _Preparation(_Prepared(run))).execute(run.run_id)
+                assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+                assert await load_runtime_session(legacy, run.channel_id, run.agent_id) is not None
+
+                await legacy.connection.execute(
+                    "UPDATE agent_definitions SET owner_runtime_profile_id = ? WHERE agent_id = ?",
+                    (replacement_profile, run.agent_id),
+                )
+                await legacy.connection.commit()
+            finally:
+                await legacy.close()
+
+        before = workshop_runtime_session_status(path)
+        assert before.startswith("Workshop conversation continuity: INCOMPLETE; successful lanes=0, sessions=1")
+        assert "missing=0, stale=1" in before
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 59
+            assert await load_runtime_session(upgraded, run.channel_id, run.agent_id) is None
+            after = workshop_runtime_session_status(path)
+            assert after.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
+            assert "missing=0, stale=0" in after
+        finally:
+            await upgraded.close()
+
+    async def test_version_fifty_nine_retains_a_current_owner_runtime_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kai.workshop import schema
+
+        path = tmp_path / "kai.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 58)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:58])
+            legacy, run = await _accepted(path)
+            try:
+                result = await _coordinator(legacy, _Preparation(_Prepared(run))).execute(run.run_id)
+                assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            finally:
+                await legacy.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 59
+            session = await load_runtime_session(upgraded, run.channel_id, run.agent_id)
+            assert session is not None
+            assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
+            status = workshop_runtime_session_status(path)
+            assert status.startswith("Workshop conversation continuity: active; successful lanes=1, sessions=1")
+            assert "missing=0, stale=0" in status
+        finally:
+            await upgraded.close()
 
     async def test_retired_successful_lane_does_not_require_a_live_provider_session(
         self,
