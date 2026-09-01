@@ -309,8 +309,12 @@ class TestDefaultWorkshopBootstrap:
         assert migrated.created_events == 4
         assert (await store.read_events())[-4].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
         assert (await store.read_events())[-3].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED
-        assert (await store.read_events())[-2].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED
-        assert (await store.read_events())[-1].envelope.event_type == WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED
+        assert (await store.read_events())[
+            -2
+        ].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED
+        assert (await store.read_events())[
+            -1
+        ].envelope.event_type == WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED
         async with store.connection.execute(
             "SELECT runtime_profile_id FROM channel_agent_runtime_assignments"
         ) as cursor:
