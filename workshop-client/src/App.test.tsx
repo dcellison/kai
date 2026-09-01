@@ -134,6 +134,7 @@ const navigation: WorkshopNavigation = {
               engaged: false,
               engagedUntil: null,
               handle: "kai",
+              lifecycleState: "active",
               memoryScope: "private",
               name: "Kai",
               principalId: "prn_00000000000000000000000000000002",
@@ -164,6 +165,7 @@ const navigation: WorkshopNavigation = {
               engaged: false,
               engagedUntil: null,
               handle: "kai",
+              lifecycleState: "active",
               memoryScope: "private",
               name: "Kai",
               principalId: "prn_00000000000000000000000000000002",
@@ -2480,6 +2482,45 @@ describe("Workshop React client", () => {
     expect(screen.getByText("Agents")).toBeVisible();
   });
 
+  it("explains that an archived agent conversation is permanently read-only", async () => {
+    const archivedNavigation: WorkshopNavigation = {
+      ...navigation,
+      workshops: navigation.workshops.map((workshop) => ({
+        ...workshop,
+        channels: workshop.channels.map((channel) =>
+          channel.channelId === channelId
+            ? {
+                ...channel,
+                agents: channel.agents.map((agent) => ({
+                  ...agent,
+                  lifecycleState: "archived",
+                })),
+                canSubmitCommands: false,
+              }
+            : channel,
+        ),
+      })),
+    };
+    vi.mocked(loadNavigation).mockResolvedValue(archivedNavigation);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByText(
+        "This agent has been archived. This conversation is read-only.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByText(
+        "Sending messages from Workshop is not available for this conversation yet.",
+      ),
+    ).toBeNull();
+  });
+
   it("opens agent management from the sidebar and starts a direct conversation", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
@@ -2767,6 +2808,7 @@ describe("Workshop React client", () => {
           engaged: false,
           engagedUntil: null,
           handle: qualificationDefinition.handle,
+          lifecycleState: "active",
           memoryScope: "private",
           name: qualificationDefinition.displayName,
           principalId: "prn_44444444444444444444444444444444",

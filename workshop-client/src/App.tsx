@@ -3740,6 +3740,9 @@ function WorkshopView({
             <p className="read-only-channel-notice">
               {channel.kind === "notification"
                 ? "This channel is outbound-only. Kai records delivery here, but it does not accept conversation commands."
+                : channel.kind === "direct" &&
+                    channel.agents.some((agent) => agent.lifecycleState === "archived")
+                  ? "This agent has been archived. This conversation is read-only."
                 : "Sending messages from Workshop is not available for this conversation yet."}
             </p>
           )}

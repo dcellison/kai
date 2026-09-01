@@ -299,6 +299,9 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
         )
         assert restarted_execution.maybe_for_principal_channel(daniel, enabled.direct_channel_id) is None
         assert all(context.channel_id != enabled.direct_channel_id for context in restarted_contexts.contexts)
+        authority_status = workshop_agent_authority_status(tmp_path / "kai.db")
+        assert authority_status.startswith("Workshop agent authority: active;")
+        assert "owner runtimes=0" in authority_status.split("integrity gaps=", 1)[1]
     finally:
         await store.close()
 

@@ -220,6 +220,42 @@ class TestCanonicalExecutionCoordinator:
         finally:
             await store.close()
 
+    async def test_retired_successful_lane_does_not_require_a_live_provider_session(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, run = await _accepted(tmp_path / "kai.db")
+        try:
+            result = await _coordinator(store, _Preparation(_Prepared(run))).execute(run.run_id)
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+
+            await store.connection.execute(
+                "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE agent_id = ?",
+                (run.agent_id,),
+            )
+            await store.connection.execute(
+                "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled' "
+                "WHERE direct_channel_id = ? AND agent_id = ?",
+                (run.channel_id, run.agent_id),
+            )
+            await store.connection.commit()
+
+            retained = workshop_runtime_session_status(tmp_path / "kai.db")
+            assert retained.startswith("Workshop conversation continuity: INCOMPLETE; successful lanes=0, sessions=1")
+            assert "missing=0, stale=1" in retained
+
+            await store.connection.execute(
+                "DELETE FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+                (run.channel_id, run.agent_id),
+            )
+            await store.connection.commit()
+
+            retired = workshop_runtime_session_status(tmp_path / "kai.db")
+            assert retired.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
+            assert "missing=0, stale=0" in retired
+        finally:
+            await store.close()
+
     async def test_cold_restart_bootstraps_only_prior_canonical_timeline(self, tmp_path: Path):
         store, first_run = await _accepted(tmp_path / "kai.db")
         first = _Prepared(first_run)
