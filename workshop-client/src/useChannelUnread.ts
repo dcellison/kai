@@ -26,6 +26,10 @@ function indexed(
   return Object.fromEntries(channels.map((state) => [state.channelId, state]));
 }
 
+function unreadTotal(state: WorkshopChannelUnreadState | undefined): number {
+  return Math.min((state?.unreadCount ?? 0) + (state?.unreadReplyCount ?? 0), 1000);
+}
+
 export interface ChannelUnreadClientState {
   byChannel: Record<string, WorkshopChannelUnreadState>;
   error: string | null;
@@ -96,10 +100,10 @@ export function useChannelUnread(
         for (const { state: changed } of change.unreadChanges) {
           setState((current) => {
             const previous = current.byChannel[changed.channelId];
-            const nextTotal = Math.max(
+            const nextTotal = Math.min(1000, Math.max(
               0,
-              current.totalUnread - (previous?.unreadCount ?? 0) + changed.unreadCount,
-            );
+              current.totalUnread - unreadTotal(previous) + unreadTotal(changed),
+            ));
             const next = {
               ...current,
               byChannel: { ...current.byChannel, [changed.channelId]: changed },
@@ -156,10 +160,13 @@ export function useChannelUnread(
                   ...currentState.byChannel,
                   [session.channelId]: mutation.state,
                 },
-                totalUnread: Math.max(
-                  0,
-                  currentState.totalUnread -
-                    (previous?.unreadCount ?? 0) + mutation.state.unreadCount,
+                totalUnread: Math.min(
+                  1000,
+                  Math.max(
+                    0,
+                    currentState.totalUnread -
+                      unreadTotal(previous) + unreadTotal(mutation.state),
+                  ),
                 ),
               };
               stateRef.current = next;

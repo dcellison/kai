@@ -6,6 +6,7 @@ import App from "./App";
 import {
   archiveChannel,
   advanceChannelReadPosition,
+  advanceThreadReadPosition,
   attachChannelAgent,
   AuthenticationError,
   cancelRun,
@@ -37,6 +38,7 @@ import {
   loadSettingsWorkspace,
   loadTimeline,
   loadThreadTimeline,
+  loadThreadUnread,
   loadWorkspaceConfig,
   redeemEnrollment,
   restoreChannel,
@@ -46,6 +48,7 @@ import {
   streamTimeline,
   streamPrincipalEvents,
   setMessageReaction,
+  setThreadFollowed,
   startAgentConversation,
   submitCommand,
   switchWorkspace,
@@ -61,6 +64,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopHumanNotification,
   WorkshopChannelUnreadState,
+  WorkshopThreadUnreadState,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -70,6 +74,7 @@ vi.mock("./api", async (importOriginal) => {
     attachChannelAgent: vi.fn(),
     archiveChannel: vi.fn(),
     advanceChannelReadPosition: vi.fn(),
+    advanceThreadReadPosition: vi.fn(),
     cancelRun: vi.fn(),
     changeChannelMember: vi.fn(),
     createChannel: vi.fn(),
@@ -95,6 +100,7 @@ vi.mock("./api", async (importOriginal) => {
     loadPreferenceHistory: vi.fn(),
     loadTimeline: vi.fn(),
     loadThreadTimeline: vi.fn(),
+    loadThreadUnread: vi.fn(),
     loadRun: vi.fn(),
     loadRunTrace: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
@@ -107,6 +113,7 @@ vi.mock("./api", async (importOriginal) => {
     streamTimeline: vi.fn(),
     streamPrincipalEvents: vi.fn(),
     setMessageReaction: vi.fn(),
+    setThreadFollowed: vi.fn(),
     startAgentConversation: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
@@ -285,6 +292,33 @@ function unreadState(
     readThroughMessageId: null,
     stateVersion: 0,
     unreadCount: 1,
+    unreadCountCapped: false,
+    unreadReplyCount: 0,
+    unreadReplyCountCapped: false,
+    unreadThreadCount: 0,
+    firstUnreadThreadRootId: null,
+    firstUnreadThreadReplyId: null,
+    firstUnreadThreadEventPosition: null,
+    ...overrides,
+  };
+}
+
+function threadUnreadState(
+  rootMessageId: string,
+  overrides: Partial<WorkshopThreadUnreadState> = {},
+): WorkshopThreadUnreadState {
+  return {
+    channelId: secondChannelId,
+    firstUnreadEventPosition: null,
+    firstUnreadMessageId: null,
+    followBaselineEventPosition: 25,
+    followed: true,
+    lastEventPosition: 25,
+    readThroughEventPosition: 25,
+    readThroughMessageId: null,
+    stateVersion: 0,
+    threadRootId: rootMessageId,
+    unreadCount: 0,
     unreadCountCapped: false,
     ...overrides,
   };
@@ -616,6 +650,21 @@ describe("Workshop React client", () => {
       totalUnread: 0,
       totalUnreadCapped: false,
     });
+    vi.mocked(loadThreadUnread).mockImplementation(async (_session, rootMessageId) => (
+      threadUnreadState(rootMessageId)
+    ));
+    vi.mocked(advanceThreadReadPosition).mockImplementation(
+      async (_session, rootMessageId) => ({
+        replayed: false,
+        state: threadUnreadState(rootMessageId),
+      }),
+    );
+    vi.mocked(setThreadFollowed).mockImplementation(
+      async (_session, rootMessageId, followed) => ({
+        replayed: false,
+        state: threadUnreadState(rootMessageId, { followed }),
+      }),
+    );
     vi.mocked(markHumanNotificationsRead).mockResolvedValue([]);
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
@@ -1125,6 +1174,7 @@ describe("Workshop React client", () => {
       principalEventHandlers?.onBatch({
         changes: [{
           agentChanges: [],
+          threadChanges: [],
           eventPosition: historyMessage.eventPosition,
           notificationChanges: [{
             eventPosition: historyMessage.eventPosition,
@@ -1236,6 +1286,7 @@ describe("Workshop React client", () => {
       const batch = {
         changes: [{
           agentChanges: [],
+          threadChanges: [],
           eventPosition: 41,
           notificationChanges: [{
             eventPosition: 41,
@@ -1770,6 +1821,7 @@ describe("Workshop React client", () => {
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
+        threadChanges: [],
         eventPosition: 30,
         notificationChanges: [],
         unreadChanges: [{ eventPosition: 30, state: unread }],
@@ -1785,6 +1837,7 @@ describe("Workshop React client", () => {
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
+        threadChanges: [],
         eventPosition: 30,
         notificationChanges: [],
         unreadChanges: [{ eventPosition: 30, state: unread }],
@@ -1799,6 +1852,7 @@ describe("Workshop React client", () => {
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
+        threadChanges: [],
         eventPosition: 31,
         notificationChanges: [],
         unreadChanges: [{
@@ -2459,6 +2513,7 @@ describe("Workshop React client", () => {
 
   it("opens a group-message thread and submits replies against its canonical root", async () => {
     const user = userEvent.setup();
+    observeMessagesAsVisible();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
@@ -2484,22 +2539,56 @@ describe("Workshop React client", () => {
       throughPosition: 26,
       previousCursor: null,
     });
+    vi.mocked(loadChannelUnread).mockResolvedValue({
+      channels: [unreadState(secondChannelId, {
+        firstUnreadEventPosition: null,
+        firstUnreadMessageId: null,
+        firstUnreadThreadEventPosition: reply.eventPosition,
+        firstUnreadThreadReplyId: reply.messageId,
+        firstUnreadThreadRootId: root.messageId,
+        unreadCount: 0,
+        unreadReplyCount: 1,
+        unreadThreadCount: 1,
+      })],
+      throughPosition: 26,
+      totalUnread: 1,
+      totalUnreadCapped: false,
+    });
     vi.mocked(loadThreadTimeline).mockResolvedValue({
       root,
       messages: [reply],
       nextCursor: null,
       throughPosition: 26,
     });
+    vi.mocked(loadThreadUnread).mockResolvedValue(threadUnreadState(root.messageId, {
+      firstUnreadEventPosition: reply.eventPosition,
+      firstUnreadMessageId: reply.messageId,
+      lastEventPosition: reply.eventPosition,
+      unreadCount: 1,
+    }));
 
     render(<App />);
     const threadButton = await screen.findByRole("button", {
-      name: "Open thread with 1 reply",
+      name: "Open thread with 1 reply, including unread replies",
     });
     expect(threadButton).toHaveTextContent("1 reply");
+    expect(threadButton).toHaveTextContent("New replies");
     expect(threadButton.querySelector("svg")).toBeNull();
     await user.click(threadButton);
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
+    expect(within(context).getByRole("button", { name: "Following" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(within(context).getByRole("separator", { name: "First unread reply" })).toBeVisible();
+    await waitFor(() => expect(advanceThreadReadPosition).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      root.messageId,
+      reply.messageId,
+      0,
+      expect.stringMatching(/^browser-/),
+    ));
     const closeThread = within(context).getByRole("button", { name: "Close thread" });
     expect(closeThread).toHaveClass("panel-icon-button");
     expect(closeThread).toHaveTextContent("×");

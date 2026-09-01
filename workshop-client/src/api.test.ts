@@ -12,6 +12,7 @@ import {
   activateAgentRevision,
   addAgentRevision,
   archiveAgentDefinition,
+  advanceThreadReadPosition,
   createChannel,
   createAgentDefinition,
   createMemoryFact,
@@ -46,6 +47,7 @@ import {
   loadRun,
   loadTimeline,
   loadThreadTimeline,
+  loadThreadUnread,
   loadChannelMessage,
   loadHumanNotificationCounts,
   loadHumanNotifications,
@@ -59,6 +61,7 @@ import {
   restorePreferenceRevision,
   savePreferenceDocument,
   setMessageReaction,
+  setThreadFollowed,
   startAgentConversation,
   submitCommand,
   streamTimeline,
@@ -2452,6 +2455,26 @@ describe("Workshop client API", () => {
       state_version: 0,
       unread_count: 1,
       unread_count_capped: false,
+      unread_reply_count: 0,
+      unread_reply_count_capped: false,
+      unread_thread_count: 0,
+      first_unread_thread_root_id: null,
+      first_unread_thread_reply_id: null,
+      first_unread_thread_event_position: null,
+    };
+    const threadUnread = {
+      channel_id: channelId,
+      thread_root_id: "msg_00000000000000000000000000000079",
+      followed: true,
+      follow_baseline_event_position: 79,
+      read_through_event_position: 79,
+      read_through_message_id: null,
+      state_version: 0,
+      last_event_position: eventPosition,
+      unread_count: 1,
+      unread_count_capped: false,
+      first_unread_message_id: "msg_00000000000000000000000000000080",
+      first_unread_event_position: eventPosition,
     };
     const frame = [
       `id: ${eventPosition}`,
@@ -2465,6 +2488,7 @@ describe("Workshop client API", () => {
             notification,
           }],
           unread_changes: [{ state: unread }],
+          thread_changes: [{ event_type: "message.created", state: threadUnread }],
         }],
         through_position: eventPosition,
         version: 1,
@@ -2493,6 +2517,11 @@ describe("Workshop client API", () => {
       {
         changes: [{
           agentChanges: [],
+          threadChanges: [expect.objectContaining({
+            eventPosition,
+            state: expect.objectContaining({ unreadCount: 1 }),
+            transition: "message.created",
+          })],
           eventPosition,
           notificationChanges: [expect.objectContaining({
             eventPosition,
@@ -2529,6 +2558,12 @@ describe("Workshop client API", () => {
       state_version: 0,
       unread_count: 1,
       unread_count_capped: false,
+      unread_reply_count: 0,
+      unread_reply_count_capped: false,
+      unread_thread_count: 0,
+      first_unread_thread_root_id: null,
+      first_unread_thread_reply_id: null,
+      first_unread_thread_event_position: null,
     };
     const changed = {
       ...unread,
@@ -2604,6 +2639,67 @@ describe("Workshop client API", () => {
     ]);
     const headers = fetchMock.mock.calls[2][1]?.headers as Headers;
     expect(headers.get("X-Kai-Stream-ID")).toMatch(/:unread$/);
+  });
+
+  it("loads and mutates canonical followed-thread unread state", async () => {
+    const rootMessageId = "msg_00000000000000000000000000000080";
+    const replyMessageId = "msg_00000000000000000000000000000081";
+    const state = {
+      channel_id: channelId,
+      thread_root_id: rootMessageId,
+      followed: true,
+      follow_baseline_event_position: 80,
+      read_through_event_position: 80,
+      read_through_message_id: null,
+      state_version: 0,
+      last_event_position: 81,
+      unread_count: 1,
+      unread_count_capped: false,
+      first_unread_message_id: replyMessageId,
+      first_unread_event_position: 81,
+    };
+    const unfollowed = {
+      ...state,
+      followed: false,
+      follow_baseline_event_position: 81,
+      read_through_event_position: 81,
+      read_through_message_id: replyMessageId,
+      state_version: 1,
+      unread_count: 0,
+      first_unread_message_id: null,
+      first_unread_event_position: null,
+    };
+    const advanced = {
+      ...state,
+      read_through_event_position: 81,
+      read_through_message_id: replyMessageId,
+      state_version: 1,
+      unread_count: 0,
+      first_unread_message_id: null,
+      first_unread_event_position: null,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ state, version: 1 }))
+      .mockResolvedValueOnce(Response.json({ replayed: false, state: unfollowed, version: 1 }))
+      .mockResolvedValueOnce(Response.json({ replayed: false, state: advanced, version: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect((await loadThreadUnread(session, rootMessageId)).unreadCount).toBe(1);
+    expect((await setThreadFollowed(session, rootMessageId, false, 0, "unfollow")).state.followed)
+      .toBe(false);
+    expect((await advanceThreadReadPosition(
+      session,
+      rootMessageId,
+      replyMessageId,
+      0,
+      "read-visible-reply",
+    )).state.unreadCount).toBe(0);
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      `/v1/channels/${channelId}/threads/${rootMessageId}/unread`,
+      `/v1/channels/${channelId}/threads/${rootMessageId}/unfollow`,
+      `/v1/channels/${channelId}/threads/${rootMessageId}/read-position`,
+    ]);
   });
 
   it("loads one exact authorized channel message", async () => {

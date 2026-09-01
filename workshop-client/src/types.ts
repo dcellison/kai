@@ -145,6 +145,12 @@ export interface WorkshopChannelUnreadState {
   stateVersion: number;
   unreadCount: number;
   unreadCountCapped: boolean;
+  unreadReplyCount: number;
+  unreadReplyCountCapped: boolean;
+  unreadThreadCount: number;
+  firstUnreadThreadRootId: string | null;
+  firstUnreadThreadReplyId: string | null;
+  firstUnreadThreadEventPosition: number | null;
 }
 
 export interface WorkshopChannelUnreadSnapshot {
@@ -164,11 +170,42 @@ export interface WorkshopChannelUnreadSignal {
   state: WorkshopChannelUnreadState;
 }
 
+export interface WorkshopThreadUnreadState {
+  channelId: string;
+  threadRootId: string;
+  followed: boolean;
+  followBaselineEventPosition: number;
+  readThroughEventPosition: number;
+  readThroughMessageId: string | null;
+  stateVersion: number;
+  lastEventPosition: number;
+  unreadCount: number;
+  unreadCountCapped: boolean;
+  firstUnreadMessageId: string | null;
+  firstUnreadEventPosition: number | null;
+}
+
+export interface WorkshopThreadUnreadMutation {
+  replayed: boolean;
+  state: WorkshopThreadUnreadState;
+}
+
+export interface WorkshopThreadUnreadSignal {
+  eventPosition: number;
+  state: WorkshopThreadUnreadState;
+  transition:
+    | "message.created"
+    | "thread.followed"
+    | "thread.unfollowed"
+    | "thread_read_position.advanced";
+}
+
 export interface WorkshopPrincipalChange {
   agentChanges: WorkshopAgentChangeSignal[];
   eventPosition: number;
   notificationChanges: WorkshopHumanNotificationSignal[];
   unreadChanges: WorkshopChannelUnreadSignal[];
+  threadChanges: WorkshopThreadUnreadSignal[];
 }
 
 export interface WorkshopPrincipalEventBatch {

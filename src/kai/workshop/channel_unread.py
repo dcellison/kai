@@ -53,6 +53,16 @@ class ChannelUnreadState:
     unread_count_capped: bool
     first_unread_message_id: MessageId | None
     first_unread_event_position: int | None
+    unread_reply_count: int
+    unread_reply_count_capped: bool
+    unread_thread_count: int
+    first_unread_thread_root_id: MessageId | None
+    first_unread_thread_reply_id: MessageId | None
+    first_unread_thread_event_position: int | None
+
+    @property
+    def combined_unread_count(self) -> int:
+        return min(self.unread_count + self.unread_reply_count, MAX_UNREAD_COUNT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,8 +165,11 @@ class WorkshopChannelUnreadService:
         if len(rows) > MAX_UNREAD_CHANNELS:
             raise WorkshopChannelUnreadValidationError("Too many accessible channels for one unread snapshot")
         states = tuple([await self._state_from_position(principal_id, _read_position_from_row(row)) for row in rows])
-        exact_total = sum(state.unread_count for state in states)
-        capped = any(state.unread_count_capped for state in states) or exact_total > MAX_UNREAD_COUNT
+        exact_total = sum(state.unread_count + state.unread_reply_count for state in states)
+        capped = (
+            any(state.unread_count_capped or state.unread_reply_count_capped for state in states)
+            or exact_total > MAX_UNREAD_COUNT
+        )
         async with self._store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
             tip_row = await cursor.fetchone()
         return ChannelUnreadSnapshot(
@@ -281,11 +294,15 @@ class WorkshopChannelUnreadService:
             "ON rp.principal_id = ? AND rp.channel_id = json_extract(e.payload_json, '$.channel_id') "
             "JOIN channel_memberships cm ON cm.principal_id = rp.principal_id "
             "AND cm.channel_id = rp.channel_id JOIN channels c ON c.id = rp.channel_id "
-            "WHERE c.archived_at IS NULL AND e.position > ? AND ((e.event_type = ? "
+            "WHERE c.archived_at IS NULL AND e.position > ? AND (((e.event_type = ? "
             "AND e.actor_principal_id = ?) OR (e.event_type = ? "
             "AND e.actor_principal_id != ? "
-            "AND json_extract(e.payload_json, '$.thread_root_id') IS NULL "
+            "AND (json_extract(e.payload_json, '$.thread_root_id') IS NULL OR EXISTS ("
+            "SELECT 1 FROM thread_read_positions trp WHERE trp.principal_id = ? "
+            "AND trp.thread_root_id = json_extract(e.payload_json, '$.thread_root_id') "
+            "AND trp.followed = 1)) "
             "AND coalesce(json_extract(e.metadata_json, '$.source'), '') != 'scheduled_job')) "
+            "OR (e.event_type IN (?, ?, ?) AND e.actor_principal_id = ?)) "
             "ORDER BY e.position LIMIT ?",
             (
                 principal_id,
@@ -293,6 +310,11 @@ class WorkshopChannelUnreadService:
                 WorkshopEventType.CHANNEL_READ_POSITION_ADVANCED.value,
                 principal_id,
                 WorkshopEventType.MESSAGE_CREATED.value,
+                principal_id,
+                principal_id,
+                WorkshopEventType.THREAD_FOLLOWED.value,
+                WorkshopEventType.THREAD_UNFOLLOWED.value,
+                WorkshopEventType.THREAD_READ_POSITION_ADVANCED.value,
                 principal_id,
                 limit,
             ),
@@ -376,6 +398,26 @@ class WorkshopChannelUnreadService:
         capped = len(rows) > MAX_UNREAD_COUNT
         bounded = rows[:MAX_UNREAD_COUNT]
         first = bounded[0] if bounded else None
+        async with self._store.connection.execute(
+            "SELECT reply.id, reply.created_event_position, rp.thread_root_id "
+            "FROM thread_read_positions rp JOIN messages reply "
+            "ON reply.thread_root_id = rp.thread_root_id "
+            "AND reply.created_event_position > rp.read_through_event_position "
+            "WHERE rp.principal_id = ? AND rp.channel_id = ? AND rp.followed = 1 "
+            "AND reply.author_principal_id != ? "
+            "ORDER BY reply.created_event_position LIMIT ?",
+            (
+                principal_id,
+                position.channel_id,
+                principal_id,
+                MAX_UNREAD_COUNT + 1,
+            ),
+        ) as cursor:
+            reply_rows = list(await cursor.fetchall())
+        reply_capped = len(reply_rows) > MAX_UNREAD_COUNT
+        bounded_replies = reply_rows[:MAX_UNREAD_COUNT]
+        first_reply = bounded_replies[0] if bounded_replies else None
+        unread_threads = len({str(row[2]) for row in bounded_replies})
         return ChannelUnreadState(
             channel_id=position.channel_id,
             channel_kind=position.channel_kind,
@@ -390,6 +432,12 @@ class WorkshopChannelUnreadService:
             unread_count_capped=capped,
             first_unread_message_id=MessageId(str(first[0])) if first is not None else None,
             first_unread_event_position=int(first[1]) if first is not None else None,
+            unread_reply_count=len(bounded_replies),
+            unread_reply_count_capped=reply_capped,
+            unread_thread_count=unread_threads,
+            first_unread_thread_root_id=(MessageId(str(first_reply[2])) if first_reply is not None else None),
+            first_unread_thread_reply_id=(MessageId(str(first_reply[0])) if first_reply is not None else None),
+            first_unread_thread_event_position=(int(first_reply[1]) if first_reply is not None else None),
         )
 
     @staticmethod
