@@ -66,6 +66,10 @@ import type {
   WorkshopHumanNotificationMutation,
   WorkshopHumanNotificationPage,
   WorkshopHumanNotificationSignal,
+  WorkshopChannelReadPositionMutation,
+  WorkshopChannelUnreadSignal,
+  WorkshopChannelUnreadSnapshot,
+  WorkshopChannelUnreadState,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -84,6 +88,7 @@ import {
 
 export class AuthenticationError extends Error {}
 export class ChannelAccessError extends Error {}
+export class ChannelReadPositionConflictError extends Error {}
 export class ResynchronizationRequired extends Error {}
 export class PreferenceRevisionConflictError extends Error {
   constructor(
@@ -3820,6 +3825,203 @@ export async function markHumanNotificationsRead(
   });
 }
 
+function parseChannelUnreadState(value: unknown): WorkshopChannelUnreadState | null {
+  if (!isRecord(value)) return null;
+  const {
+    archived,
+    channel_id: channelId,
+    channel_kind: channelKind,
+    channel_name: channelName,
+    first_unread_event_position: firstUnreadEventPosition,
+    first_unread_message_id: firstUnreadMessageId,
+    last_event_position: lastEventPosition,
+    membership_baseline_event_position: membershipBaselineEventPosition,
+    read_through_event_position: readThroughEventPosition,
+    read_through_message_id: readThroughMessageId,
+    state_version: stateVersion,
+    unread_count: unreadCount,
+    unread_count_capped: unreadCountCapped,
+  } = value;
+  if (
+    typeof archived !== "boolean" ||
+    typeof channelId !== "string" ||
+    !CHANNEL_PATTERN.test(channelId) ||
+    (channelKind !== "direct" && channelKind !== "group" && channelKind !== "notification") ||
+    (channelName !== null && typeof channelName !== "string") ||
+    (firstUnreadEventPosition !== null &&
+      (!Number.isSafeInteger(firstUnreadEventPosition) || (firstUnreadEventPosition as number) < 0)) ||
+    (firstUnreadMessageId !== null &&
+      (typeof firstUnreadMessageId !== "string" || !MESSAGE_PATTERN.test(firstUnreadMessageId))) ||
+    !Number.isSafeInteger(lastEventPosition) ||
+    (lastEventPosition as number) < 0 ||
+    !Number.isSafeInteger(membershipBaselineEventPosition) ||
+    (membershipBaselineEventPosition as number) < 0 ||
+    !Number.isSafeInteger(readThroughEventPosition) ||
+    (readThroughEventPosition as number) < 0 ||
+    (readThroughMessageId !== null &&
+      (typeof readThroughMessageId !== "string" || !MESSAGE_PATTERN.test(readThroughMessageId))) ||
+    !Number.isSafeInteger(stateVersion) ||
+    (stateVersion as number) < 0 ||
+    !Number.isSafeInteger(unreadCount) ||
+    (unreadCount as number) < 0 ||
+    typeof unreadCountCapped !== "boolean" ||
+    ((firstUnreadMessageId === null) !== (firstUnreadEventPosition === null)) ||
+    ((unreadCount as number) === 0) !== (firstUnreadMessageId === null)
+  ) {
+    return null;
+  }
+  return {
+    archived,
+    channelId,
+    channelKind,
+    channelName,
+    firstUnreadEventPosition: firstUnreadEventPosition as number | null,
+    firstUnreadMessageId,
+    lastEventPosition: lastEventPosition as number,
+    membershipBaselineEventPosition: membershipBaselineEventPosition as number,
+    readThroughEventPosition: readThroughEventPosition as number,
+    readThroughMessageId,
+    stateVersion: stateVersion as number,
+    unreadCount: unreadCount as number,
+    unreadCountCapped,
+  };
+}
+
+export async function loadChannelUnread(
+  token: string,
+  signal?: AbortSignal,
+): Promise<WorkshopChannelUnreadSnapshot> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/unread",
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !Array.isArray(payload.channels) ||
+    !Number.isSafeInteger(payload.total_unread) ||
+    (payload.total_unread as number) < 0 ||
+    typeof payload.total_unread_capped !== "boolean" ||
+    !Number.isSafeInteger(payload.through_position) ||
+    (payload.through_position as number) < 0
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not load unread messages."));
+  }
+  const channels = payload.channels.map(parseChannelUnreadState);
+  if (channels.some((state) => state === null)) {
+    throw new Error("Kai returned unsupported unread state.");
+  }
+  return {
+    channels: channels as WorkshopChannelUnreadState[],
+    throughPosition: payload.through_position as number,
+    totalUnread: payload.total_unread as number,
+    totalUnreadCapped: payload.total_unread_capped,
+  };
+}
+
+export async function advanceChannelReadPosition(
+  session: WorkshopSession,
+  messageId: string,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopChannelReadPositionMutation> {
+  if (!MESSAGE_PATTERN.test(messageId)) {
+    throw new Error("Invalid message identity.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/read-position`,
+    {
+      body: JSON.stringify({
+        client_operation_id: clientOperationId,
+        expected_state_version: expectedStateVersion,
+        message_id: messageId,
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 404) {
+    throw new ChannelAccessError("This session can no longer access that Workshop channel.");
+  }
+  if (response.status === 409) {
+    throw new ChannelReadPositionConflictError(
+      safeErrorMessage(payload, "Unread state changed in another tab."),
+    );
+  }
+  const state = isRecord(payload) ? parseChannelUnreadState(payload.state) : null;
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !state ||
+    typeof payload.replayed !== "boolean"
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not update unread messages."));
+  }
+  return { replayed: payload.replayed, state };
+}
+
+export async function streamChannelUnread(
+  token: string,
+  lastEventId: string | null,
+  handlers: {
+    onChanged: (signal: WorkshopChannelUnreadSignal, eventId: string) => void;
+    onConnected: () => void;
+  },
+  signal: AbortSignal,
+): Promise<void> {
+  const query = lastEventId === null
+    ? ""
+    : `?after_position=${encodeURIComponent(lastEventId)}`;
+  const headers = new Headers();
+  headers.set("X-Kai-Stream-ID", `${eventStreamId()}:unread`);
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/client/unread/events${query}`,
+    { headers, signal },
+  );
+  if (!response.ok || !response.body) {
+    const payload = await responsePayload(response);
+    throw new Error(safeErrorMessage(payload, "Live unread updates are unavailable."));
+  }
+  handlers.onConnected();
+  const reader = response.body.getReader();
+  const textDecoder = new TextDecoder();
+  const eventDecoder = new EventStreamDecoder();
+  while (!signal.aborted) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    for (const event of eventDecoder.push(textDecoder.decode(value, { stream: true }))) {
+      if (
+        event.eventName !== "channel_unread.changed" ||
+        !event.eventId ||
+        !/^\d+$/.test(event.eventId)
+      ) continue;
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        continue;
+      }
+      const eventPosition = Number(event.eventId);
+      const state = isRecord(payload) ? parseChannelUnreadState(payload.state) : null;
+      if (
+        !isRecord(payload) ||
+        payload.version !== 1 ||
+        payload.event_position !== eventPosition ||
+        !Number.isSafeInteger(eventPosition) ||
+        !state
+      ) continue;
+      handlers.onChanged({ eventPosition, state }, event.eventId);
+    }
+  }
+}
+
 export async function loadChannelMessage(
   session: WorkshopSession,
   messageId: string,
@@ -3861,6 +4063,7 @@ function parseTimelinePage(payload: unknown, channelId: string): TimelineSnapsho
   }
   return {
     messages,
+    nextCursor: typeof payload.next_cursor === "string" ? payload.next_cursor : null,
     throughPosition: payload.through_position as number,
     previousCursor:
       typeof payload.previous_cursor === "string" ? payload.previous_cursor : null,
@@ -3870,13 +4073,23 @@ function parseTimelinePage(payload: unknown, channelId: string): TimelineSnapsho
 export async function loadTimeline(
   session: WorkshopSession,
   signal: AbortSignal,
+  startMessageId: string | null = null,
 ): Promise<TimelineSnapshot> {
   // Tail-first: one bounded request for the newest window, so opening a
   // channel costs the same regardless of how long its history is.
   // Earlier history stays behind previousCursor and loads on demand.
+  const query = new URLSearchParams({ limit: "100" });
+  if (startMessageId !== null) {
+    if (!MESSAGE_PATTERN.test(startMessageId)) {
+      throw new Error("Invalid unread message identity.");
+    }
+    query.set("start_message_id", startMessageId);
+  } else {
+    query.set("tail", "1");
+  }
   const response = await authorizedFetch(
     session,
-    `/v1/channels/${encodeURIComponent(session.channelId)}/timeline?tail=1&limit=100`,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/timeline?${query}`,
     { signal },
   );
   const payload = await responsePayload(response);

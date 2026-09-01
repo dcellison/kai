@@ -1,5 +1,6 @@
 import {
   CSSProperties,
+  Fragment,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
@@ -52,6 +53,7 @@ import type {
   WorkshopRunTracePage,
   WorkshopRunTraceSignal,
   WorkshopChannelSummary,
+  WorkshopChannelUnreadState,
   WorkshopNavigation,
   WorkshopNotificationPreferences,
   WorkshopSession,
@@ -70,7 +72,7 @@ import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN, MESSAGE_PATTERN } from "./ty
 import { RunTraceCard } from "./RunTraceCard";
 import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
-import type { EarlierHistoryState } from "./useWorkshopTimeline";
+import type { EarlierHistoryState, LaterHistoryState } from "./useWorkshopTimeline";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
@@ -78,6 +80,7 @@ import { SettingsWorkspace } from "./SettingsWorkspace";
 import { AgentWorkspace } from "./AgentWorkspace";
 import { MentionsInbox } from "./MentionsInbox";
 import { useHumanNotifications } from "./useHumanNotifications";
+import { useChannelUnread } from "./useChannelUnread";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 
@@ -837,6 +840,7 @@ function MessageItem({
         onMessageVisible(message.messageId);
       }
     }, {
+      root: row.closest(".timeline-wrap"),
       rootMargin: "0px",
       threshold: 0,
     });
@@ -1145,6 +1149,16 @@ function channelSymbol(channel: WorkshopChannelSummary): string {
     return "@";
   }
   return "#";
+}
+
+function channelUnreadLabel(state: WorkshopChannelUnreadState | undefined): string {
+  const count = state?.unreadCount ?? 0;
+  if (count <= 0) {
+    return "";
+  }
+  const qualifiedCount = `${count}${state?.unreadCountCapped ? " or more" : ""}`;
+  const noun = count === 1 && !state?.unreadCountCapped ? "message" : "messages";
+  return `, ${qualifiedCount} unread ${noun}`;
 }
 
 function channelIsArchived(channel: WorkshopChannelSummary): boolean {
@@ -2039,12 +2053,16 @@ function WorkshopView({
   channel,
   connection,
   earlier,
+  later,
   messages,
   threadMessages,
   memoryDestination,
   memoryToken,
   mentionsDestination,
   inbox,
+  unread,
+  unreadBoundaryMessageId,
+  readActivatedInitially,
   focusedMessage,
   focusedThreadRoot,
   focusedMessageError,
@@ -2067,6 +2085,8 @@ function WorkshopView({
   onDetachAgent,
   onDownloadArtifact,
   onLoadEarlier,
+  onLoadLater,
+  onJumpLatest,
   onLoadArtifact,
   onLoadChannelMembers,
   onLoadRun,
@@ -2101,12 +2121,16 @@ function WorkshopView({
   channel: WorkshopChannelSummary;
   connection: ConnectionState;
   earlier: EarlierHistoryState;
+  later: LaterHistoryState;
   messages: TimelineMessage[];
   threadMessages: TimelineMessage[];
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
   mentionsDestination: boolean;
   inbox: ReturnType<typeof useHumanNotifications>;
+  unread: ReturnType<typeof useChannelUnread>;
+  unreadBoundaryMessageId: string | null;
+  readActivatedInitially: boolean;
   focusedMessage: TimelineMessage | null;
   focusedThreadRoot: TimelineMessage | null;
   focusedMessageError: string | null;
@@ -2129,6 +2153,8 @@ function WorkshopView({
   onDetachAgent: (agentId: string, clientOperationId: string) => Promise<void>;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadEarlier: () => void;
+  onLoadLater: () => void;
+  onJumpLatest: () => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadChannelMembers: () => Promise<WorkshopHumanMembership>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
@@ -2202,6 +2228,7 @@ function WorkshopView({
   // this state is set alongside every follow-ref write. Same-value
   // setState is a React no-op, keeping the per-scroll cost nil.
   const [awayFromBottom, setAwayFromBottom] = useState(false);
+  const [readActivated, setReadActivated] = useState(readActivatedInitially);
   const [sidebarLayout, setSidebarLayout] = useState(restoreSidebarLayout);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [contextWidth, setContextWidth] = useState(restoreContextWidth);
@@ -2285,10 +2312,33 @@ function WorkshopView({
     },
     [focusedThreadRoot, messages, threadMessages],
   );
+  const markVisibleMessageRead = useCallback((messageId: string): void => {
+    markVisibleMentionRead(messageId);
+    if (
+      auxiliaryWorkspaceOpen ||
+      !readActivated ||
+      document.visibilityState !== "visible" ||
+      channelIsArchived(channel)
+    ) return;
+    const message = displayedMessages.find((candidate) => candidate.messageId === messageId);
+    if (message) {
+      unread.advanceVisible({ channelId, token: memoryToken }, message);
+    }
+  }, [
+    auxiliaryWorkspaceOpen,
+    channel,
+    channelId,
+    displayedMessages,
+    markVisibleMentionRead,
+    memoryToken,
+    readActivated,
+    unread.advanceVisible,
+  ]);
 
   useEffect(() => {
     setThreadRootMessageId(null);
-  }, [channelId]);
+    setReadActivated(readActivatedInitially);
+  }, [channelId, readActivatedInitially]);
   useEffect(() => {
     if (focusedMessage?.threadRootId) {
       setThreadRootMessageId(focusedMessage.threadRootId);
@@ -2913,12 +2963,23 @@ function WorkshopView({
       if (messages.length === 0) {
         return;
       }
-      const restoredViewport = restoreTimelineViewport(channelId);
-      timeline.scrollTop = restoredViewport?.follow === false
-        ? Math.min(restoredViewport.scrollTop, timeline.scrollHeight)
-        : timeline.scrollHeight;
+      const unreadAnchor = unreadBoundaryMessageId
+        ? timeline.querySelector<HTMLElement>(
+            `[data-message-id="${unreadBoundaryMessageId}"]`,
+          )
+        : null;
+      const restoredViewport = unreadAnchor ? null : restoreTimelineViewport(channelId);
+      if (unreadAnchor) {
+        unreadAnchor.scrollIntoView?.({ block: "start" });
+      } else {
+        timeline.scrollTop = restoredViewport?.follow === false
+          ? Math.min(restoredViewport.scrollTop, timeline.scrollHeight)
+          : timeline.scrollHeight;
+      }
       timelineInitializedRef.current = true;
-      timelineFollowRef.current = restoredViewport?.follow ?? true;
+      timelineFollowRef.current = unreadAnchor
+        ? isNearTimelineBottom(timeline)
+        : restoredViewport?.follow ?? true;
       // Derived from the clamped position, not the stored flag: the
       // restored window is the latest page only, so a position saved
       // with earlier pages loaded can clamp to (or land near) the
@@ -2962,7 +3023,7 @@ function WorkshopView({
     } else {
       setUnseenMessageCount((count) => count + addedMessages);
     }
-  }, [channelId, messages]);
+  }, [channelId, messages, unreadBoundaryMessageId]);
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -2993,6 +3054,7 @@ function WorkshopView({
     if (!timeline || !timelineInitializedRef.current) {
       return;
     }
+    setReadActivated(true);
     const shouldFollow = isNearTimelineBottom(timeline);
     timelineFollowRef.current = shouldFollow;
     setAwayFromBottom(!shouldFollow);
@@ -3011,6 +3073,12 @@ function WorkshopView({
       return;
     }
     timelineFollowRef.current = true;
+    if (later.available) {
+      onJumpLatest();
+      setUnseenMessageCount(0);
+      setAwayFromBottom(false);
+      return;
+    }
     timeline.scrollTop = timeline.scrollHeight;
     storeTimelineViewport(channelId, {
       follow: true,
@@ -3161,22 +3229,30 @@ function WorkshopView({
               <p className="nav-heading">Direct messages</p>
               {workshop.channels
                 .filter((availableChannel) => availableChannel.kind === "direct")
-                .map((availableChannel) => (
+                .map((availableChannel) => {
+                  const unreadCount = unread.byChannel[availableChannel.channelId]?.unreadCount ?? 0;
+                  return (
                   <button
-                    className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
-                    aria-label={channelDisplayName(availableChannel)}
+                    aria-label={`${channelDisplayName(availableChannel)}${channelUnreadLabel(unread.byChannel[availableChannel.channelId])}`}
                     title={channelDisplayName(availableChannel)}
                     onClick={() => onSelectChannel(availableChannel.channelId)}
                     key={availableChannel.channelId}
                   >
                     <span>{channelSymbol(availableChannel)}</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
-                      <span className="live-pip" aria-label="Live" />
+                    {(unreadCount > 0 || (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
+                      <span className="channel-link-status">
+                        {unreadCount > 0 && <span className="unread-pip" aria-hidden="true" />}
+                        {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
+                          <span className="live-pip" aria-label="Live" />
+                        )}
+                      </span>
                     )}
                   </button>
-                ))}
+                  );
+                })}
             </>
           )}
 
@@ -3217,13 +3293,16 @@ function WorkshopView({
                 availableChannel.kind === "group" &&
                 !channelIsArchived(availableChannel),
             )
-            .map((availableChannel) => (
+            .map((availableChannel) => {
+              const unreadCount = unread.byChannel[availableChannel.channelId]?.unreadCount ?? 0;
+              const mentionCount = inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0;
+              return (
               <button
-                className={`channel-link ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                className={`channel-link ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                 type="button"
-                aria-label={`${channelDisplayName(availableChannel)}${
-                  (inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0
-                    ? `, ${inbox.counts.unreadByChannel[availableChannel.channelId]} unread mentions`
+                aria-label={`${channelDisplayName(availableChannel)}${channelUnreadLabel(unread.byChannel[availableChannel.channelId])}${
+                  mentionCount > 0
+                    ? `, ${mentionCount} unread mentions`
                     : ""
                 }`}
                 title={channelDisplayName(availableChannel)}
@@ -3232,17 +3311,16 @@ function WorkshopView({
               >
                 <span>{channelSymbol(availableChannel)}</span>
                 <span>{channelDisplayName(availableChannel)}</span>
-                {((inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0 ||
+                {(unreadCount > 0 || mentionCount > 0 ||
                   (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
                   <span className="channel-link-status">
-                    {(inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0) > 0 && (
+                    {unreadCount > 0 && <span className="unread-pip" aria-hidden="true" />}
+                    {mentionCount > 0 && (
                       <span
                         className="mention-count"
-                        aria-label={`${inbox.counts.unreadByChannel[availableChannel.channelId]} unread mentions`}
+                        aria-label={`${mentionCount} unread mentions`}
                       >
-                        {inbox.counts.unreadByChannel[availableChannel.channelId] > 99
-                          ? "99+"
-                          : inbox.counts.unreadByChannel[availableChannel.channelId]}
+                        {mentionCount > 99 ? "99+" : mentionCount}
                       </span>
                     )}
                     {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
@@ -3251,7 +3329,8 @@ function WorkshopView({
                   </span>
                 )}
               </button>
-            ))}
+              );
+            })}
 
           {workshop.channels.some(
             (availableChannel) => availableChannel.kind === "notification",
@@ -3260,22 +3339,30 @@ function WorkshopView({
               <p className="nav-heading">Notifications</p>
               {workshop.channels
                 .filter((availableChannel) => availableChannel.kind === "notification")
-                .map((availableChannel) => (
+                .map((availableChannel) => {
+                  const unreadCount = unread.byChannel[availableChannel.channelId]?.unreadCount ?? 0;
+                  return (
                   <button
-                    className={`channel-link notification ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                    className={`channel-link notification ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
                     type="button"
-                    aria-label={channelDisplayName(availableChannel)}
+                    aria-label={`${channelDisplayName(availableChannel)}${channelUnreadLabel(unread.byChannel[availableChannel.channelId])}`}
                     title={channelDisplayName(availableChannel)}
                     onClick={() => onSelectChannel(availableChannel.channelId)}
                     key={availableChannel.channelId}
                   >
                     <span>!</span>
                     <span>{channelDisplayName(availableChannel)}</span>
-                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
-                      <span className="live-pip" aria-label="Live" />
+                    {(unreadCount > 0 || (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
+                      <span className="channel-link-status">
+                        {unreadCount > 0 && <span className="unread-pip" aria-hidden="true" />}
+                        {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
+                          <span className="live-pip" aria-label="Live" />
+                        )}
+                      </span>
                     )}
                   </button>
-                ))}
+                  );
+                })}
             </>
           )}
 
@@ -3472,6 +3559,9 @@ function WorkshopView({
           className="timeline-wrap"
           aria-label="Conversation timeline"
           onScroll={handleTimelineScroll}
+          onPointerDown={() => setReadActivated(true)}
+          onKeyDown={() => setReadActivated(true)}
+          tabIndex={0}
         >
           <div className={`channel-introduction ${channel.kind === "notification" ? "notification" : ""}`}>
             <span className="channel-symbol">{symbol}</span>
@@ -3529,21 +3619,31 @@ function WorkshopView({
               aria-live="polite"
             >
               {displayedMessages.map((message) => (
-                <MessageItem
-                  highlighted={focusedMessage?.messageId === message.messageId}
-                  key={message.messageId}
-                  message={message}
-                  notification={channel.kind === "notification"}
-                  onDownloadArtifact={onDownloadArtifact}
-                  onLoadArtifact={onLoadArtifact}
-                  onMessageVisible={markVisibleMentionRead}
-                  onSetReaction={!channelIsArchived(channel) ? onSetReaction : undefined}
-                  onOpenThread={
-                    channel.kind === "group" && !channelIsArchived(channel)
-                      ? setThreadRootMessageId
-                      : undefined
-                  }
-                />
+                <Fragment key={message.messageId}>
+                  {unreadBoundaryMessageId === message.messageId && (
+                    <li
+                      className="first-unread-divider"
+                      role="separator"
+                      aria-label="First unread message"
+                    >
+                      <span aria-hidden="true">New messages</span>
+                    </li>
+                  )}
+                  <MessageItem
+                    highlighted={focusedMessage?.messageId === message.messageId}
+                    message={message}
+                    notification={channel.kind === "notification"}
+                    onDownloadArtifact={onDownloadArtifact}
+                    onLoadArtifact={onLoadArtifact}
+                    onMessageVisible={markVisibleMessageRead}
+                    onSetReaction={!channelIsArchived(channel) ? onSetReaction : undefined}
+                    onOpenThread={
+                      channel.kind === "group" && !channelIsArchived(channel)
+                        ? setThreadRootMessageId
+                        : undefined
+                    }
+                  />
+                </Fragment>
               ))}
               {runPreview && channel.kind !== "notification" && (
                 /* The preview payload carries no author; direct channels
@@ -3563,6 +3663,19 @@ function WorkshopView({
                 </li>
               )}
             </ol>
+          )}
+          {later.available && (
+            <div className="timeline-later">
+              <button
+                type="button"
+                className="timeline-earlier-button"
+                onClick={onLoadLater}
+                disabled={later.loading}
+              >
+                {later.loading ? "Loading newer messages…" : "Load newer messages"}
+              </button>
+              {later.error && <p className="timeline-earlier-error">{later.error}</p>}
+            </div>
           )}
         </div>
 
@@ -4133,6 +4246,7 @@ function ActiveWorkshopClient({
   destination,
   navigation,
   session,
+  readActivationChannelId,
   onAuthenticationFailure,
   onArchiveChannel,
   onChannelAccessFailure,
@@ -4155,6 +4269,7 @@ function ActiveWorkshopClient({
   destination: WorkshopDestination;
   navigation: WorkshopNavigation;
   session: WorkshopSession;
+  readActivationChannelId: string | null;
   onAuthenticationFailure: (message: string) => void;
   onArchiveChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onChannelAccessFailure: (message: string) => void;
@@ -4212,6 +4327,34 @@ function ActiveWorkshopClient({
     [session.channelId, session.token, settingsChannel?.channelId],
   );
   const inbox = useHumanNotifications(session.token, onAuthenticationFailure);
+  const unread = useChannelUnread(
+    session.token,
+    onAuthenticationFailure,
+    onChannelAccessFailure,
+  );
+  const [timelineAnchor, setTimelineAnchor] = useState<{
+    channelId: string;
+    messageId: string | null;
+  } | null>(null);
+  useEffect(() => {
+    if (destination.kind !== "conversation") {
+      setTimelineAnchor(null);
+      return;
+    }
+    if (unread.loading || timelineAnchor?.channelId === session.channelId) return;
+    setTimelineAnchor({
+      channelId: session.channelId,
+      messageId: unread.byChannel[session.channelId]?.firstUnreadMessageId ?? null,
+    });
+  }, [
+    destination.kind,
+    session.channelId,
+    timelineAnchor?.channelId,
+    unread.byChannel,
+    unread.loading,
+  ]);
+  const timelineAnchorReady =
+    destination.kind !== "conversation" || timelineAnchor?.channelId === session.channelId;
   const [focusedMessage, setFocusedMessage] = useState<TimelineMessage | null>(null);
   const [focusedThreadRoot, setFocusedThreadRoot] = useState<TimelineMessage | null>(null);
   const [focusedMessageError, setFocusedMessageError] = useState<string | null>(null);
@@ -4224,12 +4367,16 @@ function ActiveWorkshopClient({
     runPreview,
     runTrace,
     earlier,
+    later,
     loadEarlier,
+    loadLater,
+    jumpLatest,
     updateReactions,
   } =
     useWorkshopTimeline(
       session,
-      selected !== null && destination.kind !== "agents",
+      selected !== null && destination.kind !== "agents" && timelineAnchorReady,
+      timelineAnchor?.channelId === session.channelId ? timelineAnchor.messageId : null,
       onAuthenticationFailure,
       onChannelAccessFailure,
     );
@@ -4415,11 +4562,17 @@ function ActiveWorkshopClient({
       channel={selected.channel}
       connection={connection}
       earlier={earlier}
+      later={later}
       messages={messages}
       threadMessages={threadMessages}
       memoryDestination={destination.kind === "memory" ? destination : null}
       mentionsDestination={destination.kind === "mentions"}
       inbox={inbox}
+      unread={unread}
+      unreadBoundaryMessageId={
+        timelineAnchor?.channelId === session.channelId ? timelineAnchor.messageId : null
+      }
+      readActivatedInitially={readActivationChannelId === session.channelId}
       focusedMessage={focusedMessage}
       focusedThreadRoot={focusedThreadRoot}
       focusedMessageError={focusedMessageError}
@@ -4429,6 +4582,8 @@ function ActiveWorkshopClient({
       settingsSession={settingsSession}
       navigation={navigation}
       onLoadEarlier={loadEarlier}
+      onLoadLater={loadLater}
+      onJumpLatest={jumpLatest}
       onDownloadArtifact={downloadSelectedArtifact}
       onLoadArtifact={loadSelectedArtifact}
       onLoadChannelMembers={loadSelectedChannelMembers}
@@ -4486,6 +4641,7 @@ function WorkshopApp(): React.JSX.Element {
     destinationFromLocation,
   );
   const [settingsDirty, setSettingsDirty] = useState(false);
+  const [readActivationChannelId, setReadActivationChannelId] = useState<string | null>(null);
 
   useEffect(() => {
     const synchronizeBrowserCredential = (event: StorageEvent): void => {
@@ -4505,6 +4661,7 @@ function WorkshopApp(): React.JSX.Element {
         setNotice("Workshop session was forgotten in another tab.");
         setView("enrollment");
         setSettingsDirty(false);
+        setReadActivationChannelId(null);
         return;
       }
       if (token === access?.token) {
@@ -4516,6 +4673,7 @@ function WorkshopApp(): React.JSX.Element {
       setNotice(null);
       setView("workshop");
       setSettingsDirty(false);
+      setReadActivationChannelId(null);
     };
     window.addEventListener("storage", synchronizeBrowserCredential);
     return () =>
@@ -4550,6 +4708,7 @@ function WorkshopApp(): React.JSX.Element {
     setNotice(message);
     setView("enrollment");
     setSettingsDirty(false);
+    setReadActivationChannelId(null);
   }, []);
 
   const handleAuthenticationFailure = useCallback(
@@ -4677,6 +4836,7 @@ function WorkshopApp(): React.JSX.Element {
       return;
     }
     const nextSession = { ...session, channelId };
+    setReadActivationChannelId(channelId);
     storeWorkshopAccess(nextSession);
     setSession(nextSession);
     const nextDestination: WorkshopDestination = { kind: "conversation" };
@@ -4717,6 +4877,7 @@ function WorkshopApp(): React.JSX.Element {
       return false;
     }
     const nextSession = { ...session, channelId: notification.sourceChannelId };
+    setReadActivationChannelId(notification.sourceChannelId);
     storeWorkshopAccess(nextSession);
     setSession(nextSession);
     const nextDestination: WorkshopDestination = {
@@ -4874,6 +5035,7 @@ function WorkshopApp(): React.JSX.Element {
         );
       }
       const nextSession = { ...session, channelId };
+      setReadActivationChannelId(channelId);
       storeWorkshopAccess(nextSession);
       setAccess({ channelId, token: session.token });
       setSession(nextSession);
@@ -4904,6 +5066,7 @@ function WorkshopApp(): React.JSX.Element {
         loadAppearancePreferences({ token: session.token }),
       ]);
       adoptNavigation(session.token, discovered, channelId, appearance);
+      setReadActivationChannelId(channelId);
       const nextDestination: WorkshopDestination = { kind: "conversation" };
       setDestination(nextDestination);
       writeDestination(nextDestination, "push");
@@ -4973,6 +5136,7 @@ function WorkshopApp(): React.JSX.Element {
       destination={destination}
       navigation={navigation}
       session={session}
+      readActivationChannelId={readActivationChannelId}
       onAuthenticationFailure={handleAuthenticationFailure}
       onArchiveChannel={(channelId, clientOperationId) =>
         changeWorkshopChannelLifecycle(channelId, clientOperationId, "archive")

@@ -3603,6 +3603,9 @@ class TestWorkshopTimelineHTTPContract:
             "?tail=true",
             "?tail=1&tail=1",
             "?tail=1&cursor=not-a-cursor",
+            "?tail=1&start_message_id=msg_00000000000000000000000000000001",
+            "?cursor=not-a-cursor&start_message_id=msg_00000000000000000000000000000001",
+            "?start_message_id=not-a-message",
         ],
     )
     async def test_invalid_pagination_input_returns_bounded_error(self, tmp_path: Path, query: str):
@@ -3683,6 +3686,33 @@ class TestWorkshopTimelineHTTPContract:
             assert earlier_page["previous_cursor"] is None
             assert earlier_page["next_cursor"] is None
             assert earlier_page["through_position"] == tail_page["through_position"]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_first_unread_anchor_pages_both_directions_over_http(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        await _record_messages(store, 5)
+        client = await _open_client(store, _Authenticator({"alice-token": alice_id}))
+        try:
+            headers = {"Authorization": "Bearer alice-token"}
+            complete = await client.get(
+                f"/v1/channels/{alice_channel}/timeline?limit=10",
+                headers=headers,
+            )
+            complete_page = await complete.json()
+            anchor_id = complete_page["messages"][2]["message_id"]
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/timeline",
+                params={"start_message_id": anchor_id, "limit": "2"},
+                headers=headers,
+            )
+            page = await response.json()
+
+            assert response.status == 200
+            assert [message["body"] for message in page["messages"]] == ["Message 3", "Message 4"]
+            assert page["previous_cursor"] is not None
+            assert page["next_cursor"] is not None
         finally:
             await client.close()
             await store.close()

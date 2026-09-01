@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import {
   archiveChannel,
+  advanceChannelReadPosition,
   attachChannelAgent,
   AuthenticationError,
   cancelRun,
@@ -20,6 +21,7 @@ import {
   loadArtifactBlob,
   loadChannelMembers,
   loadChannelMessage,
+  loadChannelUnread,
   loadHumanNotificationCounts,
   loadHumanNotifications,
   loadNavigation,
@@ -44,6 +46,7 @@ import {
   streamTimeline,
   streamAgentChanges,
   streamHumanNotifications,
+  streamChannelUnread,
   setMessageReaction,
   startAgentConversation,
   submitCommand,
@@ -59,6 +62,7 @@ import type {
   WorkshopRun,
   WorkshopSettingsWorkspace,
   WorkshopHumanNotification,
+  WorkshopChannelUnreadState,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -67,6 +71,7 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     attachChannelAgent: vi.fn(),
     archiveChannel: vi.fn(),
+    advanceChannelReadPosition: vi.fn(),
     cancelRun: vi.fn(),
     changeChannelMember: vi.fn(),
     createChannel: vi.fn(),
@@ -76,6 +81,7 @@ vi.mock("./api", async (importOriginal) => {
     loadArtifactBlob: vi.fn(),
     loadChannelMembers: vi.fn(),
     loadChannelMessage: vi.fn(),
+    loadChannelUnread: vi.fn(),
     loadHumanNotificationCounts: vi.fn(),
     loadHumanNotifications: vi.fn(),
     loadAppearancePreferences: vi.fn(),
@@ -103,6 +109,7 @@ vi.mock("./api", async (importOriginal) => {
     streamTimeline: vi.fn(),
     streamAgentChanges: vi.fn(),
     streamHumanNotifications: vi.fn(),
+    streamChannelUnread: vi.fn(),
     setMessageReaction: vi.fn(),
     startAgentConversation: vi.fn(),
     submitCommand: vi.fn(),
@@ -264,6 +271,28 @@ const historyMessage: TimelineMessage = {
   latestReplyAt: null,
   threadRootId: null,
 };
+
+function unreadState(
+  channel: string,
+  overrides: Partial<WorkshopChannelUnreadState> = {},
+): WorkshopChannelUnreadState {
+  return {
+    archived: false,
+    channelId: channel,
+    channelKind: "group",
+    channelName: "Wake policy qualification",
+    firstUnreadEventPosition: 25,
+    firstUnreadMessageId: historyMessage.messageId,
+    lastEventPosition: 25,
+    membershipBaselineEventPosition: 20,
+    readThroughEventPosition: 20,
+    readThroughMessageId: null,
+    stateVersion: 0,
+    unreadCount: 1,
+    unreadCountCapped: false,
+    ...overrides,
+  };
+}
 
 const agentDefinition: WorkshopAgentDefinition = {
   activeRevisionId: revisionId,
@@ -427,6 +456,7 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
 
 type StreamHandlers = Parameters<typeof streamTimeline>[2];
 type HumanNotificationStreamHandlers = Parameters<typeof streamHumanNotifications>[2];
+type ChannelUnreadStreamHandlers = Parameters<typeof streamChannelUnread>[2];
 
 function observeMessagesAsVisible(): void {
   class TestIntersectionObserver {
@@ -505,6 +535,7 @@ function observeMessagesAtViewportEdge(): void {
 describe("Workshop React client", () => {
   let handlers: StreamHandlers | null;
   let humanNotificationHandlers: HumanNotificationStreamHandlers | null;
+  let channelUnreadHandlers: ChannelUnreadStreamHandlers | null;
   let failStream: ((reason: Error) => void) | null;
 
   beforeEach(() => {
@@ -514,6 +545,7 @@ describe("Workshop React client", () => {
     window.history.replaceState(null, "", "/workshop/");
     handlers = null;
     humanNotificationHandlers = null;
+    channelUnreadHandlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(attachChannelAgent).mockResolvedValue(undefined);
@@ -584,6 +616,12 @@ describe("Workshop React client", () => {
       nextCursor: null,
       notifications: [],
       throughPosition: 25,
+    });
+    vi.mocked(loadChannelUnread).mockResolvedValue({
+      channels: [],
+      throughPosition: 25,
+      totalUnread: 0,
+      totalUnreadCapped: false,
     });
     vi.mocked(markHumanNotificationsRead).mockResolvedValue([]);
     vi.mocked(loadRun).mockResolvedValue(completedRun);
@@ -715,10 +753,23 @@ describe("Workshop React client", () => {
         });
       },
     );
+    vi.mocked(streamChannelUnread).mockImplementation(
+      async (_token, _position, streamHandlers, signal) => {
+        channelUnreadHandlers = streamHandlers;
+        streamHandlers.onConnected();
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    );
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
   });
 
   it("enrolls, renders canonical history safely, and appends live messages", async () => {
@@ -1596,6 +1647,171 @@ describe("Workshop React client", () => {
     await waitFor(() => expect(timeline.scrollTop).toBe(640));
     // The final page reached the start of the channel; the control goes away.
     expect(screen.queryByRole("button", { name: "Load earlier messages" })).toBeNull();
+  });
+
+  it("opens at the canonical first unread boundary and advances only visible messages", async () => {
+    const visible = new Map<Element, IntersectionObserverCallback>();
+    class ControlledIntersectionObserver {
+      readonly root: Element | Document | null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+
+      constructor(
+        private readonly callback: IntersectionObserverCallback,
+        options?: IntersectionObserverInit,
+      ) {
+        this.root = options?.root ?? null;
+      }
+
+      disconnect(): void {
+        for (const [target, callback] of visible) {
+          if (callback === this.callback) visible.delete(target);
+        }
+      }
+
+      observe(target: Element): void {
+        visible.set(target, this.callback);
+      }
+
+      takeRecords(): IntersectionObserverEntry[] { return []; }
+      unobserve(target: Element): void { visible.delete(target); }
+    }
+    vi.stubGlobal("IntersectionObserver", ControlledIntersectionObserver);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    const firstUnread = { ...historyMessage, channelId: secondChannelId };
+    const secondUnread: TimelineMessage = {
+      ...firstUnread,
+      body: "Still below the viewport.",
+      eventPosition: 26,
+      messageId: "msg_00000000000000000000000000000026",
+    };
+    const initial = unreadState(secondChannelId, { unreadCount: 2 });
+    vi.mocked(loadChannelUnread).mockResolvedValue({
+      channels: [initial],
+      throughPosition: 26,
+      totalUnread: 2,
+      totalUnreadCapped: false,
+    });
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [firstUnread, secondUnread],
+      nextCursor: null,
+      previousCursor: "before-unread",
+      throughPosition: 26,
+    });
+    vi.mocked(advanceChannelReadPosition).mockResolvedValue({
+      replayed: false,
+      state: unreadState(secondChannelId, {
+        firstUnreadEventPosition: 26,
+        firstUnreadMessageId: secondUnread.messageId,
+        lastEventPosition: 27,
+        readThroughEventPosition: 25,
+        readThroughMessageId: firstUnread.messageId,
+        stateVersion: 1,
+      }),
+    });
+
+    render(<App />);
+
+    expect(await screen.findByLabelText("First unread message")).toHaveTextContent("New messages");
+    expect(loadTimeline).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      expect.anything(),
+      firstUnread.messageId,
+    );
+    expect(screen.getByRole("button", {
+      name: "Wake policy qualification, 2 unread messages",
+    })).toHaveClass("unread");
+    const firstRow = document.querySelector(`[data-message-id="${firstUnread.messageId}"]`);
+    const secondRow = document.querySelector(`[data-message-id="${secondUnread.messageId}"]`);
+    expect(firstRow).not.toBeNull();
+    expect(secondRow).not.toBeNull();
+    const reveal = (target: Element): void => {
+      const bounds = target.getBoundingClientRect();
+      visible.get(target)?.([{
+        boundingClientRect: bounds,
+        intersectionRatio: 1,
+        intersectionRect: bounds,
+        isIntersecting: true,
+        rootBounds: null,
+        target,
+        time: 0,
+      }], {} as IntersectionObserver);
+    };
+    act(() => reveal(firstRow as Element));
+    expect(advanceChannelReadPosition).not.toHaveBeenCalled();
+    fireEvent.pointerDown(screen.getByLabelText("Conversation timeline"));
+    act(() => reveal(firstRow as Element));
+    await waitFor(() => expect(advanceChannelReadPosition).toHaveBeenCalledTimes(1));
+    expect(advanceChannelReadPosition).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      firstUnread.messageId,
+      0,
+      expect.stringMatching(/^channel-read-/),
+    );
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    act(() => reveal(secondRow as Element));
+    expect(advanceChannelReadPosition).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates ordinary unread navigation from canonical live and cross-tab changes", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await waitFor(() => expect(channelUnreadHandlers).not.toBeNull());
+    const unread = unreadState(secondChannelId, {
+      firstUnreadEventPosition: 30,
+      firstUnreadMessageId: "msg_00000000000000000000000000000030",
+      lastEventPosition: 30,
+      unreadCount: 1,
+    });
+    act(() => channelUnreadHandlers?.onChanged({
+      eventPosition: 30,
+      state: unread,
+    }, "30"));
+
+    expect(screen.getByRole("button", {
+      name: "Wake policy qualification, 1 unread message",
+    })).toHaveClass("unread");
+
+    // Replaying a position after reconnect is harmless.
+    act(() => channelUnreadHandlers?.onChanged({
+      eventPosition: 30,
+      state: unread,
+    }, "30"));
+    expect(screen.getAllByRole("button", {
+      name: "Wake policy qualification, 1 unread message",
+    })).toHaveLength(1);
+
+    // A read-position mutation from another tab is authoritative here too.
+    act(() => channelUnreadHandlers?.onChanged({
+      eventPosition: 31,
+      state: unreadState(secondChannelId, {
+        firstUnreadEventPosition: null,
+        firstUnreadMessageId: null,
+        lastEventPosition: 31,
+        readThroughEventPosition: 30,
+        readThroughMessageId: unread.firstUnreadMessageId,
+        stateVersion: 1,
+        unreadCount: 0,
+      }),
+    }, "31"));
+    expect(screen.getByRole("button", {
+      name: "Wake policy qualification",
+    })).not.toHaveClass("unread");
   });
 
   it("opens at the latest message and preserves deliberate scroll position", async () => {

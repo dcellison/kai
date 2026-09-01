@@ -401,7 +401,7 @@ class TestChannelUnreadAuthority:
         store, daniel_id, scott_id, channel_id, _agent_id = await _context(tmp_path / "kai.db")
         client = await _open_client(store, _Authenticator({"daniel": daniel_id, "scott": scott_id}))
         try:
-            message = await _record(store, daniel_id, channel_id, "api-message", "api message")
+            await _record(store, daniel_id, channel_id, "api-message", "api message")
             unauthorized = await client.get("/v1/client/unread")
             assert unauthorized.status == 401
             snapshot = await client.get("/v1/client/unread", headers={"Authorization": "Bearer scott"})
@@ -413,11 +413,23 @@ class TestChannelUnreadAuthority:
                 f"/v1/client/unread/events?after_position={payload['through_position']}",
                 headers={"Authorization": "Bearer scott", "X-Kai-Stream-ID": "unread-test"},
             )
+            live_message = await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "api-live-message",
+                "live api message",
+                occurred_at=_NOW + timedelta(seconds=1),
+            )
+            live_event = await _next_sse_event(stream)
+            assert live_event["event"] == "channel_unread.changed"
+            assert live_event["data"]["state"]["channel_id"] == channel_id
+            assert live_event["data"]["state"]["unread_count"] == 2
             mutation = await client.post(
                 f"/v1/channels/{channel_id}/read-position",
                 headers={"Authorization": "Bearer scott"},
                 json={
-                    "message_id": message,
+                    "message_id": live_message,
                     "expected_state_version": group["state_version"],
                     "client_operation_id": "api-read",
                 },

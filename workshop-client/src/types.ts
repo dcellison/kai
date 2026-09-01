@@ -131,6 +131,39 @@ export interface WorkshopHumanNotificationSignal {
     | "human_notification.unread";
 }
 
+export interface WorkshopChannelUnreadState {
+  archived: boolean;
+  channelId: string;
+  channelKind: WorkshopChannelKind;
+  channelName: string | null;
+  firstUnreadEventPosition: number | null;
+  firstUnreadMessageId: string | null;
+  lastEventPosition: number;
+  membershipBaselineEventPosition: number;
+  readThroughEventPosition: number;
+  readThroughMessageId: string | null;
+  stateVersion: number;
+  unreadCount: number;
+  unreadCountCapped: boolean;
+}
+
+export interface WorkshopChannelUnreadSnapshot {
+  channels: WorkshopChannelUnreadState[];
+  throughPosition: number;
+  totalUnread: number;
+  totalUnreadCapped: boolean;
+}
+
+export interface WorkshopChannelReadPositionMutation {
+  replayed: boolean;
+  state: WorkshopChannelUnreadState;
+}
+
+export interface WorkshopChannelUnreadSignal {
+  eventPosition: number;
+  state: WorkshopChannelUnreadState;
+}
+
 export type WorkshopAgentCapability =
   | "agent_delegation"
   | "image_input"
@@ -714,6 +747,8 @@ export interface WorkshopArtifactSummary {
 
 export interface TimelineSnapshot {
   messages: TimelineMessage[];
+  // Walks toward the snapshot tip when this page begins at an anchor.
+  nextCursor?: string | null;
   throughPosition: number;
   // Walks history older than this page; null when the page reaches the
   // start of the channel.
