@@ -3,7 +3,6 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   AuthenticationError,
   ChannelAccessError,
-  ResynchronizationRequired,
   activateAgentRevision,
   addAgentRevision,
   archiveAgentDefinition,
@@ -12,7 +11,6 @@ import {
   loadAgentDefinitions,
   loadAgentEnablements,
   startAgentConversation,
-  streamAgentChanges,
 } from "./api";
 import type {
   WorkshopAgentCapability,
@@ -21,6 +19,7 @@ import type {
 } from "./types";
 import { useConfirmation } from "./ConfirmationDialog";
 import { AgentRuntimeControls } from "./SettingsWorkspace";
+import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 
 const CAPABILITIES: {
   description: string;
@@ -375,6 +374,7 @@ export function AgentWorkspace({
   onSelectAgent,
   principalId,
   principalName,
+  principalEvents,
   runActive,
   token,
 }: {
@@ -395,6 +395,7 @@ export function AgentWorkspace({
   ) => void;
   principalId: string;
   principalName: string;
+  principalEvents: WorkshopPrincipalEvents;
   runActive: boolean;
   token: string;
 }): React.JSX.Element {
@@ -410,9 +411,7 @@ export function AgentWorkspace({
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [liveState, setLiveState] = useState<"connected" | "connecting">(
-    "connecting",
-  );
+  const subscribePrincipalEvents = principalEvents.subscribe;
 
   const handleError = useCallback((caught: unknown, fallback: string): void => {
     if (caught instanceof AuthenticationError) {
@@ -460,61 +459,17 @@ export function AgentWorkspace({
   }, [handleError, refresh]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    let lastEventId: string | null = null;
-    const synchronize = async (): Promise<void> => {
-      while (!controller.signal.aborted) {
-        try {
-          setLiveState("connecting");
-          await streamAgentChanges(
-            token,
-            lastEventId,
-            {
-              onChanged: (_signal, eventId) => {
-                lastEventId = eventId;
-                void Promise.all([refresh(), onNavigationChanged()]).catch(
-                  (caught: unknown) => handleError(caught, "Could not refresh agents."),
-                );
-              },
-              onConnected: () => setLiveState("connected"),
-            },
-            controller.signal,
-          );
-        } catch (caught) {
-          if (controller.signal.aborted) {
-            return;
-          }
-          if (caught instanceof ResynchronizationRequired) {
-            lastEventId = null;
-            try {
-              await Promise.all([refresh(), onNavigationChanged()]);
-            } catch (refreshError) {
-              handleError(refreshError, "Could not resynchronize agents.");
-            }
-          } else if (
-            caught instanceof AuthenticationError ||
-            caught instanceof ChannelAccessError
-          ) {
-            handleError(caught, "Live agent updates are unavailable.");
-            return;
-          }
-          await new Promise<void>((resolve) => {
-            const timeout = window.setTimeout(resolve, 2000);
-            controller.signal.addEventListener(
-              "abort",
-              () => {
-                window.clearTimeout(timeout);
-                resolve();
-              },
-              { once: true },
-            );
-          });
-        }
+    return subscribePrincipalEvents((event) => {
+      if (
+        event.kind === "synchronize" ||
+        event.batch.changes.some((change) => change.agentChanges.length > 0)
+      ) {
+        void Promise.all([refresh(), onNavigationChanged()]).catch(
+          (caught: unknown) => handleError(caught, "Could not refresh agents."),
+        );
       }
-    };
-    void synchronize();
-    return () => controller.abort();
-  }, [handleError, onNavigationChanged, refresh, token]);
+    });
+  }, [handleError, onNavigationChanged, refresh, subscribePrincipalEvents]);
 
   const selected = definitions.find(
     (definition) => definition.definitionId === selectedDefinitionId,
@@ -694,8 +649,8 @@ export function AgentWorkspace({
           </p>
         </div>
         <div className="agent-header-actions">
-          <span className={`agent-live-state ${liveState}`} role="status">
-            {liveState === "connected" ? "Live" : "Connecting"}
+          <span className={`agent-live-state ${principalEvents.connection.tone}`} role="status">
+            {principalEvents.connection.label}
           </span>
           <div className="agent-header-controls">
             <button

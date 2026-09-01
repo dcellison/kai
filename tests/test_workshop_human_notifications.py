@@ -858,6 +858,98 @@ class TestHumanNotificationAuthority:
 
 
 class TestHumanNotificationApi:
+    async def test_principal_stream_starts_with_checkpoint_and_rejects_future_resume(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, _, scott_id, _, _ = await _notification_context(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"scott": scott_id}))
+        stream = None
+        try:
+            stream = await client.get(
+                "/v1/client/events",
+                headers={
+                    "Authorization": "Bearer scott",
+                    "X-Kai-Stream-ID": "principal-checkpoint-test",
+                },
+            )
+            assert stream.status == 200
+            event = await _next_sse_event(stream)
+            assert event["event"] == "workshop.principal.changed"
+            data = event["data"]
+            assert isinstance(data, dict)
+            assert data["changes"] == []
+            assert data["through_position"] > 0
+            stream.close()
+            stream = None
+
+            response = await client.get(
+                "/v1/client/events?after_position=999999999",
+                headers={
+                    "Authorization": "Bearer scott",
+                    "X-Kai-Stream-ID": "principal-future-resume-test",
+                },
+            )
+            assert response.status == 409
+            assert await response.json() == {
+                "error": {
+                    "code": "resynchronization_required",
+                    "message": "Workshop principal events resynchronization required",
+                }
+            }
+        finally:
+            if stream is not None:
+                stream.close()
+            await client.close()
+            await store.close()
+
+    async def test_principal_stream_groups_mention_and_unread_at_one_position(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, daniel_id, scott_id, channel_id, _ = await _notification_context(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"scott": scott_id}))
+        stream = None
+        try:
+            async with store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
+                tip_row = await cursor.fetchone()
+            assert tip_row is not None
+            stream = await client.get(
+                f"/v1/client/events?after_position={int(tip_row[0])}",
+                headers={
+                    "Authorization": "Bearer scott",
+                    "X-Kai-Stream-ID": "principal-test",
+                },
+            )
+            assert stream.status == 200
+
+            await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "multiplexed-principal-event",
+                "@scott one canonical message",
+            )
+            event = await _next_sse_event(stream)
+
+            assert event["event"] == "workshop.principal.changed"
+            data = event["data"]
+            assert isinstance(data, dict)
+            assert data["version"] == 1
+            assert len(data["changes"]) == 2
+            unread_change, notification_change = data["changes"]
+            assert len(unread_change["unread_changes"]) == 1
+            assert len(notification_change["notification_changes"]) == 1
+            assert notification_change["notification_changes"][0]["event_type"] == ("human_notification.created")
+            assert unread_change["unread_changes"][0]["state"]["channel_id"] == channel_id
+            assert unread_change["event_position"] < notification_change["event_position"]
+            assert notification_change["event_position"] == data["through_position"]
+        finally:
+            if stream is not None:
+                stream.close()
+            await client.close()
+            await store.close()
+
     async def test_authenticated_inbox_mutations_isolation_and_live_events(
         self,
         tmp_path: Path,

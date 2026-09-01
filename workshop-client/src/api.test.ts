@@ -65,6 +65,7 @@ import {
   streamAgentChanges,
   streamHumanNotifications,
   streamChannelUnread,
+  streamPrincipalEvents,
   markHumanNotificationRead,
   updateRuntimeSettings,
   updateRoutingPolicy,
@@ -2417,6 +2418,100 @@ describe("Workshop client API", () => {
     const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
     expect(headers.get("Last-Event-ID")).toBe("79");
     expect(headers.get("X-Kai-Stream-ID")).toMatch(/:mentions$/);
+  });
+
+  it("streams same-position principal changes through one multiplexed connection", async () => {
+    const eventPosition = 80;
+    const notification = {
+      channel_name: "General",
+      created_at: "2026-08-31T15:00:00Z",
+      created_event_position: eventPosition,
+      kind: "mention",
+      last_event_position: eventPosition,
+      notification_id: "ntf_00000000000000000000000000000001",
+      read: false,
+      read_at: null,
+      source_author_display_name: "Scott",
+      source_author_principal_id: "prn_00000000000000000000000000000003",
+      source_channel_id: channelId,
+      source_message_id: "msg_00000000000000000000000000000080",
+      source_thread_root_id: null,
+      state_version: 0,
+    };
+    const unread = {
+      archived: false,
+      channel_id: channelId,
+      channel_kind: "group",
+      channel_name: "General",
+      first_unread_event_position: eventPosition,
+      first_unread_message_id: "msg_00000000000000000000000000000080",
+      last_event_position: eventPosition,
+      membership_baseline_event_position: 70,
+      read_through_event_position: 70,
+      read_through_message_id: null,
+      state_version: 0,
+      unread_count: 1,
+      unread_count_capped: false,
+    };
+    const frame = [
+      `id: ${eventPosition}`,
+      "event: workshop.principal.changed",
+      `data: ${JSON.stringify({
+        changes: [{
+          agent_changes: [],
+          event_position: eventPosition,
+          notification_changes: [{
+            event_type: "human_notification.created",
+            notification,
+          }],
+          unread_changes: [{ state: unread }],
+        }],
+        through_position: eventPosition,
+        version: 1,
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(stream, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onBatch = vi.fn();
+
+    await streamPrincipalEvents(
+      "session-secret",
+      "79",
+      { onBatch, onConnected: vi.fn() },
+      new AbortController().signal,
+    );
+
+    expect(onBatch).toHaveBeenCalledWith(
+      {
+        changes: [{
+          agentChanges: [],
+          eventPosition,
+          notificationChanges: [expect.objectContaining({
+            eventPosition,
+            transition: "human_notification.created",
+          })],
+          unreadChanges: [expect.objectContaining({
+            eventPosition,
+            state: expect.objectContaining({ channelId, unreadCount: 1 }),
+          })],
+        }],
+        throughPosition: eventPosition,
+      },
+      String(eventPosition),
+    );
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/v1/client/events");
+    const headers = options.headers as Headers;
+    expect(headers.get("Last-Event-ID")).toBe("79");
+    expect(headers.get("X-Kai-Stream-ID")).toMatch(/:principal$/);
   });
 
   it("loads, advances, and streams canonical channel unread state", async () => {

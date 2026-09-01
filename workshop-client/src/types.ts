@@ -164,6 +164,18 @@ export interface WorkshopChannelUnreadSignal {
   state: WorkshopChannelUnreadState;
 }
 
+export interface WorkshopPrincipalChange {
+  agentChanges: WorkshopAgentChangeSignal[];
+  eventPosition: number;
+  notificationChanges: WorkshopHumanNotificationSignal[];
+  unreadChanges: WorkshopChannelUnreadSignal[];
+}
+
+export interface WorkshopPrincipalEventBatch {
+  changes: WorkshopPrincipalChange[];
+  throughPosition: number;
+}
+
 export type WorkshopAgentCapability =
   | "agent_delegation"
   | "image_input"

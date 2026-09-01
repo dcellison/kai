@@ -70,6 +70,7 @@ import type {
   WorkshopChannelUnreadSignal,
   WorkshopChannelUnreadSnapshot,
   WorkshopChannelUnreadState,
+  WorkshopPrincipalEventBatch,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -4376,6 +4377,155 @@ export async function streamHumanNotifications(
         },
         event.eventId,
       );
+    }
+  }
+}
+
+export async function streamPrincipalEvents(
+  token: string,
+  lastEventId: string | null,
+  handlers: {
+    onBatch: (batch: WorkshopPrincipalEventBatch, eventId: string) => void;
+    onConnected: () => void;
+  },
+  signal: AbortSignal,
+): Promise<void> {
+  const headers = new Headers();
+  if (lastEventId !== null) {
+    headers.set("Last-Event-ID", lastEventId);
+  }
+  headers.set("X-Kai-Stream-ID", `${eventStreamId()}:principal`);
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/events",
+    { headers, signal },
+  );
+  if (response.status === 409) {
+    throw new ResynchronizationRequired();
+  }
+  if (!response.ok || !response.body) {
+    const payload = await responsePayload(response);
+    throw new Error(
+      safeErrorMessage(payload, "Live Workshop updates are unavailable."),
+    );
+  }
+  handlers.onConnected();
+  const reader = response.body.getReader();
+  const textDecoder = new TextDecoder();
+  const eventDecoder = new EventStreamDecoder();
+  while (!signal.aborted) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    for (const event of eventDecoder.push(textDecoder.decode(value, { stream: true }))) {
+      if (
+        event.eventName !== "workshop.principal.changed" ||
+        !event.eventId ||
+        !/^\d+$/.test(event.eventId)
+      ) continue;
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        continue;
+      }
+      const throughPosition = Number(event.eventId);
+      if (
+        !isRecord(payload) ||
+        payload.version !== 1 ||
+        payload.through_position !== throughPosition ||
+        !Number.isSafeInteger(throughPosition) ||
+        !Array.isArray(payload.changes)
+      ) continue;
+      const changes: WorkshopPrincipalEventBatch["changes"] = [];
+      let valid = true;
+      for (const rawChange of payload.changes) {
+        if (
+          !isRecord(rawChange) ||
+          !Number.isSafeInteger(rawChange.event_position) ||
+          (rawChange.event_position as number) < 0 ||
+          (rawChange.event_position as number) > throughPosition ||
+          !Array.isArray(rawChange.agent_changes) ||
+          !Array.isArray(rawChange.notification_changes) ||
+          !Array.isArray(rawChange.unread_changes)
+        ) {
+          valid = false;
+          break;
+        }
+        const eventPosition = rawChange.event_position as number;
+        const agentChanges: WorkshopPrincipalEventBatch["changes"][number]["agentChanges"] = [];
+        for (const item of rawChange.agent_changes) {
+          if (
+            !isRecord(item) ||
+            ![
+              "agent.definition.changed",
+              "agent.enablement.changed",
+              "workshop.navigation.changed",
+            ].includes(String(item.kind)) ||
+            typeof item.event_type !== "string" ||
+            (item.kind === "workshop.navigation.changed"
+              ? item.definition_id !== null
+              : typeof item.definition_id !== "string" ||
+                !AGENT_DEFINITION_PATTERN.test(item.definition_id)) ||
+            (item.revision_id !== null &&
+              (typeof item.revision_id !== "string" ||
+                !AGENT_REVISION_PATTERN.test(item.revision_id))) ||
+            typeof item.occurred_at !== "string"
+          ) {
+            valid = false;
+            break;
+          }
+          agentChanges.push({
+            definitionId: item.definition_id as string | null,
+            eventPosition,
+            eventType: item.event_type,
+            kind: item.kind === "workshop.navigation.changed"
+              ? "navigation"
+              : item.kind === "agent.definition.changed"
+                ? "definition"
+                : "enablement",
+            occurredAt: item.occurred_at,
+            revisionId: item.revision_id as string | null,
+          });
+        }
+        if (!valid) break;
+        const notificationChanges: WorkshopPrincipalEventBatch["changes"][number]["notificationChanges"] = [];
+        for (const item of rawChange.notification_changes) {
+          const notification = isRecord(item)
+            ? parseHumanNotification(item.notification)
+            : null;
+          if (
+            !isRecord(item) ||
+            !notification ||
+            ![
+              "human_notification.created",
+              "human_notification.read",
+              "human_notification.unread",
+            ].includes(String(item.event_type))
+          ) {
+            valid = false;
+            break;
+          }
+          notificationChanges.push({
+            eventPosition,
+            notification,
+            transition: item.event_type as WorkshopHumanNotificationSignal["transition"],
+          });
+        }
+        if (!valid) break;
+        const unreadChanges: WorkshopPrincipalEventBatch["changes"][number]["unreadChanges"] = [];
+        for (const item of rawChange.unread_changes) {
+          const state = isRecord(item) ? parseChannelUnreadState(item.state) : null;
+          if (!state) {
+            valid = false;
+            break;
+          }
+          unreadChanges.push({ eventPosition, state });
+        }
+        if (!valid) break;
+        changes.push({ agentChanges, eventPosition, notificationChanges, unreadChanges });
+      }
+      if (!valid) continue;
+      handlers.onBatch({ changes, throughPosition }, event.eventId);
     }
   }
 }

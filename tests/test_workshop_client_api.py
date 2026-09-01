@@ -4247,18 +4247,18 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             await client.close()
             await store.close()
 
-    async def test_default_stream_capacity_supports_four_workshop_pages(self):
+    async def test_default_stream_capacity_supports_six_multiplexed_workshop_pages(self):
         principal_id = PrincipalId("prn_00000000000000000000000000000001")
         limiter = WorkshopEventStreamLimiter()
 
         claims = tuple(
             limiter.acquire(principal_id, f"page-{page}:{stream}".encode())
-            for page in range(4)
-            for stream in ("timeline", "agents", "mentions")
+            for page in range(6)
+            for stream in ("timeline", "principal")
         )
 
         assert all(claim is not None for claim in claims)
-        assert limiter.acquire(principal_id, b"fifth-page:timeline") is None
+        assert limiter.acquire(principal_id, b"seventh-page:timeline") is None
         for claim in claims:
             assert claim is not None
             limiter.release(claim)
