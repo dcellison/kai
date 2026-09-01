@@ -7,15 +7,13 @@ import {
   markHumanNotificationRead,
   markHumanNotificationsRead,
   markHumanNotificationUnread,
-  ResynchronizationRequired,
-  streamHumanNotifications,
 } from "./api";
 import type {
   WorkshopHumanNotification,
   WorkshopHumanNotificationCounts,
 } from "./types";
+import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 
-const RECONNECT_DELAY_MS = 2000;
 const EMPTY_COUNTS: WorkshopHumanNotificationCounts = {
   read: 0,
   total: 0,
@@ -27,16 +25,6 @@ function operationId(prefix: string): string {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
   return `${prefix}-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function waitForRetry(signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timeout = window.setTimeout(resolve, RECONNECT_DELAY_MS);
-    signal.addEventListener("abort", () => {
-      window.clearTimeout(timeout);
-      resolve();
-    }, { once: true });
-  });
 }
 
 function mergeNotification(
@@ -64,6 +52,7 @@ export interface HumanNotificationState {
 
 export function useHumanNotifications(
   token: string,
+  principalEvents: WorkshopPrincipalEvents,
   onAuthenticationFailure: (message: string) => void,
 ): HumanNotificationState & {
   loadMore: () => void;
@@ -84,6 +73,7 @@ export function useHumanNotifications(
   const loadMorePendingRef = useRef(false);
   const countsRefreshRef = useRef<number | null>(null);
   const visibleReadPendingRef = useRef(new Set<string>());
+  const subscribePrincipalEvents = principalEvents.subscribe;
 
   const refreshCounts = useCallback(async (signal?: AbortSignal): Promise<void> => {
     const counts = await loadHumanNotificationCounts(token, signal);
@@ -99,15 +89,15 @@ export function useHumanNotifications(
       error: null,
       hasMore: page.nextCursor !== null,
       loading: false,
-      notifications: page.notifications,
+      notifications: current.notifications
+        .filter((item) => item.lastEventPosition > page.throughPosition)
+        .reduce(mergeNotification, page.notifications),
     }));
     return page.throughPosition;
   }, [token]);
 
   useEffect(() => {
     const controller = new AbortController();
-    let lastEventId: string | null = null;
-    let needsReload = true;
     const scheduleCountsRefresh = (): void => {
       if (countsRefreshRef.current !== null) return;
       countsRefreshRef.current = window.setTimeout(() => {
@@ -119,63 +109,49 @@ export function useHumanNotifications(
         });
       }, 100);
     };
-    const synchronize = async (): Promise<void> => {
-      while (!controller.signal.aborted) {
-        try {
-          if (needsReload) {
-            lastEventId = String(await reload(controller.signal));
-            needsReload = false;
-          }
-          await streamHumanNotifications(
-            token,
-            lastEventId,
-            {
-              onChanged: ({ notification }, eventId) => {
-                lastEventId = eventId;
-                setState((current) => ({
-                  ...current,
-                  notifications: mergeNotification(current.notifications, notification),
-                }));
-                scheduleCountsRefresh();
-              },
-              onConnected: () => undefined,
-            },
-            controller.signal,
-          );
-          if (!controller.signal.aborted) {
-            await waitForRetry(controller.signal);
-          }
-        } catch (caught) {
-          if (controller.signal.aborted) return;
-          if (caught instanceof AuthenticationError) {
-            onAuthenticationFailure(caught.message);
-            return;
-          }
-          if (caught instanceof ResynchronizationRequired) {
-            lastEventId = null;
-            needsReload = true;
-          } else {
-            setState((current) => ({
-              ...current,
-              error: current.loading
-                ? caught instanceof Error ? caught.message : "Could not load mentions."
-                : current.error,
-              loading: false,
-            }));
-          }
-          await waitForRetry(controller.signal);
+    const requestReload = (): void => {
+      void reload(controller.signal).catch((caught: unknown) => {
+        if (controller.signal.aborted) return;
+        if (caught instanceof AuthenticationError) {
+          onAuthenticationFailure(caught.message);
+          return;
+        }
+        setState((current) => ({
+          ...current,
+          error: current.loading
+            ? caught instanceof Error ? caught.message : "Could not load mentions."
+            : current.error,
+          loading: false,
+        }));
+      });
+    };
+    const unsubscribe = subscribePrincipalEvents((event) => {
+      if (event.kind === "synchronize") {
+        requestReload();
+        return;
+      }
+      let changed = false;
+      for (const change of event.batch.changes) {
+        for (const { notification } of change.notificationChanges) {
+          changed = true;
+          setState((current) => ({
+            ...current,
+            notifications: mergeNotification(current.notifications, notification),
+          }));
         }
       }
-    };
-    void synchronize();
+      if (changed) scheduleCountsRefresh();
+    });
+    requestReload();
     return () => {
+      unsubscribe();
       controller.abort();
       if (countsRefreshRef.current !== null) {
         window.clearTimeout(countsRefreshRef.current);
         countsRefreshRef.current = null;
       }
     };
-  }, [onAuthenticationFailure, refreshCounts, reload, token]);
+  }, [onAuthenticationFailure, refreshCounts, reload, subscribePrincipalEvents]);
 
   const loadMore = useCallback((): void => {
     const cursor = cursorRef.current;

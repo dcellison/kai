@@ -861,6 +861,7 @@ class TestNotificationChatIdMutations:
                 "/v1/client/navigation",
                 "/v1/client/agents",
                 "/v1/client/agents/events",
+                "/v1/client/events",
                 "/v1/client/agents/{definition_id}",
                 "/v1/client/agents/{definition_id}/revisions",
                 "/v1/client/agents/{definition_id}/activate",

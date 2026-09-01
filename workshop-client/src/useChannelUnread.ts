@@ -6,31 +6,18 @@ import {
   ChannelAccessError,
   ChannelReadPositionConflictError,
   loadChannelUnread,
-  ResynchronizationRequired,
-  streamChannelUnread,
 } from "./api";
 import type {
   TimelineMessage,
   WorkshopChannelUnreadState,
   WorkshopSession,
 } from "./types";
-
-const RECONNECT_DELAY_MS = 2000;
+import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 
 function operationId(): string {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
   return `channel-read-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function waitForRetry(signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timeout = window.setTimeout(resolve, RECONNECT_DELAY_MS);
-    signal.addEventListener("abort", () => {
-      window.clearTimeout(timeout);
-      resolve();
-    }, { once: true });
-  });
 }
 
 function indexed(
@@ -49,6 +36,7 @@ export interface ChannelUnreadClientState {
 
 export function useChannelUnread(
   token: string,
+  principalEvents: WorkshopPrincipalEvents,
   onAuthenticationFailure: (message: string) => void,
   onChannelAccessFailure: (message: string) => void,
 ): ChannelUnreadClientState & {
@@ -64,6 +52,7 @@ export function useChannelUnread(
   const stateRef = useRef(state);
   const pendingRef = useRef(new Map<string, TimelineMessage>());
   const runningRef = useRef(new Set<string>());
+  const subscribePrincipalEvents = principalEvents.subscribe;
   stateRef.current = state;
 
   const reload = useCallback(async (signal?: AbortSignal): Promise<number> => {
@@ -82,68 +71,52 @@ export function useChannelUnread(
 
   useEffect(() => {
     const controller = new AbortController();
-    let cursor: string | null = null;
-    let needsReload = true;
-    const synchronize = async (): Promise<void> => {
-      while (!controller.signal.aborted) {
-        try {
-          if (needsReload) {
-            cursor = String(await reload(controller.signal));
-            needsReload = false;
-          }
-          await streamChannelUnread(
-            token,
-            cursor,
-            {
-              onChanged: ({ state: changed }, eventId) => {
-                cursor = eventId;
-                setState((current) => {
-                  const previous = current.byChannel[changed.channelId];
-                  const nextTotal = Math.max(
-                    0,
-                    current.totalUnread - (previous?.unreadCount ?? 0) + changed.unreadCount,
-                  );
-                  const next = {
-                    ...current,
-                    byChannel: { ...current.byChannel, [changed.channelId]: changed },
-                    totalUnread: nextTotal,
-                  };
-                  stateRef.current = next;
-                  return next;
-                });
-              },
-              onConnected: () => undefined,
-            },
-            controller.signal,
-          );
-          if (!controller.signal.aborted) {
-            await waitForRetry(controller.signal);
-          }
-        } catch (caught) {
-          if (controller.signal.aborted) return;
-          if (caught instanceof AuthenticationError) {
-            onAuthenticationFailure(caught.message);
-            return;
-          }
-          if (caught instanceof ResynchronizationRequired) {
-            cursor = null;
-            needsReload = true;
-          } else {
-            setState((current) => ({
-              ...current,
-              error: current.loading
-                ? caught instanceof Error ? caught.message : "Could not load unread messages."
-                : current.error,
-              loading: false,
-            }));
-          }
+    const requestReload = (): void => {
+      void reload(controller.signal).catch((caught: unknown) => {
+        if (controller.signal.aborted) return;
+        if (caught instanceof AuthenticationError) {
+          onAuthenticationFailure(caught.message);
+          return;
         }
-        await waitForRetry(controller.signal);
-      }
+        setState((current) => ({
+          ...current,
+          error: current.loading
+            ? caught instanceof Error ? caught.message : "Could not load unread messages."
+            : current.error,
+          loading: false,
+        }));
+      });
     };
-    void synchronize();
-    return () => controller.abort();
-  }, [onAuthenticationFailure, reload, token]);
+    const unsubscribe = subscribePrincipalEvents((event) => {
+      if (event.kind === "synchronize") {
+        requestReload();
+        return;
+      }
+      for (const change of event.batch.changes) {
+        for (const { state: changed } of change.unreadChanges) {
+          setState((current) => {
+            const previous = current.byChannel[changed.channelId];
+            const nextTotal = Math.max(
+              0,
+              current.totalUnread - (previous?.unreadCount ?? 0) + changed.unreadCount,
+            );
+            const next = {
+              ...current,
+              byChannel: { ...current.byChannel, [changed.channelId]: changed },
+              totalUnread: nextTotal,
+            };
+            stateRef.current = next;
+            return next;
+          });
+        }
+      }
+    });
+    requestReload();
+    return () => {
+      unsubscribe();
+      controller.abort();
+    };
+  }, [onAuthenticationFailure, reload, subscribePrincipalEvents]);
 
   const advanceVisible = useCallback((session: WorkshopSession, message: TimelineMessage): void => {
     const current = stateRef.current.byChannel[session.channelId];

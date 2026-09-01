@@ -35,11 +35,9 @@ import {
   loadSettingsWorkspace,
   loadThreadTimeline,
   redeemEnrollment,
-  ResynchronizationRequired,
   restoreChannel,
   setMessageReaction,
   submitCommand,
-  streamAgentChanges,
   switchWorkspace,
 } from "./api";
 import type {
@@ -81,6 +79,8 @@ import { AgentWorkspace } from "./AgentWorkspace";
 import { MentionsInbox } from "./MentionsInbox";
 import { useHumanNotifications } from "./useHumanNotifications";
 import { useChannelUnread } from "./useChannelUnread";
+import { usePrincipalEvents } from "./usePrincipalEvents";
+import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 
@@ -2061,6 +2061,7 @@ function WorkshopView({
   mentionsDestination,
   inbox,
   unread,
+  principalEvents,
   unreadBoundaryMessageId,
   readActivatedInitially,
   focusedMessage,
@@ -2129,6 +2130,7 @@ function WorkshopView({
   mentionsDestination: boolean;
   inbox: ReturnType<typeof useHumanNotifications>;
   unread: ReturnType<typeof useChannelUnread>;
+  principalEvents: WorkshopPrincipalEvents;
   unreadBoundaryMessageId: string | null;
   readActivatedInitially: boolean;
   focusedMessage: TimelineMessage | null;
@@ -3498,6 +3500,7 @@ function WorkshopView({
           onSelectAgent={onSelectAgent}
           principalId={navigation.principal.principalId}
           principalName={humanName}
+          principalEvents={principalEvents}
           runActive={isRunActive(activeRun)}
           token={agentToken}
         />
@@ -4326,12 +4329,30 @@ function ActiveWorkshopClient({
     }),
     [session.channelId, session.token, settingsChannel?.channelId],
   );
-  const inbox = useHumanNotifications(session.token, onAuthenticationFailure);
+  const principalEvents = usePrincipalEvents(
+    session.token,
+    onAuthenticationFailure,
+  );
+  const subscribePrincipalEvents = principalEvents.subscribe;
+  const inbox = useHumanNotifications(
+    session.token,
+    principalEvents,
+    onAuthenticationFailure,
+  );
   const unread = useChannelUnread(
     session.token,
+    principalEvents,
     onAuthenticationFailure,
     onChannelAccessFailure,
   );
+  useEffect(() => subscribePrincipalEvents((event) => {
+    if (
+      event.kind === "synchronize" ||
+      event.batch.changes.some((change) => change.agentChanges.length > 0)
+    ) {
+      void onAgentNavigationChanged().catch(() => undefined);
+    }
+  }), [onAgentNavigationChanged, subscribePrincipalEvents]);
   const [timelineAnchor, setTimelineAnchor] = useState<{
     channelId: string;
     messageId: string | null;
@@ -4569,6 +4590,7 @@ function ActiveWorkshopClient({
       mentionsDestination={destination.kind === "mentions"}
       inbox={inbox}
       unread={unread}
+      principalEvents={principalEvents}
       unreadBoundaryMessageId={
         timelineAnchor?.channelId === session.channelId ? timelineAnchor.messageId : null
       }
@@ -4971,57 +4993,6 @@ function WorkshopApp(): React.JSX.Element {
       }
     }
   }, [forgetSession, session]);
-
-  useEffect(() => {
-    if (!session || destination.kind === "agents") {
-      return;
-    }
-    const controller = new AbortController();
-    let lastEventId: string | null = null;
-    const synchronize = async (): Promise<void> => {
-      while (!controller.signal.aborted) {
-        try {
-          await streamAgentChanges(
-            session.token,
-            lastEventId,
-            {
-              onChanged: (_signal, eventId) => {
-                lastEventId = eventId;
-                void refreshAgentNavigation().catch(() => undefined);
-              },
-              onConnected: () => undefined,
-            },
-            controller.signal,
-          );
-        } catch (caught) {
-          if (controller.signal.aborted) {
-            return;
-          }
-          if (caught instanceof AuthenticationError) {
-            forgetSession(caught.message);
-            return;
-          }
-          if (caught instanceof ResynchronizationRequired) {
-            lastEventId = null;
-            await refreshAgentNavigation();
-          }
-          await new Promise<void>((resolve) => {
-            const timeout = window.setTimeout(resolve, 2000);
-            controller.signal.addEventListener(
-              "abort",
-              () => {
-                window.clearTimeout(timeout);
-                resolve();
-              },
-              { once: true },
-            );
-          });
-        }
-      }
-    };
-    void synchronize();
-    return () => controller.abort();
-  }, [destination.kind, forgetSession, refreshAgentNavigation, session]);
 
   const openAgentChannel = useCallback(async (channelId: string): Promise<void> => {
     if (!session) {

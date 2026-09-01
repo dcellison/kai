@@ -44,9 +44,7 @@ import {
   markHumanNotificationUnread,
   markHumanNotificationsRead,
   streamTimeline,
-  streamAgentChanges,
-  streamHumanNotifications,
-  streamChannelUnread,
+  streamPrincipalEvents,
   setMessageReaction,
   startAgentConversation,
   submitCommand,
@@ -107,9 +105,7 @@ vi.mock("./api", async (importOriginal) => {
     markHumanNotificationUnread: vi.fn(),
     markHumanNotificationsRead: vi.fn(),
     streamTimeline: vi.fn(),
-    streamAgentChanges: vi.fn(),
-    streamHumanNotifications: vi.fn(),
-    streamChannelUnread: vi.fn(),
+    streamPrincipalEvents: vi.fn(),
     setMessageReaction: vi.fn(),
     startAgentConversation: vi.fn(),
     submitCommand: vi.fn(),
@@ -455,8 +451,7 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
 };
 
 type StreamHandlers = Parameters<typeof streamTimeline>[2];
-type HumanNotificationStreamHandlers = Parameters<typeof streamHumanNotifications>[2];
-type ChannelUnreadStreamHandlers = Parameters<typeof streamChannelUnread>[2];
+type PrincipalEventStreamHandlers = Parameters<typeof streamPrincipalEvents>[2];
 
 function observeMessagesAsVisible(): void {
   class TestIntersectionObserver {
@@ -534,8 +529,7 @@ function observeMessagesAtViewportEdge(): void {
 
 describe("Workshop React client", () => {
   let handlers: StreamHandlers | null;
-  let humanNotificationHandlers: HumanNotificationStreamHandlers | null;
-  let channelUnreadHandlers: ChannelUnreadStreamHandlers | null;
+  let principalEventHandlers: PrincipalEventStreamHandlers | null;
   let failStream: ((reason: Error) => void) | null;
 
   beforeEach(() => {
@@ -544,8 +538,7 @@ describe("Workshop React client", () => {
     sessionStorage.clear();
     window.history.replaceState(null, "", "/workshop/");
     handlers = null;
-    humanNotificationHandlers = null;
-    channelUnreadHandlers = null;
+    principalEventHandlers = null;
     failStream = null;
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(attachChannelAgent).mockResolvedValue(undefined);
@@ -736,26 +729,9 @@ describe("Workshop React client", () => {
         });
       },
     );
-    vi.mocked(streamAgentChanges).mockImplementation(
+    vi.mocked(streamPrincipalEvents).mockImplementation(
       async (_token, _position, streamHandlers, signal) => {
-        streamHandlers.onConnected();
-        await new Promise<void>((resolve) => {
-          signal.addEventListener("abort", () => resolve(), { once: true });
-        });
-      },
-    );
-    vi.mocked(streamHumanNotifications).mockImplementation(
-      async (_token, _position, streamHandlers, signal) => {
-        humanNotificationHandlers = streamHandlers;
-        streamHandlers.onConnected();
-        await new Promise<void>((resolve) => {
-          signal.addEventListener("abort", () => resolve(), { once: true });
-        });
-      },
-    );
-    vi.mocked(streamChannelUnread).mockImplementation(
-      async (_token, _position, streamHandlers, signal) => {
-        channelUnreadHandlers = streamHandlers;
+        principalEventHandlers = streamHandlers;
         streamHandlers.onConnected();
         await new Promise<void>((resolve) => {
           signal.addEventListener("abort", () => resolve(), { once: true });
@@ -1144,14 +1120,21 @@ describe("Workshop React client", () => {
     render(<App />);
 
     expect(await screen.findByText(historyMessage.body)).toBeVisible();
-    await waitFor(() => expect(streamHumanNotifications).toHaveBeenCalled());
+    await waitFor(() => expect(streamPrincipalEvents).toHaveBeenCalled());
     act(() => {
-      humanNotificationHandlers?.onChanged(
-        {
+      principalEventHandlers?.onBatch({
+        changes: [{
+          agentChanges: [],
           eventPosition: historyMessage.eventPosition,
-          notification: mention,
-          transition: "human_notification.created",
-        },
+          notificationChanges: [{
+            eventPosition: historyMessage.eventPosition,
+            notification: mention,
+            transition: "human_notification.created",
+          }],
+          unreadChanges: [],
+        }],
+        throughPosition: historyMessage.eventPosition,
+      },
         String(historyMessage.eventPosition),
       );
     });
@@ -1232,7 +1215,7 @@ describe("Workshop React client", () => {
       unreadByChannel: { [secondChannelId]: 1 },
     });
     render(<App />);
-    await waitFor(() => expect(streamHumanNotifications).toHaveBeenCalled());
+    await waitFor(() => expect(streamPrincipalEvents).toHaveBeenCalled());
     const mention: WorkshopHumanNotification = {
       channelName: "Wake policy qualification",
       createdAt: "2026-08-31T15:00:00Z",
@@ -1250,14 +1233,20 @@ describe("Workshop React client", () => {
       stateVersion: 0,
     };
     act(() => {
-      humanNotificationHandlers?.onChanged(
-        { eventPosition: 41, notification: mention, transition: "human_notification.created" },
-        "41",
-      );
-      humanNotificationHandlers?.onChanged(
-        { eventPosition: 41, notification: mention, transition: "human_notification.created" },
-        "41",
-      );
+      const batch = {
+        changes: [{
+          agentChanges: [],
+          eventPosition: 41,
+          notificationChanges: [{
+            eventPosition: 41,
+            notification: mention,
+            transition: "human_notification.created" as const,
+          }],
+          unreadChanges: [],
+        }],
+        throughPosition: 41,
+      };
+      principalEventHandlers?.onBatch(batch, "41");
     });
 
     expect(await screen.findByRole("button", { name: "Mentions, 1 unread" })).toBeVisible();
@@ -1771,16 +1760,21 @@ describe("Workshop React client", () => {
     render(<App />);
 
     await screen.findByText("Canonical history is ready.");
-    await waitFor(() => expect(channelUnreadHandlers).not.toBeNull());
+    await waitFor(() => expect(principalEventHandlers).not.toBeNull());
     const unread = unreadState(secondChannelId, {
       firstUnreadEventPosition: 30,
       firstUnreadMessageId: "msg_00000000000000000000000000000030",
       lastEventPosition: 30,
       unreadCount: 1,
     });
-    act(() => channelUnreadHandlers?.onChanged({
-      eventPosition: 30,
-      state: unread,
+    act(() => principalEventHandlers?.onBatch({
+      changes: [{
+        agentChanges: [],
+        eventPosition: 30,
+        notificationChanges: [],
+        unreadChanges: [{ eventPosition: 30, state: unread }],
+      }],
+      throughPosition: 30,
     }, "30"));
 
     expect(screen.getByRole("button", {
@@ -1788,18 +1782,28 @@ describe("Workshop React client", () => {
     })).toHaveClass("unread");
 
     // Replaying a position after reconnect is harmless.
-    act(() => channelUnreadHandlers?.onChanged({
-      eventPosition: 30,
-      state: unread,
+    act(() => principalEventHandlers?.onBatch({
+      changes: [{
+        agentChanges: [],
+        eventPosition: 30,
+        notificationChanges: [],
+        unreadChanges: [{ eventPosition: 30, state: unread }],
+      }],
+      throughPosition: 30,
     }, "30"));
     expect(screen.getAllByRole("button", {
       name: "Wake policy qualification, 1 unread message",
     })).toHaveLength(1);
 
     // A read-position mutation from another tab is authoritative here too.
-    act(() => channelUnreadHandlers?.onChanged({
-      eventPosition: 31,
-      state: unreadState(secondChannelId, {
+    act(() => principalEventHandlers?.onBatch({
+      changes: [{
+        agentChanges: [],
+        eventPosition: 31,
+        notificationChanges: [],
+        unreadChanges: [{
+          eventPosition: 31,
+          state: unreadState(secondChannelId, {
         firstUnreadEventPosition: null,
         firstUnreadMessageId: null,
         lastEventPosition: 31,
@@ -1807,7 +1811,10 @@ describe("Workshop React client", () => {
         readThroughMessageId: unread.firstUnreadMessageId,
         stateVersion: 1,
         unreadCount: 0,
-      }),
+          }),
+        }],
+      }],
+      throughPosition: 31,
     }, "31"));
     expect(screen.getByRole("button", {
       name: "Wake policy qualification",
@@ -2773,7 +2780,7 @@ describe("Workshop React client", () => {
     expect(createAgent.parentElement).toBe(closeAgents.parentElement);
     expect(createAgent.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(closeAgents.querySelector("span")).toHaveAttribute("aria-hidden", "true");
-    expect(streamAgentChanges).toHaveBeenCalled();
+    expect(streamPrincipalEvents).toHaveBeenCalledTimes(1);
 
     await user.click(screen.getByRole("button", { name: "Start conversation" }));
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();

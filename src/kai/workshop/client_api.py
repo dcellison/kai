@@ -304,6 +304,7 @@ _HUMAN_NOTIFICATION_EVENTS_PATH = "/v1/client/notifications/events"
 _HUMAN_NOTIFICATION_READ_PATH = "/v1/client/notifications/{notification_id}/read"
 _HUMAN_NOTIFICATION_UNREAD_PATH = "/v1/client/notifications/{notification_id}/unread"
 _HUMAN_NOTIFICATION_BULK_READ_PATH = "/v1/client/notifications/read"
+_PRINCIPAL_EVENTS_PATH = "/v1/client/events"
 _CHANNEL_UNREAD_PATH = "/v1/client/unread"
 _CHANNEL_UNREAD_EVENTS_PATH = "/v1/client/unread/events"
 _CHANNEL_UNREAD_DETAIL_PATH = "/v1/channels/{channel_id}/unread"
@@ -4619,14 +4620,51 @@ def _serialize_run_trace_event(run_id: str, channel_id: str, seq: int) -> bytes:
     return (f"event: run.trace.updated\ndata: {payload}\n\n").encode()
 
 
-async def _read_agent_lifecycle_events(
+@dataclass(frozen=True, slots=True)
+class _AgentLifecycleClientEvent:
+    event_name: str
+    event_position: int
+    event_type: str
+    definition_id: str | None
+    revision_id: str | None
+    occurred_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PrincipalClientEventBatch:
+    changes: tuple[dict[str, object], ...]
+    through_position: int
+
+
+class _PrincipalEventResynchronizationRequired(ValueError):
+    pass
+
+
+def _serialize_agent_lifecycle_event(event: _AgentLifecycleClientEvent) -> bytes:
+    event_payload = json.dumps(
+        {
+            "version": 1,
+            "event_position": event.event_position,
+            "event_type": event.event_type,
+            "definition_id": event.definition_id,
+            "revision_id": event.revision_id,
+            "occurred_at": event.occurred_at,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"id: {event.event_position}\nevent: {event.event_name}\ndata: {event_payload}\n\n").encode()
+
+
+async def _read_agent_lifecycle_event_records(
     store: WorkshopEventStore,
     *,
     workshop_id: str,
     principal_id: PrincipalId,
     role: str,
     after_position: int,
-) -> tuple[tuple[bytes, ...], int]:
+) -> tuple[tuple[_AgentLifecycleClientEvent, ...], int, bool]:
     definition_event_types = (
         WorkshopEventType.AGENT_DEFINITION_CREATED,
         WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
@@ -4662,7 +4700,7 @@ async def _read_agent_lifecycle_events(
         ),
     ) as cursor:
         rows = list(await cursor.fetchall())
-    serialized: list[bytes] = []
+    records: list[_AgentLifecycleClientEvent] = []
     position = after_position
     for row in rows:
         position = int(row[0])
@@ -4706,21 +4744,278 @@ async def _read_agent_lifecycle_events(
         elif event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED:
             candidate = payload.get("revision_id")
             revision_id = candidate if isinstance(candidate, str) else None
-        event_payload = json.dumps(
-            {
-                "version": 1,
-                "event_position": position,
-                "event_type": event_type,
-                "definition_id": definition_id,
-                "revision_id": revision_id,
-                "occurred_at": str(row[5]),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
+        records.append(
+            _AgentLifecycleClientEvent(
+                event_name=event_name,
+                event_position=position,
+                event_type=event_type,
+                definition_id=definition_id,
+                revision_id=revision_id,
+                occurred_at=str(row[5]),
+            )
         )
-        serialized.append((f"id: {position}\nevent: {event_name}\ndata: {event_payload}\n\n").encode())
-    return tuple(serialized), position
+    return tuple(records), position, len(rows) < _EVENT_BATCH_SIZE
+
+
+async def _read_agent_lifecycle_events(
+    store: WorkshopEventStore,
+    *,
+    workshop_id: str,
+    principal_id: PrincipalId,
+    role: str,
+    after_position: int,
+) -> tuple[tuple[bytes, ...], int]:
+    records, position, _complete = await _read_agent_lifecycle_event_records(
+        store,
+        workshop_id=workshop_id,
+        principal_id=principal_id,
+        role=role,
+        after_position=after_position,
+    )
+    return tuple(_serialize_agent_lifecycle_event(event) for event in records), position
+
+
+async def _read_principal_client_events(
+    store: WorkshopEventStore,
+    *,
+    workshop_id: str,
+    principal_id: PrincipalId,
+    role: str,
+    human_notifications: WorkshopHumanNotificationService,
+    channel_unread: WorkshopChannelUnreadService,
+    after_position: int | None,
+) -> _PrincipalClientEventBatch:
+    async with store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
+        tip_row = await cursor.fetchone()
+    tip = int(tip_row[0]) if tip_row is not None else 0
+    if after_position is None:
+        return _PrincipalClientEventBatch((), tip)
+    if not isinstance(after_position, int) or isinstance(after_position, bool) or after_position < 0:
+        raise ValueError("Invalid principal-event resume position")
+    if after_position > tip:
+        raise _PrincipalEventResynchronizationRequired
+
+    agent_events, agent_scan_position, agent_scan_complete = await _read_agent_lifecycle_event_records(
+        store,
+        workshop_id=workshop_id,
+        principal_id=principal_id,
+        role=role,
+        after_position=after_position,
+    )
+    notification_batch = await human_notifications.events(
+        principal_id,
+        after_position=after_position,
+        limit=_EVENT_BATCH_SIZE,
+    )
+    unread_batch = await channel_unread.events(
+        principal_id,
+        after_position=after_position,
+        limit=_EVENT_BATCH_SIZE,
+    )
+
+    safe_position = tip
+    if not agent_scan_complete:
+        safe_position = min(safe_position, agent_scan_position)
+    if len(notification_batch.events) == _EVENT_BATCH_SIZE:
+        safe_position = min(safe_position, notification_batch.next_position)
+    if len(unread_batch.events) == _EVENT_BATCH_SIZE:
+        safe_position = min(safe_position, unread_batch.next_position)
+
+    positions = sorted(
+        {
+            *(event.event_position for event in agent_events if event.event_position <= safe_position),
+            *(event.event_position for event in notification_batch.events if event.event_position <= safe_position),
+            *(event.event_position for event in unread_batch.events if event.event_position <= safe_position),
+        }
+    )
+    if len(positions) > _EVENT_BATCH_SIZE:
+        safe_position = positions[_EVENT_BATCH_SIZE - 1]
+        positions = positions[:_EVENT_BATCH_SIZE]
+
+    changes_by_position: dict[int, dict[str, object]] = {
+        position: {
+            "event_position": position,
+            "agent_changes": [],
+            "notification_changes": [],
+            "unread_changes": [],
+        }
+        for position in positions
+    }
+    for event in agent_events:
+        if event.event_position > safe_position:
+            continue
+        agent_changes = changes_by_position[event.event_position]["agent_changes"]
+        assert isinstance(agent_changes, list)
+        agent_changes.append(
+            {
+                "kind": event.event_name,
+                "event_type": event.event_type,
+                "definition_id": event.definition_id,
+                "revision_id": event.revision_id,
+                "occurred_at": event.occurred_at,
+            }
+        )
+    for event in notification_batch.events:
+        if event.event_position > safe_position:
+            continue
+        notification_changes = changes_by_position[event.event_position]["notification_changes"]
+        assert isinstance(notification_changes, list)
+        notification_changes.append(
+            {
+                "event_type": event.transition.value,
+                "notification": _serialize_human_notification(event.notification),
+            }
+        )
+    for event in unread_batch.events:
+        if event.event_position > safe_position:
+            continue
+        unread_changes = changes_by_position[event.event_position]["unread_changes"]
+        assert isinstance(unread_changes, list)
+        unread_changes.append({"state": _serialize_channel_unread(event.state)})
+    return _PrincipalClientEventBatch(
+        tuple(changes_by_position[position] for position in positions),
+        safe_position,
+    )
+
+
+def _serialize_principal_client_event_batch(batch: _PrincipalClientEventBatch) -> bytes:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "through_position": batch.through_position,
+            "changes": batch.changes,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"id: {batch.through_position}\nevent: workshop.principal.changed\ndata: {payload}\n\n").encode()
+
+
+async def _handle_principal_event_stream(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    agent_lifecycle: WorkshopAgentLifecycleService,
+    human_notifications: WorkshopHumanNotificationService,
+    channel_unread: WorkshopChannelUnreadService,
+    request_lock: asyncio.Lock,
+    poll_interval: float,
+    heartbeat_interval: float,
+    authentication_recheck_interval: float,
+    stream_limiter: WorkshopEventStreamLimiter,
+    shutdown_event: asyncio.Event,
+) -> web.StreamResponse:
+    try:
+        async with request_lock:
+            principal_id = await authenticator.authenticate(request)
+            if not isinstance(principal_id, PrincipalId):
+                response = _error_response(
+                    status=401,
+                    code="authentication_required",
+                    message="Authentication required",
+                )
+                response.headers["WWW-Authenticate"] = "Bearer"
+                return response
+            after_position = _parse_agent_event_stream_request(request)
+            stream_key = _event_stream_key(request)
+            authority = await agent_lifecycle.authority_for(principal_id)
+            batch = await _read_principal_client_events(
+                store,
+                workshop_id=str(authority.workshop_id),
+                principal_id=principal_id,
+                role=authority.role,
+                human_notifications=human_notifications,
+                channel_unread=channel_unread,
+                after_position=after_position,
+            )
+    except WorkshopAgentLifecycleAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except _PrincipalEventResynchronizationRequired:
+        return _error_response(
+            status=409,
+            code="resynchronization_required",
+            message="Workshop principal events resynchronization required",
+        )
+    except (
+        TypeError,
+        ValueError,
+        WorkshopHumanNotificationValidationError,
+        WorkshopChannelUnreadValidationError,
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid principal event stream")
+
+    claim = stream_limiter.acquire(principal_id, stream_key)
+    if claim is None:
+        response = _error_response(
+            status=429,
+            code="stream_capacity_exceeded",
+            message="Too many active event streams",
+        )
+        response.headers["Retry-After"] = "5"
+        return response
+    response = web.StreamResponse(status=200)
+    try:
+        response.content_type = "text/event-stream"
+        response.charset = "utf-8"
+        _apply_client_security_headers(response)
+        response.headers["X-Accel-Buffering"] = "no"
+        await response.prepare(request)
+        await response.write(f": connected\nretry: {_SSE_RETRY_MILLISECONDS}\n\n".encode())
+        position = after_position
+        pending_batch: _PrincipalClientEventBatch | None = batch
+        last_heartbeat = time.monotonic()
+        last_authentication_check = last_heartbeat
+        while True:
+            if not stream_limiter.is_current(claim):
+                break
+            transport = request.transport
+            if transport is None or transport.is_closing():
+                break
+            if pending_batch is not None and (position is None or pending_batch.through_position > position):
+                await response.write(_serialize_principal_client_event_batch(pending_batch))
+                position = pending_batch.through_position
+                pending_batch = None
+                last_heartbeat = time.monotonic()
+                continue
+            pending_batch = None
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_interval:
+                await response.write(b": keep-alive\n\n")
+                last_heartbeat = now
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval)
+                break
+            except TimeoutError:
+                pass
+            async with request_lock:
+                if time.monotonic() - last_authentication_check >= authentication_recheck_interval:
+                    if await authenticator.authenticate(request) != principal_id:
+                        break
+                    authority = await agent_lifecycle.authority_for(principal_id)
+                    last_authentication_check = time.monotonic()
+                assert position is not None
+                pending_batch = await _read_principal_client_events(
+                    store,
+                    workshop_id=str(authority.workshop_id),
+                    principal_id=principal_id,
+                    role=authority.role,
+                    human_notifications=human_notifications,
+                    channel_unread=channel_unread,
+                    after_position=position,
+                )
+    except (
+        BrokenPipeError,
+        ConnectionResetError,
+        WorkshopAgentLifecycleAccessDenied,
+        WorkshopChannelUnreadAccessDenied,
+        WorkshopHumanNotificationAccessDenied,
+    ):
+        pass
+    finally:
+        stream_limiter.release(claim)
+    return response
 
 
 async def _handle_agent_event_stream(
@@ -6298,6 +6593,22 @@ def register_workshop_read_routes(
             shutdown_event=shutdown_event,
         )
 
+    async def handle_principal_event_stream(request: web.Request) -> web.StreamResponse:
+        return await _handle_principal_event_stream(
+            request,
+            store=store,
+            authenticator=authenticator,
+            agent_lifecycle=agent_lifecycle,
+            human_notifications=human_notifications,
+            channel_unread=channel_unread,
+            request_lock=request_lock,
+            poll_interval=event_poll_interval,
+            heartbeat_interval=event_heartbeat_interval,
+            authentication_recheck_interval=event_authentication_recheck_interval,
+            stream_limiter=stream_limiter,
+            shutdown_event=shutdown_event,
+        )
+
     async def handle_channel_event_stream(request: web.Request) -> web.StreamResponse:
         return await _handle_channel_event_stream(
             request,
@@ -6422,6 +6733,7 @@ def register_workshop_read_routes(
         )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
+    app.router.add_get(_PRINCIPAL_EVENTS_PATH, handle_principal_event_stream)
     app.router.add_get(_CHANNEL_UNREAD_PATH, handle_channel_unread_snapshot)
     app.router.add_get(_CHANNEL_UNREAD_EVENTS_PATH, handle_channel_unread_event_stream)
     app.router.add_get(_CHANNEL_UNREAD_DETAIL_PATH, handle_channel_unread_detail)
