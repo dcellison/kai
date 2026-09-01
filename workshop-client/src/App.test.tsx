@@ -2541,8 +2541,15 @@ describe("Workshop React client", () => {
     ).toBeVisible();
   });
 
-  it("uses the sidebar as the active agent catalogue and archives as the historical catalogue", async () => {
+  it("keeps active agents in the sidebar and owner drafts in the inactive browser", async () => {
     const user = userEvent.setup();
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      workshops: navigation.workshops.map((workshop) => ({
+        ...workshop,
+        role: "member",
+      })),
+    });
     const qualificationDefinition: WorkshopAgentDefinition = {
       ...agentDefinition,
       activeRevisionId: "adr_55555555555555555555555555555555",
@@ -2550,6 +2557,8 @@ describe("Workshop React client", () => {
       definitionId: "adf_55555555555555555555555555555555",
       displayName: "Qualification agent",
       handle: "qualification_agent",
+      ownerDisplayName: "Scott",
+      ownerPrincipalId: "prn_99999999999999999999999999999999",
       revisions: agentDefinition.revisions.map((revision) => ({
         ...revision,
         revisionId: "adr_55555555555555555555555555555555",
@@ -2577,15 +2586,33 @@ describe("Workshop React client", () => {
       displayName: "Archived specialist",
       handle: "archived_specialist",
       lifecycleState: "archived",
+      ownerDisplayName: "Daniel",
+      ownerPrincipalId: navigation.principal.principalId,
       revisions: qualificationDefinition.revisions.map((revision) => ({
         ...revision,
         revisionId: "adr_66666666666666666666666666666666",
+      })),
+    };
+    const draftDefinition: WorkshopAgentDefinition = {
+      ...qualificationDefinition,
+      activeRevisionId: null,
+      agentId: "agt_77777777777777777777777777777777",
+      definitionId: "adf_77777777777777777777777777777777",
+      displayName: "Daniel draft",
+      handle: "daniel_draft",
+      lifecycleState: "draft",
+      ownerDisplayName: "Daniel",
+      ownerPrincipalId: navigation.principal.principalId,
+      revisions: qualificationDefinition.revisions.map((revision) => ({
+        ...revision,
+        revisionId: "adr_77777777777777777777777777777777",
       })),
     };
     vi.mocked(loadAgentDefinitions).mockResolvedValue([
       agentDefinition,
       qualificationDefinition,
       archivedDefinition,
+      draftDefinition,
     ]);
     vi.mocked(loadAgentEnablements).mockResolvedValue([
       { ...agentEnablement, canManage: false },
@@ -2620,10 +2647,30 @@ describe("Workshop React client", () => {
     expect(screen.queryByLabelText("Agent catalogue")).toBeNull();
     expect(screen.getByText("Conversation available")).toBeVisible();
 
-    await user.click(sidebar.getByRole("button", { name: "Archived agents" }));
-    const archive = await screen.findByRole("dialog", { name: "Archive" });
+    await user.click(
+      sidebar.getByRole("button", { name: "Drafts and archived agents" }),
+    );
+    let archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
     expect(within(archive).getByText("Archived specialist")).toBeVisible();
-    expect(within(archive).getByText("@archived_specialist")).toBeVisible();
+    expect(within(archive).getByText("@archived_specialist · archived")).toBeVisible();
+    expect(within(archive).getByText("Daniel draft")).toBeVisible();
+    expect(within(archive).getByText("@daniel_draft · draft")).toBeVisible();
+    await user.click(
+      within(archive).getByRole("button", {
+        name: "View draft agent Daniel draft",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Daniel draft", level: 2 }),
+    ).toBeVisible();
+    expect(screen.getByText("You own and manage this agent.")).toBeVisible();
+    expect(screen.getByText("Owner controls")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Activate" })).toBeVisible();
+
+    await user.click(
+      sidebar.getByRole("button", { name: "Drafts and archived agents" }),
+    );
+    archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
     await user.click(
       within(archive).getByRole("button", {
         name: "View archived agent Archived specialist",
@@ -2637,6 +2684,18 @@ describe("Workshop React client", () => {
 
   it("shows one shared agent definition without owner controls to another principal", async () => {
     const user = userEvent.setup();
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      principal: {
+        displayName: "Scott",
+        handle: "scott",
+        principalId: "prn_99999999999999999999999999999999",
+      },
+      workshops: navigation.workshops.map((workshop) => ({
+        ...workshop,
+        role: "member",
+      })),
+    });
     vi.mocked(loadAgentEnablements).mockResolvedValue([
       {
         ...agentEnablement,

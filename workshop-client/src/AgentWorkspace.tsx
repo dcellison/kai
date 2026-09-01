@@ -372,6 +372,7 @@ export function AgentWorkspace({
   onNavigationChanged,
   onOpenChannel,
   onSelectAgent,
+  principalId,
   principalName,
   runActive,
   token,
@@ -391,6 +392,7 @@ export function AgentWorkspace({
     definitionId: string | null,
     section?: "runtime" | null,
   ) => void;
+  principalId: string;
   principalName: string;
   runActive: boolean;
   token: string;
@@ -520,6 +522,7 @@ export function AgentWorkspace({
     (item) => item.definitionId === selectedDefinitionId,
   ) ?? null;
   const selectedRevision = selected ? activeRevision(selected) : null;
+  const canManage = selected?.ownerPrincipalId === principalId;
   const runtimeSession = useMemo(() => (
     enablement?.lifecycleState === "enabled" && enablement.directChannelId
       ? { channelId: enablement.directChannelId, token }
@@ -730,7 +733,7 @@ export function AgentWorkspace({
 
               <section className="agent-authority-note">
                 <strong>
-                  {enablement?.canManage
+                  {canManage
                     ? "You own and manage this agent."
                     : `Owned and managed by ${selected.ownerDisplayName ?? "another Workshop member"}.`}
                 </strong>
@@ -839,7 +842,7 @@ export function AgentWorkspace({
                 </section>
               )}
 
-              {runtimeSession && selected && enablement?.canManage && (
+              {runtimeSession && selected && canManage && (
                 <AgentRuntimeControls
                   isAdministrator={isAdministrator}
                   onAuthenticationFailure={onAuthenticationFailure}
@@ -873,7 +876,7 @@ export function AgentWorkspace({
                 </p>
               )}
 
-              {enablement?.canManage && selected.lifecycleState !== "archived" && (
+              {canManage && selected.lifecycleState !== "archived" && (
                 <section className="agent-admin-controls">
                   <div className="agent-section-heading">
                     <div>
