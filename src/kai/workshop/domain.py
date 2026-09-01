@@ -53,6 +53,7 @@ class WorkshopEventType(StrEnum):
     HUMAN_NOTIFICATION_CREATED = "human_notification.created"
     HUMAN_NOTIFICATION_READ = "human_notification.read"
     HUMAN_NOTIFICATION_UNREAD = "human_notification.unread"
+    CHANNEL_READ_POSITION_ADVANCED = "channel_read_position.advanced"
     ARTIFACT_CREATED = "artifact.created"
     DELIVERY_REQUESTED = "delivery.requested"
     DELIVERY_SUCCEEDED = "delivery.succeeded"
@@ -181,6 +182,10 @@ class HumanNotificationId(OpaqueId):
     prefix = "ntf"
 
 
+class ChannelReadPositionId(OpaqueId):
+    prefix = "crp"
+
+
 @dataclass(frozen=True, slots=True)
 class MessageMention:
     """One principal mention resolved when a canonical message is accepted."""
@@ -275,6 +280,7 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         RuntimeAssignmentId,
         MessageId,
         HumanNotificationId,
+        ChannelReadPositionId,
         ArtifactId,
         DeliveryId,
         DeliveryAttemptId,
