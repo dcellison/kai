@@ -8,6 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from kai.workshop.agent_authority import (
+    WorkshopAgentAuthorityError,
+    reconcile_single_owner_agent_authority,
+)
 from kai.workshop.agent_enablement import (
     WorkshopAgentEnablementAccessDenied,
     WorkshopAgentEnablementService,
@@ -197,6 +201,71 @@ async def test_runtime_authority_cannot_cross_principals(tmp_path: Path) -> None
             (definition_id,),
         ) as cursor:
             assert int((await cursor.fetchone())[0]) == 0
+    finally:
+        await store.close()
+
+
+async def test_reconciliation_allows_archived_agent_without_runtime(tmp_path: Path) -> None:
+    store, _service_instance, _execution, _contexts, _runtime_pool = await _service(tmp_path / "kai.db")
+    try:
+        daniel = await _principal(store, "101")
+        lifecycle = WorkshopAgentLifecycleService(store)
+        draft = await lifecycle.create_draft(
+            daniel,
+            idempotency_key="archived-without-runtime-create",
+            handle="archived_specialist",
+            display_name="Archived specialist",
+            description="An archived agent with no runtime access.",
+            presentation={"avatar": "A"},
+            purpose="Preserve archived provenance.",
+            instructions="Do not run after archival.",
+            capabilities=["text_generation"],
+        )
+        archived = await lifecycle.archive(
+            daniel,
+            draft.definition_id,
+            idempotency_key="archived-without-runtime-archive",
+            expected_version=draft.state_version,
+        )
+
+        result = await reconcile_single_owner_agent_authority(
+            store,
+            profile_registry(101, 202),
+        )
+
+        assert archived.lifecycle_state == "archived"
+        assert result.definitions == 2
+        async with store.connection.execute(
+            "SELECT owner_principal_id, owner_runtime_profile_id, owner_direct_channel_id "
+            "FROM agent_definitions WHERE id = ?",
+            (draft.definition_id,),
+        ) as cursor:
+            authority = await cursor.fetchone()
+        assert authority is not None
+        assert tuple(authority) == (str(daniel), None, None)
+    finally:
+        await store.close()
+
+
+async def test_reconciliation_rejects_active_agent_without_runtime(tmp_path: Path) -> None:
+    store, _service_instance, _execution, _contexts, _runtime_pool = await _service(tmp_path / "kai.db")
+    try:
+        daniel = await _principal(store, "101")
+        definition_id = await _active_specialist(store, daniel)
+
+        with pytest.raises(WorkshopAgentAuthorityError, match="has no enabled runtime"):
+            await reconcile_single_owner_agent_authority(
+                store,
+                profile_registry(101, 202),
+            )
+
+        async with store.connection.execute(
+            "SELECT owner_runtime_profile_id FROM agent_definitions WHERE id = ?",
+            (definition_id,),
+        ) as cursor:
+            authority = await cursor.fetchone()
+        assert authority is not None
+        assert authority[0] is None
     finally:
         await store.close()
 

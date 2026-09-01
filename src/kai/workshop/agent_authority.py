@@ -111,13 +111,15 @@ async def reconcile_single_owner_agent_authority(
             ) as cursor:
                 runtime_rows = list(await cursor.fetchall())
             if not runtime_rows:
-                # Draft definitions may exist before their owner activates a runtime.
+                # Only active definitions are runnable. Draft definitions may
+                # not have been enabled yet, and archived definitions retain
+                # provenance after their runtime access has been removed.
                 async with connection.execute(
                     "SELECT lifecycle_state FROM agent_definitions WHERE id = ?",
                     (definition_id,),
                 ) as cursor:
                     lifecycle_row = await cursor.fetchone()
-                if lifecycle_row is not None and str(lifecycle_row[0]) == "draft":
+                if lifecycle_row is not None and str(lifecycle_row[0]) != "active":
                     continue
                 raise WorkshopAgentAuthorityError(
                     f"Agent definition {definition_id} has no enabled runtime owned by its owner"
