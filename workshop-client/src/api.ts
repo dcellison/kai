@@ -70,6 +70,9 @@ import type {
   WorkshopChannelUnreadSignal,
   WorkshopChannelUnreadSnapshot,
   WorkshopChannelUnreadState,
+  WorkshopThreadUnreadMutation,
+  WorkshopThreadUnreadSignal,
+  WorkshopThreadUnreadState,
   WorkshopPrincipalEventBatch,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
@@ -90,6 +93,7 @@ import {
 export class AuthenticationError extends Error {}
 export class ChannelAccessError extends Error {}
 export class ChannelReadPositionConflictError extends Error {}
+export class ThreadUnreadConflictError extends Error {}
 export class ResynchronizationRequired extends Error {}
 export class PreferenceRevisionConflictError extends Error {
   constructor(
@@ -3842,6 +3846,12 @@ function parseChannelUnreadState(value: unknown): WorkshopChannelUnreadState | n
     state_version: stateVersion,
     unread_count: unreadCount,
     unread_count_capped: unreadCountCapped,
+    unread_reply_count: unreadReplyCount,
+    unread_reply_count_capped: unreadReplyCountCapped,
+    unread_thread_count: unreadThreadCount,
+    first_unread_thread_root_id: firstUnreadThreadRootId,
+    first_unread_thread_reply_id: firstUnreadThreadReplyId,
+    first_unread_thread_event_position: firstUnreadThreadEventPosition,
   } = value;
   if (
     typeof archived !== "boolean" ||
@@ -3866,6 +3876,21 @@ function parseChannelUnreadState(value: unknown): WorkshopChannelUnreadState | n
     !Number.isSafeInteger(unreadCount) ||
     (unreadCount as number) < 0 ||
     typeof unreadCountCapped !== "boolean" ||
+    !Number.isSafeInteger(unreadReplyCount) ||
+    (unreadReplyCount as number) < 0 ||
+    typeof unreadReplyCountCapped !== "boolean" ||
+    !Number.isSafeInteger(unreadThreadCount) ||
+    (unreadThreadCount as number) < 0 ||
+    (firstUnreadThreadRootId !== null &&
+      (typeof firstUnreadThreadRootId !== "string" || !MESSAGE_PATTERN.test(firstUnreadThreadRootId))) ||
+    (firstUnreadThreadReplyId !== null &&
+      (typeof firstUnreadThreadReplyId !== "string" || !MESSAGE_PATTERN.test(firstUnreadThreadReplyId))) ||
+    (firstUnreadThreadEventPosition !== null &&
+      (!Number.isSafeInteger(firstUnreadThreadEventPosition) ||
+        (firstUnreadThreadEventPosition as number) < 0)) ||
+    ((firstUnreadThreadRootId === null) !== (firstUnreadThreadReplyId === null)) ||
+    ((firstUnreadThreadReplyId === null) !== (firstUnreadThreadEventPosition === null)) ||
+    ((unreadReplyCount as number) === 0) !== (firstUnreadThreadReplyId === null) ||
     ((firstUnreadMessageId === null) !== (firstUnreadEventPosition === null)) ||
     ((unreadCount as number) === 0) !== (firstUnreadMessageId === null)
   ) {
@@ -3885,7 +3910,147 @@ function parseChannelUnreadState(value: unknown): WorkshopChannelUnreadState | n
     stateVersion: stateVersion as number,
     unreadCount: unreadCount as number,
     unreadCountCapped,
+    unreadReplyCount: unreadReplyCount as number,
+    unreadReplyCountCapped,
+    unreadThreadCount: unreadThreadCount as number,
+    firstUnreadThreadRootId,
+    firstUnreadThreadReplyId,
+    firstUnreadThreadEventPosition: firstUnreadThreadEventPosition as number | null,
   };
+}
+
+function parseThreadUnreadState(value: unknown): WorkshopThreadUnreadState | null {
+  if (!isRecord(value)) return null;
+  const {
+    channel_id: channelId,
+    thread_root_id: threadRootId,
+    followed,
+    follow_baseline_event_position: followBaselineEventPosition,
+    read_through_event_position: readThroughEventPosition,
+    read_through_message_id: readThroughMessageId,
+    state_version: stateVersion,
+    last_event_position: lastEventPosition,
+    unread_count: unreadCount,
+    unread_count_capped: unreadCountCapped,
+    first_unread_message_id: firstUnreadMessageId,
+    first_unread_event_position: firstUnreadEventPosition,
+  } = value;
+  if (
+    typeof channelId !== "string" || !CHANNEL_PATTERN.test(channelId) ||
+    typeof threadRootId !== "string" || !MESSAGE_PATTERN.test(threadRootId) ||
+    typeof followed !== "boolean" ||
+    !Number.isSafeInteger(followBaselineEventPosition) || (followBaselineEventPosition as number) < 0 ||
+    !Number.isSafeInteger(readThroughEventPosition) || (readThroughEventPosition as number) < 0 ||
+    (readThroughMessageId !== null &&
+      (typeof readThroughMessageId !== "string" || !MESSAGE_PATTERN.test(readThroughMessageId))) ||
+    !Number.isSafeInteger(stateVersion) || (stateVersion as number) < 0 ||
+    !Number.isSafeInteger(lastEventPosition) || (lastEventPosition as number) < 0 ||
+    !Number.isSafeInteger(unreadCount) || (unreadCount as number) < 0 ||
+    typeof unreadCountCapped !== "boolean" ||
+    (firstUnreadMessageId !== null &&
+      (typeof firstUnreadMessageId !== "string" || !MESSAGE_PATTERN.test(firstUnreadMessageId))) ||
+    (firstUnreadEventPosition !== null &&
+      (!Number.isSafeInteger(firstUnreadEventPosition) || (firstUnreadEventPosition as number) < 0)) ||
+    ((firstUnreadMessageId === null) !== (firstUnreadEventPosition === null)) ||
+    ((unreadCount as number) === 0) !== (firstUnreadMessageId === null)
+  ) return null;
+  return {
+    channelId,
+    threadRootId,
+    followed,
+    followBaselineEventPosition: followBaselineEventPosition as number,
+    readThroughEventPosition: readThroughEventPosition as number,
+    readThroughMessageId,
+    stateVersion: stateVersion as number,
+    lastEventPosition: lastEventPosition as number,
+    unreadCount: unreadCount as number,
+    unreadCountCapped,
+    firstUnreadMessageId,
+    firstUnreadEventPosition: firstUnreadEventPosition as number | null,
+  };
+}
+
+export async function loadThreadUnread(
+  session: WorkshopSession,
+  rootMessageId: string,
+  signal?: AbortSignal,
+): Promise<WorkshopThreadUnreadState> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/threads/${encodeURIComponent(rootMessageId)}/unread`,
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 404) throw new ChannelAccessError("This thread is no longer accessible.");
+  const state = isRecord(payload) ? parseThreadUnreadState(payload.state) : null;
+  if (!response.ok || !isRecord(payload) || payload.version !== 1 || !state) {
+    throw new Error(safeErrorMessage(payload, "Could not load thread unread state."));
+  }
+  return state;
+}
+
+async function mutateThreadUnread(
+  session: WorkshopSession,
+  rootMessageId: string,
+  operation: "follow" | "unfollow" | "read-position",
+  expectedStateVersion: number,
+  clientOperationId: string,
+  messageId?: string,
+): Promise<WorkshopThreadUnreadMutation> {
+  const body: Record<string, unknown> = {
+    client_operation_id: clientOperationId,
+    expected_state_version: expectedStateVersion,
+  };
+  if (messageId !== undefined) body.message_id = messageId;
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/threads/${encodeURIComponent(rootMessageId)}/${operation}`,
+    { body: JSON.stringify(body), headers: { "Content-Type": "application/json" }, method: "POST" },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 404) throw new ChannelAccessError("This thread is no longer accessible.");
+  if (response.status === 409) {
+    throw new ThreadUnreadConflictError(safeErrorMessage(payload, "Thread state changed in another tab."));
+  }
+  const state = isRecord(payload) ? parseThreadUnreadState(payload.state) : null;
+  if (!response.ok || !isRecord(payload) || payload.version !== 1 || !state ||
+      typeof payload.replayed !== "boolean") {
+    throw new Error(safeErrorMessage(payload, "Could not update thread unread state."));
+  }
+  return { replayed: payload.replayed, state };
+}
+
+export function setThreadFollowed(
+  session: WorkshopSession,
+  rootMessageId: string,
+  followed: boolean,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopThreadUnreadMutation> {
+  return mutateThreadUnread(
+    session,
+    rootMessageId,
+    followed ? "follow" : "unfollow",
+    expectedStateVersion,
+    clientOperationId,
+  );
+}
+
+export function advanceThreadReadPosition(
+  session: WorkshopSession,
+  rootMessageId: string,
+  messageId: string,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopThreadUnreadMutation> {
+  return mutateThreadUnread(
+    session,
+    rootMessageId,
+    "read-position",
+    expectedStateVersion,
+    clientOperationId,
+    messageId,
+  );
 }
 
 export async function loadChannelUnread(
@@ -4446,7 +4611,8 @@ export async function streamPrincipalEvents(
           (rawChange.event_position as number) > throughPosition ||
           !Array.isArray(rawChange.agent_changes) ||
           !Array.isArray(rawChange.notification_changes) ||
-          !Array.isArray(rawChange.unread_changes)
+          !Array.isArray(rawChange.unread_changes) ||
+          !Array.isArray(rawChange.thread_changes)
         ) {
           valid = false;
           break;
@@ -4522,7 +4688,30 @@ export async function streamPrincipalEvents(
           unreadChanges.push({ eventPosition, state });
         }
         if (!valid) break;
-        changes.push({ agentChanges, eventPosition, notificationChanges, unreadChanges });
+        const threadChanges: WorkshopPrincipalEventBatch["changes"][number]["threadChanges"] = [];
+        for (const item of rawChange.thread_changes) {
+          const state = isRecord(item) ? parseThreadUnreadState(item.state) : null;
+          if (
+            !isRecord(item) ||
+            !state ||
+            ![
+              "message.created",
+              "thread.followed",
+              "thread.unfollowed",
+              "thread_read_position.advanced",
+            ].includes(String(item.event_type))
+          ) {
+            valid = false;
+            break;
+          }
+          threadChanges.push({
+            eventPosition,
+            state,
+            transition: item.event_type as WorkshopThreadUnreadSignal["transition"],
+          });
+        }
+        if (!valid) break;
+        changes.push({ agentChanges, eventPosition, notificationChanges, threadChanges, unreadChanges });
       }
       if (!valid) continue;
       handlers.onBatch({ changes, throughPosition }, event.eventId);

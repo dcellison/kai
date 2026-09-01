@@ -1302,6 +1302,11 @@ button:disabled {
   font-weight: 500;
 }
 
+.thread-summary strong {
+  color: var(--color-accent);
+  font-weight: 700;
+}
+
 .message-artifact {
   margin-top: 0.8rem;
   overflow: hidden;
@@ -1951,6 +1956,11 @@ button:disabled {
   margin: 0.25rem 0 0;
   color: var(--color-text-strong);
   font-size: 1rem;
+}
+
+.thread-follow-button {
+  align-self: center;
+  margin-left: auto;
 }
 
 .thread-scroll {

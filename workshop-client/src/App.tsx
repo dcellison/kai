@@ -14,6 +14,7 @@ import {
 
 import {
   AuthenticationError,
+  advanceThreadReadPosition,
   archiveChannel,
   attachChannelAgent,
   cancelRun,
@@ -34,9 +35,11 @@ import {
   loadRunTrace,
   loadSettingsWorkspace,
   loadThreadTimeline,
+  loadThreadUnread,
   redeemEnrollment,
   restoreChannel,
   setMessageReaction,
+  setThreadFollowed,
   submitCommand,
   switchWorkspace,
 } from "./api";
@@ -52,6 +55,8 @@ import type {
   WorkshopRunTraceSignal,
   WorkshopChannelSummary,
   WorkshopChannelUnreadState,
+  WorkshopThreadUnreadMutation,
+  WorkshopThreadUnreadState,
   WorkshopNavigation,
   WorkshopNotificationPreferences,
   WorkshopSession,
@@ -801,6 +806,7 @@ const MESSAGE_REACTIONS: {
 ];
 
 function MessageItem({
+  hasUnreadReplies = false,
   highlighted = false,
   message,
   notification = false,
@@ -810,6 +816,7 @@ function MessageItem({
   onOpenThread,
   onSetReaction,
 }: {
+  hasUnreadReplies?: boolean;
   highlighted?: boolean;
   message: TimelineMessage;
   notification?: boolean;
@@ -1012,13 +1019,14 @@ function MessageItem({
               <button
                 className="thread-summary"
                 type="button"
-                aria-label={`Open thread with ${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}`}
+                aria-label={`Open thread with ${message.replyCount} ${message.replyCount === 1 ? "reply" : "replies"}${hasUnreadReplies ? ", including unread replies" : ""}`}
                 title="Open thread"
                 onClick={() => onOpenThread(message.messageId)}
               >
                 <span>
                   {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
                 </span>
+                {hasUnreadReplies && <strong>New replies</strong>}
               </button>
             )}
           </div>
@@ -1152,13 +1160,19 @@ function channelSymbol(channel: WorkshopChannelSummary): string {
 }
 
 function channelUnreadLabel(state: WorkshopChannelUnreadState | undefined): string {
-  const count = state?.unreadCount ?? 0;
+  const count = channelUnreadCount(state);
   if (count <= 0) {
     return "";
   }
-  const qualifiedCount = `${count}${state?.unreadCountCapped ? " or more" : ""}`;
-  const noun = count === 1 && !state?.unreadCountCapped ? "message" : "messages";
+  const qualifiedCount = `${count}${state?.unreadCountCapped || state?.unreadReplyCountCapped ? " or more" : ""}`;
+  const noun = count === 1 && !state?.unreadCountCapped && !state?.unreadReplyCountCapped
+    ? "message"
+    : "messages";
   return `, ${qualifiedCount} unread ${noun}`;
+}
+
+function channelUnreadCount(state: WorkshopChannelUnreadState | undefined): number {
+  return Math.min((state?.unreadCount ?? 0) + (state?.unreadReplyCount ?? 0), 1000);
 }
 
 function channelIsArchived(channel: WorkshopChannelSummary): boolean {
@@ -1816,10 +1830,14 @@ function ThreadPane({
   onDownloadArtifact,
   onLoadArtifact,
   onLoadThread,
+  onLoadThreadUnread,
+  onAdvanceThreadRead,
+  onSetThreadFollowed,
   onMessageVisible,
   onSetReaction,
   onSubmitCommand,
   reactionUpdates,
+  principalEvents,
   readOnly,
   rootMessage,
   runActive,
@@ -1831,7 +1849,20 @@ function ThreadPane({
   onDownloadArtifact: (artifactId: string) => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadThread: (rootMessageId: string, cursor: string | null, signal?: AbortSignal) => Promise<ThreadTimelineSnapshot>;
+  onLoadThreadUnread: (rootMessageId: string, signal?: AbortSignal) => Promise<WorkshopThreadUnreadState>;
   onMessageVisible: (messageId: string) => void;
+  onAdvanceThreadRead: (
+    rootMessageId: string,
+    messageId: string,
+    expectedStateVersion: number,
+    clientOperationId: string,
+  ) => Promise<WorkshopThreadUnreadMutation>;
+  onSetThreadFollowed: (
+    rootMessageId: string,
+    followed: boolean,
+    expectedStateVersion: number,
+    clientOperationId: string,
+  ) => Promise<WorkshopThreadUnreadMutation>;
   onSetReaction: (
     messageId: string,
     reaction: WorkshopReaction,
@@ -1839,6 +1870,7 @@ function ThreadPane({
   ) => Promise<void>;
   onSubmitCommand: (clientMessageId: string, body: string, artifact: File | null, threadRootId: string | null) => Promise<CommandSubmissionResult>;
   reactionUpdates: Record<string, TimelineMessage["reactions"]>;
+  principalEvents: WorkshopPrincipalEvents;
   readOnly: boolean;
   rootMessage: TimelineMessage;
   runActive: boolean;
@@ -1849,14 +1881,30 @@ function ThreadPane({
   const [draft, setDraft] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
+  const [unreadState, setUnreadState] = useState<WorkshopThreadUnreadState | null>(null);
+  const [unreadBoundaryMessageId, setUnreadBoundaryMessageId] = useState<string | null>(null);
+  const [followBusy, setFollowBusy] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const unreadStateRef = useRef(unreadState);
+  const pendingReadRef = useRef<TimelineMessage | null>(null);
+  const readRunningRef = useRef(false);
+  unreadStateRef.current = unreadState;
 
   useEffect(() => {
     const controller = new AbortController();
     setSnapshot(null);
+    setUnreadState(null);
+    setUnreadBoundaryMessageId(null);
     setError(null);
-    void onLoadThread(rootMessage.messageId, null, controller.signal).then(
-      setSnapshot,
+    void Promise.all([
+      onLoadThread(rootMessage.messageId, null, controller.signal),
+      onLoadThreadUnread(rootMessage.messageId, controller.signal),
+    ]).then(
+      ([timeline, unread]) => {
+        setSnapshot(timeline);
+        setUnreadState(unread);
+        setUnreadBoundaryMessageId(unread.firstUnreadMessageId);
+      },
       (caught: unknown) => {
         if (!controller.signal.aborted) {
           setError(caught instanceof Error ? caught.message : "Could not load this thread.");
@@ -1864,7 +1912,21 @@ function ThreadPane({
       },
     );
     return () => controller.abort();
-  }, [onLoadThread, rootMessage.messageId]);
+  }, [onLoadThread, onLoadThreadUnread, rootMessage.messageId]);
+
+  useEffect(() => principalEvents.subscribe((event) => {
+    if (event.kind === "synchronize") {
+      void onLoadThreadUnread(rootMessage.messageId).then(setUnreadState, () => undefined);
+      return;
+    }
+    for (const change of event.batch.changes) {
+      for (const threadChange of change.threadChanges) {
+        if (threadChange.state.threadRootId === rootMessage.messageId) {
+          setUnreadState(threadChange.state);
+        }
+      }
+    }
+  }), [onLoadThreadUnread, principalEvents, rootMessage.messageId]);
 
   useLayoutEffect(() => {
     const composer = composerRef.current;
@@ -1945,6 +2007,79 @@ function ThreadPane({
     }
   };
 
+  const toggleFollow = async (): Promise<void> => {
+    const current = unreadStateRef.current;
+    if (!current || followBusy) return;
+    setFollowBusy(true);
+    setError(null);
+    try {
+      const mutation = await onSetThreadFollowed(
+        rootMessage.messageId,
+        !current.followed,
+        current.stateVersion,
+        createClientMessageId(),
+      );
+      setUnreadState(mutation.state);
+      if (mutation.state.followed) {
+        setUnreadBoundaryMessageId(mutation.state.firstUnreadMessageId);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update thread follow state.");
+      try {
+        setUnreadState(await onLoadThreadUnread(rootMessage.messageId));
+      } catch {
+        // Preserve the original mutation error.
+      }
+    } finally {
+      setFollowBusy(false);
+    }
+  };
+
+  const markReplyVisible = useCallback((messageId: string): void => {
+    onMessageVisible(messageId);
+    if (document.visibilityState !== "visible") return;
+    const message = replies.find((candidate) => candidate.messageId === messageId);
+    const current = unreadStateRef.current;
+    if (!message || !current?.followed || message.eventPosition <= current.readThroughEventPosition) return;
+    if (!pendingReadRef.current || pendingReadRef.current.eventPosition < message.eventPosition) {
+      pendingReadRef.current = message;
+    }
+    if (readRunningRef.current) return;
+    readRunningRef.current = true;
+    const drain = async (): Promise<void> => {
+      try {
+        while (pendingReadRef.current) {
+          const target = pendingReadRef.current;
+          pendingReadRef.current = null;
+          let latest = unreadStateRef.current;
+          if (!latest?.followed || target.eventPosition <= latest.readThroughEventPosition) continue;
+          try {
+            const mutation = await onAdvanceThreadRead(
+              rootMessage.messageId,
+              target.messageId,
+              latest.stateVersion,
+              createClientMessageId(),
+            );
+            unreadStateRef.current = mutation.state;
+            setUnreadState(mutation.state);
+          } catch {
+            latest = await onLoadThreadUnread(rootMessage.messageId);
+            unreadStateRef.current = latest;
+            setUnreadState(latest);
+            if (latest.followed && target.eventPosition > latest.readThroughEventPosition) {
+              pendingReadRef.current = target;
+            }
+          }
+        }
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : "Could not update thread unread state.");
+      } finally {
+        readRunningRef.current = false;
+      }
+    };
+    void drain();
+  }, [onAdvanceThreadRead, onLoadThreadUnread, onMessageVisible, replies, rootMessage.messageId]);
+
   return (
     <div className="thread-pane">
       <header className="thread-header">
@@ -1952,6 +2087,17 @@ function ThreadPane({
           <p className="overline">Thread in {channelName}</p>
           <h2>{replies.length} {replies.length === 1 ? "reply" : "replies"}</h2>
         </div>
+        {unreadState && !readOnly && (
+          <button
+            className="quiet-button thread-follow-button"
+            type="button"
+            aria-pressed={unreadState.followed}
+            disabled={followBusy}
+            onClick={() => void toggleFollow()}
+          >
+            {followBusy ? "Saving…" : unreadState.followed ? "Following" : "Follow"}
+          </button>
+        )}
         <button
           className="panel-icon-button"
           type="button"
@@ -1979,18 +2125,24 @@ function ThreadPane({
             onSetReaction={readOnly ? undefined : onSetReaction}
           />
           {replies.map((message) => (
-            <MessageItem
-              highlighted={focusedMessage?.messageId === message.messageId}
-              key={message.messageId}
-              message={{
-                ...message,
-                reactions: reactionUpdates[message.messageId] ?? message.reactions,
-              }}
-              onDownloadArtifact={onDownloadArtifact}
-              onLoadArtifact={onLoadArtifact}
-              onMessageVisible={onMessageVisible}
-              onSetReaction={readOnly ? undefined : onSetReaction}
-            />
+            <Fragment key={message.messageId}>
+              {unreadBoundaryMessageId === message.messageId && (
+                <li className="first-unread-divider" role="separator" aria-label="First unread reply">
+                  <span aria-hidden="true">New replies</span>
+                </li>
+              )}
+              <MessageItem
+                highlighted={focusedMessage?.messageId === message.messageId}
+                message={{
+                  ...message,
+                  reactions: reactionUpdates[message.messageId] ?? message.reactions,
+                }}
+                onDownloadArtifact={onDownloadArtifact}
+                onLoadArtifact={onLoadArtifact}
+                onMessageVisible={markReplyVisible}
+                onSetReaction={readOnly ? undefined : onSetReaction}
+              />
+            </Fragment>
           ))}
         </ol>
         {!snapshot && !error && <p className="thread-state">Loading replies…</p>}
@@ -2094,6 +2246,9 @@ function WorkshopView({
   onLoadRunTrace,
   onLoadSettingsWorkspace,
   onLoadThread,
+  onLoadThreadUnread,
+  onAdvanceThreadRead,
+  onSetThreadFollowed,
   onChangeChannelMember,
   onMemoryAuthenticationFailure,
   onOpenMemory,
@@ -2167,6 +2322,22 @@ function WorkshopView({
     cursor: string | null,
     signal?: AbortSignal,
   ) => Promise<ThreadTimelineSnapshot>;
+  onLoadThreadUnread: (
+    rootMessageId: string,
+    signal?: AbortSignal,
+  ) => Promise<WorkshopThreadUnreadState>;
+  onAdvanceThreadRead: (
+    rootMessageId: string,
+    messageId: string,
+    expectedStateVersion: number,
+    clientOperationId: string,
+  ) => Promise<WorkshopThreadUnreadMutation>;
+  onSetThreadFollowed: (
+    rootMessageId: string,
+    followed: boolean,
+    expectedStateVersion: number,
+    clientOperationId: string,
+  ) => Promise<WorkshopThreadUnreadMutation>;
   onChangeChannelMember: (
     principalId: string,
     operation: "add" | "remove",
@@ -3232,7 +3403,7 @@ function WorkshopView({
               {workshop.channels
                 .filter((availableChannel) => availableChannel.kind === "direct")
                 .map((availableChannel) => {
-                  const unreadCount = unread.byChannel[availableChannel.channelId]?.unreadCount ?? 0;
+                  const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
                   return (
                   <button
                     className={`channel-link ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
@@ -3296,7 +3467,7 @@ function WorkshopView({
                 !channelIsArchived(availableChannel),
             )
             .map((availableChannel) => {
-              const unreadCount = unread.byChannel[availableChannel.channelId]?.unreadCount ?? 0;
+              const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
               const mentionCount = inbox.counts.unreadByChannel[availableChannel.channelId] ?? 0;
               return (
               <button
@@ -3342,7 +3513,7 @@ function WorkshopView({
               {workshop.channels
                 .filter((availableChannel) => availableChannel.kind === "notification")
                 .map((availableChannel) => {
-                  const unreadCount = unread.byChannel[availableChannel.channelId]?.unreadCount ?? 0;
+                  const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
                   return (
                   <button
                     className={`channel-link notification ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
@@ -3633,6 +3804,9 @@ function WorkshopView({
                     </li>
                   )}
                   <MessageItem
+                    hasUnreadReplies={
+                      unread.byChannel[channel.channelId]?.firstUnreadThreadRootId === message.messageId
+                    }
                     highlighted={focusedMessage?.messageId === message.messageId}
                     message={message}
                     notification={channel.kind === "notification"}
@@ -3913,10 +4087,14 @@ function WorkshopView({
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
             onLoadThread={onLoadThread}
+            onLoadThreadUnread={onLoadThreadUnread}
             onMessageVisible={markVisibleMentionRead}
+            onAdvanceThreadRead={onAdvanceThreadRead}
+            onSetThreadFollowed={onSetThreadFollowed}
             onSetReaction={onSetReaction}
             onSubmitCommand={onSubmitCommand}
             reactionUpdates={reactionUpdates}
+            principalEvents={principalEvents}
             readOnly={channelIsArchived(channel)}
             rootMessage={threadRootMessage}
             runActive={isRunActive(activeRun)}
@@ -4490,6 +4668,41 @@ function ActiveWorkshopClient({
       ),
     [session, withAccessHandling],
   );
+  const loadSelectedThreadUnread = useCallback(
+    (rootMessageId: string, signal?: AbortSignal) =>
+      withAccessHandling(() => loadThreadUnread(session, rootMessageId, signal)),
+    [session, withAccessHandling],
+  );
+  const advanceSelectedThreadRead = useCallback(
+    (
+      rootMessageId: string,
+      messageId: string,
+      expectedStateVersion: number,
+      clientOperationId: string,
+    ) => withAccessHandling(() => advanceThreadReadPosition(
+      session,
+      rootMessageId,
+      messageId,
+      expectedStateVersion,
+      clientOperationId,
+    )),
+    [session, withAccessHandling],
+  );
+  const setSelectedThreadFollowed = useCallback(
+    (
+      rootMessageId: string,
+      followed: boolean,
+      expectedStateVersion: number,
+      clientOperationId: string,
+    ) => withAccessHandling(() => setThreadFollowed(
+      session,
+      rootMessageId,
+      followed,
+      expectedStateVersion,
+      clientOperationId,
+    )),
+    [session, withAccessHandling],
+  );
   const loadSelectedArtifact = useCallback(
     (artifactId: string) =>
       withAccessHandling(() => loadArtifactBlob(session, artifactId)),
@@ -4627,6 +4840,9 @@ function ActiveWorkshopClient({
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadSettingsWorkspace={loadSelectedSettingsWorkspace}
       onLoadThread={loadSelectedThread}
+      onLoadThreadUnread={loadSelectedThreadUnread}
+      onAdvanceThreadRead={advanceSelectedThreadRead}
+      onSetThreadFollowed={setSelectedThreadFollowed}
       onChangeChannelMember={changeSelectedChannelMember}
       onMemoryAuthenticationFailure={onAuthenticationFailure}
       onOpenAgentChannel={onOpenAgentChannel}

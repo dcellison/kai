@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 61
+WORKSHOP_SCHEMA_VERSION = 62
 
 
 @dataclass(frozen=True, slots=True)
@@ -2748,6 +2748,46 @@ _CANONICAL_CHANNEL_READ_POSITION_BOUNDARY_REPAIR_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_FOLLOWED_THREAD_UNREAD_SCHEMA = SchemaMigration(
+    version=62,
+    name="canonical_followed_thread_unread",
+    statements=(
+        # This receipt is deliberately outside the replayed projection. It
+        # prevents historical messages from auto-following old threads when
+        # canonical projections are rebuilt after this authority is deployed.
+        """
+        CREATE TABLE thread_unread_authority_cutover (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            baseline_event_position INTEGER NOT NULL CHECK (baseline_event_position >= 0),
+            captured_at TEXT NOT NULL
+        )
+        """,
+        "INSERT INTO thread_unread_authority_cutover "
+        "(singleton, baseline_event_position, captured_at) VALUES "
+        "(1, (SELECT COALESCE(MAX(position), 0) FROM event_log), "
+        "strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        """
+        CREATE TABLE thread_read_positions (
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            thread_root_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            followed INTEGER NOT NULL CHECK (followed IN (0, 1)),
+            follow_baseline_event_position INTEGER NOT NULL
+                CHECK (follow_baseline_event_position >= 0),
+            read_through_event_position INTEGER NOT NULL CHECK (read_through_event_position >= 0),
+            read_through_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            state_version INTEGER NOT NULL CHECK (state_version >= 0),
+            last_event_position INTEGER NOT NULL CHECK (last_event_position >= 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, thread_root_id),
+            CHECK (read_through_event_position >= follow_baseline_event_position)
+        )
+        """,
+        "CREATE INDEX thread_read_positions_channel_idx ON thread_read_positions (principal_id, channel_id, followed)",
+        "CREATE INDEX thread_read_positions_root_idx ON thread_read_positions (thread_root_id, principal_id, followed)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2810,6 +2850,7 @@ _MIGRATIONS = (
     _OWNER_RUNTIME_SESSION_RECONCILIATION_SCHEMA,
     _CANONICAL_CHANNEL_READ_POSITION_SCHEMA,
     _CANONICAL_CHANNEL_READ_POSITION_BOUNDARY_REPAIR_SCHEMA,
+    _CANONICAL_FOLLOWED_THREAD_UNREAD_SCHEMA,
 )
 
 

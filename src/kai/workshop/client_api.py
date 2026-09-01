@@ -234,6 +234,14 @@ from kai.workshop.settings_workspaces import (
     WorkspaceConfigSnapshot,
 )
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from kai.workshop.thread_unread import (
+    ThreadUnreadMutation,
+    ThreadUnreadState,
+    WorkshopThreadUnreadAccessDenied,
+    WorkshopThreadUnreadConflict,
+    WorkshopThreadUnreadService,
+    WorkshopThreadUnreadValidationError,
+)
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
     TimelineCursorError,
@@ -309,6 +317,10 @@ _CHANNEL_UNREAD_PATH = "/v1/client/unread"
 _CHANNEL_UNREAD_EVENTS_PATH = "/v1/client/unread/events"
 _CHANNEL_UNREAD_DETAIL_PATH = "/v1/channels/{channel_id}/unread"
 _CHANNEL_READ_POSITION_PATH = "/v1/channels/{channel_id}/read-position"
+_THREAD_UNREAD_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/unread"
+_THREAD_FOLLOW_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/follow"
+_THREAD_UNFOLLOW_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/unfollow"
+_THREAD_READ_POSITION_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/read-position"
 _MAX_PREFERENCE_UPDATE_BODY_BYTES = MAX_PREFERENCE_BYTES * 6 + 1024
 _MAX_PREFERENCE_RESTORE_BODY_BYTES = 512
 _MAX_REACTION_BODY_BYTES = 256
@@ -357,6 +369,8 @@ _HUMAN_NOTIFICATION_STATE_FIELDS = frozenset({"expected_state_version", "client_
 _HUMAN_NOTIFICATION_BULK_FIELDS = frozenset({"notifications", "client_operation_id"})
 _HUMAN_NOTIFICATION_BULK_ITEM_FIELDS = frozenset({"notification_id", "expected_state_version"})
 _CHANNEL_READ_POSITION_FIELDS = frozenset({"message_id", "expected_state_version", "client_operation_id"})
+_THREAD_FOLLOW_FIELDS = frozenset({"expected_state_version", "client_operation_id"})
+_THREAD_READ_POSITION_FIELDS = frozenset({"message_id", "expected_state_version", "client_operation_id"})
 _CHANNEL_CREATION_REQUEST_FIELDS = frozenset({"name", "agent_ids", "origin_channel_id"})
 _MAX_CHANNEL_CREATION_BODY_BYTES = 8_192
 _CHANNEL_AGENT_OPERATION_FIELDS = frozenset({"client_operation_id"})
@@ -3288,6 +3302,16 @@ def _serialize_channel_unread(state: ChannelUnreadState) -> dict[str, object]:
             str(state.first_unread_message_id) if state.first_unread_message_id is not None else None
         ),
         "first_unread_event_position": state.first_unread_event_position,
+        "unread_reply_count": state.unread_reply_count,
+        "unread_reply_count_capped": state.unread_reply_count_capped,
+        "unread_thread_count": state.unread_thread_count,
+        "first_unread_thread_root_id": (
+            str(state.first_unread_thread_root_id) if state.first_unread_thread_root_id is not None else None
+        ),
+        "first_unread_thread_reply_id": (
+            str(state.first_unread_thread_reply_id) if state.first_unread_thread_reply_id is not None else None
+        ),
+        "first_unread_thread_event_position": state.first_unread_thread_event_position,
     }
 
 
@@ -3298,6 +3322,31 @@ def _serialize_channel_read_position_mutation(
         "state": _serialize_channel_unread(mutation.state),
         "replayed": mutation.replayed,
     }
+
+
+def _serialize_thread_unread(state: ThreadUnreadState) -> dict[str, object]:
+    return {
+        "channel_id": str(state.channel_id),
+        "thread_root_id": str(state.thread_root_id),
+        "followed": state.followed,
+        "follow_baseline_event_position": state.follow_baseline_event_position,
+        "read_through_event_position": state.read_through_event_position,
+        "read_through_message_id": (
+            str(state.read_through_message_id) if state.read_through_message_id is not None else None
+        ),
+        "state_version": state.state_version,
+        "last_event_position": state.last_event_position,
+        "unread_count": state.unread_count,
+        "unread_count_capped": state.unread_count_capped,
+        "first_unread_message_id": (
+            str(state.first_unread_message_id) if state.first_unread_message_id is not None else None
+        ),
+        "first_unread_event_position": state.first_unread_event_position,
+    }
+
+
+def _serialize_thread_unread_mutation(mutation: ThreadUnreadMutation) -> dict[str, object]:
+    return {"state": _serialize_thread_unread(mutation.state), "replayed": mutation.replayed}
 
 
 def _serialize_reactions(reactions: Sequence[MessageReactionSummary]) -> list[dict[str, object]]:
@@ -4783,6 +4832,7 @@ async def _read_principal_client_events(
     role: str,
     human_notifications: WorkshopHumanNotificationService,
     channel_unread: WorkshopChannelUnreadService,
+    thread_unread: WorkshopThreadUnreadService,
     after_position: int | None,
 ) -> _PrincipalClientEventBatch:
     async with store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
@@ -4812,6 +4862,11 @@ async def _read_principal_client_events(
         after_position=after_position,
         limit=_EVENT_BATCH_SIZE,
     )
+    thread_batch = await thread_unread.events(
+        principal_id,
+        after_position=after_position,
+        limit=_EVENT_BATCH_SIZE,
+    )
 
     safe_position = tip
     if not agent_scan_complete:
@@ -4820,12 +4875,15 @@ async def _read_principal_client_events(
         safe_position = min(safe_position, notification_batch.next_position)
     if len(unread_batch.events) == _EVENT_BATCH_SIZE:
         safe_position = min(safe_position, unread_batch.next_position)
+    if len(thread_batch.events) == _EVENT_BATCH_SIZE:
+        safe_position = min(safe_position, thread_batch.next_position)
 
     positions = sorted(
         {
             *(event.event_position for event in agent_events if event.event_position <= safe_position),
             *(event.event_position for event in notification_batch.events if event.event_position <= safe_position),
             *(event.event_position for event in unread_batch.events if event.event_position <= safe_position),
+            *(event.event_position for event in thread_batch.events if event.event_position <= safe_position),
         }
     )
     if len(positions) > _EVENT_BATCH_SIZE:
@@ -4838,6 +4896,7 @@ async def _read_principal_client_events(
             "agent_changes": [],
             "notification_changes": [],
             "unread_changes": [],
+            "thread_changes": [],
         }
         for position in positions
     }
@@ -4872,6 +4931,17 @@ async def _read_principal_client_events(
         unread_changes = changes_by_position[event.event_position]["unread_changes"]
         assert isinstance(unread_changes, list)
         unread_changes.append({"state": _serialize_channel_unread(event.state)})
+    for event in thread_batch.events:
+        if event.event_position > safe_position:
+            continue
+        thread_changes = changes_by_position[event.event_position]["thread_changes"]
+        assert isinstance(thread_changes, list)
+        thread_changes.append(
+            {
+                "event_type": event.transition.value,
+                "state": _serialize_thread_unread(event.state),
+            }
+        )
     return _PrincipalClientEventBatch(
         tuple(changes_by_position[position] for position in positions),
         safe_position,
@@ -4900,6 +4970,7 @@ async def _handle_principal_event_stream(
     agent_lifecycle: WorkshopAgentLifecycleService,
     human_notifications: WorkshopHumanNotificationService,
     channel_unread: WorkshopChannelUnreadService,
+    thread_unread: WorkshopThreadUnreadService,
     request_lock: asyncio.Lock,
     poll_interval: float,
     heartbeat_interval: float,
@@ -4928,6 +4999,7 @@ async def _handle_principal_event_stream(
                 role=authority.role,
                 human_notifications=human_notifications,
                 channel_unread=channel_unread,
+                thread_unread=thread_unread,
                 after_position=after_position,
             )
     except WorkshopAgentLifecycleAccessDenied:
@@ -4943,6 +5015,7 @@ async def _handle_principal_event_stream(
         ValueError,
         WorkshopHumanNotificationValidationError,
         WorkshopChannelUnreadValidationError,
+        WorkshopThreadUnreadValidationError,
     ):
         return _error_response(status=400, code="invalid_request", message="Invalid principal event stream")
 
@@ -5003,6 +5076,7 @@ async def _handle_principal_event_stream(
                     role=authority.role,
                     human_notifications=human_notifications,
                     channel_unread=channel_unread,
+                    thread_unread=thread_unread,
                     after_position=position,
                 )
     except (
@@ -5224,6 +5298,107 @@ async def _handle_channel_read_position(
         {"version": 1, **_serialize_channel_read_position_mutation(mutation)},
         status=200,
     )
+
+
+async def _handle_thread_unread(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopThreadUnreadService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid thread unread request")
+    try:
+        state = await service.thread(
+            principal_id,
+            ChannelId(request.match_info["channel_id"]),
+            MessageId(request.match_info["root_message_id"]),
+        )
+    except (TypeError, ValueError, WorkshopThreadUnreadValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid thread unread request")
+    except WorkshopThreadUnreadAccessDenied:
+        return _error_response(status=404, code="thread_not_found", message="Thread not found")
+    return _json_response({"version": 1, "state": _serialize_thread_unread(state)}, status=200)
+
+
+async def _handle_thread_follow_state(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopThreadUnreadService,
+    followed: bool,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    payload = await _read_human_notification_mutation_payload(request)
+    if payload is None or set(payload) != _THREAD_FOLLOW_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid thread follow mutation")
+    try:
+        operation = service.follow if followed else service.unfollow
+        mutation = await operation(
+            principal_id,
+            ChannelId(request.match_info["channel_id"]),
+            MessageId(request.match_info["root_message_id"]),
+            expected_state_version=payload["expected_state_version"],
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (TypeError, ValueError, WorkshopThreadUnreadValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid thread follow mutation")
+    except WorkshopThreadUnreadAccessDenied:
+        return _error_response(status=404, code="thread_not_found", message="Thread not found")
+    except WorkshopThreadUnreadConflict as exc:
+        return _error_response(status=409, code="thread_unread_conflict", message=str(exc))
+    return _json_response({"version": 1, **_serialize_thread_unread_mutation(mutation)}, status=200)
+
+
+async def _handle_thread_read_position(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopThreadUnreadService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    payload = await _read_human_notification_mutation_payload(request)
+    if payload is None or set(payload) != _THREAD_READ_POSITION_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid thread read-position mutation")
+    message_id = payload["message_id"]
+    expected_state_version = payload["expected_state_version"]
+    client_operation_id = payload["client_operation_id"]
+    if (
+        not isinstance(message_id, str)
+        or not isinstance(expected_state_version, int)
+        or isinstance(expected_state_version, bool)
+        or not isinstance(client_operation_id, str)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid thread read-position mutation")
+    try:
+        mutation = await service.advance(
+            principal_id,
+            ChannelId(request.match_info["channel_id"]),
+            MessageId(request.match_info["root_message_id"]),
+            MessageId(message_id),
+            expected_state_version=expected_state_version,
+            client_operation_id=client_operation_id,
+        )
+    except (TypeError, ValueError, WorkshopThreadUnreadValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid thread read-position mutation")
+    except WorkshopThreadUnreadAccessDenied:
+        return _error_response(status=404, code="thread_not_found", message="Thread not found")
+    except WorkshopThreadUnreadConflict as exc:
+        return _error_response(status=409, code="thread_unread_conflict", message=str(exc))
+    return _json_response({"version": 1, **_serialize_thread_unread_mutation(mutation)}, status=200)
 
 
 async def _handle_channel_unread_event_stream(
@@ -6428,6 +6603,7 @@ def register_workshop_read_routes(
     agent_lifecycle = WorkshopAgentLifecycleService(store)
     human_notifications = WorkshopHumanNotificationService(store)
     channel_unread = WorkshopChannelUnreadService(store)
+    thread_unread = WorkshopThreadUnreadService(store)
     shutdown_event = asyncio.Event()
 
     async def stop_event_streams(_app: web.Application) -> None:
@@ -6601,6 +6777,7 @@ def register_workshop_read_routes(
             agent_lifecycle=agent_lifecycle,
             human_notifications=human_notifications,
             channel_unread=channel_unread,
+            thread_unread=thread_unread,
             request_lock=request_lock,
             poll_interval=event_poll_interval,
             heartbeat_interval=event_heartbeat_interval,
@@ -6662,6 +6839,40 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=channel_unread,
+            )
+
+    async def handle_thread_unread(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_thread_unread(
+                request,
+                authenticator=authenticator,
+                service=thread_unread,
+            )
+
+    async def handle_thread_follow(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_thread_follow_state(
+                request,
+                authenticator=authenticator,
+                service=thread_unread,
+                followed=True,
+            )
+
+    async def handle_thread_unfollow(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_thread_follow_state(
+                request,
+                authenticator=authenticator,
+                service=thread_unread,
+                followed=False,
+            )
+
+    async def handle_thread_read_position(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_thread_read_position(
+                request,
+                authenticator=authenticator,
+                service=thread_unread,
             )
 
     async def handle_channel_unread_event_stream(request: web.Request) -> web.StreamResponse:
@@ -6738,6 +6949,10 @@ def register_workshop_read_routes(
     app.router.add_get(_CHANNEL_UNREAD_EVENTS_PATH, handle_channel_unread_event_stream)
     app.router.add_get(_CHANNEL_UNREAD_DETAIL_PATH, handle_channel_unread_detail)
     app.router.add_post(_CHANNEL_READ_POSITION_PATH, handle_channel_read_position)
+    app.router.add_get(_THREAD_UNREAD_PATH, handle_thread_unread)
+    app.router.add_post(_THREAD_FOLLOW_PATH, handle_thread_follow)
+    app.router.add_post(_THREAD_UNFOLLOW_PATH, handle_thread_unfollow)
+    app.router.add_post(_THREAD_READ_POSITION_PATH, handle_thread_read_position)
     app.router.add_get(_HUMAN_NOTIFICATIONS_PATH, handle_human_notifications)
     app.router.add_get(_HUMAN_NOTIFICATION_COUNTS_PATH, handle_human_notification_counts)
     app.router.add_get(_HUMAN_NOTIFICATION_EVENTS_PATH, handle_human_notification_event_stream)

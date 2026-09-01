@@ -35,6 +35,7 @@ from kai.workshop.domain import (
     RunAttemptId,
     RunExecutionOwnerId,
     RunId,
+    ThreadReadPositionId,
     WorkshopEventType,
     WorkshopId,
 )
@@ -1105,7 +1106,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 22
+    version = 23
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1130,6 +1131,7 @@ class CanonicalConversationProjection:
             "human_notification_adapter_delivery_decisions",
             "human_notification_publications",
             "human_notifications",
+            "thread_read_positions",
             "channel_read_positions",
             "messages",
             "principal_agent_enablements",
@@ -1426,6 +1428,11 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop membership removal has no matching participant")
+            if await _table_has_column(connection, "thread_read_positions", "principal_id"):
+                await connection.execute(
+                    "DELETE FROM thread_read_positions WHERE principal_id = ? AND channel_id = ?",
+                    (principal_id, channel_id),
+                )
             await connection.execute(
                 "UPDATE channels SET membership_event_position = ? WHERE id = ?",
                 (event.position, channel_id),
@@ -2222,6 +2229,78 @@ class CanonicalConversationProjection:
                     "UPDATE messages SET thread_root_id = ? WHERE id = ?",
                     (thread_root, envelope.aggregate_id),
                 )
+            async with connection.execute(
+                "SELECT kind FROM channels WHERE id = ?",
+                (channel_id,),
+            ) as cursor:
+                channel_row = await cursor.fetchone()
+            if (
+                channel_row is not None
+                and str(channel_row[0]) == "group"
+                and await _table_has_column(connection, "thread_read_positions", "principal_id")
+            ):
+                async with connection.execute(
+                    "SELECT baseline_event_position FROM thread_unread_authority_cutover WHERE singleton = 1"
+                ) as cursor:
+                    cutover = await cursor.fetchone()
+                if cutover is not None and event.position > int(cutover[0]):
+                    root_id = str(thread_root or envelope.aggregate_id)
+                    # Authors start/follow the thread they create or reply in;
+                    # directly mentioned humans follow it as well. Only active
+                    # human channel members are eligible. Repeated activity in
+                    # an already-followed thread does not clear older replies.
+                    author_id = _required_text(payload, "author_principal_id")
+                    follower_boundaries: dict[str, tuple[int, str]] = {
+                        author_id: (event.position, str(envelope.aggregate_id))
+                    }
+                    mention_boundary = (event.position, str(envelope.aggregate_id))
+                    if thread_root is not None:
+                        async with connection.execute(
+                            "SELECT id, created_event_position FROM messages "
+                            "WHERE id = ? OR (thread_root_id = ? AND created_event_position < ?) "
+                            "ORDER BY created_event_position DESC LIMIT 1",
+                            (thread_root, thread_root, event.position),
+                        ) as cursor:
+                            prior = await cursor.fetchone()
+                        if prior is None:
+                            raise ValueError("Workshop thread mention has no prior canonical boundary")
+                        mention_boundary = (int(prior[1]), str(prior[0]))
+                    for mention in json.loads(mentions_json):
+                        if mention.get("kind") == "human" and isinstance(mention.get("principal_id"), str):
+                            follower_boundaries.setdefault(str(mention["principal_id"]), mention_boundary)
+                    for follower_id, (boundary_position, boundary_message_id) in sorted(follower_boundaries.items()):
+                        async with connection.execute(
+                            "SELECT 1 FROM principals p JOIN channel_memberships cm "
+                            "ON cm.principal_id = p.id AND cm.channel_id = ? "
+                            "WHERE p.id = ? AND p.kind = 'human'",
+                            (channel_id, follower_id),
+                        ) as cursor:
+                            if await cursor.fetchone() is None:
+                                continue
+                        await connection.execute(
+                            "INSERT INTO thread_read_positions "
+                            "(principal_id, channel_id, thread_root_id, followed, "
+                            "follow_baseline_event_position, read_through_event_position, "
+                            "read_through_message_id, state_version, last_event_position, updated_at) "
+                            "VALUES (?, ?, ?, 1, ?, ?, ?, 1, ?, ?) "
+                            "ON CONFLICT(principal_id, thread_root_id) DO UPDATE SET "
+                            "followed = 1, follow_baseline_event_position = excluded.follow_baseline_event_position, "
+                            "read_through_event_position = excluded.read_through_event_position, "
+                            "read_through_message_id = excluded.read_through_message_id, "
+                            "state_version = thread_read_positions.state_version + 1, "
+                            "last_event_position = excluded.last_event_position, updated_at = excluded.updated_at "
+                            "WHERE thread_read_positions.followed = 0",
+                            (
+                                follower_id,
+                                channel_id,
+                                root_id,
+                                boundary_position,
+                                boundary_position,
+                                boundary_message_id,
+                                event.position,
+                                occurred_at,
+                            ),
+                        )
         elif envelope.event_type == WorkshopEventType.HUMAN_NOTIFICATION_CREATED:
             if not isinstance(envelope.aggregate_id, HumanNotificationId):
                 raise ValueError("Workshop human notification requires a typed notification aggregate")
@@ -2450,6 +2529,151 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop channel read position revision is stale or unauthorized")
+        elif envelope.event_type in {
+            WorkshopEventType.THREAD_FOLLOWED,
+            WorkshopEventType.THREAD_UNFOLLOWED,
+        }:
+            if not isinstance(envelope.aggregate_id, ThreadReadPositionId):
+                raise ValueError("Workshop thread follow state requires a typed aggregate")
+            _require_exact_payload(
+                payload,
+                {
+                    "principal_id",
+                    "channel_id",
+                    "thread_root_id",
+                    "expected_state_version",
+                    "boundary_event_position",
+                    "boundary_message_id",
+                },
+            )
+            principal_id = PrincipalId(_required_text(payload, "principal_id"))
+            channel_id = ChannelId(_required_text(payload, "channel_id"))
+            thread_root_id = MessageId(_required_text(payload, "thread_root_id"))
+            boundary_message_id = MessageId(_required_text(payload, "boundary_message_id"))
+            expected_version = payload.get("expected_state_version")
+            boundary_position = payload.get("boundary_event_position")
+            if (
+                not isinstance(expected_version, int)
+                or isinstance(expected_version, bool)
+                or expected_version < 0
+                or not isinstance(boundary_position, int)
+                or isinstance(boundary_position, bool)
+                or boundary_position < 0
+                or envelope.actor_principal_id != principal_id
+            ):
+                raise ValueError("Workshop thread follow state is invalid")
+            async with connection.execute(
+                "SELECT m.created_event_position FROM messages root "
+                "JOIN channels c ON c.id = root.channel_id AND c.kind = 'group' "
+                "JOIN channel_memberships cm ON cm.channel_id = root.channel_id AND cm.principal_id = ? "
+                "JOIN messages m ON m.id = ? AND m.channel_id = root.channel_id "
+                "AND (m.id = root.id OR m.thread_root_id = root.id) "
+                "WHERE root.id = ? AND root.channel_id = ? AND root.thread_root_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM messages newer WHERE newer.channel_id = root.channel_id "
+                "AND (newer.id = root.id OR newer.thread_root_id = root.id) "
+                "AND newer.created_event_position > m.created_event_position)",
+                (principal_id, boundary_message_id, thread_root_id, channel_id),
+            ) as cursor:
+                boundary = await cursor.fetchone()
+            if boundary is None or int(boundary[0]) != boundary_position:
+                raise ValueError("Workshop thread follow boundary is unauthorized")
+            async with connection.execute(
+                "SELECT followed, state_version FROM thread_read_positions "
+                "WHERE principal_id = ? AND thread_root_id = ?",
+                (principal_id, thread_root_id),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            current_followed = bool(existing[0]) if existing is not None else False
+            current_version = int(existing[1]) if existing is not None else 0
+            if current_version != expected_version:
+                raise ValueError("Workshop thread follow revision is stale")
+            following = envelope.event_type == WorkshopEventType.THREAD_FOLLOWED
+            if following == current_followed:
+                raise ValueError("Workshop thread follow transition has no state change")
+            if following:
+                await connection.execute(
+                    "INSERT INTO thread_read_positions "
+                    "(principal_id, channel_id, thread_root_id, followed, "
+                    "follow_baseline_event_position, read_through_event_position, "
+                    "read_through_message_id, state_version, last_event_position, updated_at) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?, 1, ?, ?) "
+                    "ON CONFLICT(principal_id, thread_root_id) DO UPDATE SET "
+                    "followed = 1, follow_baseline_event_position = excluded.follow_baseline_event_position, "
+                    "read_through_event_position = excluded.read_through_event_position, "
+                    "read_through_message_id = excluded.read_through_message_id, "
+                    "state_version = thread_read_positions.state_version + 1, "
+                    "last_event_position = excluded.last_event_position, updated_at = excluded.updated_at",
+                    (
+                        principal_id,
+                        channel_id,
+                        thread_root_id,
+                        boundary_position,
+                        boundary_position,
+                        boundary_message_id,
+                        event.position,
+                        occurred_at,
+                    ),
+                )
+            else:
+                cursor = await connection.execute(
+                    "UPDATE thread_read_positions SET followed = 0, state_version = state_version + 1, "
+                    "last_event_position = ?, updated_at = ? "
+                    "WHERE principal_id = ? AND thread_root_id = ? AND followed = 1 AND state_version = ?",
+                    (event.position, occurred_at, principal_id, thread_root_id, expected_version),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Workshop thread follow revision is stale")
+        elif envelope.event_type == WorkshopEventType.THREAD_READ_POSITION_ADVANCED:
+            if not isinstance(envelope.aggregate_id, ThreadReadPositionId):
+                raise ValueError("Workshop thread read position requires a typed aggregate")
+            _require_exact_payload(
+                payload,
+                {"principal_id", "channel_id", "thread_root_id", "message_id", "expected_state_version"},
+            )
+            principal_id = PrincipalId(_required_text(payload, "principal_id"))
+            channel_id = ChannelId(_required_text(payload, "channel_id"))
+            thread_root_id = MessageId(_required_text(payload, "thread_root_id"))
+            message_id = MessageId(_required_text(payload, "message_id"))
+            expected_version = payload.get("expected_state_version")
+            if (
+                not isinstance(expected_version, int)
+                or isinstance(expected_version, bool)
+                or expected_version < 0
+                or envelope.actor_principal_id != principal_id
+            ):
+                raise ValueError("Workshop thread read position is invalid")
+            async with connection.execute(
+                "SELECT m.created_event_position, rp.read_through_event_position "
+                "FROM thread_read_positions rp "
+                "JOIN channel_memberships cm ON cm.channel_id = rp.channel_id AND cm.principal_id = rp.principal_id "
+                "JOIN messages m ON m.id = ? AND m.channel_id = rp.channel_id "
+                "AND m.thread_root_id = rp.thread_root_id "
+                "WHERE rp.principal_id = ? AND rp.channel_id = ? AND rp.thread_root_id = ? "
+                "AND rp.followed = 1 AND rp.state_version = ?",
+                (message_id, principal_id, channel_id, thread_root_id, expected_version),
+            ) as cursor:
+                source = await cursor.fetchone()
+            if source is None or int(source[0]) <= int(source[1]):
+                raise ValueError("Workshop thread read position boundary is stale or unauthorized")
+            cursor = await connection.execute(
+                "UPDATE thread_read_positions SET read_through_event_position = ?, "
+                "read_through_message_id = ?, state_version = state_version + 1, "
+                "last_event_position = ?, updated_at = ? "
+                "WHERE principal_id = ? AND thread_root_id = ? AND followed = 1 "
+                "AND state_version = ? AND read_through_event_position < ?",
+                (
+                    int(source[0]),
+                    message_id,
+                    event.position,
+                    occurred_at,
+                    principal_id,
+                    thread_root_id,
+                    expected_version,
+                    int(source[0]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop thread read position revision is stale or unauthorized")
         elif envelope.event_type in {
             WorkshopEventType.MESSAGE_REACTION_ADDED,
             WorkshopEventType.MESSAGE_REACTION_REMOVED,
