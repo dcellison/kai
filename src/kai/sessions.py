@@ -465,6 +465,19 @@ async def load_workshop_principal_storage_registry(
         )
 
 
+async def reconcile_workshop_agent_authority(
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+):
+    """Converge agent ownership before protected runtime registries load."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    from kai.workshop.agent_authority import reconcile_single_owner_agent_authority
+
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await reconcile_single_owner_agent_authority(store, runtime_profiles)
+
+
 async def load_workshop_internal_api_context_registry(
     runtime_profiles: WorkshopRuntimeProfileRegistry,
 ) -> WorkshopInternalAPIContextRegistry:

@@ -93,7 +93,7 @@ class TestDefaultWorkshopBootstrap:
             [_human(202, "Second"), _human(101, "Admin", role="admin")],
         )
 
-        assert result.created_events == 25
+        assert result.created_events == 26
         assert result.existing_events == 0
         assert result.human_count == 2
         assert result.channel_count == 2
@@ -157,10 +157,10 @@ class TestDefaultWorkshopBootstrap:
             notification_channels=(notification,),
         )
 
-        assert first.created_events == 31
+        assert first.created_events == 32
         assert first.channel_count == 3
         assert second.created_events == 0
-        assert second.existing_events == 31
+        assert second.existing_events == 32
         async with store.connection.execute(
             "SELECT c.kind, c.name, cb.transport, cb.external_channel_id "
             "FROM channels c JOIN channel_bindings cb ON cb.channel_id = c.id "
@@ -223,9 +223,9 @@ class TestDefaultWorkshopBootstrap:
         second = await bootstrap_default_workshop(store, [_human(101, "Admin", role="admin")])
         second_events = await store.read_events()
 
-        assert first.created_events == 17
+        assert first.created_events == 18
         assert second.created_events == 0
-        assert second.existing_events == 17
+        assert second.existing_events == 18
         assert second.workshop_id == first.workshop_id
         assert second.agent_id == first.agent_id
         assert second_events == first_events
@@ -250,8 +250,8 @@ class TestDefaultWorkshopBootstrap:
             ],
         )
 
-        assert first.created_events == 17
-        assert upgraded.created_events == 2
+        assert first.created_events == 18
+        assert upgraded.created_events == 3
         assert upgraded.existing_events == 17
         async with store.connection.execute(
             "SELECT provider, external_subject FROM external_identities ORDER BY provider"
@@ -306,9 +306,12 @@ class TestDefaultWorkshopBootstrap:
             ],
         )
 
-        assert migrated.created_events == 2
-        assert (await store.read_events())[-2].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
-        assert (await store.read_events())[-1].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED
+        assert migrated.created_events == 3
+        assert (await store.read_events())[-3].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
+        assert (await store.read_events())[-2].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED
+        assert (await store.read_events())[
+            -1
+        ].envelope.event_type == WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED
         async with store.connection.execute(
             "SELECT runtime_profile_id FROM channel_agent_runtime_assignments"
         ) as cursor:
@@ -347,10 +350,10 @@ class TestDefaultWorkshopBootstrap:
         )
 
         assert result.created_events == 8
-        assert result.existing_events == 17
+        assert result.existing_events == 18
         assert result.human_count == 2
         assert result.channel_count == 2
-        assert len(await store.read_events()) == 25
+        assert len(await store.read_events()) == 26
 
     async def test_existing_bootstrap_receives_missing_channel_memberships(self, store):
         await bootstrap_default_workshop(
@@ -367,7 +370,7 @@ class TestDefaultWorkshopBootstrap:
         )
 
         assert result.created_events == 4
-        assert result.existing_events == 21
+        assert result.existing_events == 22
         async with store.connection.execute("SELECT COUNT(*) FROM channel_memberships") as cursor:
             assert (await cursor.fetchone())[0] == 4
 

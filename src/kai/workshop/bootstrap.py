@@ -135,6 +135,7 @@ async def _ensure_event(
     occurred_at: datetime,
     payload: dict[str, Any],
     event_version: int = 1,
+    actor_principal_id: PrincipalId | None = None,
 ) -> tuple[StoredEvent, bool]:
     existing = await store.event_by_idempotency_key(idempotency_key)
     if existing is not None:
@@ -146,6 +147,7 @@ async def _ensure_event(
             workshop_id=workshop_id,
             aggregate_type=aggregate_type,
             aggregate_id=aggregate_id,
+            actor_principal_id=actor_principal_id,
             occurred_at=occurred_at,
             idempotency_key=idempotency_key,
             payload=payload,
@@ -272,6 +274,13 @@ async def bootstrap_default_workshop(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'principal_agent_enablements'"
     ) as cursor:
         enablements_supported = await cursor.fetchone() is not None
+    async with store.connection.execute("PRAGMA table_info(agent_definitions)") as cursor:
+        definition_columns = {str(row[1]) for row in await cursor.fetchall()}
+    agent_authority_supported = "owner_principal_id" in definition_columns
+    async with store.connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runtime_profile_owners'"
+    ) as cursor:
+        profile_ownership_supported = await cursor.fetchone() is not None
     handles_supported = await human_handle_schema_supported(store)
     definition_id = AgentDefinitionId.derived(agent_id, "definition")
     # Historical-schema migration tests exercise bootstrap at the simulated
@@ -582,6 +591,54 @@ async def bootstrap_default_workshop(
         )
 
     await store.rebuild_projection(CanonicalConversationProjection())
+    if profile_ownership_supported:
+        await store.connection.execute(
+            "INSERT OR IGNORE INTO runtime_profile_owners (runtime_profile_id, principal_id) "
+            "SELECT DISTINCT e.runtime_profile_id, e.principal_id "
+            "FROM principal_agent_enablements e JOIN channels c "
+            "ON c.id = e.direct_channel_id AND c.kind = 'direct' "
+            "JOIN channel_memberships cm ON cm.channel_id = c.id "
+            "AND cm.principal_id = e.principal_id AND cm.role = 'owner' "
+            "WHERE e.lifecycle_state = 'enabled'"
+        )
+        await store.connection.commit()
+    if definitions_supported and agent_authority_supported:
+        async with store.connection.execute(
+            "SELECT wm.principal_id, e.runtime_profile_id, e.direct_channel_id "
+            "FROM workshop_memberships wm JOIN principals p "
+            "ON p.id = wm.principal_id AND p.kind = 'human' "
+            "LEFT JOIN principal_agent_enablements e ON e.principal_id = wm.principal_id "
+            "AND e.agent_definition_id = ? AND e.lifecycle_state = 'enabled' "
+            "WHERE wm.workshop_id = ? AND wm.role = 'admin' ORDER BY wm.principal_id",
+            (definition_id, workshop_id),
+        ) as cursor:
+            administrator_rows = list(await cursor.fetchall())
+        if len(administrator_rows) == 1:
+            owner_principal_id = PrincipalId(str(administrator_rows[0][0]))
+            authority_payload: dict[str, Any] = {"owner_principal_id": owner_principal_id}
+            authority_version = 1
+            authority_token = f"kai:{owner_principal_id}"
+            if administrator_rows[0][1] is not None and administrator_rows[0][2] is not None:
+                runtime_profile_id = str(administrator_rows[0][1])
+                owner_channel_id = ChannelId(str(administrator_rows[0][2]))
+                authority_payload.update(
+                    {
+                        "runtime_profile_id": runtime_profile_id,
+                        "owner_direct_channel_id": owner_channel_id,
+                    }
+                )
+                authority_version = 2
+                authority_token += f":{runtime_profile_id}:{owner_channel_id}"
+            await ensure(
+                idempotency_key=_idempotency_key("agent-authority", authority_token),
+                event_type=WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED,
+                event_version=authority_version,
+                aggregate_type="agent_definition",
+                aggregate_id=definition_id,
+                actor_principal_id=owner_principal_id,
+                payload=authority_payload,
+            )
+            await store.project_pending(CanonicalConversationProjection())
     if handles_supported:
         await reconcile_human_handles(store)
     return BootstrapResult(

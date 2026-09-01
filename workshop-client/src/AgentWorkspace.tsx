@@ -696,8 +696,7 @@ export function AgentWorkspace({
             {liveState === "connected" ? "Live" : "Connecting"}
           </span>
           <div className="agent-header-controls">
-            {isAdministrator && (
-              <button
+            <button
                 className="panel-icon-button"
                 type="button"
                 aria-label="Create agent"
@@ -710,8 +709,7 @@ export function AgentWorkspace({
                 }}
               >
                 <span aria-hidden="true">+</span>
-              </button>
-            )}
+            </button>
             <button
               className="panel-icon-button"
               type="button"
@@ -806,26 +804,32 @@ export function AgentWorkspace({
               </div>
 
               <section className="agent-authority-note">
-                <strong>Authority stays with the person and runtime.</strong>
+                <strong>
+                  {enablement?.canManage
+                    ? "You own and manage this agent."
+                    : `Owned and managed by ${selected.ownerDisplayName ?? "another Workshop member"}.`}
+                </strong>
                 <p>
-                  This definition describes behavior. Enabling it does not grant a
-                  backend, model, workspace, service, credential, or capability.
+                  Everyone talks to the same @{selected.handle} definition and owner-sponsored
+                  runtime. Conversations, transcripts, and memory remain private to each person.
                 </p>
               </section>
 
               {selected.lifecycleState === "active" && enablement && (
                 <section className="agent-enablement-card">
                   <div>
-                    <p className="overline">Your runtime binding</p>
+                    <p className="overline">
+                      {enablement.canManage ? "Owner runtime" : "Conversation access"}
+                    </p>
                     <h3>
                       {enablement.lifecycleState === "enabled"
-                        ? "Enabled for you"
+                        ? enablement.canManage ? "Runtime active" : "Available to you"
                         : enablement.lifecycleState === "disabled"
                           ? "Disabled for you"
                           : "Available to enable"}
                     </h3>
                   </div>
-                  {enablement.eligibleRuntimes.length > 0 ? (
+                  {enablement.canManage && enablement.eligibleRuntimes.length > 0 ? (
                     <label>
                       Authorized runtime
                       <select
@@ -846,11 +850,11 @@ export function AgentWorkspace({
                         ))}
                       </select>
                     </label>
-                  ) : (
+                  ) : enablement.canManage ? (
                     <p className="agent-state-copy">
                       No authorized runtime can satisfy this agent yet.
                     </p>
-                  )}
+                  ) : null}
                   <div className="form-actions">
                     {enablement.lifecycleState === "enabled" &&
                       enablement.directChannelId && (
@@ -874,7 +878,19 @@ export function AgentWorkspace({
                           Start conversation
                         </button>
                       )}
-                    {enablement.eligibleRuntimes.length > 0 &&
+                    {!enablement.canManage &&
+                      enablement.lifecycleState !== "enabled" &&
+                      enablement.eligibleRuntimes.length > 0 && (
+                        <button
+                          className="primary-button"
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void enable()}
+                        >
+                          Start conversation
+                        </button>
+                      )}
+                    {enablement.canManage && enablement.eligibleRuntimes.length > 0 &&
                       (enablement.lifecycleState !== "enabled" ||
                         runtimeProfileId !== enablement.runtimeProfileId) && (
                         <button
@@ -894,7 +910,7 @@ export function AgentWorkspace({
                               : "Enable agent"}
                         </button>
                       )}
-                    {enablement.lifecycleState === "enabled" && (
+                    {!enablement.canManage && enablement.lifecycleState === "enabled" && (
                       <button
                         className="danger-button"
                         type="button"
@@ -908,7 +924,7 @@ export function AgentWorkspace({
                 </section>
               )}
 
-              {runtimeSession && selected && (
+              {runtimeSession && selected && enablement?.canManage && (
                 <AgentRuntimeControls
                   isAdministrator={isAdministrator}
                   onAuthenticationFailure={onAuthenticationFailure}
@@ -942,11 +958,11 @@ export function AgentWorkspace({
                 </p>
               )}
 
-              {isAdministrator && selected.lifecycleState !== "archived" && (
+              {enablement?.canManage && selected.lifecycleState !== "archived" && (
                 <section className="agent-admin-controls">
                   <div className="agent-section-heading">
                     <div>
-                      <p className="overline">Administrator controls</p>
+                      <p className="overline">Owner controls</p>
                       <h3>Definition revisions</h3>
                     </div>
                     {!editingRevision && (

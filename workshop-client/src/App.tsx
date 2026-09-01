@@ -1323,6 +1323,9 @@ function ChannelAgentManagementDialog({
           lifecycleState: "disabled",
           runtimeProfileId: agent.runtimeProfileId,
           stateVersion: null,
+          canManage: false,
+          ownerPrincipalId: null,
+          ownerRuntimeProfileId: agent.runtimeProfileId,
         });
       }
     }

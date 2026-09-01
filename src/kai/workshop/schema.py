@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 56
+WORKSHOP_SCHEMA_VERSION = 57
 
 
 @dataclass(frozen=True, slots=True)
@@ -2605,6 +2605,39 @@ _HUMAN_NOTIFICATION_ADAPTER_PREFERENCE_SCHEMA = SchemaMigration(
     ),
 )
 
+_SINGLE_OWNER_AGENT_AUTHORITY_SCHEMA = SchemaMigration(
+    version=57,
+    name="single_owner_agent_authority",
+    statements=(
+        "ALTER TABLE agent_definitions ADD COLUMN owner_principal_id TEXT REFERENCES principals(id) ON DELETE RESTRICT",
+        "ALTER TABLE agent_definitions ADD COLUMN owner_runtime_profile_id TEXT",
+        "ALTER TABLE agent_definitions ADD COLUMN owner_direct_channel_id TEXT "
+        "REFERENCES channels(id) ON DELETE RESTRICT",
+        "ALTER TABLE agent_definitions ADD COLUMN authority_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "CREATE INDEX agent_definitions_owner_idx ON agent_definitions (owner_principal_id, lifecycle_state, handle)",
+        "CREATE UNIQUE INDEX agent_definitions_owner_lane_idx "
+        "ON agent_definitions (owner_direct_channel_id) "
+        "WHERE owner_direct_channel_id IS NOT NULL",
+        """
+        CREATE TABLE runtime_profile_owners (
+            runtime_profile_id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL,
+            captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+        "CREATE INDEX runtime_profile_owners_principal_idx "
+        "ON runtime_profile_owners (principal_id, runtime_profile_id)",
+        "INSERT INTO runtime_profile_owners (runtime_profile_id, principal_id) "
+        "SELECT ra.runtime_profile_id, MIN(cm.principal_id) "
+        "FROM channel_agent_runtime_assignments ra "
+        "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+        "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+        "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+        "GROUP BY ra.runtime_profile_id HAVING COUNT(DISTINCT cm.principal_id) = 1",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2662,6 +2695,7 @@ _MIGRATIONS = (
     _CHANNEL_NOTIFICATION_POLICY_SCHEMA,
     _HUMAN_NOTIFICATION_PUBLICATION_SCHEMA,
     _HUMAN_NOTIFICATION_ADAPTER_PREFERENCE_SCHEMA,
+    _SINGLE_OWNER_AGENT_AUTHORITY_SCHEMA,
 )
 
 

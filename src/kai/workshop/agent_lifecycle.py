@@ -80,6 +80,8 @@ class AgentDefinitionSnapshot:
     state_version: int
     created_at: str
     created_by_principal_id: PrincipalId | None
+    owner_principal_id: PrincipalId | None
+    owner_display_name: str | None
     revisions: tuple[AgentRevisionSnapshot, ...]
 
 
@@ -161,7 +163,7 @@ class WorkshopAgentLifecycleService:
         instructions: object,
         capabilities: object,
     ) -> AgentDefinitionSnapshot:
-        workshop_id = await self._admin_workshop(principal_id)
+        workshop_id, _role = await self._authority(principal_id)
         key = _normalize_idempotency_key(idempotency_key)
         try:
             normalized_handle = normalize_agent_handle(handle)
@@ -243,7 +245,7 @@ class WorkshopAgentLifecycleService:
             ),
             EventEnvelope.create(
                 event_type=WorkshopEventType.AGENT_DEFINITION_CREATED,
-                event_version=1,
+                event_version=2,
                 workshop_id=workshop_id,
                 aggregate_type="agent_definition",
                 aggregate_id=definition_id,
@@ -257,6 +259,7 @@ class WorkshopAgentLifecycleService:
                     "description": normalized_description,
                     "presentation": json.loads(presentation_json),
                     "lifecycle_state": "draft",
+                    "owner_principal_id": principal_id,
                 },
                 metadata=metadata,
             ),
@@ -300,7 +303,7 @@ class WorkshopAgentLifecycleService:
         instructions: object,
         capabilities: object,
     ) -> AgentDefinitionSnapshot:
-        workshop_id = await self._admin_workshop(principal_id)
+        workshop_id, _role = await self._authority(principal_id)
         key = _normalize_idempotency_key(idempotency_key)
         expected = _normalize_expected_version(expected_version)
         try:
@@ -328,6 +331,7 @@ class WorkshopAgentLifecycleService:
                 await connection.commit()
                 return replay
             current = await self._snapshot_or_denied(definition_id, workshop_id)
+            self._require_owner(current, principal_id)
             self._require_version(current, expected)
             if current.lifecycle_state == "archived":
                 raise WorkshopAgentLifecycleConflict("Archived agent definitions cannot be revised")
@@ -414,7 +418,7 @@ class WorkshopAgentLifecycleService:
         idempotency_key: object,
         expected_version: object,
     ) -> AgentDefinitionSnapshot:
-        workshop_id = await self._admin_workshop(principal_id)
+        workshop_id, _role = await self._authority(principal_id)
         key = _normalize_idempotency_key(idempotency_key)
         expected = _normalize_expected_version(expected_version)
         operation_payload = {
@@ -432,6 +436,7 @@ class WorkshopAgentLifecycleService:
                 await connection.commit()
                 return replay
             current = await self._snapshot_or_denied(definition_id, workshop_id)
+            self._require_owner(current, principal_id)
             self._require_version(current, expected)
             if current.lifecycle_state == "archived":
                 raise WorkshopAgentLifecycleConflict("Archived agent definitions cannot be changed")
@@ -550,9 +555,11 @@ class WorkshopAgentLifecycleService:
     ) -> AgentDefinitionSnapshot:
         async with self._store.connection.execute(
             "SELECT d.id, d.workshop_id, d.agent_id, d.handle, d.display_name, d.description, "
-            "presentation_json, lifecycle_state, active_revision_id, created_at, "
-            "created_event_position, e.actor_principal_id FROM agent_definitions d "
+            "presentation_json, lifecycle_state, active_revision_id, d.created_at, "
+            "created_event_position, e.actor_principal_id, d.owner_principal_id, owner.display_name "
+            "FROM agent_definitions d "
             "JOIN event_log e ON e.position = d.created_event_position "
+            "LEFT JOIN principals owner ON owner.id = d.owner_principal_id "
             "WHERE d.id = ? AND d.workshop_id = ?",
             (definition_id, workshop_id),
         ) as cursor:
@@ -604,8 +611,15 @@ class WorkshopAgentLifecycleService:
             state_version=int(version_row[0]),
             created_at=str(row[9]),
             created_by_principal_id=(PrincipalId(str(row[11])) if row[11] is not None else None),
+            owner_principal_id=(PrincipalId(str(row[12])) if row[12] is not None else None),
+            owner_display_name=(str(row[13]) if row[13] is not None else None),
             revisions=revisions,
         )
+
+    @staticmethod
+    def _require_owner(snapshot: AgentDefinitionSnapshot, principal_id: PrincipalId) -> None:
+        if snapshot.owner_principal_id != principal_id:
+            raise WorkshopAgentLifecycleAccessDenied("Only the agent owner may change its definition")
 
     async def _replayed(
         self,

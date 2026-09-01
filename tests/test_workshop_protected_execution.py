@@ -143,6 +143,62 @@ async def _accepted_run(path: Path, home: Path):
 
 
 class TestProtectedExecutionPreparation:
+    async def test_shared_agent_keeps_requester_identity_and_uses_owner_runtime(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = await WorkshopEventStore.open(tmp_path / "kai.db")
+        await bootstrap_default_workshop(
+            store,
+            (
+                BootstrapHuman("Daniel", "admin", "telegram", "101", "101", profile_id(101)),
+                BootstrapHuman("Scott", "member", "telegram", "202", "202", profile_id(202)),
+            ),
+        )
+        async with store.connection.execute(
+            "SELECT e.external_subject, e.principal_id, cb.channel_id "
+            "FROM external_identities e JOIN channel_bindings cb "
+            "ON cb.transport = e.provider AND cb.external_channel_id = e.external_subject "
+            "ORDER BY e.external_subject"
+        ) as cursor:
+            identity_rows = list(await cursor.fetchall())
+        assert len(identity_rows) == 2
+        daniel_id = PrincipalId(str(identity_rows[0][1]))
+        daniel_channel_id = ChannelId(str(identity_rows[0][2]))
+        scott_id = PrincipalId(str(identity_rows[1][1]))
+        scott_channel_id = ChannelId(str(identity_rows[1][2]))
+        accepted = await WorkshopConversationCommandService(store).accept(
+            InboundMessage(
+                transport="telegram",
+                update_id="shared-agent-scott",
+                message_id="shared-agent-scott-message",
+                sender_subject="202",
+                channel_subject="202",
+                body="Use Kai without becoming Daniel.",
+                occurred_at=_NOW,
+            )
+        )
+        runtime_pool = _RuntimePool(tmp_path / "owner-home")
+        try:
+            prepared = await WorkshopProtectedExecutionPreparationService(
+                store,
+                runtime_pool,  # type: ignore[arg-type]
+                _RoutingPolicy(),  # type: ignore[arg-type]
+                registered_backend_ids=frozenset({"codex"}),
+            ).prepare(accepted.run.run_id)
+
+            assert prepared.run.requested_by_principal_id == scott_id
+            assert prepared.run.sponsor_principal_id == daniel_id
+            assert prepared.run.runtime_profile_id == profile_id(101)
+            assert runtime_pool.context is not None
+            assert runtime_pool.context.principal_id == scott_id
+            assert runtime_pool.context.channel_id == scott_channel_id
+            assert runtime_pool.context.runtime_owner_principal_id == daniel_id
+            assert runtime_pool.context.runtime_profile_id == profile_id(101)
+            assert runtime_pool.context.effective_settings_channel_id == daniel_channel_id
+        finally:
+            await store.close()
+
     async def test_accepted_group_run_keeps_sponsored_shared_runtime_after_detach(
         self,
         tmp_path: Path,

@@ -145,13 +145,15 @@ async def _open_group_store(
     for event in (
         EventEnvelope.create(
             event_type=WorkshopEventType.AGENT_DEFINITION_CREATED,
-            event_version=1,
+            event_version=2,
             workshop_id=workshop_id,
             aggregate_type="agent_definition",
             aggregate_id=nova_definition_id,
+            actor_principal_id=human_id,
             occurred_at=_NOW,
             payload={
                 "agent_id": second_agent_id,
+                "owner_principal_id": human_id,
                 "handle": "nova",
                 "display_name": "Nova",
                 "description": "Test agent",
@@ -274,6 +276,10 @@ async def _open_group_store(
         ),
     )
     await store.connection.execute(
+        "INSERT OR IGNORE INTO runtime_profile_owners (runtime_profile_id, principal_id) VALUES (?, ?)",
+        (nova_profile, human_id),
+    )
+    await store.connection.execute(
         "UPDATE channel_agents SET sponsor_principal_id = ?, "
         "sponsored_runtime_profile_id = ? WHERE channel_id = ? AND agent_id = ?",
         (human_id, first_profile, group_id, first_agent_id),
@@ -284,6 +290,23 @@ async def _open_group_store(
         (human_id, nova_profile, group_id, second_agent_id),
     )
     await store.connection.commit()
+    await store.append(
+        EventEnvelope.create(
+            event_type=WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED,
+            event_version=2,
+            workshop_id=workshop_id,
+            aggregate_type="agent_definition",
+            aggregate_id=nova_definition_id,
+            actor_principal_id=human_id,
+            occurred_at=_NOW,
+            payload={
+                "owner_principal_id": human_id,
+                "runtime_profile_id": nova_profile,
+                "owner_direct_channel_id": nova_direct_channel,
+            },
+        )
+    )
+    await store.project_pending(CanonicalConversationProjection())
     return store, human_id, group_id, (first_agent_id, second_agent_id)
 
 

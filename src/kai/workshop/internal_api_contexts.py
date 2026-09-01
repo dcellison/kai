@@ -23,6 +23,16 @@ class WorkshopInternalAPIExecutionContext:
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
     private_context: bool = True
+    sponsor_principal_id: PrincipalId | None = None
+    settings_channel_id: ChannelId | None = None
+
+    @property
+    def runtime_owner_principal_id(self) -> PrincipalId:
+        return self.sponsor_principal_id or self.principal_id
+
+    @property
+    def effective_settings_channel_id(self) -> ChannelId:
+        return self.settings_channel_id or self.channel_id
 
     @classmethod
     def for_unprotected_runtime(
@@ -57,7 +67,7 @@ class WorkshopInternalAPIContextRegistry:
             if key in by_lane:
                 raise WorkshopInternalAPIContextError("Duplicate internal API execution lane")
             primary = by_profile.get(context.runtime_profile_id)
-            if primary is not None and primary.principal_id != context.principal_id:
+            if primary is not None and (primary.runtime_owner_principal_id != context.runtime_owner_principal_id):
                 raise WorkshopInternalAPIContextError("Runtime profile cannot cross internal API principals")
             by_profile.setdefault(context.runtime_profile_id, context)
             by_lane[key] = context
@@ -140,7 +150,7 @@ class WorkshopInternalAPIContextRegistry:
                 raise WorkshopInternalAPIContextError("Internal API execution lane conflicts")
             return
         primary = self._by_profile.get(context.runtime_profile_id)
-        if primary is None or primary.principal_id != context.principal_id:
+        if primary is None or (primary.runtime_owner_principal_id != context.runtime_owner_principal_id):
             raise WorkshopInternalAPIContextError("Runtime profile is not owned by this internal API principal")
         self._by_lane[key] = context
         self._contexts.append(context)
@@ -157,7 +167,7 @@ class WorkshopInternalAPIContextRegistry:
         if (replacement.principal_id, replacement.channel_id, replacement.agent_id) != key:
             raise WorkshopInternalAPIContextError("Internal API context identity cannot change")
         primary = self._by_profile.get(replacement.runtime_profile_id)
-        if primary is None or primary.principal_id != replacement.principal_id:
+        if primary is None or (primary.runtime_owner_principal_id != replacement.runtime_owner_principal_id):
             raise WorkshopInternalAPIContextError("Replacement runtime profile is not owned by the principal")
         self._by_lane[key] = replacement
         self._contexts[self._contexts.index(prior)] = replacement

@@ -161,6 +161,8 @@ export interface WorkshopAgentDefinition {
   displayName: string;
   handle: string;
   lifecycleState: WorkshopAgentLifecycleState;
+  ownerDisplayName: string | null;
+  ownerPrincipalId: string | null;
   presentation: { avatar?: string };
   revisions: WorkshopAgentRevision[];
   stateVersion: number;
@@ -183,6 +185,9 @@ export interface WorkshopAgentEnablement {
   lifecycleState: WorkshopAgentEnablementState;
   runtimeProfileId: string | null;
   stateVersion: number | null;
+  canManage: boolean;
+  ownerPrincipalId: string | null;
+  ownerRuntimeProfileId: string | null;
 }
 
 export interface WorkshopAgentChangeSignal {

@@ -828,6 +828,8 @@ def _serialize_agent_definition(snapshot: AgentDefinitionSnapshot) -> dict[str, 
         "created_by_principal_id": (
             str(snapshot.created_by_principal_id) if snapshot.created_by_principal_id is not None else None
         ),
+        "owner_principal_id": (str(snapshot.owner_principal_id) if snapshot.owner_principal_id is not None else None),
+        "owner_display_name": snapshot.owner_display_name,
         "revisions": [
             {
                 "revision_id": str(revision.revision_id),
@@ -865,6 +867,11 @@ def _serialize_agent_enablement(snapshot: PrincipalAgentEnablement) -> dict[str,
             }
             for runtime in snapshot.eligible_runtimes
         ],
+        "owner_principal_id": (str(snapshot.owner_principal_id) if snapshot.owner_principal_id is not None else None),
+        "owner_runtime_profile_id": (
+            str(snapshot.owner_runtime_profile_id) if snapshot.owner_runtime_profile_id is not None else None
+        ),
+        "can_manage": snapshot.can_manage,
     }
 
 

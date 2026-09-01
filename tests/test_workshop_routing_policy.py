@@ -298,7 +298,7 @@ async def test_group_run_routes_through_immutable_sponsor_authority(tmp_path: Pa
         run = accepted.command.runs[0]
         authority = RoutingEligibilityAuthority(
             direct_authority.principal_id,
-            group.channel_id,
+            direct_authority.channel_id,
             direct_authority.agent_id,
             profile_id(101),
         )

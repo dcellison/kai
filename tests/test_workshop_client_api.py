@@ -696,6 +696,9 @@ class _AgentEnablement:
             profile_id(101) if enabled else None,
             42 if enabled else None,
             (EligibleAgentRuntime(profile_id(101), "Daniel", ("claude:anthropic",)),),
+            self.principal_id,
+            profile_id(101),
+            True,
         )
 
     async def list_for_principal(self, principal_id):

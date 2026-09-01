@@ -551,6 +551,13 @@ def _start() -> None:
             workshop_bootstrap.created_events,
             workshop_bootstrap.existing_events,
         )
+        agent_authority = await sessions.reconcile_workshop_agent_authority(runtime_profiles)
+        logging.info(
+            "Workshop agent authority ready (definitions=%d, owners=%d, runtimes=%d)",
+            agent_authority.definitions,
+            agent_authority.assigned_owners,
+            agent_authority.assigned_runtimes,
+        )
         principal_storage = await sessions.load_workshop_principal_storage_registry(runtime_profiles)
         from kai.backend import configure_principal_storage_namespaces
 

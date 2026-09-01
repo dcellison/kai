@@ -271,6 +271,8 @@ const agentDefinition: WorkshopAgentDefinition = {
   displayName: "Kai",
   handle: "kai",
   lifecycleState: "active",
+  ownerDisplayName: "Daniel",
+  ownerPrincipalId: "prn_00000000000000000000000000000001",
   presentation: { avatar: "K" },
   revisions: [
     {
@@ -304,6 +306,9 @@ const agentEnablement: WorkshopAgentEnablement = {
   lifecycleState: "enabled",
   runtimeProfileId,
   stateVersion: 3,
+  canManage: true,
+  ownerPrincipalId: "prn_00000000000000000000000000000001",
+  ownerRuntimeProfileId: runtimeProfileId,
 };
 const memoryRecord: WorkshopMemoryRecord = {
   confidence: 1,
@@ -2487,7 +2492,8 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
-    expect(screen.getByText("Enabled for you")).toBeVisible();
+    expect(screen.getByText("Runtime active")).toBeVisible();
+    expect(screen.getByText("You own and manage this agent.")).toBeVisible();
     const agentWorkspace = within(screen.getByLabelText("Agents workspace"));
     const createAgent = agentWorkspace.getByRole("button", {
       name: "Create agent",
@@ -2507,6 +2513,37 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("button", { name: "Start conversation" }));
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
+  });
+
+  it("shows one shared agent definition without owner controls to another principal", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadAgentEnablements).mockResolvedValue([
+      {
+        ...agentEnablement,
+        canManage: false,
+        directChannelId: secondChannelId,
+        eligibleRuntimes: [],
+        ownerPrincipalId: agentDefinition.ownerPrincipalId,
+        ownerRuntimeProfileId: runtimeProfileId,
+        runtimeProfileId: "rtp_22222222222222222222222222222222",
+      },
+    ]);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Manage Kai" }));
+
+    expect(await screen.findByText("Owned and managed by Daniel.")).toBeVisible();
+    expect(screen.getByText("Available to you")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Start conversation" })).toBeVisible();
+    expect(screen.queryByText("Owner controls")).toBeNull();
+    expect(screen.queryByText("Runtime active")).toBeNull();
+    expect(screen.queryByLabelText("Authorized runtime")).toBeNull();
+    expect(screen.queryByRole("button", { name: "New revision" })).toBeNull();
   });
 
   it("opens runtime settings for the exact enabled agent lane", async () => {

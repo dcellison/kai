@@ -259,13 +259,10 @@ class WorkshopConversationCommandService:
                 inbound_message_id,
                 occurred_at=inbound.event.envelope.occurred_at,
             )
-            try:
-                _, runtime_profile_id = await resolve_channel_runtime_profile(
-                    self._store,
-                    message.channel_id,
-                )
-            except WorkshopRuntimeAssignmentError as exc:
-                raise ConversationCommandStateConflictError(str(exc)) from exc
+            runtime_profile_id = await self._runtime_profile_for_run(
+                message.channel_id,
+                lifecycle.run,
+            )
             if inbound.inserted != lifecycle.changed:
                 raise ConversationCommandStateConflictError(
                     "Scheduled inbound and run acceptance did not share one prior state"
@@ -343,16 +340,26 @@ class WorkshopConversationCommandService:
     ) -> tuple[RuntimeProfileId, ...]:
         profiles: list[RuntimeProfileId] = []
         for lifecycle in lifecycles:
-            try:
-                _, profile_id = await resolve_channel_runtime_profile(
-                    self._store,
-                    channel_id,
-                    lifecycle.run.agent_id,
-                )
-            except WorkshopRuntimeAssignmentError as exc:
-                raise ConversationCommandStateConflictError(str(exc)) from exc
-            profiles.append(profile_id)
+            profiles.append(await self._runtime_profile_for_run(channel_id, lifecycle.run))
         return tuple(profiles)
+
+    async def _runtime_profile_for_run(
+        self,
+        channel_id: ChannelId,
+        run: DurableRun,
+    ) -> RuntimeProfileId:
+        """Return the immutable run sponsorship, with a legacy-event fallback."""
+        if run.runtime_profile_id is not None:
+            return run.runtime_profile_id
+        try:
+            _, profile_id = await resolve_channel_runtime_profile(
+                self._store,
+                channel_id,
+                run.agent_id,
+            )
+        except WorkshopRuntimeAssignmentError as exc:
+            raise ConversationCommandStateConflictError(str(exc)) from exc
+        return profile_id
 
     async def _run_dispositions(
         self,

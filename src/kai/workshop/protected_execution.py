@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
-from kai.workshop.domain import RunId, RuntimeProfileId
+from kai.workshop.domain import ChannelId, RunId, RuntimeProfileId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.routing_policy import RunRoutingDecision, WorkshopRoutingPolicyService
 from kai.workshop.run_execution_authority import RunExecutionSelection
@@ -107,6 +107,18 @@ class WorkshopProtectedExecutionPreparationService:
         if channel_row is None or str(channel_row[0]) not in {"direct", "group"}:
             raise ProtectedExecutionPreparationError("Canonical run channel is unavailable")
         private_context = str(channel_row[0]) == "direct"
+        async with self._store.connection.execute(
+            "SELECT owner_direct_channel_id FROM agent_definitions "
+            "WHERE agent_id = ? AND owner_principal_id = ? "
+            "AND owner_runtime_profile_id = ? AND lifecycle_state = 'active'",
+            (run.agent_id, run.sponsor_principal_id, run.runtime_profile_id),
+        ) as cursor:
+            authority_row = await cursor.fetchone()
+        settings_channel_id = (
+            ChannelId(str(authority_row[0]))
+            if authority_row is not None and authority_row[0] is not None
+            else run.channel_id
+        )
 
         decision = await self._routing_policy.decide_for_run(
             run,
@@ -115,11 +127,13 @@ class WorkshopProtectedExecutionPreparationService:
         if decision.rejected or decision.selected_backend_option_id is None:
             raise ProtectedExecutionRoutingRejected(run, decision)
         runtime_authority = WorkshopInternalAPIExecutionContext(
-            principal_id=run.sponsor_principal_id,
+            principal_id=run.requested_by_principal_id,
             channel_id=run.channel_id,
             agent_id=run.agent_id,
             runtime_profile_id=run.runtime_profile_id,
             private_context=private_context,
+            sponsor_principal_id=run.sponsor_principal_id,
+            settings_channel_id=settings_channel_id,
         )
         runtime = await self._pool.prepare_routed_execution(
             runtime_authority,

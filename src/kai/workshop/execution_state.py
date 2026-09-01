@@ -24,6 +24,16 @@ class WorkshopExecutionStateNamespace:
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
     legacy_runtime_key: int | None
+    sponsor_principal_id: PrincipalId | None = None
+    settings_channel_id: ChannelId | None = None
+
+    @property
+    def runtime_owner_principal_id(self) -> PrincipalId:
+        return self.sponsor_principal_id or self.principal_id
+
+    @property
+    def effective_settings_channel_id(self) -> ChannelId:
+        return self.settings_channel_id or self.channel_id
 
     def require_legacy_runtime_key(self) -> int:
         """Return archived migration state or fail closed."""
@@ -60,7 +70,7 @@ class WorkshopExecutionStateRegistry:
                 raise WorkshopExecutionStateError("Duplicate archived runtime execution-state key")
             lane_key = (namespace.principal_id, namespace.channel_id)
             primary = by_profile.get(namespace.runtime_profile_id)
-            if primary is not None and primary.principal_id != namespace.principal_id:
+            if primary is not None and (primary.runtime_owner_principal_id != namespace.runtime_owner_principal_id):
                 raise WorkshopExecutionStateError("Runtime profile cannot cross canonical human owners")
             if namespace.legacy_runtime_key is not None:
                 by_legacy_key[namespace.legacy_runtime_key] = namespace
@@ -154,7 +164,7 @@ class WorkshopExecutionStateRegistry:
                 raise WorkshopExecutionStateError("Canonical execution-state lane conflicts")
             return
         primary = self._by_profile.get(namespace.runtime_profile_id)
-        if primary is None or primary.principal_id != namespace.principal_id:
+        if primary is None or (primary.runtime_owner_principal_id != namespace.runtime_owner_principal_id):
             raise WorkshopExecutionStateError("Runtime profile is not owned by the canonical principal")
         if namespace.legacy_runtime_key is not None:
             raise WorkshopExecutionStateError("New execution lanes cannot claim archived runtime state")
@@ -177,7 +187,7 @@ class WorkshopExecutionStateRegistry:
         ):
             raise WorkshopExecutionStateError("Canonical execution-state lane replacement conflicts")
         primary = self._by_profile.get(replacement.runtime_profile_id)
-        if primary is None or primary.principal_id != replacement.principal_id:
+        if primary is None or (primary.runtime_owner_principal_id != replacement.runtime_owner_principal_id):
             raise WorkshopExecutionStateError("Replacement runtime profile is not owned by the principal")
         self._by_principal_channel[key] = replacement
         self._lanes[self._lanes.index(prior)] = replacement
