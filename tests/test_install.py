@@ -5061,6 +5061,7 @@ class TestCmdStatus:
         output = capsys.readouterr().out
         assert "Installation Status" in output
         assert "Workshop bootstrap:" in output
+        assert "Workshop unread authority:" in output
         assert "Workshop delivery authority:" in output
         assert "Workshop conversation continuity:" in output
         assert "Workshop memory authority:" in output

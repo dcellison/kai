@@ -1435,6 +1435,241 @@ def workshop_canonical_message_integrity_status(db_path: Path) -> str:
     )
 
 
+def workshop_unread_authority_status(db_path: Path) -> str:
+    """Report content-free channel/thread unread authority and replay integrity."""
+    prefix = "Workshop unread authority:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical unread schema unavailable"
+    required = {
+        "channel_memberships",
+        "channel_read_positions",
+        "channel_unread_migration_baselines",
+        "channels",
+        "event_log",
+        "messages",
+        "principals",
+        "thread_read_positions",
+        "thread_unread_authority_cutover",
+    }
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= required:
+                return f"{prefix} pending; canonical unread schema unavailable"
+            tip = _scalar(connection, "SELECT COALESCE(MAX(position), 0) FROM event_log")
+            principals = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT cm.principal_id) FROM channel_memberships cm "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human'",
+            )
+            channels = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT cm.channel_id) FROM channel_memberships cm "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human'",
+            )
+            eligible = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_memberships cm "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human'",
+            )
+            baselines = _scalar(connection, "SELECT COUNT(*) FROM channel_unread_migration_baselines")
+            positions = _scalar(connection, "SELECT COUNT(*) FROM channel_read_positions")
+            thread_totals = connection.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN followed = 1 THEN 1 ELSE 0 END) FROM thread_read_positions"
+            ).fetchone()
+            thread_positions = int(thread_totals[0] or 0) if thread_totals is not None else 0
+            followed_threads = int(thread_totals[1] or 0) if thread_totals is not None else 0
+            unread_messages = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_read_positions rp "
+                "JOIN channel_memberships cm ON cm.principal_id = rp.principal_id "
+                "AND cm.channel_id = rp.channel_id "
+                "JOIN messages m ON m.channel_id = rp.channel_id AND m.thread_root_id IS NULL "
+                "AND m.author_principal_id != rp.principal_id "
+                "AND m.created_event_position > rp.read_through_event_position "
+                "JOIN principals author ON author.id = m.author_principal_id "
+                "JOIN event_log e ON e.position = m.created_event_position "
+                "WHERE NOT (author.kind = 'human' "
+                "AND coalesce(json_extract(e.metadata_json, '$.source'), '') = 'scheduled_job')",
+            )
+            unread_replies = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM thread_read_positions rp "
+                "JOIN channel_memberships cm ON cm.principal_id = rp.principal_id "
+                "AND cm.channel_id = rp.channel_id "
+                "JOIN messages reply ON reply.thread_root_id = rp.thread_root_id "
+                "AND reply.author_principal_id != rp.principal_id "
+                "AND reply.created_event_position > rp.read_through_event_position "
+                "WHERE rp.followed = 1",
+            )
+            missing_channels = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_memberships cm "
+                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+                "LEFT JOIN channel_read_positions rp ON rp.principal_id = cm.principal_id "
+                "AND rp.channel_id = cm.channel_id WHERE rp.principal_id IS NULL",
+            )
+            missing_threads = _scalar(
+                connection,
+                "WITH cutover AS (SELECT baseline_event_position AS position "
+                "FROM thread_unread_authority_cutover WHERE singleton = 1), candidates AS ("
+                "SELECT m.author_principal_id AS principal_id, m.channel_id, "
+                "COALESCE(m.thread_root_id, m.id) AS thread_root_id "
+                "FROM messages m JOIN principals p ON p.id = m.author_principal_id AND p.kind = 'human' "
+                "JOIN channel_read_positions crp ON crp.principal_id = m.author_principal_id "
+                "AND crp.channel_id = m.channel_id JOIN channels c ON c.id = m.channel_id AND c.kind = 'group' "
+                "JOIN cutover ON m.created_event_position > cutover.position "
+                "WHERE m.created_event_position >= crp.membership_baseline_event_position "
+                "UNION SELECT json_extract(mention.value, '$.principal_id'), m.channel_id, "
+                "COALESCE(m.thread_root_id, m.id) FROM messages m, json_each(m.mentions_json) mention "
+                "JOIN cutover ON m.created_event_position > cutover.position "
+                "JOIN channel_read_positions crp "
+                "ON crp.principal_id = json_extract(mention.value, '$.principal_id') "
+                "AND crp.channel_id = m.channel_id JOIN channels c ON c.id = m.channel_id AND c.kind = 'group' "
+                "WHERE json_extract(mention.value, '$.kind') = 'human' "
+                "AND m.created_event_position >= crp.membership_baseline_event_position) "
+                "SELECT COUNT(*) FROM candidates candidate LEFT JOIN thread_read_positions rp "
+                "ON rp.principal_id = candidate.principal_id "
+                "AND rp.thread_root_id = candidate.thread_root_id WHERE rp.principal_id IS NULL",
+            )
+            orphaned_channels = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_read_positions rp "
+                "LEFT JOIN channel_memberships cm ON cm.principal_id = rp.principal_id "
+                "AND cm.channel_id = rp.channel_id "
+                "LEFT JOIN principals p ON p.id = rp.principal_id "
+                "WHERE cm.principal_id IS NULL OR p.kind IS NULL OR p.kind != 'human'",
+            )
+            orphaned_threads = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM thread_read_positions rp "
+                "LEFT JOIN channel_memberships cm ON cm.principal_id = rp.principal_id "
+                "AND cm.channel_id = rp.channel_id "
+                "LEFT JOIN principals p ON p.id = rp.principal_id "
+                "LEFT JOIN messages root ON root.id = rp.thread_root_id "
+                "LEFT JOIN channels c ON c.id = rp.channel_id "
+                "WHERE cm.principal_id IS NULL OR p.kind IS NULL OR p.kind != 'human' "
+                "OR root.id IS NULL OR root.channel_id != rp.channel_id "
+                "OR root.thread_root_id IS NOT NULL OR c.kind IS NULL OR c.kind != 'group'",
+            )
+            stale_channels = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_read_positions rp "
+                "LEFT JOIN messages boundary ON boundary.id = rp.read_through_message_id "
+                "WHERE rp.membership_baseline_event_position > ? "
+                "OR rp.read_through_event_position < rp.membership_baseline_event_position "
+                "OR rp.last_event_position < rp.membership_baseline_event_position "
+                "OR rp.last_event_position > ? "
+                "OR (rp.state_version = 0 AND (rp.read_through_event_position "
+                "!= rp.membership_baseline_event_position OR rp.read_through_message_id IS NOT NULL "
+                "OR rp.last_event_position != rp.membership_baseline_event_position)) "
+                "OR (rp.state_version > 0 AND rp.read_through_message_id IS NULL) "
+                "OR (rp.read_through_message_id IS NOT NULL AND (boundary.id IS NULL "
+                "OR boundary.channel_id != rp.channel_id OR boundary.thread_root_id IS NOT NULL "
+                "OR boundary.created_event_position != rp.read_through_event_position))",
+                (tip, tip),
+            )
+            stale_threads = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM thread_read_positions rp "
+                "LEFT JOIN messages boundary ON boundary.id = rp.read_through_message_id "
+                "WHERE rp.follow_baseline_event_position > ? "
+                "OR rp.read_through_event_position < rp.follow_baseline_event_position "
+                "OR rp.last_event_position < rp.follow_baseline_event_position "
+                "OR rp.last_event_position > ? OR rp.read_through_message_id IS NULL "
+                "OR boundary.id IS NULL OR boundary.channel_id != rp.channel_id "
+                "OR (boundary.id != rp.thread_root_id AND boundary.thread_root_id != rp.thread_root_id) "
+                "OR boundary.created_event_position != rp.read_through_event_position",
+                (tip, tip),
+            )
+            cutover_gaps = _scalar(
+                connection,
+                "SELECT CASE WHEN COUNT(*) = 1 "
+                "AND MIN(singleton) = 1 AND MIN(baseline_event_position) >= 0 "
+                "AND MAX(baseline_event_position) <= ? THEN 0 ELSE 1 END "
+                "FROM thread_unread_authority_cutover",
+                (tip,),
+            )
+            baseline_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_unread_migration_baselines b "
+                "LEFT JOIN principals p ON p.id = b.principal_id "
+                "LEFT JOIN channels c ON c.id = b.channel_id "
+                "WHERE p.id IS NULL OR c.id IS NULL OR b.baseline_event_position > ?",
+                (tip,),
+            )
+            channel_replay_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_read_positions rp LEFT JOIN event_log e "
+                "ON e.position = rp.last_event_position "
+                "WHERE (rp.state_version = 0 AND (rp.last_event_position "
+                "!= rp.membership_baseline_event_position "
+                "OR rp.read_through_event_position != rp.membership_baseline_event_position "
+                "OR rp.read_through_message_id IS NOT NULL)) "
+                "OR (rp.state_version > 0 AND (e.event_type IS NULL "
+                "OR e.event_type != 'channel_read_position.advanced' "
+                "OR e.actor_principal_id != rp.principal_id "
+                "OR json_extract(e.payload_json, '$.channel_id') != rp.channel_id "
+                "OR json_extract(e.payload_json, '$.message_id') != rp.read_through_message_id "
+                "OR json_extract(e.payload_json, '$.expected_state_version') != rp.state_version - 1)) "
+                "OR rp.state_version != (SELECT COUNT(*) FROM event_log advanced "
+                "WHERE advanced.event_type = 'channel_read_position.advanced' "
+                "AND advanced.actor_principal_id = rp.principal_id "
+                "AND json_extract(advanced.payload_json, '$.channel_id') = rp.channel_id "
+                "AND advanced.position > rp.membership_baseline_event_position)",
+            )
+            thread_replay_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM thread_read_positions rp LEFT JOIN event_log e "
+                "ON e.position = rp.last_event_position LEFT JOIN messages source "
+                "ON source.created_event_position = e.position "
+                "WHERE e.event_type IS NULL OR e.event_type NOT IN ('message.created', "
+                "'thread.followed', 'thread.unfollowed', 'thread_read_position.advanced') "
+                "OR (e.event_type IN ('thread.followed', 'thread.unfollowed', "
+                "'thread_read_position.advanced') AND (e.actor_principal_id != rp.principal_id "
+                "OR json_extract(e.payload_json, '$.channel_id') != rp.channel_id "
+                "OR json_extract(e.payload_json, '$.thread_root_id') != rp.thread_root_id "
+                "OR json_extract(e.payload_json, '$.expected_state_version') != rp.state_version - 1)) "
+                "OR (e.event_type = 'thread.followed' AND rp.followed != 1) "
+                "OR (e.event_type = 'thread.unfollowed' AND rp.followed != 0) "
+                "OR (e.event_type = 'thread_read_position.advanced' "
+                "AND (rp.followed != 1 OR json_extract(e.payload_json, '$.message_id') "
+                "!= rp.read_through_message_id)) "
+                "OR (e.event_type = 'message.created' AND (rp.followed != 1 OR source.id IS NULL "
+                "OR source.channel_id != rp.channel_id "
+                "OR COALESCE(source.thread_root_id, source.id) != rp.thread_root_id "
+                "OR (source.author_principal_id != rp.principal_id AND NOT EXISTS ("
+                "SELECT 1 FROM json_each(source.mentions_json) mention "
+                "WHERE json_extract(mention.value, '$.kind') = 'human' "
+                "AND json_extract(mention.value, '$.principal_id') = rp.principal_id))))",
+            )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    missing = missing_channels + missing_threads
+    stale = stale_channels + stale_threads
+    orphaned = orphaned_channels + orphaned_threads
+    integrity_gaps = cutover_gaps + baseline_gaps
+    replay_gaps = channel_replay_gaps + thread_replay_gaps
+    state = "active" if missing == stale == orphaned == integrity_gaps == replay_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; principals={principals}, channels={channels}, eligible lanes={eligible}, "
+        f"channel positions={positions}, cutover baselines={baselines}, "
+        f"thread positions={thread_positions} (followed={followed_threads}), "
+        f"unread messages={unread_messages}, unread replies={unread_replies}; "
+        f"missing={missing}, stale={stale}, orphaned={orphaned}, "
+        f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; "
+        "authority=canonical, storage=bounded cursors"
+    )
+
+
 def workshop_transcript_authority_status(db_path: Path) -> str:
     """Describe the durable protected direct-interaction transcript cutover."""
     prefix = "Workshop transcript authority:"
