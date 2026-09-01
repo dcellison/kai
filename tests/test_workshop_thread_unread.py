@@ -386,6 +386,16 @@ class TestFollowedThreadUnreadAuthority:
             assert state_response.status == 200
             initial = await state_response.json()
             assert initial["state"]["followed"] is True
+            malformed = await client.post(
+                f"{thread_path}/read-position",
+                headers={"Authorization": "Bearer daniel"},
+                json={
+                    "message_id": 7,
+                    "expected_state_version": initial["state"]["state_version"],
+                    "client_operation_id": "malformed-thread-read",
+                },
+            )
+            assert malformed.status == 400
 
             async with context.store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
                 tip_row = await cursor.fetchone()

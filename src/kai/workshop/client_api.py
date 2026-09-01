@@ -5373,14 +5373,24 @@ async def _handle_thread_read_position(
     payload = await _read_human_notification_mutation_payload(request)
     if payload is None or set(payload) != _THREAD_READ_POSITION_FIELDS:
         return _error_response(status=400, code="invalid_request", message="Invalid thread read-position mutation")
+    message_id = payload["message_id"]
+    expected_state_version = payload["expected_state_version"]
+    client_operation_id = payload["client_operation_id"]
+    if (
+        not isinstance(message_id, str)
+        or not isinstance(expected_state_version, int)
+        or isinstance(expected_state_version, bool)
+        or not isinstance(client_operation_id, str)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid thread read-position mutation")
     try:
         mutation = await service.advance(
             principal_id,
             ChannelId(request.match_info["channel_id"]),
             MessageId(request.match_info["root_message_id"]),
-            MessageId(payload["message_id"]),
-            expected_state_version=payload["expected_state_version"],
-            client_operation_id=payload["client_operation_id"],
+            MessageId(message_id),
+            expected_state_version=expected_state_version,
+            client_operation_id=client_operation_id,
         )
     except (TypeError, ValueError, WorkshopThreadUnreadValidationError):
         return _error_response(status=400, code="invalid_request", message="Invalid thread read-position mutation")
