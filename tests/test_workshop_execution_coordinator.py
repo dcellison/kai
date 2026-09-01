@@ -220,6 +220,37 @@ class TestCanonicalExecutionCoordinator:
         finally:
             await store.close()
 
+    async def test_owner_runtime_continuity_ignores_a_distinct_access_profile(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, run = await _accepted(tmp_path / "kai.db")
+        access_profile = RuntimeProfileId.new()
+        try:
+            await store.connection.execute(
+                "UPDATE channel_agent_runtime_assignments SET runtime_profile_id = ? "
+                "WHERE channel_id = ? AND agent_id = ?",
+                (access_profile, run.channel_id, run.agent_id),
+            )
+            await store.connection.execute(
+                "UPDATE principal_agent_enablements SET runtime_profile_id = ? "
+                "WHERE direct_channel_id = ? AND agent_id = ?",
+                (access_profile, run.channel_id, run.agent_id),
+            )
+            await store.connection.commit()
+
+            result = await _coordinator(store, _Preparation(_Prepared(run))).execute(run.run_id)
+
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            session = await load_runtime_session(store, run.channel_id, run.agent_id)
+            assert session is not None
+            assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
+            assert workshop_runtime_session_status(tmp_path / "kai.db").startswith(
+                "Workshop conversation continuity: active; successful lanes=1, sessions=1"
+            )
+        finally:
+            await store.close()
+
     async def test_retired_successful_lane_does_not_require_a_live_provider_session(
         self,
         tmp_path: Path,

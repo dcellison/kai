@@ -123,13 +123,27 @@ async def settle_runtime_session_in_transaction(
     _require_text(settlement.workspace, "workspace")
     when = _timestamp(occurred_at)
 
-    async with store.connection.execute(
-        "SELECT runtime_profile_id FROM channel_agent_runtime_assignments WHERE channel_id = ? AND agent_id = ?",
-        (settlement.channel_id, settlement.agent_id),
-    ) as cursor:
-        assignment = await cursor.fetchone()
-    if assignment is None or str(assignment[0]) != settlement.runtime_profile_id:
-        raise RuntimeSessionStateConflictError("Runtime session does not match current canonical assignment")
+    async with store.connection.execute("PRAGMA table_info(agent_definitions)") as cursor:
+        definition_columns = {str(row[1]) for row in await cursor.fetchall()}
+    if "owner_runtime_profile_id" in definition_columns:
+        async with store.connection.execute(
+            "SELECT CASE WHEN d.lifecycle_state = 'active' THEN "
+            "COALESCE(d.owner_runtime_profile_id, ca.sponsored_runtime_profile_id, ra.runtime_profile_id) "
+            "END FROM channel_agents ca JOIN agent_definitions d ON d.agent_id = ca.agent_id "
+            "LEFT JOIN channel_agent_runtime_assignments ra ON ra.channel_id = ca.channel_id "
+            "AND ra.agent_id = ca.agent_id WHERE ca.channel_id = ? AND ca.agent_id = ? "
+            "AND ca.detached_at IS NULL",
+            (settlement.channel_id, settlement.agent_id),
+        ) as cursor:
+            authority = await cursor.fetchone()
+    else:
+        async with store.connection.execute(
+            "SELECT runtime_profile_id FROM channel_agent_runtime_assignments WHERE channel_id = ? AND agent_id = ?",
+            (settlement.channel_id, settlement.agent_id),
+        ) as cursor:
+            authority = await cursor.fetchone()
+    if authority is None or authority[0] is None or str(authority[0]) != settlement.runtime_profile_id:
+        raise RuntimeSessionStateConflictError("Runtime session does not match current canonical authority")
 
     existing = await load_runtime_session(store, settlement.channel_id, settlement.agent_id)
     expected = (
