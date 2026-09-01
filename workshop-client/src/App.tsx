@@ -1595,7 +1595,7 @@ function ArchivedChannelsDialog({
   );
 }
 
-function ArchivedAgentsDialog({
+function InactiveAgentsDialog({
   agents,
   onClose,
   onView,
@@ -1610,39 +1610,41 @@ function ArchivedAgentsDialog({
         className="channel-creation-dialog channel-archive-dialog"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="agent-archive-title"
+        aria-labelledby="inactive-agents-title"
       >
         <header className="channel-archive-header">
           <div>
             <p className="overline">Agents</p>
-            <h2 id="agent-archive-title">Archive</h2>
+            <h2 id="inactive-agents-title">Drafts and archive</h2>
           </div>
           <button
             className="panel-icon-button"
             type="button"
-            aria-label="Close agent archive"
-            title="Close agent archive"
+            aria-label="Close drafts and archive"
+            title="Close drafts and archive"
             onClick={onClose}
           >
             <span aria-hidden="true">×</span>
           </button>
         </header>
         {agents.length === 0 ? (
-          <p className="channel-archive-empty">No archived agents.</p>
+          <p className="channel-archive-empty">No draft or archived agents.</p>
         ) : (
           <ul className="channel-archive-list">
             {agents.map((agent) => (
               <li key={agent.definitionId}>
                 <span>
                   <strong>{agent.displayName}</strong>
-                  <small>@{agent.handle}</small>
+                  <small>@{agent.handle} · {agent.lifecycleState}</small>
                 </span>
                 <span className="channel-archive-actions">
                   <button
                     className="panel-icon-button"
                     type="button"
-                    aria-label={`View archived agent ${agent.displayName}`}
-                    title="View archived agent"
+                    aria-label={
+                      `View ${agent.lifecycleState} agent ${agent.displayName}`
+                    }
+                    title={`View ${agent.lifecycleState} agent`}
                     onClick={() => onView(agent.definitionId)}
                   >
                     <ViewIcon />
@@ -3283,8 +3285,8 @@ function WorkshopView({
                 <button
                   className="nav-tool-button"
                   type="button"
-                  aria-label="Archived agents"
-                  title="Archived agents"
+                  aria-label="Drafts and archived agents"
+                  title="Drafts and archived agents"
                   onClick={() => setArchivedAgentsOpen(true)}
                 >
                   <ArchiveIcon />
@@ -3406,6 +3408,7 @@ function WorkshopView({
           onNavigationChanged={synchronizeAgentNavigation}
           onOpenChannel={onOpenAgentChannel}
           onSelectAgent={onSelectAgent}
+          principalId={navigation.principal.principalId}
           principalName={humanName}
           runActive={isRunActive(activeRun)}
           token={agentToken}
@@ -4066,9 +4069,9 @@ function WorkshopView({
         </>
       )}
       {archivedAgentsOpen && (
-        <ArchivedAgentsDialog
+        <InactiveAgentsDialog
           agents={agentDefinitions
-            .filter((agent) => agent.lifecycleState === "archived")
+            .filter((agent) => agent.lifecycleState !== "active")
             .sort((left, right) => left.displayName.localeCompare(right.displayName))}
           onClose={() => setArchivedAgentsOpen(false)}
           onView={(definitionId) => {
