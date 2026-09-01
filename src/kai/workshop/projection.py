@@ -1376,7 +1376,7 @@ class CanonicalConversationProjection:
                         "read_through_event_position = excluded.read_through_event_position, "
                         "read_through_message_id = NULL, state_version = 0, "
                         "last_event_position = excluded.last_event_position, updated_at = excluded.updated_at",
-                        (principal_id, channel_id, baseline, baseline, event.position, occurred_at),
+                        (principal_id, channel_id, baseline, baseline, baseline, occurred_at),
                     )
             if envelope.event_version == 2:
                 await connection.execute(

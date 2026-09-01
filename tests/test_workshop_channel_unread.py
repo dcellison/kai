@@ -371,6 +371,9 @@ class TestChannelUnreadAuthority:
             state = await WorkshopChannelUnreadService(store).channel(scott_id, channel_id)
             assert state.unread_count == 0
             assert state.read_through_event_position == state.membership_baseline_event_position
+            assert state.last_event_position == state.membership_baseline_event_position
+            await store.rebuild_projection(CanonicalConversationProjection())
+            assert await WorkshopChannelUnreadService(store).channel(scott_id, channel_id) == state
         finally:
             await store.close()
 
