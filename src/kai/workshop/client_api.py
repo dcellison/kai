@@ -263,7 +263,6 @@ _AGENT_ARCHIVAL_PATH = "/v1/client/agents/{definition_id}/archive"
 _AGENT_ENABLEMENTS_PATH = "/v1/client/agent-enablement"
 _AGENT_ENABLEMENT_PATH = "/v1/client/agents/{definition_id}/enablement"
 _AGENT_ENABLE_PATH = "/v1/client/agents/{definition_id}/enable"
-_AGENT_DISABLE_PATH = "/v1/client/agents/{definition_id}/disable"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
@@ -4198,7 +4197,6 @@ async def _handle_agent_enablement_mutation(
     *,
     authenticator: WorkshopClientAuthenticator,
     service: WorkshopAgentEnablementService,
-    enable: bool,
 ) -> web.Response:
     principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
     if error is not None:
@@ -4208,40 +4206,18 @@ async def _handle_agent_enablement_mutation(
         return _error_response(status=400, code="invalid_request", message="Invalid agent enablement request")
     try:
         payload = await request.json()
-        allowed = (
-            {"idempotency_key", "expected_version", "runtime_profile_id"}
-            if enable
-            else {
-                "idempotency_key",
-                "expected_version",
-            }
-        )
-        required = (
-            {"idempotency_key", "runtime_profile_id"}
-            if enable
-            else {
-                "idempotency_key",
-                "expected_version",
-            }
-        )
+        allowed = {"idempotency_key", "expected_version", "runtime_profile_id"}
+        required = {"idempotency_key", "runtime_profile_id"}
         if not isinstance(payload, dict) or not required.issubset(payload) or not set(payload).issubset(allowed):
             raise WorkshopAgentEnablementValidationError("Invalid agent enablement payload")
         definition_id = _agent_definition_id(request)
-        if enable:
-            snapshot = await service.enable(
-                principal_id,
-                definition_id,
-                RuntimeProfileId(payload["runtime_profile_id"]),
-                idempotency_key=payload["idempotency_key"],
-                expected_version=payload.get("expected_version"),
-            )
-        else:
-            snapshot = await service.disable(
-                principal_id,
-                definition_id,
-                idempotency_key=payload["idempotency_key"],
-                expected_version=payload["expected_version"],
-            )
+        snapshot = await service.enable(
+            principal_id,
+            definition_id,
+            RuntimeProfileId(payload["runtime_profile_id"]),
+            idempotency_key=payload["idempotency_key"],
+            expected_version=payload.get("expected_version"),
+        )
     except (TypeError, ValueError):
         return _error_response(status=400, code="invalid_request", message="Invalid agent enablement request")
     except WorkshopAgentLifecycleError:
@@ -6153,22 +6129,11 @@ def register_workshop_read_routes(
                     request,
                     authenticator=authenticator,
                     service=agent_enablement,
-                    enable=True,
-                )
-
-        async def handle_agent_disable(request: web.Request) -> web.Response:
-            async with request_lock:
-                return await _handle_agent_enablement_mutation(
-                    request,
-                    authenticator=authenticator,
-                    service=agent_enablement,
-                    enable=False,
                 )
 
         app.router.add_get(_AGENT_ENABLEMENTS_PATH, handle_agent_enablement_list)
         app.router.add_get(_AGENT_ENABLEMENT_PATH, handle_agent_enablement_detail)
         app.router.add_post(_AGENT_ENABLE_PATH, handle_agent_enable)
-        app.router.add_post(_AGENT_DISABLE_PATH, handle_agent_disable)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_CHANNEL_MESSAGE_PATH, handle_channel_message)
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)

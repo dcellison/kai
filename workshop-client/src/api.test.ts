@@ -19,7 +19,6 @@ import {
   deactivateOperatorModel,
   detachChannelAgent,
   dismissChannelAgent,
-  disableAgentDefinition,
   editMemory,
   enableAgentDefinition,
   loadArtifactBlob,
@@ -2189,18 +2188,12 @@ describe("Workshop client API", () => {
       idempotencyKey: "enable-key",
       runtimeProfileId,
     });
-    await disableAgentDefinition("session-secret", agentDefinitionId, {
-      expectedVersion: 2,
-      idempotencyKey: "disable-key",
-    });
-
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
       "/v1/client/agents",
       `/v1/client/agents/${agentDefinitionId}/revisions`,
       `/v1/client/agents/${agentDefinitionId}/activate`,
       `/v1/client/agents/${agentDefinitionId}/archive`,
       `/v1/client/agents/${agentDefinitionId}/enable`,
-      `/v1/client/agents/${agentDefinitionId}/disable`,
     ]);
     expect(JSON.parse(String(fetchMock.mock.calls[4][1]?.body))).toEqual({
       idempotency_key: "enable-key",
