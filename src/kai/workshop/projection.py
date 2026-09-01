@@ -1428,6 +1428,11 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop membership removal has no matching participant")
+            if await _table_has_column(connection, "channel_read_positions", "principal_id"):
+                await connection.execute(
+                    "DELETE FROM channel_read_positions WHERE principal_id = ? AND channel_id = ?",
+                    (principal_id, channel_id),
+                )
             if await _table_has_column(connection, "thread_read_positions", "principal_id"):
                 await connection.execute(
                     "DELETE FROM thread_read_positions WHERE principal_id = ? AND channel_id = ?",

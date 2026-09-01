@@ -94,6 +94,7 @@ from kai.workshop.diagnostics import (
     workshop_runtime_session_status,
     workshop_transcript_authority_status,
     workshop_transition_tooling_status,
+    workshop_unread_authority_status,
 )
 from kai.workshop.domain import RuntimeProfileId, WorkshopId
 from kai.workshop.human_provisioning import provisioned_human_ids
@@ -9560,6 +9561,7 @@ def _cmd_status() -> None:
     print(workshop_human_handle_status(Path(data_dir) / "kai.db"))
     print(workshop_human_notification_status(Path(data_dir) / "kai.db"))
     print(workshop_channel_notification_policy_status(Path(data_dir) / "kai.db"))
+    print(workshop_unread_authority_status(Path(data_dir) / "kai.db"))
     print(_channel_lifecycle_status(Path(data_dir) / "kai.db"))
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))

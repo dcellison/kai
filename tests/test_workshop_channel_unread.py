@@ -20,6 +20,7 @@ from kai.workshop.channel_unread import (
     WorkshopChannelUnreadService,
 )
 from kai.workshop.client_api import register_workshop_read_routes
+from kai.workshop.diagnostics import workshop_unread_authority_status
 from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId
 from kai.workshop.inbound import ClientInboundMessage, record_client_inbound_message_in_transaction
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
@@ -269,6 +270,19 @@ class TestChannelUnreadAuthority:
         lifecycle = WorkshopChannelLifecycleService(store)
         service = WorkshopChannelUnreadService(store)
         try:
+            await _record(store, scott_id, channel_id, "before-removal", "before removal")
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_read_positions WHERE principal_id = ? AND channel_id = ?",
+                (scott_id, channel_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                assert row is not None and int(row[0]) == 1
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM thread_read_positions WHERE principal_id = ? AND channel_id = ?",
+                (scott_id, channel_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                assert row is not None and int(row[0]) == 1
             members = await lifecycle.human_members(daniel_id, channel_id)
             await lifecycle.remove_human_member(
                 daniel_id,
@@ -277,6 +291,18 @@ class TestChannelUnreadAuthority:
                 expected_state_version=members.state_version,
                 client_operation_id="remove-scott",
             )
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_read_positions WHERE principal_id = ? AND channel_id = ?",
+                (scott_id, channel_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                assert row is not None and int(row[0]) == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM thread_read_positions WHERE principal_id = ? AND channel_id = ?",
+                (scott_id, channel_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                assert row is not None and int(row[0]) == 0
             await _record(store, daniel_id, channel_id, "while-away", "while away")
             members = await lifecycle.human_members(daniel_id, channel_id)
             await lifecycle.add_human_member(
@@ -297,6 +323,64 @@ class TestChannelUnreadAuthority:
                 occurred_at=_NOW + timedelta(seconds=1),
             )
             assert (await service.channel(scott_id, channel_id)).unread_count == 1
+        finally:
+            await store.close()
+
+    async def test_diagnostic_is_content_free_and_rebuild_stable(self, tmp_path: Path) -> None:
+        path = tmp_path / "kai.db"
+        store, daniel_id, _scott_id, channel_id, _agent_id = await _context(path)
+        secret = "private unread diagnostic marker must never be rendered"
+        try:
+            await _record(store, daniel_id, channel_id, "diagnostic", secret)
+            before = workshop_unread_authority_status(path)
+            assert before.startswith("Workshop unread authority: active;")
+            assert "missing=0, stale=0, orphaned=0" in before
+            assert "integrity gaps=0, replay gaps=0" in before
+            assert "authority=canonical, storage=bounded cursors" in before
+            assert secret not in before
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            assert workshop_unread_authority_status(path) == before
+        finally:
+            await store.close()
+
+    async def test_diagnostic_fails_closed_for_damaged_cursor(self, tmp_path: Path) -> None:
+        path = tmp_path / "kai.db"
+        store, _daniel_id, scott_id, channel_id, _agent_id = await _context(path)
+        try:
+            await store.connection.execute(
+                "UPDATE channel_read_positions SET last_event_position = 9223372036854775807 "
+                "WHERE principal_id = ? AND channel_id = ?",
+                (scott_id, channel_id),
+            )
+            await store.connection.commit()
+
+            status = workshop_unread_authority_status(path)
+            assert status.startswith("Workshop unread authority: INCOMPLETE;")
+            assert "stale=1" in status
+            assert "replay gaps=1" in status
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            assert workshop_unread_authority_status(path).startswith("Workshop unread authority: active;")
+
+            await store.connection.execute(
+                "DELETE FROM channel_read_positions WHERE principal_id = ? AND channel_id = ?",
+                (scott_id, channel_id),
+            )
+            await store.connection.commit()
+            missing = workshop_unread_authority_status(path)
+            assert missing.startswith("Workshop unread authority: INCOMPLETE;")
+            assert "missing=1" in missing
+
+            await store.rebuild_projection(CanonicalConversationProjection())
+            await store.connection.execute(
+                "DELETE FROM channel_memberships WHERE principal_id = ? AND channel_id = ?",
+                (scott_id, channel_id),
+            )
+            await store.connection.commit()
+            orphaned = workshop_unread_authority_status(path)
+            assert orphaned.startswith("Workshop unread authority: INCOMPLETE;")
+            assert "orphaned=1" in orphaned
         finally:
             await store.close()
 
