@@ -2867,15 +2867,15 @@ describe("Workshop React client", () => {
     ).toBeVisible();
     expect(
       await screen.findByRole("heading", {
-        name: "Runtime and workspace",
-        level: 3,
+        name: "Runtime settings",
+        level: 2,
       }),
     ).toBeVisible();
     expect(screen.queryByText("Personal preferences")).toBeNull();
     expect(screen.queryByRole("button", { name: "Back to agent" })).toBeNull();
-    expect(
-      screen.getByText(/Your policy-bounded controls for Qualification agent/),
-    ).toBeVisible();
+    expect(screen.queryByText("Your runtime")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Runtime and workspace" })).toBeNull();
+    expect(screen.getByText(/These controls apply only to Qualification agent/)).toBeVisible();
     await waitFor(() => expect(loadSettingsWorkspace).toHaveBeenCalledWith({
       channelId: qualificationChannelId,
       token: "existing-session",
@@ -2897,8 +2897,8 @@ describe("Workshop React client", () => {
     render(<App />);
     expect(
       await screen.findByRole("heading", {
-        name: "Runtime and workspace",
-        level: 3,
+        name: "Runtime settings",
+        level: 2,
       }),
     ).toBeVisible();
     expect(
@@ -2920,8 +2920,8 @@ describe("Workshop React client", () => {
     render(<App />);
     expect(
       await screen.findByRole("heading", {
-        name: "Runtime and workspace",
-        level: 3,
+        name: "Runtime settings",
+        level: 2,
       }),
     ).toBeVisible();
     expect(

@@ -1036,33 +1036,23 @@ function SettingsWorkspaceContent({
   return (
     <section
       className={nativeRuntime ? "agent-runtime-controls" : "settings-workspace"}
-      aria-labelledby={titleId}
+      aria-labelledby={nativeRuntime ? undefined : titleId}
+      aria-label={nativeRuntime ? `${runtimeLabel} runtime and workspace settings` : undefined}
       id={nativeRuntime ? "agent-runtime-settings" : undefined}
     >
-      <header
-        className={nativeRuntime
-          ? "agent-runtime-controls-header"
-          : "settings-header"}
-      >
+      {!nativeRuntime && (
+      <header className="settings-header">
         <div>
           <p className="overline">
-            {nativeRuntime
-              ? "Your runtime"
-              : agentRuntime
+            {agentRuntime
                 ? "Agent runtime"
                 : "Personal workspace"}
           </p>
-          {nativeRuntime ? (
-            <h3 id={titleId}>Runtime and workspace</h3>
-          ) : (
-            <h1 id={titleId}>
-              {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
-            </h1>
-          )}
+          <h1 id={titleId}>
+            {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
+          </h1>
           <p>
-            {nativeRuntime
-              ? `Your policy-bounded controls for ${runtimeLabel}. The shared agent definition remains unchanged.`
-              : agentRuntime
+            {agentRuntime
               ? `Policy-bounded controls for ${runtimeLabel}`
               : `${principalName} · ${roleLabel}`}
           </p>
@@ -1079,6 +1069,7 @@ function SettingsWorkspaceContent({
           </button>
         )}
       </header>
+      )}
 
       {!nativeRuntime && (
         <nav className="settings-section-navigation" aria-label="Settings sections">
@@ -1230,7 +1221,6 @@ function SettingsWorkspaceContent({
         {agentRuntime && (
           <section className="settings-section" id="settings-section-runtime">
           <div>
-            <p className="section-number">01</p>
             <h2>Runtime settings</h2>
             <p>
               These controls apply only to {runtimeLabel}.{" "}
@@ -1242,7 +1232,8 @@ function SettingsWorkspaceContent({
             <p role="status">Loading runtime policy…</p>
           ) : runtime ? (
             <div className="settings-card-stack">
-              <div className="settings-card-pair">
+              <div className="settings-card-columns">
+                <div className="settings-card-column">
                 {runtimeBackendCapability && (
                 <form
                   className="settings-card"
@@ -1285,6 +1276,32 @@ function SettingsWorkspaceContent({
                 </form>
                 )}
 
+                {runtimeModelCapability && (
+                <form
+                  className="settings-card"
+                  onSubmit={(event: FormEvent) => {
+                    event.preventDefault();
+                    void mutateRuntime(
+                      { field: "model", value: runtimeModel },
+                      "Change the runtime model? The active runtime may restart and provider-session continuity will be cleared.",
+                    );
+                  }}
+                >
+                  <label htmlFor="runtime-model">Runtime model</label>
+                  {modelControl("runtime-model", runtimeModel, runtimeModelCapability.choices, setRuntimeModel)}
+                  <p>Effective: <strong>{runtime.model.value}</strong> · {runtime.model.source}</p>
+                  <p>Policy default: {runtime.model.defaultValue}</p>
+                  <div className="settings-actions">
+                    <button className="primary-button" type="submit" disabled={runtimeBusy || runtimeModel === runtime.model.value}>Apply</button>
+                    {runtimeModelCapability.resettable && (
+                      <button className="quiet-button" type="button" disabled={runtimeBusy || runtime.model.source === "runtime policy"} onClick={() => void mutateRuntime({ field: "reset", value: "model" }, "Reset the runtime model to protected policy? The active runtime may restart.")}>Reset</button>
+                    )}
+                  </div>
+                </form>
+                )}
+                </div>
+
+                <div className="settings-card-column">
                 <article className="settings-card policy-card">
                   <p className="settings-card-label">Policy-controlled</p>
                   <dl>
@@ -1292,6 +1309,31 @@ function SettingsWorkspaceContent({
                   </dl>
                   <p>Credentials, identity mappings, executable paths, assignments, and workspace grants remain operator managed.</p>
                 </article>
+
+                {runtimeTimeoutCapability && (
+                <form
+                  className="settings-card"
+                  onSubmit={(event: FormEvent) => {
+                    event.preventDefault();
+                    void mutateRuntime(
+                      { field: "timeout", value: Number(runtimeTimeout) },
+                      "Change the response timeout? The active runtime may restart and provider-session continuity will be cleared.",
+                    );
+                  }}
+                >
+                  <label htmlFor="runtime-timeout">Response timeout</label>
+                  <div className="settings-number-input"><input id="runtime-timeout" type="number" min={runtimeTimeoutCapability.minimum ?? undefined} max={runtimeTimeoutCapability.maximum ?? undefined} value={runtimeTimeout} onChange={(event) => setRuntimeTimeout(event.target.value)} /><span>seconds</span></div>
+                  <p>Effective: <strong>{runtime.timeoutSeconds.value}s</strong> · {runtime.timeoutSeconds.source}</p>
+                  <p>Allowed: {runtimeTimeoutCapability.minimum}–{runtimeTimeoutCapability.maximum}s</p>
+                  <div className="settings-actions">
+                    <button className="primary-button" type="submit" disabled={runtimeBusy || !runtimeTimeout || Number(runtimeTimeout) === runtime.timeoutSeconds.value}>Apply</button>
+                    {runtimeTimeoutCapability.resettable && (
+                      <button className="quiet-button" type="button" disabled={runtimeBusy || runtime.timeoutSeconds.source === "runtime policy"} onClick={() => void mutateRuntime({ field: "reset", value: "timeout" }, "Reset the timeout to protected policy? The active runtime may restart.")}>Reset</button>
+                    )}
+                  </div>
+                </form>
+                )}
+                </div>
               </div>
 
               <details className="settings-card model-catalogue-card">
@@ -1411,55 +1453,6 @@ function SettingsWorkspaceContent({
                 </div>
               </details>
 
-              <div className="settings-card-pair">
-                {runtimeModelCapability && (
-                <form
-                  className="settings-card"
-                  onSubmit={(event: FormEvent) => {
-                    event.preventDefault();
-                    void mutateRuntime(
-                      { field: "model", value: runtimeModel },
-                      "Change the runtime model? The active runtime may restart and provider-session continuity will be cleared.",
-                    );
-                  }}
-                >
-                  <label htmlFor="runtime-model">Runtime model</label>
-                  {modelControl("runtime-model", runtimeModel, runtimeModelCapability.choices, setRuntimeModel)}
-                  <p>Effective: <strong>{runtime.model.value}</strong> · {runtime.model.source}</p>
-                  <p>Policy default: {runtime.model.defaultValue}</p>
-                  <div className="settings-actions">
-                    <button className="primary-button" type="submit" disabled={runtimeBusy || runtimeModel === runtime.model.value}>Apply</button>
-                    {runtimeModelCapability.resettable && (
-                      <button className="quiet-button" type="button" disabled={runtimeBusy || runtime.model.source === "runtime policy"} onClick={() => void mutateRuntime({ field: "reset", value: "model" }, "Reset the runtime model to protected policy? The active runtime may restart.")}>Reset</button>
-                    )}
-                  </div>
-                </form>
-                )}
-
-                {runtimeTimeoutCapability && (
-                <form
-                  className="settings-card"
-                  onSubmit={(event: FormEvent) => {
-                    event.preventDefault();
-                    void mutateRuntime(
-                      { field: "timeout", value: Number(runtimeTimeout) },
-                      "Change the response timeout? The active runtime may restart and provider-session continuity will be cleared.",
-                    );
-                  }}
-                >
-                  <label htmlFor="runtime-timeout">Response timeout</label>
-                  <div className="settings-number-input"><input id="runtime-timeout" type="number" min={runtimeTimeoutCapability.minimum ?? undefined} max={runtimeTimeoutCapability.maximum ?? undefined} value={runtimeTimeout} onChange={(event) => setRuntimeTimeout(event.target.value)} /><span>seconds</span></div>
-                  <p>Effective: <strong>{runtime.timeoutSeconds.value}s</strong> · {runtime.timeoutSeconds.source}</p>
-                  <p>Allowed: {runtimeTimeoutCapability.minimum}–{runtimeTimeoutCapability.maximum}s</p>
-                  <div className="settings-actions">
-                    <button className="primary-button" type="submit" disabled={runtimeBusy || !runtimeTimeout || Number(runtimeTimeout) === runtime.timeoutSeconds.value}>Apply</button>
-                    {runtimeTimeoutCapability.resettable && (
-                      <button className="quiet-button" type="button" disabled={runtimeBusy || runtime.timeoutSeconds.source === "runtime policy"} onClick={() => void mutateRuntime({ field: "reset", value: "timeout" }, "Reset the timeout to protected policy? The active runtime may restart.")}>Reset</button>
-                    )}
-                  </div>
-                </form>
-                )}
-              </div>
             </div>
           ) : (
             <div className="settings-failure"><p role="alert">{runtimeError ?? "Runtime settings are unavailable."}</p><button className="quiet-button" type="button" onClick={() => void refreshRuntime()}>Retry</button></div>
@@ -1472,7 +1465,6 @@ function SettingsWorkspaceContent({
         {agentRuntime && runtime && workspaceConfig && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">02</p>
               <h2>Workspace settings</h2>
               <p>Choose an existing authorized workspace and manage overrides that apply only within it.</p>
             </div>
@@ -1495,7 +1487,8 @@ function SettingsWorkspaceContent({
               </select>
             </div>
             <div className="settings-card-stack workspace-overrides">
-              <div className="settings-card-pair">
+              <div className="settings-card-columns">
+                <div className="settings-card-column">
                 {workspaceModelCapability && (
                   <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "model", value: workspaceModel }, "Apply this model only to the active workspace? The active runtime may restart."); }}>
                     <label htmlFor="workspace-model">Workspace model override</label>
@@ -1504,6 +1497,16 @@ function SettingsWorkspaceContent({
                     <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || workspaceModel === workspaceConfig.model.value}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("model")} onClick={() => void mutateWorkspace({ field: "reset", value: "model" }, "Remove this workspace model override?")}>Reset</button></div>
                   </form>
                 )}
+                {workspacePromptCapability && (
+                  <form className="settings-card prompt-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "prompt", value: workspacePrompt }, "Apply this system prompt only to the active workspace? The active runtime may restart."); }}>
+                    <label htmlFor="workspace-prompt">Workspace system prompt</label>
+                    <textarea id="workspace-prompt" rows={7} maxLength={workspacePromptCapability.maximum ?? undefined} value={workspacePrompt} onChange={(event) => setWorkspacePrompt(event.target.value)} />
+                    <p>{workspaceConfig.hasPrompt ? `Effective source: ${workspaceConfig.promptSource ?? "workspace"}` : "No workspace prompt is active."}</p>
+                    <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || workspacePrompt === (workspaceConfig.prompt ?? "")}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("prompt")} onClick={() => void mutateWorkspace({ field: "reset", value: "prompt" }, "Remove this workspace prompt override?")}>Reset</button></div>
+                  </form>
+                )}
+                </div>
+                <div className="settings-card-column">
                 {workspaceTimeoutCapability && (
                   <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "timeout", value: workspaceTimeout }, "Apply this timeout only to the active workspace? The active runtime may restart."); }}>
                     <label htmlFor="workspace-timeout">Workspace timeout override</label>
@@ -1512,22 +1515,14 @@ function SettingsWorkspaceContent({
                     <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || !workspaceTimeout || Number(workspaceTimeout) === workspaceConfig.timeoutSeconds.value}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("timeout")} onClick={() => void mutateWorkspace({ field: "reset", value: "timeout" }, "Remove this workspace timeout override?")}>Reset</button></div>
                   </form>
                 )}
+                </div>
               </div>
-              {workspacePromptCapability && (
-                <form className="settings-card prompt-card" onSubmit={(event) => { event.preventDefault(); void mutateWorkspace({ field: "prompt", value: workspacePrompt }, "Apply this system prompt only to the active workspace? The active runtime may restart."); }}>
-                  <label htmlFor="workspace-prompt">Workspace system prompt</label>
-                  <textarea id="workspace-prompt" rows={7} maxLength={workspacePromptCapability.maximum ?? undefined} value={workspacePrompt} onChange={(event) => setWorkspacePrompt(event.target.value)} />
-                  <p>{workspaceConfig.hasPrompt ? `Effective source: ${workspaceConfig.promptSource ?? "workspace"}` : "No workspace prompt is active."}</p>
-                  <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || workspacePrompt === (workspaceConfig.prompt ?? "")}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("prompt")} onClick={() => void mutateWorkspace({ field: "reset", value: "prompt" }, "Remove this workspace prompt override?")}>Reset</button></div>
-                </form>
-              )}
             </div>
           </section>
         )}
         {agentRuntime && runtime && !workspaceConfig && !runtimeLoading && (
           <section className="settings-section" id="settings-section-workspace">
             <div>
-              <p className="section-number">02</p>
               <h2>Workspace settings</h2>
               <p>Runtime settings remain available, but workspace-specific overrides could not be loaded.</p>
             </div>
@@ -1553,7 +1548,8 @@ function SettingsWorkspaceContent({
           {githubLoading ? (
             <p role="status">Loading GitHub settings…</p>
           ) : github ? (
-            <div className="settings-card-grid github-settings-grid">
+            <div className="settings-card-columns github-settings-grid">
+              <div className="settings-card-column">
               <article className="settings-card policy-card">
                 <p className="settings-card-label">Protected identity</p>
                 <dl>
@@ -1634,7 +1630,9 @@ function SettingsWorkspaceContent({
                   </div>
                 </div>
               </article>
+              </div>
 
+              <div className="settings-card-column">
               <article className="settings-card github-repositories-card">
                 <p className="settings-card-label">Subscribed repositories</p>
                 {github.repositories.length > 0 ? (
@@ -1768,6 +1766,7 @@ function SettingsWorkspaceContent({
                   )}
                 </div>
               </form>
+              </div>
             </div>
           ) : (
             <div className="settings-failure">
@@ -1820,7 +1819,8 @@ function SettingsWorkspaceContent({
             </div>
           )}
           {(channelNotifications || notifications) && (
-            <div className="settings-card-grid notification-preference-grid">
+            <div className="settings-card-columns notification-preference-grid">
+              <div className="settings-card-column">
               {channelNotifications?.adapterDeliveries.map((adapter) => (
                 <article className="settings-card" key={`adapter-${adapter.transport}`}>
                   <label className="settings-checkbox-row">
@@ -1865,6 +1865,8 @@ function SettingsWorkspaceContent({
                   <p>{channel.source}</p>
                 </article>
               ))}
+              </div>
+              <div className="settings-card-column">
               {channelNotifications && (
                 <>
                   <article className="settings-card">
@@ -2010,6 +2012,7 @@ function SettingsWorkspaceContent({
                   </article>
                 );
               })}
+              </div>
             </div>
           )}
           {channelNotificationNotice && (
@@ -2037,6 +2040,8 @@ function SettingsWorkspaceContent({
             </p>
           </div>
           <div className="settings-client-preferences">
+          <div className="settings-card-columns">
+          <div className="settings-card-column">
           {appearanceLoading ? (
             <p role="status">Loading Workshop appearance…</p>
           ) : appearance ? (
@@ -2069,13 +2074,13 @@ function SettingsWorkspaceContent({
               </button>
             </div>
           )}
-          {appearanceNotice && <p className="settings-notice" role="status">{appearanceNotice}</p>}
-          {appearanceError && appearance && <p className="settings-error" role="alert">{appearanceError}</p>}
+          </div>
+          <div className="settings-card-column">
           {clientLoading ? (
             <p role="status">Loading client preferences…</p>
           ) : clients ? (
             clients.voiceOutput.bindings.length > 0 ? (
-              <div className="settings-card-grid">
+              <>
                 {clients.voiceOutput.bindings.map((binding) => (
                   <article className="settings-card" key={binding.choiceId}>
                     <h3>{binding.clientName} voice output</h3>
@@ -2114,7 +2119,7 @@ function SettingsWorkspaceContent({
                     </select>
                   </article>
                 ))}
-              </div>
+              </>
             ) : (
               <p>No voice-capable client binding is available for this account.</p>
             )
@@ -2126,6 +2131,10 @@ function SettingsWorkspaceContent({
               </button>
             </div>
           )}
+          </div>
+          </div>
+          {appearanceNotice && <p className="settings-notice" role="status">{appearanceNotice}</p>}
+          {appearanceError && appearance && <p className="settings-error" role="alert">{appearanceError}</p>}
           {clientNotice && <p className="settings-notice" role="status">{clientNotice}</p>}
           {clientError && clients && <p className="settings-error" role="alert">{clientError}</p>}
           </div>

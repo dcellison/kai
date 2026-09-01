@@ -2911,25 +2911,6 @@ button:disabled {
   border-top: 1px solid var(--color-border);
 }
 
-.agent-runtime-controls-header {
-  margin-bottom: 0.7rem;
-}
-
-.agent-runtime-controls-header h3 {
-  margin: 0;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.15rem;
-  font-weight: 560;
-}
-
-.agent-runtime-controls-header > div > p:last-child {
-  margin: 0.25rem 0 0;
-  color: var(--color-text-muted);
-  font-size: 0.72rem;
-  line-height: 1.55;
-}
-
 .agent-runtime-controls-body {
   min-width: 0;
 }
@@ -2942,18 +2923,16 @@ button:disabled {
 }
 
 .agent-runtime-controls .settings-section > div:first-child {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr);
-  align-items: baseline;
-  gap: 0.65rem;
   position: static;
   margin-bottom: 0.65rem;
 }
 
-.agent-runtime-controls .settings-section > div:first-child .section-number,
-.agent-runtime-controls .settings-section > div:first-child h2,
-.agent-runtime-controls .settings-section > div:first-child > p:last-child {
+.agent-runtime-controls .settings-section > div:first-child h2 {
   margin: 0;
+}
+
+.agent-runtime-controls .settings-section > div:first-child > p:last-child {
+  margin: 0.4rem 0 0;
 }
 
 .agent-runtime-controls .workspace-settings-heading,
@@ -2968,7 +2947,7 @@ button:disabled {
 }
 
 @container agent-runtime (max-width: 48rem) {
-  .agent-runtime-controls .settings-card-pair {
+  .agent-runtime-controls .settings-card-columns {
     grid-template-columns: 1fr;
   }
 
@@ -2989,16 +2968,6 @@ button:disabled {
   .agent-runtime-controls .model-catalogue-disclosure {
     grid-column: 2;
     grid-row: 1;
-  }
-}
-
-@container agent-runtime (max-width: 32rem) {
-  .agent-runtime-controls .settings-section > div:first-child {
-    grid-template-columns: auto minmax(0, 1fr);
-  }
-
-  .agent-runtime-controls .settings-section > div:first-child > p:last-child {
-    grid-column: 1 / -1;
   }
 }
 
@@ -3346,29 +3315,23 @@ button:disabled {
   font-size: 0.66rem;
 }
 
-.settings-card-grid {
-  column-count: 2;
-  column-gap: 0.75rem;
-}
-
 .settings-card-stack {
   display: grid;
   gap: 0.75rem;
 }
 
-.settings-card-pair {
+.settings-card-columns {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
   gap: 0.75rem;
 }
 
-.settings-card-pair > .settings-card {
-  width: 100%;
-}
-
-.settings-card-pair > .settings-card:only-child {
-  grid-column: 1 / -1;
+.settings-card-column {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.75rem;
 }
 
 .settings-client-preferences {
@@ -3430,12 +3393,8 @@ button:disabled {
   align-self: start;
 }
 
-.settings-card-grid > .settings-card {
-  display: inline-block;
+.settings-card-column > .settings-card {
   width: 100%;
-  margin: 0 0 0.75rem;
-  break-inside: avoid;
-  vertical-align: top;
 }
 
 .settings-card p {
@@ -3478,11 +3437,6 @@ button:disabled {
   margin: 0;
   color: var(--color-text-strong);
   font: 0.7rem var(--mono);
-}
-
-.settings-card-grid > .model-catalogue-card {
-  display: block;
-  column-span: all;
 }
 
 .model-catalogue-card > summary {
@@ -3639,15 +3593,6 @@ button:disabled {
 
 .workspace-overrides {
   margin-top: -1rem;
-}
-
-.settings-card-grid > .prompt-card {
-  display: block;
-  column-span: all;
-}
-
-.github-settings-grid {
-  column-fill: balance;
 }
 
 .github-toggle-row,
@@ -4838,11 +4783,7 @@ button:disabled {
     padding-inline: 1rem;
   }
 
-  .settings-card-grid {
-    column-count: 1;
-  }
-
-  .settings-card-pair {
+  .settings-card-columns {
     grid-template-columns: 1fr;
   }
 
