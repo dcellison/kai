@@ -2083,7 +2083,7 @@ function WorkshopView({
   onOpenMentions: () => void;
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onCreateAgent: () => void;
-  onOpenAgentDefinition: (agentId: string) => Promise<void>;
+  onOpenAgentDefinition: (definitionId: string) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenSettings: () => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
@@ -2152,6 +2152,7 @@ function WorkshopView({
   } | null>(null);
   const [archivedChannelsOpen, setArchivedChannelsOpen] = useState(false);
   const [channelLifecycleBusy, setChannelLifecycleBusy] = useState<string | null>(null);
+  const [agentCatalogue, setAgentCatalogue] = useState<WorkshopAgentEnablement[]>([]);
   const [agentManagement, setAgentManagement] = useState<WorkshopAgentEnablement[] | null>(null);
   const [agentManagementLoading, setAgentManagementLoading] = useState(false);
   const [memberManagement, setMemberManagement] = useState<WorkshopHumanMembership | null>(null);
@@ -2244,25 +2245,11 @@ function WorkshopView({
       left.name.localeCompare(right.name),
     );
   }, [workshop.channels]);
-  const enabledAgentChannels = useMemo(
-    () =>
-      workshop.channels
-        .filter(
-          (availableChannel) =>
-            availableChannel.kind === "direct" &&
-            availableChannel.canSubmitCommands &&
-            availableChannel.agents.length === 1,
-        )
-        .map((availableChannel) => ({
-          agent: availableChannel.agents[0],
-          channelId: availableChannel.channelId,
-        }))
-        .filter(
-          (item): item is { agent: WorkshopAgentSummary; channelId: string } =>
-            item.agent !== undefined,
-        )
-        .sort((left, right) => left.agent.name.localeCompare(right.agent.name)),
-    [workshop.channels],
+  const visibleAgents = useMemo(
+    () => [...agentCatalogue].sort((left, right) =>
+      left.displayName.localeCompare(right.displayName)
+    ),
+    [agentCatalogue],
   );
   const mentionCandidates = useMemo(() => {
     if (channel.kind !== "group" || !mentionTrigger) {
@@ -2402,6 +2389,31 @@ function WorkshopView({
     }
   };
 
+  const refreshAgentCatalogue = useCallback(async (): Promise<void> => {
+    try {
+      setAgentCatalogue(await loadAgentEnablements(agentToken));
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        onMemoryAuthenticationFailure(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        onSettingsAccessFailure(caught.message);
+      }
+      throw caught;
+    }
+  }, [agentToken, onMemoryAuthenticationFailure, onSettingsAccessFailure]);
+
+  useEffect(() => {
+    void refreshAgentCatalogue().catch((caught: unknown) => {
+      setSubmissionError(
+        caught instanceof Error ? caught.message : "Could not load visible agents.",
+      );
+    });
+  }, [refreshAgentCatalogue]);
+
+  const synchronizeAgentNavigation = useCallback(async (): Promise<void> => {
+    await Promise.all([onAgentNavigationChanged(), refreshAgentCatalogue()]);
+  }, [onAgentNavigationChanged, refreshAgentCatalogue]);
+
   const openAgentManagement = async (): Promise<void> => {
     if (agentManagementLoading) {
       return;
@@ -2448,7 +2460,7 @@ function WorkshopView({
       expectedStateVersion,
       clientOperationId,
     );
-    await onAgentNavigationChanged();
+    await synchronizeAgentNavigation();
     return nextVersion;
   };
 
@@ -2465,7 +2477,7 @@ function WorkshopView({
         await onAttachAgent(agentId, createClientMessageId());
       }
     }
-    await onAgentNavigationChanged();
+    await synchronizeAgentNavigation();
     setAgentManagement(null);
   };
 
@@ -3209,30 +3221,40 @@ function WorkshopView({
               )}
             </div>
           )}
-          {enabledAgentChannels.map(({ agent }) => (
-            <button
-              className={`agent-link ${engagedAgents.some((engaged) => engaged.agentId === agent.agentId) ? "engaged" : ""}`}
-              type="button"
-              title={`Manage ${agent.name}`}
-              aria-label={`Manage ${agent.name}`}
-              onClick={() => void onOpenAgentDefinition(agent.agentId)}
-              key={agent.agentId}
-            >
-              <span className="mini-avatar">
-                {agent.name.slice(0, 1).toUpperCase()}
-              </span>
-              <span>
-                <strong>{agent.name}</strong>
-                <small>
-                  {engagedAgents.some(
-                    (engaged) => engaged.agentId === agent.agentId,
-                  )
-                    ? "awake"
-                    : "enabled"}
-                </small>
-              </span>
-            </button>
-          ))}
+          {visibleAgents.map((agent) => {
+            const engaged = engagedAgents.some(
+              (candidate) => candidate.agentId === agent.agentId,
+            );
+            const conversationStarted =
+              agent.lifecycleState === "enabled" && agent.directChannelId !== null;
+            const status = engaged
+              ? agent.canManage
+                ? "owner · awake"
+                : "conversation · awake"
+              : agent.canManage
+                ? "owner"
+                : conversationStarted
+                  ? "conversation started"
+                  : "available";
+            return (
+              <button
+                className={`agent-link ${engaged ? "engaged" : ""}`}
+                type="button"
+                title={`Manage ${agent.displayName}`}
+                aria-label={`Manage ${agent.displayName}`}
+                onClick={() => void onOpenAgentDefinition(agent.definitionId)}
+                key={agent.definitionId}
+              >
+                <span className="mini-avatar">
+                  {agent.displayName.slice(0, 1).toUpperCase()}
+                </span>
+                <span>
+                  <strong>{agent.displayName}</strong>
+                  <small>{status}</small>
+                </span>
+              </button>
+            );
+          })}
         </nav>
 
         <footer
@@ -3313,7 +3335,7 @@ function WorkshopView({
           onChannelAccessFailure={onSettingsAccessFailure}
           onClose={() => onSelectChannel(channelId)}
           onCreateAgent={onCreateAgent}
-          onNavigationChanged={onAgentNavigationChanged}
+          onNavigationChanged={synchronizeAgentNavigation}
           onOpenChannel={onOpenAgentChannel}
           onSelectAgent={onSelectAgent}
           principalName={humanName}
@@ -4053,7 +4075,7 @@ function ActiveWorkshopClient({
   onForget: () => void;
   onAgentNavigationChanged: () => Promise<void>;
   onCreateAgent: () => void;
-  onOpenAgentDefinition: (agentId: string) => Promise<void>;
+  onOpenAgentDefinition: (definitionId: string) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
@@ -4671,23 +4693,8 @@ function WorkshopApp(): React.JSX.Element {
     writeDestination(nextDestination, "replace");
   }, []);
 
-  const openAgentDefinition = async (agentId: string): Promise<void> => {
-    if (!session) {
-      throw new Error("Workshop is not connected.");
-    }
-    try {
-      const enablements = await loadAgentEnablements(session.token);
-      const definitionId = enablements.find(
-        (enablement) => enablement.agentId === agentId,
-      )?.definitionId ?? null;
-      await openAgents(definitionId);
-    } catch (caught) {
-      if (caught instanceof AuthenticationError) {
-        forgetSession(caught.message);
-      } else if (caught instanceof ChannelAccessError) {
-        handleChannelAccessFailure(caught.message);
-      }
-    }
+  const openAgentDefinition = async (definitionId: string): Promise<void> => {
+    await openAgents(definitionId);
   };
 
   const refreshAgentNavigation = useCallback(async (): Promise<void> => {

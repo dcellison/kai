@@ -738,9 +738,14 @@ export function AgentWorkspace({
                         <small>@{definition.handle}</small>
                       </span>
                       <span className={`agent-status ${definition.lifecycleState}`}>
-                        {itemEnablement?.lifecycleState === "enabled"
-                          ? "enabled"
-                          : definition.lifecycleState}
+                        {definition.lifecycleState !== "active"
+                          ? definition.lifecycleState
+                          : itemEnablement?.canManage
+                            ? "owner"
+                            : itemEnablement?.lifecycleState === "enabled" &&
+                                itemEnablement.directChannelId
+                              ? "conversation started"
+                              : "available"}
                       </span>
                     </button>
                   </li>

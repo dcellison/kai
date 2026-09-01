@@ -2515,6 +2515,68 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
   });
 
+  it("lists every visible agent separately from started direct conversations", async () => {
+    const user = userEvent.setup();
+    const qualificationDefinition: WorkshopAgentDefinition = {
+      ...agentDefinition,
+      activeRevisionId: "adr_55555555555555555555555555555555",
+      agentId: "agt_55555555555555555555555555555555",
+      definitionId: "adf_55555555555555555555555555555555",
+      displayName: "Qualification agent",
+      handle: "qualification_agent",
+      revisions: agentDefinition.revisions.map((revision) => ({
+        ...revision,
+        revisionId: "adr_55555555555555555555555555555555",
+      })),
+    };
+    const qualificationEnablement: WorkshopAgentEnablement = {
+      ...agentEnablement,
+      agentId: qualificationDefinition.agentId,
+      canManage: false,
+      definitionId: qualificationDefinition.definitionId,
+      directChannelId: null,
+      displayName: qualificationDefinition.displayName,
+      eligibleRuntimes: [],
+      enablementId: null,
+      handle: qualificationDefinition.handle,
+      lifecycleState: "available",
+      runtimeProfileId: null,
+      stateVersion: null,
+    };
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([
+      agentDefinition,
+      qualificationDefinition,
+    ]);
+    vi.mocked(loadAgentEnablements).mockResolvedValue([
+      { ...agentEnablement, canManage: false },
+      qualificationEnablement,
+    ]);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    const sidebar = within(screen.getByLabelText("Workshop navigation"));
+    expect(sidebar.getByRole("button", { name: "Kai" })).toBeVisible();
+    expect(sidebar.queryByRole("button", { name: "Qualification agent" })).toBeNull();
+    expect(sidebar.getByRole("button", { name: "Manage Kai" })).toBeVisible();
+    expect(
+      sidebar.getByRole("button", { name: "Manage Qualification agent" }),
+    ).toBeVisible();
+    expect(sidebar.getByText("conversation started")).toBeVisible();
+    expect(sidebar.getByText("available")).toBeVisible();
+
+    await user.click(
+      sidebar.getByRole("button", { name: "Manage Qualification agent" }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
+    ).toBeVisible();
+    expect(screen.getByText("Conversation available")).toBeVisible();
+  });
+
   it("shows one shared agent definition without owner controls to another principal", async () => {
     const user = userEvent.setup();
     vi.mocked(loadAgentEnablements).mockResolvedValue([
