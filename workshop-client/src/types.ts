@@ -186,6 +186,7 @@ export interface WorkshopAgentEnablement {
   runtimeProfileId: string | null;
   stateVersion: number | null;
   canManage: boolean;
+  conversationStarted: boolean;
   ownerPrincipalId: string | null;
   ownerRuntimeProfileId: string | null;
 }

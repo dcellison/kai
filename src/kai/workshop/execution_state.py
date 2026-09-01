@@ -108,6 +108,9 @@ class WorkshopExecutionStateRegistry:
             "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
             "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+            "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
+            "AND pae.agent_id = ra.agent_id "
+            "WHERE pae.id IS NULL OR pae.lifecycle_state = 'enabled' "
             "ORDER BY ra.runtime_profile_id, ra.created_event_position, cm.principal_id"
         ) as cursor:
             rows = list(await cursor.fetchall())
@@ -191,6 +194,25 @@ class WorkshopExecutionStateRegistry:
             raise WorkshopExecutionStateError("Replacement runtime profile is not owned by the principal")
         self._by_principal_channel[key] = replacement
         self._lanes[self._lanes.index(prior)] = replacement
+
+    def unregister_lane(self, namespace: WorkshopExecutionStateNamespace) -> None:
+        """Remove one non-primary lane after its canonical authority is retired."""
+        key = (namespace.principal_id, namespace.channel_id)
+        existing = self._by_principal_channel.get(key)
+        if existing is None:
+            return
+        if existing != namespace or self._by_profile.get(namespace.runtime_profile_id) == namespace:
+            raise WorkshopExecutionStateError("Canonical execution-state lane cannot be retired")
+        self._by_principal_channel.pop(key)
+        self._lanes.remove(namespace)
+        principal_lanes = [item for item in self._lanes if item.principal_id == namespace.principal_id]
+        profiles = {item.runtime_profile_id for item in principal_lanes}
+        if not principal_lanes:
+            self._by_principal.pop(namespace.principal_id, None)
+        elif len(profiles) == 1:
+            self._by_principal[namespace.principal_id] = principal_lanes[0]
+        else:
+            self._by_principal[namespace.principal_id] = None
 
     def maybe_for_legacy_runtime_key(self, legacy_runtime_key: int) -> WorkshopExecutionStateNamespace | None:
         if isinstance(legacy_runtime_key, bool) or not isinstance(legacy_runtime_key, int):

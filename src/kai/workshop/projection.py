@@ -1609,6 +1609,11 @@ class CanonicalConversationProjection:
                 "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE id = ?",
                 (envelope.aggregate_id,),
             )
+            await connection.execute(
+                "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled', "
+                "updated_at = ? WHERE agent_definition_id = ? AND lifecycle_state = 'enabled'",
+                (occurred_at, envelope.aggregate_id),
+            )
         elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED:
             if (
                 not isinstance(envelope.aggregate_id, AgentDefinitionId)
@@ -1772,6 +1777,30 @@ class CanonicalConversationProjection:
                         agent_id,
                     ),
                 )
+        elif envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED:
+            if not isinstance(envelope.aggregate_id, AgentEnablementId):
+                raise ValueError("Workshop agent conversation start requires a typed enablement aggregate")
+            _require_exact_payload(payload, set())
+            cursor = await connection.execute(
+                "UPDATE principal_agent_enablements SET conversation_started_at = ?, "
+                "conversation_started_event_position = ?, updated_at = ?, last_event_position = ? "
+                "WHERE id = ? AND workshop_id = ? AND principal_id = ? "
+                "AND lifecycle_state = 'enabled' AND conversation_started_at IS NULL "
+                "AND EXISTS (SELECT 1 FROM agent_definitions d "
+                "WHERE d.id = principal_agent_enablements.agent_definition_id "
+                "AND d.lifecycle_state = 'active')",
+                (
+                    occurred_at,
+                    event.position,
+                    occurred_at,
+                    event.position,
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    envelope.actor_principal_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop agent conversation cannot be started")
         elif envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_DISABLED:
             if not isinstance(envelope.aggregate_id, AgentEnablementId):
                 raise ValueError("Workshop agent disablement requires a typed enablement aggregate")
@@ -1779,7 +1808,10 @@ class CanonicalConversationProjection:
             cursor = await connection.execute(
                 "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled', "
                 "updated_at = ?, last_event_position = ? WHERE id = ? "
-                "AND workshop_id = ? AND lifecycle_state = 'enabled'",
+                "AND workshop_id = ? AND (lifecycle_state = 'enabled' OR "
+                "(lifecycle_state = 'disabled' AND EXISTS (SELECT 1 FROM agent_definitions d "
+                "WHERE d.id = principal_agent_enablements.agent_definition_id "
+                "AND d.lifecycle_state = 'archived')))",
                 (occurred_at, event.position, envelope.aggregate_id, envelope.workshop_id),
             )
             if cursor.rowcount != 1:

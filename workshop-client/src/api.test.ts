@@ -57,6 +57,7 @@ import {
   restorePreferenceRevision,
   savePreferenceDocument,
   setMessageReaction,
+  startAgentConversation,
   submitCommand,
   streamTimeline,
   streamAgentChanges,
@@ -132,6 +133,7 @@ function agentEnablementPayload(): Record<string, unknown> {
     runtime_profile_id: runtimeProfileId,
     state_version: 2,
     can_manage: true,
+    conversation_started: false,
     owner_principal_id: "prn_00000000000000000000000000000001",
     owner_runtime_profile_id: runtimeProfileId,
   };
@@ -2154,6 +2156,7 @@ describe("Workshop client API", () => {
       .mockResolvedValueOnce(definitionResponse())
       .mockResolvedValueOnce(definitionResponse())
       .mockResolvedValueOnce(enablementResponse())
+      .mockResolvedValueOnce(enablementResponse())
       .mockResolvedValueOnce(enablementResponse());
     vi.stubGlobal("fetch", fetchMock);
 
@@ -2188,16 +2191,25 @@ describe("Workshop client API", () => {
       idempotencyKey: "enable-key",
       runtimeProfileId,
     });
+    await startAgentConversation("session-secret", agentDefinitionId, {
+      expectedVersion: 2,
+      idempotencyKey: "conversation-key",
+    });
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
       "/v1/client/agents",
       `/v1/client/agents/${agentDefinitionId}/revisions`,
       `/v1/client/agents/${agentDefinitionId}/activate`,
       `/v1/client/agents/${agentDefinitionId}/archive`,
       `/v1/client/agents/${agentDefinitionId}/enable`,
+      `/v1/client/agents/${agentDefinitionId}/conversation`,
     ]);
     expect(JSON.parse(String(fetchMock.mock.calls[4][1]?.body))).toEqual({
       idempotency_key: "enable-key",
       runtime_profile_id: runtimeProfileId,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[5][1]?.body))).toEqual({
+      expected_version: 2,
+      idempotency_key: "conversation-key",
     });
   });
 

@@ -263,6 +263,7 @@ _AGENT_ARCHIVAL_PATH = "/v1/client/agents/{definition_id}/archive"
 _AGENT_ENABLEMENTS_PATH = "/v1/client/agent-enablement"
 _AGENT_ENABLEMENT_PATH = "/v1/client/agents/{definition_id}/enablement"
 _AGENT_ENABLE_PATH = "/v1/client/agents/{definition_id}/enable"
+_AGENT_CONVERSATION_START_PATH = "/v1/client/agents/{definition_id}/conversation"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
@@ -871,6 +872,7 @@ def _serialize_agent_enablement(snapshot: PrincipalAgentEnablement) -> dict[str,
             str(snapshot.owner_runtime_profile_id) if snapshot.owner_runtime_profile_id is not None else None
         ),
         "can_manage": snapshot.can_manage,
+        "conversation_started": snapshot.conversation_started,
     }
 
 
@@ -3411,7 +3413,8 @@ async def _handle_client_navigation(
         "CASE WHEN cara.id IS NULL THEN 0 ELSE 1 END, pae.lifecycle_state, "
         "ca.sponsor_principal_id, sponsor.display_name, "
         "ca.sponsored_runtime_profile_id, "
-        "CASE WHEN sponsored.id IS NULL THEN 0 ELSE 1 END "
+        "CASE WHEN sponsored.id IS NULL THEN 0 ELSE 1 END, "
+        "pae.conversation_started_at "
         "FROM channel_memberships cm "
         "JOIN channels c ON c.id = cm.channel_id "
         "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
@@ -3476,6 +3479,7 @@ async def _handle_client_navigation(
                 "participants": [],
                 "_runtime_assignments": [],
                 "_agent_enablement": str(row[12]) if row[12] is not None else None,
+                "_conversation_started": row[17] is not None,
             },
         )
         if row[7] is not None:
@@ -3524,9 +3528,12 @@ async def _handle_client_navigation(
         for channel in channels_by_workshop.get(workshop_id, {}).values():
             assignments = channel.pop("_runtime_assignments")
             enablement = channel.pop("_agent_enablement")
+            conversation_started = channel.pop("_conversation_started")
             agents = channel["agents"]
             if not isinstance(assignments, list) or not isinstance(agents, list):
                 raise RuntimeError("Workshop navigation capability assembly failed")
+            if channel["kind"] == "direct" and enablement is not None and not conversation_started:
+                continue
             channel["can_submit_commands"] = (
                 channel["archived_at"] is None
                 and channel["kind"] in {"direct", "group"}
@@ -4108,6 +4115,7 @@ async def _handle_agent_archival(
     *,
     authenticator: WorkshopClientAuthenticator,
     service: WorkshopAgentLifecycleService,
+    enablement_service: WorkshopAgentEnablementService | None = None,
 ) -> web.Response:
     principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
     if error is not None:
@@ -4124,6 +4132,13 @@ async def _handle_agent_archival(
             idempotency_key=payload["idempotency_key"],
             expected_version=payload["expected_version"],
         )
+        if enablement_service is not None:
+            await enablement_service.suspend_archived_definition(
+                principal_id,
+                snapshot.definition_id,
+            )
+    except WorkshopAgentEnablementError as exc:
+        return _agent_enablement_error_response(exc)
     except WorkshopAgentLifecycleError as exc:
         return _agent_lifecycle_error_response(exc)
     return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=200)
@@ -4220,6 +4235,37 @@ async def _handle_agent_enablement_mutation(
         )
     except (TypeError, ValueError):
         return _error_response(status=400, code="invalid_request", message="Invalid agent enablement request")
+    except WorkshopAgentLifecycleError:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent definition")
+    except WorkshopAgentEnablementError as exc:
+        return _agent_enablement_error_response(exc)
+    return _json_response({"version": 1, "agent": _serialize_agent_enablement(snapshot)}, status=200)
+
+
+async def _handle_agent_conversation_start(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentEnablementService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid conversation request")
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict) or set(payload) != {"idempotency_key", "expected_version"}:
+            raise WorkshopAgentEnablementValidationError("Invalid conversation payload")
+        snapshot = await service.start_conversation(
+            principal_id,
+            _agent_definition_id(request),
+            idempotency_key=payload["idempotency_key"],
+            expected_version=payload["expected_version"],
+        )
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid conversation request")
     except WorkshopAgentLifecycleError:
         return _error_response(status=400, code="invalid_request", message="Invalid agent definition")
     except WorkshopAgentEnablementError as exc:
@@ -4529,6 +4575,7 @@ async def _read_agent_lifecycle_events(
         WorkshopEventType.PRINCIPAL_AGENT_ENABLED,
         WorkshopEventType.PRINCIPAL_AGENT_DISABLED,
         WorkshopEventType.PRINCIPAL_AGENT_RUNTIME_CHANGED,
+        WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED,
     )
     membership_event_types = (
         WorkshopEventType.CHANNEL_MEMBER_ADDED,
@@ -5981,6 +6028,7 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=agent_lifecycle,
+                enablement_service=agent_enablement,
             )
 
     async def handle_agent_event_stream(request: web.Request) -> web.StreamResponse:
@@ -6131,9 +6179,18 @@ def register_workshop_read_routes(
                     service=agent_enablement,
                 )
 
+        async def handle_agent_conversation_start(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_agent_conversation_start(
+                    request,
+                    authenticator=authenticator,
+                    service=agent_enablement,
+                )
+
         app.router.add_get(_AGENT_ENABLEMENTS_PATH, handle_agent_enablement_list)
         app.router.add_get(_AGENT_ENABLEMENT_PATH, handle_agent_enablement_detail)
         app.router.add_post(_AGENT_ENABLE_PATH, handle_agent_enable)
+        app.router.add_post(_AGENT_CONVERSATION_START_PATH, handle_agent_conversation_start)
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_CHANNEL_MESSAGE_PATH, handle_channel_message)
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)

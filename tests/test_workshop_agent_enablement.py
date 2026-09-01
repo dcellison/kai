@@ -24,13 +24,14 @@ from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_api import _read_agent_lifecycle_events
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.diagnostics import workshop_agent_authority_status
-from kai.workshop.domain import AgentDefinitionId, MessageId, PrincipalId
+from kai.workshop.domain import AgentDefinitionId, AgentEnablementId, ChannelId, MessageId, PrincipalId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
     WorkshopInternalAPIExecutionContext,
 )
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -203,6 +204,173 @@ async def test_runtime_authority_cannot_cross_principals(tmp_path: Path) -> None
             assert int((await cursor.fetchone())[0]) == 0
     finally:
         await store.close()
+
+
+async def test_direct_conversation_requires_an_explicit_durable_start(tmp_path: Path) -> None:
+    store, service, _execution, _contexts, _runtime_pool = await _service(tmp_path / "kai.db")
+    try:
+        daniel = await _principal(store, "101")
+        definition_id = await _active_specialist(store, daniel)
+        enabled = await service.enable(
+            daniel,
+            definition_id,
+            profile_id(101),
+            idempotency_key="explicit-conversation-enable",
+        )
+
+        assert enabled.conversation_started is False
+        started = await service.start_conversation(
+            daniel,
+            definition_id,
+            idempotency_key="explicit-conversation-start",
+            expected_version=enabled.state_version,
+        )
+        replayed = await service.start_conversation(
+            daniel,
+            definition_id,
+            idempotency_key="explicit-conversation-start",
+            expected_version=enabled.state_version,
+        )
+
+        assert started.conversation_started is True
+        assert replayed == started
+        assert started.state_version is not None
+        assert enabled.state_version is not None
+        assert started.state_version > enabled.state_version
+        async with store.connection.execute(
+            "SELECT conversation_started_at, conversation_started_event_position "
+            "FROM principal_agent_enablements WHERE agent_definition_id = ? AND principal_id = ?",
+            (definition_id, daniel),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] is not None
+        assert int(row[1]) == started.state_version
+    finally:
+        await store.close()
+
+
+async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_path: Path) -> None:
+    store, service, execution, contexts, runtime_pool = await _service(tmp_path / "kai.db")
+    try:
+        daniel = await _principal(store, "101")
+        definition_id = await _active_specialist(store, daniel)
+        enabled = await service.enable(
+            daniel,
+            definition_id,
+            profile_id(101),
+            idempotency_key="archive-runtime-enable",
+        )
+        assert enabled.direct_channel_id is not None
+        current = await WorkshopAgentLifecycleService(store).get_visible(daniel, definition_id)
+
+        archived = await WorkshopAgentLifecycleService(store).archive(
+            daniel,
+            definition_id,
+            idempotency_key="archive-runtime-definition",
+            expected_version=current.state_version,
+        )
+        await service.suspend_archived_definition(daniel, definition_id)
+
+        assert archived.lifecycle_state == "archived"
+        assert runtime_pool.suspended[-1].channel_id == enabled.direct_channel_id
+        assert execution.maybe_for_principal_channel(daniel, enabled.direct_channel_id) is None
+        assert all(context.channel_id != enabled.direct_channel_id for context in contexts.contexts)
+        async with store.connection.execute(
+            "SELECT lifecycle_state FROM principal_agent_enablements "
+            "WHERE agent_definition_id = ? AND principal_id = ?",
+            (definition_id, daniel),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None and str(row[0]) == "disabled"
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM channels WHERE id = ?",
+            (enabled.direct_channel_id,),
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == 1
+
+        restarted_execution = await WorkshopExecutionStateRegistry.from_store(
+            store,
+            profile_registry(101, 202),
+        )
+        restarted_contexts = await WorkshopInternalAPIContextRegistry.from_store(
+            store,
+            profile_registry(101, 202),
+        )
+        assert restarted_execution.maybe_for_principal_channel(daniel, enabled.direct_channel_id) is None
+        assert all(context.channel_id != enabled.direct_channel_id for context in restarted_contexts.contexts)
+    finally:
+        await store.close()
+
+
+async def test_version_fifty_seven_archived_enablement_is_retired_on_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kai.workshop import schema
+
+    path = tmp_path / "kai.db"
+    profiles = profile_registry(101, 202)
+    with monkeypatch.context() as migration_context:
+        migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 57)
+        migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:57])
+        legacy = await WorkshopEventStore.open(path)
+        await bootstrap_default_workshop(
+            legacy,
+            (
+                BootstrapHuman("Daniel", "admin", "telegram", "101", "101", profile_id(101)),
+                BootstrapHuman("Scott", "member", "telegram", "202", "202", profile_id(202)),
+            ),
+        )
+        execution = await WorkshopExecutionStateRegistry.from_store(legacy, profiles)
+        contexts = await WorkshopInternalAPIContextRegistry.from_store(legacy, profiles)
+        service = WorkshopAgentEnablementService(
+            legacy,
+            profiles,
+            execution,
+            contexts,
+            _RuntimePool(),  # type: ignore[arg-type]
+        )
+        daniel = await _principal(legacy, "101")
+        definition_id = await _active_specialist(legacy, daniel)
+        workshop_id = await service._workshop_for(daniel)
+        definition = await service._active_definition(workshop_id, definition_id)
+        enablement_id = AgentEnablementId.derived(definition_id, f"principal:{daniel}")
+        channel_id = ChannelId.derived(enablement_id, "direct-channel")
+        for event in service._creation_events(
+            workshop_id,
+            daniel,
+            definition_id,
+            definition,
+            enablement_id,
+            channel_id,
+            profile_id(101),
+            datetime.now(UTC),
+            "legacy-archived-enable",
+            {"source": "test"},
+        ):
+            await legacy.append(event)
+        await legacy.project_pending(CanonicalConversationProjection())
+        await legacy.connection.execute(
+            "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE id = ?",
+            (definition_id,),
+        )
+        await legacy.connection.commit()
+        await legacy.close()
+
+    upgraded = await WorkshopEventStore.open(path)
+    try:
+        assert await upgraded.schema_version() == 58
+        async with upgraded.connection.execute(
+            "SELECT lifecycle_state, conversation_started_at "
+            "FROM principal_agent_enablements WHERE agent_definition_id = ?",
+            (definition_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert tuple(row) == ("disabled", None)
+    finally:
+        await upgraded.close()
 
 
 async def test_reconciliation_allows_archived_agent_without_runtime(tmp_path: Path) -> None:

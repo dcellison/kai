@@ -41,6 +41,7 @@ class WorkshopEventType(StrEnum):
     PRINCIPAL_AGENT_ENABLED = "principal_agent.enabled"
     PRINCIPAL_AGENT_DISABLED = "principal_agent.disabled"
     PRINCIPAL_AGENT_RUNTIME_CHANGED = "principal_agent.runtime_changed"
+    PRINCIPAL_AGENT_CONVERSATION_STARTED = "principal_agent.conversation_started"
     CHANNEL_AGENT_ATTACHED = "channel.agent_attached"
     CHANNEL_AGENT_DETACHED = "channel.agent_detached"
     CHANNEL_AGENT_DISMISSED = "channel.agent_dismissed"

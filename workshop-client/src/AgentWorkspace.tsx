@@ -11,6 +11,7 @@ import {
   enableAgentDefinition,
   loadAgentDefinitions,
   loadAgentEnablements,
+  startAgentConversation,
   streamAgentChanges,
 } from "./api";
 import type {
@@ -652,6 +653,31 @@ export function AgentWorkspace({
     }, "Could not enable this agent.");
   };
 
+  const startConversation = (): Promise<void> => {
+    if (
+      !selected ||
+      !enablement ||
+      !enablement.directChannelId ||
+      enablement.stateVersion === null
+    ) {
+      return Promise.resolve();
+    }
+    const directChannelId = enablement.directChannelId;
+    const stateVersion = enablement.stateVersion;
+    const definitionId = selected.definitionId;
+    return runMutation(async () => {
+      if (!enablement.conversationStarted) {
+        await startAgentConversation(token, definitionId, {
+          expectedVersion: stateVersion,
+          idempotencyKey: operationKey("conversation"),
+        });
+        await refresh();
+        await onNavigationChanged();
+      }
+      await onOpenChannel(directChannelId);
+    }, "Could not open this agent conversation.");
+  };
+
   const counts = useMemo(() => ({
     active: definitions.filter((item) => item.lifecycleState === "active").length,
     enabled: enablements.filter((item) => item.lifecycleState === "enabled").length,
@@ -790,18 +816,7 @@ export function AgentWorkspace({
                           className="primary-button"
                           type="button"
                           disabled={busy}
-                          onClick={() => {
-                            const directChannelId = enablement.directChannelId;
-                            if (!directChannelId) {
-                              return;
-                            }
-                            void onOpenChannel(directChannelId).catch(
-                              (caught: unknown) => handleError(
-                                caught,
-                                "Could not open this agent conversation.",
-                              ),
-                            );
-                          }}
+                          onClick={() => void startConversation()}
                         >
                           Start conversation
                         </button>

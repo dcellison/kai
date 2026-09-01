@@ -21,6 +21,7 @@ from kai.workshop.agent_definitions import (
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentDefinitionRevisionId,
+    AgentEnablementId,
     AgentId,
     EventEnvelope,
     PrincipalId,
@@ -444,6 +445,15 @@ class WorkshopAgentLifecycleService:
                 revision_id = payload["revision_id"]
                 if revision_id not in {revision.revision_id for revision in current.revisions}:
                     raise WorkshopAgentLifecycleValidationError("Revision is not part of this agent definition")
+            retirement_ids: list[AgentEnablementId] = []
+            if operation == "archive":
+                async with connection.execute(
+                    "SELECT id FROM principal_agent_enablements "
+                    "WHERE agent_definition_id = ? AND lifecycle_state = 'enabled' "
+                    "ORDER BY created_event_position",
+                    (definition_id,),
+                ) as cursor:
+                    retirement_ids = [AgentEnablementId(str(row[0])) for row in await cursor.fetchall()]
             event = EventEnvelope.create(
                 event_type=event_type,
                 event_version=1,
@@ -457,6 +467,21 @@ class WorkshopAgentLifecycleService:
                 metadata=self._metadata(operation, fingerprint, definition_id),
             )
             await self._store.append_in_transaction(event)
+            for index, enablement_id in enumerate(retirement_ids):
+                await self._store.append_in_transaction(
+                    EventEnvelope.create(
+                        event_type=WorkshopEventType.PRINCIPAL_AGENT_DISABLED,
+                        event_version=1,
+                        workshop_id=workshop_id,
+                        aggregate_type="agent_enablement",
+                        aggregate_id=enablement_id,
+                        actor_principal_id=principal_id,
+                        occurred_at=event.occurred_at,
+                        idempotency_key=f"{operation_key}:retire:{index}:{enablement_id}",
+                        payload={},
+                        metadata=self._metadata("archive_retire", fingerprint, definition_id),
+                    )
+                )
             await self._store.project_pending_in_transaction(CanonicalConversationProjection())
             result = await self._snapshot(definition_id, workshop_id=workshop_id)
             await connection.commit()

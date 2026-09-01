@@ -274,6 +274,9 @@ async def bootstrap_default_workshop(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'principal_agent_enablements'"
     ) as cursor:
         enablements_supported = await cursor.fetchone() is not None
+    async with store.connection.execute("PRAGMA table_info(principal_agent_enablements)") as cursor:
+        enablement_columns = {str(row[1]) for row in await cursor.fetchall()}
+    explicit_conversations_supported = "conversation_started_at" in enablement_columns
     async with store.connection.execute("PRAGMA table_info(agent_definitions)") as cursor:
         definition_columns = {str(row[1]) for row in await cursor.fetchall()}
     agent_authority_supported = "owner_principal_id" in definition_columns
@@ -508,6 +511,15 @@ async def bootstrap_default_workshop(
                         "runtime_profile_id": human.runtime_profile_id,
                     },
                 )
+                if explicit_conversations_supported:
+                    await ensure(
+                        idempotency_key=_idempotency_key("agent-conversation-start", channel_token),
+                        event_type=WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED,
+                        aggregate_type="agent_enablement",
+                        aggregate_id=enablement_id,
+                        actor_principal_id=principal_id,
+                        payload={},
+                    )
 
     for notification in ordered_notifications:
         channel_token = _stable_token(notification.transport, notification.external_channel_id)

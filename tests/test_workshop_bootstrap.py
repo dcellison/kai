@@ -251,7 +251,7 @@ class TestDefaultWorkshopBootstrap:
         )
 
         assert first.created_events == 18
-        assert upgraded.created_events == 3
+        assert upgraded.created_events == 4
         assert upgraded.existing_events == 17
         async with store.connection.execute(
             "SELECT provider, external_subject FROM external_identities ORDER BY provider"
@@ -306,9 +306,12 @@ class TestDefaultWorkshopBootstrap:
             ],
         )
 
-        assert migrated.created_events == 3
-        assert (await store.read_events())[-3].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
-        assert (await store.read_events())[-2].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED
+        assert migrated.created_events == 4
+        assert (await store.read_events())[-4].envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED
+        assert (await store.read_events())[-3].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED
+        assert (await store.read_events())[
+            -2
+        ].envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED
         assert (await store.read_events())[
             -1
         ].envelope.event_type == WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED

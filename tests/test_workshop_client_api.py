@@ -726,6 +726,19 @@ class _AgentEnablement:
         self.calls.append(("enable", (runtime_profile_id, idempotency_key, expected_version)))
         return self._snapshot("enabled")
 
+    async def start_conversation(
+        self,
+        principal_id,
+        definition_id,
+        *,
+        idempotency_key,
+        expected_version,
+    ):
+        assert principal_id == self.principal_id
+        assert definition_id == self.definition_id
+        self.calls.append(("conversation", (idempotency_key, expected_version)))
+        return replace(self._snapshot("enabled"), conversation_started=True)
+
 
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
@@ -1712,13 +1725,21 @@ class TestWorkshopAgentEnablementHTTPContract:
             assert enabled.status == 200
             assert (await enabled.json())["agent"]["lifecycle_state"] == "enabled"
 
+            conversation = await client.post(
+                f"/v1/client/agents/{service.definition_id}/conversation",
+                headers={"Authorization": "Bearer alice"},
+                json={"idempotency_key": "start-specialist", "expected_version": 42},
+            )
+            assert conversation.status == 200
+            assert (await conversation.json())["agent"]["conversation_started"] is True
+
             disabled = await client.post(
                 f"/v1/client/agents/{service.definition_id}/disable",
                 headers={"Authorization": "Bearer alice"},
                 json={"idempotency_key": "disable-specialist", "expected_version": 42},
             )
             assert disabled.status == 404
-            assert [item[0] for item in service.calls] == ["list", "enable"]
+            assert [item[0] for item in service.calls] == ["list", "enable", "conversation"]
         finally:
             await client.close()
             await store.close()
