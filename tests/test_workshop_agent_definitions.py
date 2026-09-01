@@ -14,6 +14,7 @@ from kai.workshop.agent_definitions import (
     render_agent_definition_context,
 )
 from kai.workshop.agent_lifecycle import (
+    WorkshopAgentLifecycleAccessDenied,
     WorkshopAgentLifecycleConflict,
     WorkshopAgentLifecycleService,
 )
@@ -51,6 +52,19 @@ async def _open(path: Path) -> tuple[WorkshopEventStore, AgentId]:
         ),
     )
     return store, result.agent_id
+
+
+async def _principal(
+    store: WorkshopEventStore,
+    external_subject: str,
+) -> PrincipalId:
+    async with store.connection.execute(
+        "SELECT principal_id FROM external_identities WHERE provider = 'desktop' AND external_subject = ?",
+        (external_subject,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return PrincipalId(str(row[0]))
 
 
 async def _append_and_project(store: WorkshopEventStore, envelope: EventEnvelope) -> None:
@@ -98,6 +112,87 @@ class TestAgentDefinitionBootstrap:
                     instructions="Do nothing.",
                     capabilities=["text_generation"],
                 )
+        finally:
+            await store.close()
+
+    async def test_member_owns_and_discovers_nonactive_definitions_without_exposing_them(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = await WorkshopEventStore.open(tmp_path / "principal-owned.db")
+        try:
+            await bootstrap_default_workshop(
+                store,
+                (
+                    BootstrapHuman("Daniel", "admin", "desktop", "daniel", "daniel"),
+                    BootstrapHuman("Scott", "member", "desktop", "scott", "scott"),
+                    BootstrapHuman("Alex", "member", "desktop", "alex", "alex"),
+                ),
+            )
+            daniel = await _principal(store, "daniel")
+            scott = await _principal(store, "scott")
+            alex = await _principal(store, "alex")
+            service = WorkshopAgentLifecycleService(store)
+
+            draft = await service.create_draft(
+                scott,
+                idempotency_key="scott-specialist-create",
+                handle="scott_specialist",
+                display_name="Scott specialist",
+                description="Owned by Scott.",
+                presentation={"avatar": "S"},
+                purpose="Qualify principal-owned creation.",
+                instructions="Reply only within authorized conversations.",
+                capabilities=["text_generation"],
+            )
+
+            assert draft.owner_principal_id == scott
+            assert draft.lifecycle_state == "draft"
+            assert draft.definition_id in {definition.definition_id for definition in await service.list_visible(scott)}
+            assert draft.definition_id not in {
+                definition.definition_id for definition in await service.list_visible(alex)
+            }
+            assert draft.definition_id not in {
+                definition.definition_id for definition in await service.list_visible(daniel)
+            }
+            assert (await service.get_visible(scott, draft.definition_id)).definition_id == draft.definition_id
+            with pytest.raises(WorkshopAgentLifecycleAccessDenied, match="Access denied"):
+                await service.get_visible(alex, draft.definition_id)
+            with pytest.raises(WorkshopAgentLifecycleAccessDenied, match="Access denied"):
+                await service.get_visible(daniel, draft.definition_id)
+
+            active = await service.activate_revision(
+                scott,
+                draft.definition_id,
+                revision_id=draft.revisions[0].revision_id,
+                idempotency_key="scott-specialist-activate",
+                expected_version=draft.state_version,
+            )
+            assert active.definition_id in {definition.definition_id for definition in await service.list_visible(alex)}
+            assert active.definition_id in {
+                definition.definition_id for definition in await service.list_visible(daniel)
+            }
+
+            archived = await service.archive(
+                scott,
+                active.definition_id,
+                idempotency_key="scott-specialist-archive",
+                expected_version=active.state_version,
+            )
+            assert archived.lifecycle_state == "archived"
+            assert archived.definition_id in {
+                definition.definition_id for definition in await service.list_visible(scott)
+            }
+            assert archived.definition_id not in {
+                definition.definition_id for definition in await service.list_visible(alex)
+            }
+            assert archived.definition_id not in {
+                definition.definition_id for definition in await service.list_visible(daniel)
+            }
+            with pytest.raises(WorkshopAgentLifecycleAccessDenied, match="Access denied"):
+                await service.get_visible(alex, archived.definition_id)
+            with pytest.raises(WorkshopAgentLifecycleAccessDenied, match="Access denied"):
+                await service.get_visible(daniel, archived.definition_id)
         finally:
             await store.close()
 
