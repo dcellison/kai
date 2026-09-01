@@ -1296,6 +1296,7 @@ class TestWorkshopNavigationHTTPContract:
                         "sponsor_display_name": "Alice",
                         "runtime_profile_id": direct["agents"][0]["runtime_profile_id"],
                         "available": True,
+                        "lifecycle_state": "active",
                         "memory_scope": "private",
                     }
                 ],
@@ -2336,6 +2337,18 @@ class TestWorkshopChannelLifecycleHTTPContract:
             )
             assert archived_response.status == 200
 
+            navigation_response = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert navigation_response.status == 200
+            navigation = await navigation_response.json()
+            direct = next(
+                item for item in navigation["workshops"][0]["channels"] if item["channel_id"] == alice_channel
+            )
+            assert direct["agents"][0]["lifecycle_state"] == "archived"
+            assert direct["can_submit_commands"] is False
+
             response = await client.post(
                 "/v1/channels",
                 headers={"Authorization": "Bearer alice"},
@@ -2472,6 +2485,7 @@ class TestWorkshopChannelLifecycleHTTPContract:
                     "sponsor_display_name": "Alice",
                     "runtime_profile_id": visible["agents"][0]["runtime_profile_id"],
                     "available": True,
+                    "lifecycle_state": "active",
                     "memory_scope": "shared_channel",
                 }
             ]

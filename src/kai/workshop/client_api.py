@@ -3414,7 +3414,7 @@ async def _handle_client_navigation(
         "ca.sponsor_principal_id, sponsor.display_name, "
         "ca.sponsored_runtime_profile_id, "
         "CASE WHEN sponsored.id IS NULL THEN 0 ELSE 1 END, "
-        "pae.conversation_started_at "
+        "pae.conversation_started_at, ad.lifecycle_state "
         "FROM channel_memberships cm "
         "JOIN channels c ON c.id = cm.channel_id "
         "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
@@ -3499,6 +3499,7 @@ async def _handle_client_navigation(
                     "sponsor_display_name": str(row[14]) if row[14] is not None else None,
                     "runtime_profile_id": str(row[15]) if row[15] is not None else None,
                     "available": bool(row[16]),
+                    "lifecycle_state": str(row[18]),
                     "memory_scope": "private" if str(row[2]) == "direct" else "shared_channel",
                 }
             )

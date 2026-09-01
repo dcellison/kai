@@ -58,6 +58,7 @@ import type {
   WorkshopAgentChangeSignal,
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
+  WorkshopAgentSummary,
   WorkshopHumanChannelMember,
   WorkshopHumanMembership,
   WorkshopHumanNotification,
@@ -523,6 +524,9 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           !PRINCIPAL_PATTERN.test(rawAgent.principal_id) ||
           typeof rawAgent.engaged !== "boolean" ||
           typeof rawAgent.available !== "boolean" ||
+          !["draft", "active", "archived"].includes(
+            String(rawAgent.lifecycle_state),
+          ) ||
           (rawAgent.engaged_until !== null &&
             typeof rawAgent.engaged_until !== "string") ||
           !["private", "shared_channel"].includes(String(rawAgent.memory_scope)) ||
@@ -546,6 +550,7 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           engaged: rawAgent.engaged,
           engagedUntil: rawAgent.engaged_until,
           handle: rawAgent.handle,
+          lifecycleState: rawAgent.lifecycle_state as WorkshopAgentSummary["lifecycleState"],
           memoryScope: rawAgent.memory_scope as "private" | "shared_channel",
           name: rawAgent.name,
           principalId: rawAgent.principal_id,

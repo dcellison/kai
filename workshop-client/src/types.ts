@@ -22,6 +22,7 @@ export interface WorkshopAgentSummary {
   engaged: boolean;
   engagedUntil: string | null;
   handle: string;
+  lifecycleState: WorkshopAgentLifecycleState;
   memoryScope: "private" | "shared_channel";
   name: string;
   principalId: string;
