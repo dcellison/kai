@@ -75,11 +75,17 @@ async def resolve_canonical_conversation_target(
     sponsorship_supported = "detached_at" in channel_agent_columns
     attachment_clause = " AND ca.detached_at IS NULL" if sponsorship_supported else ""
     sponsorship_join = (
-        "LEFT JOIN principal_agent_enablements sponsored "
-        "ON sponsored.principal_id = ca.sponsor_principal_id "
-        "AND sponsored.agent_id = ca.agent_id "
-        "AND sponsored.runtime_profile_id = ca.sponsored_runtime_profile_id "
-        "AND sponsored.lifecycle_state = 'enabled' "
+        "LEFT JOIN agent_definitions sponsored "
+        "ON sponsored.agent_id = ca.agent_id "
+        "AND sponsored.lifecycle_state = 'active' "
+        "AND ((sponsored.owner_principal_id = ca.sponsor_principal_id "
+        "AND sponsored.owner_runtime_profile_id = ca.sponsored_runtime_profile_id) "
+        "OR (sponsored.owner_principal_id IS NULL AND EXISTS ("
+        "SELECT 1 FROM principal_agent_enablements legacy "
+        "WHERE legacy.agent_definition_id = sponsored.id "
+        "AND legacy.principal_id = ca.sponsor_principal_id "
+        "AND legacy.runtime_profile_id = ca.sponsored_runtime_profile_id "
+        "AND legacy.lifecycle_state = 'enabled'))) "
         if sponsorship_supported
         else ""
     )
@@ -127,39 +133,79 @@ async def resolve_canonical_conversation_run(
     profile later; human or transport identities are not execution authority.
     """
     target = await resolve_canonical_conversation_target(store, inbound_message_id, agent_id)
-    try:
-        _, runtime_profile_id = await resolve_channel_runtime_profile(
-            store,
-            target.channel_id,
-            target.agent_id,
+    async with store.connection.execute("PRAGMA table_info(agent_definitions)") as cursor:
+        definition_columns = {str(row[1]) for row in await cursor.fetchall()}
+    if "owner_principal_id" not in definition_columns:
+        try:
+            _, runtime_profile_id = await resolve_channel_runtime_profile(
+                store,
+                target.channel_id,
+                target.agent_id,
+            )
+        except WorkshopRuntimeAssignmentError as exc:
+            raise ConversationRunUnavailableError(str(exc)) from exc
+        async with store.connection.execute("PRAGMA table_info(channel_agents)") as cursor:
+            attachment_columns = {str(row[1]) for row in await cursor.fetchall()}
+        sponsor_principal_id = target.requested_by_principal_id
+        if "sponsor_principal_id" in attachment_columns:
+            async with store.connection.execute(
+                "SELECT sponsor_principal_id, sponsored_runtime_profile_id, c.kind "
+                "FROM channel_agents ca JOIN channels c ON c.id = ca.channel_id "
+                "WHERE ca.channel_id = ? AND ca.agent_id = ? AND ca.detached_at IS NULL",
+                (target.channel_id, target.agent_id),
+            ) as cursor:
+                sponsor_row = await cursor.fetchone()
+            if sponsor_row is None or sponsor_row[1] is None or str(sponsor_row[1]) != str(runtime_profile_id):
+                raise ConversationRunUnavailableError("Channel agent has incomplete runtime sponsorship")
+            if sponsor_row[0] is not None:
+                sponsor_principal_id = PrincipalId(str(sponsor_row[0]))
+            elif str(sponsor_row[2]) != "direct":
+                raise ConversationRunUnavailableError("Channel agent has incomplete runtime sponsorship")
+        else:
+            async with store.connection.execute(
+                "SELECT kind FROM channels WHERE id = ?",
+                (target.channel_id,),
+            ) as cursor:
+                channel_row = await cursor.fetchone()
+            if channel_row is None or str(channel_row[0]) != "direct":
+                raise ConversationRunUnavailableError("Legacy group agent has no runtime sponsorship")
+        return CanonicalConversationRunResolution(
+            target=target,
+            runtime_profile_id=runtime_profile_id,
+            sponsor_principal_id=sponsor_principal_id,
         )
-    except WorkshopRuntimeAssignmentError as exc:
-        raise ConversationRunUnavailableError(str(exc)) from exc
-
-    async with store.connection.execute("PRAGMA table_info(channel_agents)") as cursor:
-        channel_agent_columns = {str(row[1]) for row in await cursor.fetchall()}
-    if "sponsor_principal_id" not in channel_agent_columns:
-        raise ConversationRunUnavailableError("Channel agent sponsorship is not available in this schema")
-
     async with store.connection.execute(
-        "SELECT ca.sponsor_principal_id, ca.sponsored_runtime_profile_id, c.kind "
-        "FROM channel_agents ca JOIN channels c ON c.id = ca.channel_id "
-        "WHERE ca.channel_id = ? AND ca.agent_id = ? AND ca.detached_at IS NULL",
+        "SELECT COALESCE(d.owner_principal_id, ca.sponsor_principal_id, "
+        "CASE WHEN c.kind = 'direct' THEN target_owner.principal_id END), "
+        "COALESCE(d.owner_runtime_profile_id, ca.sponsored_runtime_profile_id, ra.runtime_profile_id), "
+        "COALESCE(d.owner_direct_channel_id, CASE WHEN c.kind = 'direct' THEN c.id END, "
+        "legacy.direct_channel_id) "
+        "FROM agent_definitions d JOIN channel_agents ca ON ca.agent_id = d.agent_id "
+        "JOIN channels c ON c.id = ca.channel_id "
+        "LEFT JOIN channel_memberships target_owner ON target_owner.channel_id = c.id "
+        "AND target_owner.role = 'owner' "
+        "LEFT JOIN channel_agent_runtime_assignments ra ON ra.channel_id = ca.channel_id "
+        "AND ra.agent_id = ca.agent_id "
+        "LEFT JOIN principal_agent_enablements legacy ON legacy.agent_definition_id = d.id "
+        "AND legacy.principal_id = ca.sponsor_principal_id "
+        "AND legacy.runtime_profile_id = ca.sponsored_runtime_profile_id "
+        "AND legacy.lifecycle_state = 'enabled' "
+        "WHERE ca.channel_id = ? AND ca.agent_id = ? AND ca.detached_at IS NULL "
+        "AND d.lifecycle_state = 'active'",
         (target.channel_id, target.agent_id),
     ) as cursor:
         sponsor_row = await cursor.fetchone()
-    if sponsor_row is None or sponsor_row[1] is None or str(sponsor_row[1]) != str(runtime_profile_id):
-        raise ConversationRunUnavailableError("Channel agent has incomplete runtime sponsorship")
-    sponsor_principal_id = sponsor_row[0]
-    if sponsor_principal_id is None and str(sponsor_row[2]) == "direct":
-        sponsor_principal_id = target.requested_by_principal_id
-    if sponsor_principal_id is None:
-        raise ConversationRunUnavailableError("Channel agent has incomplete runtime sponsorship")
+    if sponsor_row is None or any(value is None for value in sponsor_row):
+        raise ConversationRunUnavailableError(
+            "Agent has no explicit runtime profile assignment or owner runtime authority"
+        )
+    sponsor_principal_id = PrincipalId(str(sponsor_row[0]))
+    runtime_profile_id = RuntimeProfileId(str(sponsor_row[1]))
 
     return CanonicalConversationRunResolution(
         target=target,
         runtime_profile_id=runtime_profile_id,
-        sponsor_principal_id=PrincipalId(str(sponsor_principal_id)),
+        sponsor_principal_id=sponsor_principal_id,
     )
 
 

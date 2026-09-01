@@ -141,6 +141,19 @@ class _CanonicalRoutingEligibility:
         assert channel_id == self.authority.channel_id
         return self.authority
 
+    def authority_for_sponsored_channel(
+        self,
+        principal_id,
+        channel_id,
+        agent_id,
+        runtime_profile_id,
+    ):
+        assert principal_id == self.authority.principal_id
+        assert channel_id == self.authority.channel_id
+        assert agent_id == self.authority.agent_id
+        assert runtime_profile_id == self.authority.runtime_profile_id
+        return self.authority
+
     async def inspect(self, authority, task_class, *, additional_required=()):
         assert not additional_required or additional_required[0].value == "text_generation"
         assert authority == self.authority
@@ -173,6 +186,19 @@ class _CanonicalRoutingEligibility:
                     reasons=(EligibilityReason("eligible", "test"),),
                 ),
             ),
+        )
+
+    async def inspect_sponsored_channel(
+        self,
+        authority,
+        task_class,
+        *,
+        additional_required=(),
+    ):
+        return await self.inspect(
+            authority,
+            task_class,
+            additional_required=additional_required,
         )
 
 

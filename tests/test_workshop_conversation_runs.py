@@ -140,15 +140,16 @@ class TestCanonicalRunResolution:
         finally:
             await store.close()
 
-    async def test_rejects_missing_runtime_assignment(self, tmp_path: Path):
+    async def test_owner_runtime_authority_survives_conversation_assignment_loss(self, tmp_path: Path):
         store = await WorkshopEventStore.open(tmp_path / "kai.db")
         try:
             inbound_id = await _canonical_inbound(store)
             await store.connection.execute("DELETE FROM channel_agent_runtime_assignments")
             await store.connection.commit()
 
-            with pytest.raises(ConversationRunUnavailableError, match="explicit runtime profile assignment"):
-                await resolve_canonical_conversation_run(store, inbound_id)
+            resolution = await resolve_canonical_conversation_run(store, inbound_id)
+
+            assert resolution.runtime_profile_id == profile_id(101)
         finally:
             await store.close()
 

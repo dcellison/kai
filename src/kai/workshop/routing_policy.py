@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from kai.workshop.agent_definitions import load_agent_definition_revision
-from kai.workshop.domain import RunId, RuntimeProfileId
+from kai.workshop.domain import ChannelId, RunId, RuntimeProfileId
 from kai.workshop.routing_eligibility import (
     RoutingEligibilityAuthority,
     RoutingTaskClass,
@@ -191,21 +191,25 @@ class WorkshopRoutingPolicyService:
             channel_row = await cursor.fetchone()
         if channel_row is None:
             raise RoutingPolicyError("Run channel is unavailable")
-        shared_channel = str(channel_row[0]) == "group"
-        if shared_channel:
-            if run.sponsor_principal_id is None:
-                raise RoutingPolicyError("Shared-channel run has no runtime sponsor")
-            authority = self._eligibility.authority_for_sponsored_channel(
-                run.sponsor_principal_id,
-                run.channel_id,
-                run.agent_id,
-                runtime_profile_id,
-            )
-        else:
-            authority = self._eligibility.authority_for_principal_channel(
-                run.requested_by_principal_id,
-                run.channel_id,
-            )
+        if run.sponsor_principal_id is None:
+            raise RoutingPolicyError("Agent run has no owner runtime sponsor")
+        async with self._store.connection.execute(
+            "SELECT owner_direct_channel_id FROM agent_definitions "
+            "WHERE agent_id = ? AND owner_principal_id = ? "
+            "AND owner_runtime_profile_id = ? AND lifecycle_state = 'active'",
+            (run.agent_id, run.sponsor_principal_id, runtime_profile_id),
+        ) as cursor:
+            owner_row = await cursor.fetchone()
+        owner_channel_id = (
+            ChannelId(str(owner_row[0])) if owner_row is not None and owner_row[0] is not None else run.channel_id
+        )
+        authority = self._eligibility.authority_for_sponsored_channel(
+            run.sponsor_principal_id,
+            owner_channel_id,
+            run.agent_id,
+            runtime_profile_id,
+        )
+        shared_channel = True
         if authority.runtime_profile_id != runtime_profile_id:
             raise RoutingPolicyError("Run does not match canonical routing profile")
         if authority.agent_id != run.agent_id:

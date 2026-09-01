@@ -95,6 +95,8 @@ function agentDefinitionPayload(): Record<string, unknown> {
     display_name: "Builder",
     handle: "builder",
     lifecycle_state: "active",
+    owner_display_name: "Daniel",
+    owner_principal_id: "prn_00000000000000000000000000000001",
     presentation: { avatar: "B" },
     revisions: [
       {
@@ -130,6 +132,9 @@ function agentEnablementPayload(): Record<string, unknown> {
     lifecycle_state: "enabled",
     runtime_profile_id: runtimeProfileId,
     state_version: 2,
+    can_manage: true,
+    owner_principal_id: "prn_00000000000000000000000000000001",
+    owner_runtime_profile_id: runtimeProfileId,
   };
 }
 

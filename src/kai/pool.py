@@ -406,7 +406,7 @@ class SubprocessPool:
                 raise RuntimeError("Canonical runtime lane requires protected runtime policy")
             profile = self._runtime_profiles.resolve(runtime.runtime_profile_id)
             primary = self._contexts_by_runtime.get(profile.profile_id)
-            if primary is None or primary.principal_id != runtime.principal_id:
+            if primary is None or (primary.runtime_owner_principal_id != runtime.runtime_owner_principal_id):
                 raise RuntimeError("Canonical runtime lane does not own the protected profile")
             self._register_lane_state(runtime)
             return runtime, self._runtime_profiles.legacy_runtime_key(profile.profile_id), profile
@@ -494,7 +494,7 @@ class SubprocessPool:
 
         return WorkshopExecutionStateNamespace(
             principal_id=context.principal_id,
-            channel_id=context.channel_id,
+            channel_id=context.effective_settings_channel_id,
             agent_id=context.agent_id,
             runtime_profile_id=context.runtime_profile_id,
             legacy_runtime_key=(
@@ -502,6 +502,8 @@ class SubprocessPool:
                 if runtime_key == profile.profile_id
                 else None
             ),
+            sponsor_principal_id=context.runtime_owner_principal_id,
+            settings_channel_id=context.effective_settings_channel_id,
         )
 
     def get_runtime_profile(self, runtime: RuntimeSelector) -> ProtectedRuntimeProfile | None:

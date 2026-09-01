@@ -657,6 +657,11 @@ function parseAgentDefinition(value: unknown): WorkshopAgentDefinition | null {
     (value.created_by_principal_id !== null &&
       (typeof value.created_by_principal_id !== "string" ||
         !PRINCIPAL_PATTERN.test(value.created_by_principal_id))) ||
+    (value.owner_principal_id !== null &&
+      (typeof value.owner_principal_id !== "string" ||
+        !PRINCIPAL_PATTERN.test(value.owner_principal_id))) ||
+    (value.owner_display_name !== null &&
+      typeof value.owner_display_name !== "string") ||
     !Array.isArray(value.revisions)
   ) {
     return null;
@@ -707,6 +712,8 @@ function parseAgentDefinition(value: unknown): WorkshopAgentDefinition | null {
     displayName: value.display_name,
     handle: value.handle,
     lifecycleState: value.lifecycle_state as WorkshopAgentDefinition["lifecycleState"],
+    ownerDisplayName: value.owner_display_name,
+    ownerPrincipalId: value.owner_principal_id,
     presentation: value.presentation as { avatar?: string },
     revisions: revisions as WorkshopAgentDefinition["revisions"],
     stateVersion: value.state_version as number,
@@ -737,7 +744,14 @@ function parseAgentEnablement(value: unknown): WorkshopAgentEnablement | null {
     (value.state_version !== null &&
       (!Number.isSafeInteger(value.state_version) ||
         (value.state_version as number) < 1)) ||
-    !Array.isArray(value.eligible_runtimes)
+    !Array.isArray(value.eligible_runtimes) ||
+    typeof value.can_manage !== "boolean" ||
+    (value.owner_principal_id !== null &&
+      (typeof value.owner_principal_id !== "string" ||
+        !PRINCIPAL_PATTERN.test(value.owner_principal_id))) ||
+    (value.owner_runtime_profile_id !== null &&
+      (typeof value.owner_runtime_profile_id !== "string" ||
+        !RUNTIME_PROFILE_PATTERN.test(value.owner_runtime_profile_id)))
   ) {
     return null;
   }
@@ -772,6 +786,9 @@ function parseAgentEnablement(value: unknown): WorkshopAgentEnablement | null {
     lifecycleState: value.lifecycle_state as WorkshopAgentEnablement["lifecycleState"],
     runtimeProfileId: value.runtime_profile_id,
     stateVersion: value.state_version as number | null,
+    canManage: value.can_manage,
+    ownerPrincipalId: value.owner_principal_id,
+    ownerRuntimeProfileId: value.owner_runtime_profile_id,
   };
 }
 

@@ -906,27 +906,46 @@ class WorkshopChannelLifecycleService:
         agent_ids: tuple[AgentId, ...],
     ) -> tuple[_AgentAttachment, ...]:
         placeholders = ",".join("?" for _ in agent_ids)
+        async with self._store.connection.execute("PRAGMA table_info(agent_definitions)") as cursor:
+            definition_columns = {str(row[1]) for row in await cursor.fetchall()}
+        if "owner_principal_id" in definition_columns:
+            query = (
+                "SELECT a.id, a.principal_id, "
+                "COALESCE(ad.owner_principal_id, pae.principal_id), "
+                "COALESCE(ad.owner_runtime_profile_id, pae.runtime_profile_id) "
+                "FROM agents a "
+                "JOIN agent_definitions ad ON ad.agent_id = a.id "
+                "AND ad.workshop_id = a.workshop_id "
+                "AND ad.lifecycle_state = 'active' "
+                "AND ad.active_revision_id IS NOT NULL "
+                "JOIN workshop_memberships agent_wm ON agent_wm.workshop_id = a.workshop_id "
+                "AND agent_wm.principal_id = a.principal_id AND agent_wm.role = 'agent' "
+                "JOIN principal_agent_enablements pae ON pae.agent_definition_id = ad.id "
+                "AND pae.lifecycle_state = 'enabled' "
+                "AND ((ad.owner_principal_id IS NOT NULL "
+                "AND pae.principal_id = ad.owner_principal_id "
+                "AND pae.direct_channel_id = ad.owner_direct_channel_id "
+                "AND pae.runtime_profile_id = ad.owner_runtime_profile_id) "
+                "OR (ad.owner_principal_id IS NULL AND pae.principal_id = ?)) "
+                f"WHERE a.workshop_id = ? AND a.id IN ({placeholders}) "
+                "ORDER BY a.id"
+            )
+        else:
+            query = (
+                "SELECT a.id, a.principal_id, pae.principal_id, pae.runtime_profile_id "
+                "FROM agents a "
+                "JOIN agent_definitions ad ON ad.agent_id = a.id "
+                "AND ad.workshop_id = a.workshop_id "
+                "AND ad.lifecycle_state = 'active' "
+                "AND ad.active_revision_id IS NOT NULL "
+                "JOIN workshop_memberships agent_wm ON agent_wm.workshop_id = a.workshop_id "
+                "AND agent_wm.principal_id = a.principal_id AND agent_wm.role = 'agent' "
+                "JOIN principal_agent_enablements pae ON pae.agent_definition_id = ad.id "
+                "AND pae.lifecycle_state = 'enabled' AND pae.principal_id = ? "
+                f"WHERE a.workshop_id = ? AND a.id IN ({placeholders}) ORDER BY a.id"
+            )
         async with self._store.connection.execute(
-            "SELECT a.id, a.principal_id, ra.runtime_profile_id "
-            "FROM agents a "
-            "JOIN agent_definitions ad ON ad.agent_id = a.id "
-            "AND ad.workshop_id = a.workshop_id "
-            "AND ad.lifecycle_state = 'active' "
-            "AND ad.active_revision_id IS NOT NULL "
-            "JOIN workshop_memberships agent_wm ON agent_wm.workshop_id = a.workshop_id "
-            "AND agent_wm.principal_id = a.principal_id AND agent_wm.role = 'agent' "
-            "JOIN channel_agents ca ON ca.agent_id = a.id AND ca.detached_at IS NULL "
-            "JOIN channels c ON c.id = ca.channel_id AND c.workshop_id = a.workshop_id "
-            "AND c.kind = 'direct' "
-            "JOIN channel_memberships cm ON cm.channel_id = c.id "
-            "AND cm.principal_id = ? AND cm.role = 'owner' "
-            "JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
-            "AND pae.principal_id = cm.principal_id AND pae.agent_id = a.id "
-            "AND pae.lifecycle_state = 'enabled' "
-            "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = c.id "
-            "AND ra.agent_id = a.id AND ra.runtime_profile_id = pae.runtime_profile_id "
-            f"WHERE a.workshop_id = ? AND a.id IN ({placeholders}) "
-            "ORDER BY a.id",
+            query,
             (principal_id, workshop_id, *agent_ids),
         ) as cursor:
             rows = list(await cursor.fetchall())
@@ -935,8 +954,8 @@ class WorkshopChannelLifecycleService:
             attachment = _AgentAttachment(
                 AgentId(str(row[0])),
                 PrincipalId(str(row[1])),
-                principal_id,
-                RuntimeProfileId(str(row[2])),
+                PrincipalId(str(row[2])),
+                RuntimeProfileId(str(row[3])),
             )
             by_agent.setdefault(attachment.agent_id, []).append(attachment)
         if any(len(by_agent.get(agent_id, ())) != 1 for agent_id in agent_ids):

@@ -343,7 +343,9 @@ class WorkshopRunLifecycle:
             definition_revision_id = AgentDefinitionRevisionId(str(definition_row[0]))
             payload["agent_definition_revision_id"] = definition_revision_id
             event_version = 2
-        if resolution is not None:
+        async with self._store.connection.execute("PRAGMA table_info(runs)") as cursor:
+            run_columns = {str(row[1]) for row in await cursor.fetchall()}
+        if resolution is not None and definitions_supported and "runtime_profile_id" in run_columns:
             payload["runtime_profile_id"] = resolution.runtime_profile_id
             payload["sponsor_principal_id"] = resolution.sponsor_principal_id
             event_version = 3

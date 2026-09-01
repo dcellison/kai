@@ -91,6 +91,19 @@ class _Eligibility:
     def authority_for_principal_runtime(self, principal_id, runtime_profile_id):
         raise AssertionError("Run routing must resolve the exact channel lane")
 
+    def authority_for_sponsored_channel(
+        self,
+        principal_id,
+        channel_id,
+        agent_id,
+        runtime_profile_id,
+    ):
+        assert principal_id == self.authority.principal_id
+        assert channel_id == self.authority.channel_id
+        assert agent_id == self.authority.agent_id
+        assert runtime_profile_id == self.authority.runtime_profile_id
+        return self.authority
+
     async def inspect(self, authority, task_class, *, additional_required=()):
         assert not additional_required or additional_required[0].value == "text_generation"
         return RuntimeEligibilityReport(
@@ -122,6 +135,19 @@ class _Eligibility:
                     reasons=(EligibilityReason("eligible", "test"),),
                 ),
             ),
+        )
+
+    async def inspect_sponsored_channel(
+        self,
+        authority,
+        task_class,
+        *,
+        additional_required=(),
+    ):
+        return await self.inspect(
+            authority,
+            task_class,
+            additional_required=additional_required,
         )
 
 
@@ -205,6 +231,8 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
                 accepted.run.channel_id,
                 accepted.run.agent_id,
                 profile_id(101),
+                sponsor_principal_id=accepted.run.sponsor_principal_id,
+                settings_channel_id=accepted.run.channel_id,
             ),
             "codex:openai",
             "gpt-5.6-sol",

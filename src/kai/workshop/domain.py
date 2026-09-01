@@ -37,6 +37,7 @@ class WorkshopEventType(StrEnum):
     AGENT_DEFINITION_REVISION_ADDED = "agent_definition.revision_added"
     AGENT_DEFINITION_REVISION_ACTIVATED = "agent_definition.revision_activated"
     AGENT_DEFINITION_ARCHIVED = "agent_definition.archived"
+    AGENT_DEFINITION_AUTHORITY_ASSIGNED = "agent_definition.authority_assigned"
     PRINCIPAL_AGENT_ENABLED = "principal_agent.enabled"
     PRINCIPAL_AGENT_DISABLED = "principal_agent.disabled"
     PRINCIPAL_AGENT_RUNTIME_CHANGED = "principal_agent.runtime_changed"

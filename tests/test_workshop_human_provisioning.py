@@ -11,10 +11,7 @@ from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_access import WorkshopClientAccess
 from kai.workshop.client_sessions import WorkshopClientEnrollmentManager
-from kai.workshop.conversation_commands import (
-    ConversationCommandStateConflictError,
-    WorkshopConversationCommandService,
-)
+from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.human_provisioning import (
     WorkshopHumanProvisioner,
     WorkshopHumanProvisioningError,
@@ -92,7 +89,7 @@ class TestWorkshopHumanProvisioner:
         finally:
             await store.close()
 
-    async def test_provisioned_human_can_enroll_and_read_but_has_no_runtime_authority(
+    async def test_provisioned_human_uses_the_shared_agent_owner_runtime(
         self,
         tmp_path: Path,
     ):
@@ -118,19 +115,17 @@ class TestWorkshopHumanProvisioner:
                 provisioned.principal_id,
                 provisioned.channel_id,
             )
-            with pytest.raises(
-                ConversationCommandStateConflictError,
-                match="explicit runtime profile assignment",
-            ):
-                await WorkshopConversationCommandService(store).accept_client(
-                    ClientInboundMessage(
-                        principal_id=provisioned.principal_id,
-                        channel_id=provisioned.channel_id,
-                        client_message_id="provisioned-human-no-runtime",
-                        body="This must not inherit another user's runtime",
-                        occurred_at=datetime.now(UTC),
-                    )
+            accepted = await WorkshopConversationCommandService(store).accept_client(
+                ClientInboundMessage(
+                    principal_id=provisioned.principal_id,
+                    channel_id=provisioned.channel_id,
+                    client_message_id="provisioned-human-shared-agent-runtime",
+                    body="Use the shared agent owner's runtime",
+                    occurred_at=datetime.now(UTC),
                 )
+            )
+            assert accepted.runtime_profile_id == profile_id(101)
+            assert accepted.run.requested_by_principal_id == provisioned.principal_id
         finally:
             await store.close()
 

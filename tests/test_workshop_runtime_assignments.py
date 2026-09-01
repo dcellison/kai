@@ -76,7 +76,7 @@ class TestRuntimeAssignmentPolicy:
         finally:
             await store.close()
 
-    async def test_provisioned_human_gains_runtime_only_after_explicit_assignment(
+    async def test_provisioned_human_uses_agent_owner_runtime_after_access_assignment(
         self,
         tmp_path: Path,
     ):
@@ -119,7 +119,7 @@ class TestRuntimeAssignmentPolicy:
                     principal_id=human.principal_id,
                     channel_id=human.channel_id,
                     client_message_id="charlie-command-1",
-                    body="Use only my explicitly assigned runtime",
+                    body="Use the agent owner's runtime",
                     occurred_at=datetime.now(UTC),
                 )
             )
@@ -128,8 +128,8 @@ class TestRuntimeAssignmentPolicy:
                 MessageId(str(accepted.command.message.event.envelope.aggregate_id)),
             )
 
-            assert accepted.runtime_profile_id == profile_id(202)
-            assert resolution.runtime_profile_id == profile_id(202)
+            assert accepted.runtime_profile_id == profile_id(101)
+            assert resolution.runtime_profile_id == profile_id(101)
         finally:
             await store.close()
 
@@ -178,7 +178,7 @@ class TestRuntimeAssignmentPolicy:
 
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
 
-            assert checkpoint.version == 20
+            assert checkpoint.version == 21
             assert await resolve_channel_runtime_profile(store, human.channel_id) == (
                 assigned.agent_id,
                 profile_id(202),

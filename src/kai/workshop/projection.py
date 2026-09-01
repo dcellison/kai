@@ -303,13 +303,20 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                 raise ValueError("Workshop run must bind the agent's active definition revision")
         if envelope.event_version in {3, 4}:
             async with connection.execute(
-                "SELECT COALESCE(ca.sponsor_principal_id, CASE WHEN c.kind = 'direct' "
-                "THEN ? ELSE NULL END), ca.sponsored_runtime_profile_id, "
-                "ra.runtime_profile_id FROM channel_agents ca "
+                "SELECT COALESCE(d.owner_principal_id, ca.sponsor_principal_id, "
+                "CASE WHEN c.kind = 'direct' THEN ? ELSE NULL END), "
+                "COALESCE(d.owner_runtime_profile_id, ca.sponsored_runtime_profile_id, "
+                "ra.runtime_profile_id), COALESCE(d.owner_runtime_profile_id, ra.runtime_profile_id) "
+                "FROM channel_agents ca "
                 "JOIN channels c ON c.id = ca.channel_id "
-                "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = ca.channel_id "
-                "AND ra.agent_id = ca.agent_id WHERE ca.channel_id = ? AND ca.agent_id = ? "
-                "AND ca.detached_at IS NULL",
+                "LEFT JOIN channel_agent_runtime_assignments ra ON ra.channel_id = ca.channel_id "
+                "AND ra.agent_id = ca.agent_id "
+                "LEFT JOIN agent_definitions d ON d.agent_id = ca.agent_id "
+                "AND d.lifecycle_state = 'active' "
+                "WHERE ca.channel_id = ? AND ca.agent_id = ? AND ca.detached_at IS NULL "
+                "AND (d.owner_principal_id IS NULL OR ("
+                "d.owner_principal_id = ca.sponsor_principal_id "
+                "AND d.owner_runtime_profile_id = ca.sponsored_runtime_profile_id))",
                 (requested_by, channel_id, agent_id),
             ) as cursor:
                 sponsorship_row = await cursor.fetchone()
@@ -1096,8 +1103,8 @@ class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
     name = "canonical_conversations"
-    # Human-notification adapter decisions project from versioned creation events.
-    version = 20
+    # Agent ownership and runtime sponsorship project from explicit authority events.
+    version = 21
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1127,11 +1134,11 @@ class CanonicalConversationProjection:
             "channel_agent_dismissals",
             "channel_agent_runtime_assignments",
             "channel_agents",
+            "agent_definition_revisions",
+            "agent_definitions",
             "channel_bindings",
             "channel_memberships",
             "channels",
-            "agent_definition_revisions",
-            "agent_definitions",
             "agents",
             "human_handles",
             "workshop_memberships",
@@ -1421,10 +1428,19 @@ class CanonicalConversationProjection:
                 or envelope.aggregate_type != "agent_definition"
             ):
                 raise ValueError("Workshop agent definition creation requires a typed definition aggregate")
-            _require_exact_payload(
-                payload,
-                {"agent_id", "handle", "display_name", "description", "presentation", "lifecycle_state"},
-            )
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop agent definition creation event version")
+            definition_keys = {
+                "agent_id",
+                "handle",
+                "display_name",
+                "description",
+                "presentation",
+                "lifecycle_state",
+            }
+            if envelope.event_version == 2:
+                definition_keys.add("owner_principal_id")
+            _require_exact_payload(payload, definition_keys)
             agent_id = AgentId(_required_text(payload, "agent_id"))
             handle = normalize_agent_handle(payload.get("handle"))
             display_name = validate_agent_text(
@@ -1440,10 +1456,24 @@ class CanonicalConversationProjection:
             if lifecycle_state not in {"draft", "active", "archived"}:
                 raise ValueError("Workshop agent definition lifecycle_state is invalid")
             presentation_json = validate_agent_presentation(payload.get("presentation"))
+            owner_principal_id = (
+                PrincipalId(_required_text(payload, "owner_principal_id")) if envelope.event_version == 2 else None
+            )
             async with connection.execute("SELECT workshop_id FROM agents WHERE id = ?", (agent_id,)) as cursor:
                 agent_row = await cursor.fetchone()
             if agent_row is None or WorkshopId(str(agent_row[0])) != envelope.workshop_id:
                 raise ValueError("Workshop agent definition must reference an agent in its workshop")
+            if owner_principal_id is not None:
+                if envelope.actor_principal_id != owner_principal_id:
+                    raise ValueError("Workshop agent definition owner must create the definition")
+                async with connection.execute(
+                    "SELECT 1 FROM workshop_memberships wm JOIN principals p "
+                    "ON p.id = wm.principal_id AND p.kind = 'human' "
+                    "WHERE wm.workshop_id = ? AND wm.principal_id = ?",
+                    (envelope.workshop_id, owner_principal_id),
+                ) as cursor:
+                    if await cursor.fetchone() is None:
+                        raise ValueError("Workshop agent definition owner must be a human member")
             if await _table_has_column(connection, "human_handles", "handle"):
                 async with connection.execute(
                     "SELECT 1 FROM human_handles WHERE workshop_id = ? AND handle = ? COLLATE NOCASE",
@@ -1451,24 +1481,35 @@ class CanonicalConversationProjection:
                 ) as cursor:
                     if await cursor.fetchone() is not None:
                         raise ValueError("Workshop agent handle conflicts with a human handle")
-            await connection.execute(
-                "INSERT INTO agent_definitions "
-                "(id, workshop_id, agent_id, handle, display_name, description, "
-                "presentation_json, lifecycle_state, active_revision_id, created_at, "
-                "created_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
-                (
-                    envelope.aggregate_id,
-                    envelope.workshop_id,
-                    agent_id,
-                    handle,
-                    display_name,
-                    description,
-                    presentation_json,
-                    lifecycle_state,
-                    occurred_at,
-                    event.position,
-                ),
+            definition_values = (
+                envelope.aggregate_id,
+                envelope.workshop_id,
+                agent_id,
+                handle,
+                display_name,
+                description,
+                presentation_json,
+                lifecycle_state,
+                occurred_at,
+                event.position,
             )
+            if await _table_has_column(connection, "agent_definitions", "owner_principal_id"):
+                await connection.execute(
+                    "INSERT INTO agent_definitions "
+                    "(id, workshop_id, agent_id, handle, display_name, description, "
+                    "presentation_json, lifecycle_state, active_revision_id, created_at, "
+                    "created_event_position, owner_principal_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                    (*definition_values, owner_principal_id),
+                )
+            else:
+                await connection.execute(
+                    "INSERT INTO agent_definitions "
+                    "(id, workshop_id, agent_id, handle, display_name, description, "
+                    "presentation_json, lifecycle_state, active_revision_id, created_at, "
+                    "created_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                    definition_values,
+                )
         elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
             if (
                 not isinstance(envelope.aggregate_id, AgentDefinitionRevisionId)
@@ -1568,6 +1609,74 @@ class CanonicalConversationProjection:
                 "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE id = ?",
                 (envelope.aggregate_id,),
             )
+        elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED:
+            if (
+                not isinstance(envelope.aggregate_id, AgentDefinitionId)
+                or envelope.aggregate_type != "agent_definition"
+                or envelope.actor_principal_id is None
+            ):
+                raise ValueError("Workshop agent authority requires a human definition owner")
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop agent authority event version")
+            authority_keys = {"owner_principal_id"}
+            if envelope.event_version == 2:
+                authority_keys.update({"runtime_profile_id", "owner_direct_channel_id"})
+            _require_exact_payload(payload, authority_keys)
+            owner_principal_id = PrincipalId(_required_text(payload, "owner_principal_id"))
+            if envelope.actor_principal_id != owner_principal_id:
+                raise ValueError("Workshop agent authority must be assigned by its owner")
+            async with connection.execute(
+                "SELECT owner_principal_id, workshop_id FROM agent_definitions WHERE id = ?",
+                (envelope.aggregate_id,),
+            ) as cursor:
+                definition_row = await cursor.fetchone()
+            if (
+                definition_row is None
+                or WorkshopId(str(definition_row[1])) != envelope.workshop_id
+                or (definition_row[0] is not None and str(definition_row[0]) != str(owner_principal_id))
+            ):
+                raise ValueError("Workshop agent owner authority conflicts")
+            if envelope.event_version == 1:
+                await connection.execute(
+                    "UPDATE agent_definitions SET owner_principal_id = ?, authority_event_position = ? WHERE id = ?",
+                    (owner_principal_id, event.position, envelope.aggregate_id),
+                )
+                return
+            runtime_profile_id = _required_text(payload, "runtime_profile_id")
+            owner_direct_channel_id = ChannelId(_required_text(payload, "owner_direct_channel_id"))
+            async with connection.execute(
+                "SELECT d.agent_id, d.workshop_id, e.runtime_profile_id, e.lifecycle_state "
+                "FROM agent_definitions d JOIN principal_agent_enablements e "
+                "ON e.agent_definition_id = d.id AND e.principal_id = ? "
+                "AND e.direct_channel_id = ? WHERE d.id = ?",
+                (owner_principal_id, owner_direct_channel_id, envelope.aggregate_id),
+            ) as cursor:
+                authority_row = await cursor.fetchone()
+            if (
+                authority_row is None
+                or WorkshopId(str(authority_row[1])) != envelope.workshop_id
+                or str(authority_row[2]) != runtime_profile_id
+                or str(authority_row[3]) != "enabled"
+            ):
+                raise ValueError("Workshop agent authority has no enabled owner runtime")
+            agent_id = AgentId(str(authority_row[0]))
+            await connection.execute(
+                "UPDATE agent_definitions SET owner_principal_id = ?, "
+                "owner_runtime_profile_id = ?, owner_direct_channel_id = ?, "
+                "authority_event_position = ? WHERE id = ?",
+                (
+                    owner_principal_id,
+                    runtime_profile_id,
+                    owner_direct_channel_id,
+                    event.position,
+                    envelope.aggregate_id,
+                ),
+            )
+            await connection.execute(
+                "UPDATE channel_agents SET sponsor_principal_id = ?, "
+                "sponsored_runtime_profile_id = ? WHERE agent_id = ? AND detached_at IS NULL",
+                (owner_principal_id, runtime_profile_id, agent_id),
+            )
         elif envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_ENABLED:
             if not isinstance(envelope.aggregate_id, AgentEnablementId):
                 raise ValueError("Workshop agent enablement requires a typed enablement aggregate")
@@ -1647,6 +1756,22 @@ class CanonicalConversationProjection:
                     event.position,
                 ),
             )
+            if await _table_has_column(connection, "agent_definitions", "owner_principal_id"):
+                await connection.execute(
+                    "UPDATE channel_agents SET sponsor_principal_id = COALESCE(("
+                    "SELECT owner_principal_id FROM agent_definitions WHERE id = ?), ?), "
+                    "sponsored_runtime_profile_id = COALESCE(("
+                    "SELECT owner_runtime_profile_id FROM agent_definitions WHERE id = ?), ?) "
+                    "WHERE channel_id = ? AND agent_id = ?",
+                    (
+                        definition_id,
+                        principal_id,
+                        definition_id,
+                        runtime_profile_id,
+                        channel_id,
+                        agent_id,
+                    ),
+                )
         elif envelope.event_type == WorkshopEventType.PRINCIPAL_AGENT_DISABLED:
             if not isinstance(envelope.aggregate_id, AgentEnablementId):
                 raise ValueError("Workshop agent disablement requires a typed enablement aggregate")
@@ -1696,6 +1821,20 @@ class CanonicalConversationProjection:
                 PrincipalId(_required_text(payload, "sponsor_principal_id")) if envelope.event_version == 2 else None
             )
             runtime_profile_id = _required_text(payload, "runtime_profile_id") if envelope.event_version == 2 else None
+            if envelope.event_version == 1 and await _table_has_column(
+                connection,
+                "agent_definitions",
+                "owner_principal_id",
+            ):
+                async with connection.execute(
+                    "SELECT owner_principal_id, owner_runtime_profile_id "
+                    "FROM agent_definitions WHERE agent_id = ? AND lifecycle_state = 'active'",
+                    (agent_id,),
+                ) as cursor:
+                    owner_row = await cursor.fetchone()
+                if owner_row is not None and owner_row[0] is not None and owner_row[1] is not None:
+                    sponsor_principal_id = PrincipalId(str(owner_row[0]))
+                    runtime_profile_id = str(owner_row[1])
             if envelope.event_version == 2:
                 if envelope.actor_principal_id is None:
                     raise ValueError("Workshop channel-agent attachment requires a human actor")
@@ -1718,11 +1857,7 @@ class CanonicalConversationProjection:
                     ),
                 ) as cursor:
                     attachment_row = await cursor.fetchone()
-                if (
-                    attachment_row is None
-                    or str(attachment_row[0]) != str(envelope.workshop_id)
-                    or envelope.actor_principal_id != sponsor_principal_id
-                ):
+                if attachment_row is None or str(attachment_row[0]) != str(envelope.workshop_id):
                     raise ValueError("Workshop channel-agent attachment has no enabled sponsorship")
             has_attachment_lifecycle = await _table_has_column(
                 connection,
@@ -1881,26 +2016,60 @@ class CanonicalConversationProjection:
                 "channel_agents",
                 "sponsored_runtime_profile_id",
             ):
-                await connection.execute(
-                    "UPDATE channel_agents SET sponsored_runtime_profile_id = "
-                    "COALESCE(sponsored_runtime_profile_id, ?), sponsor_principal_id = "
-                    "COALESCE(sponsor_principal_id, ("
-                    "SELECT owner.principal_id FROM channel_agent_runtime_assignments direct_ra "
-                    "JOIN channels direct_channel ON direct_channel.id = direct_ra.channel_id "
-                    "AND direct_channel.kind = 'direct' "
-                    "JOIN channel_memberships owner ON owner.channel_id = direct_channel.id "
-                    "AND owner.role = 'owner' "
-                    "WHERE direct_ra.runtime_profile_id = ? AND direct_ra.agent_id = ? "
-                    "ORDER BY direct_ra.created_event_position LIMIT 1)) "
-                    "WHERE channel_id = ? AND agent_id = ?",
-                    (
-                        _required_text(payload, "runtime_profile_id"),
-                        _required_text(payload, "runtime_profile_id"),
-                        _required_text(payload, "agent_id"),
-                        _required_text(payload, "channel_id"),
-                        _required_text(payload, "agent_id"),
-                    ),
+                has_owner_authority = await _table_has_column(
+                    connection,
+                    "agent_definitions",
+                    "owner_principal_id",
                 )
+                if has_owner_authority:
+                    await connection.execute(
+                        "UPDATE channel_agents SET sponsored_runtime_profile_id = "
+                        "COALESCE(sponsored_runtime_profile_id, ("
+                        "SELECT owner_runtime_profile_id FROM agent_definitions "
+                        "WHERE agent_id = ? AND lifecycle_state = 'active'), ?), "
+                        "sponsor_principal_id = "
+                        "COALESCE(sponsor_principal_id, ("
+                        "SELECT owner_principal_id FROM agent_definitions "
+                        "WHERE agent_id = ? AND lifecycle_state = 'active'), ("
+                        "SELECT owner.principal_id FROM channel_agent_runtime_assignments direct_ra "
+                        "JOIN channels direct_channel ON direct_channel.id = direct_ra.channel_id "
+                        "AND direct_channel.kind = 'direct' "
+                        "JOIN channel_memberships owner ON owner.channel_id = direct_channel.id "
+                        "AND owner.role = 'owner' "
+                        "WHERE direct_ra.runtime_profile_id = ? AND direct_ra.agent_id = ? "
+                        "ORDER BY direct_ra.created_event_position LIMIT 1)) "
+                        "WHERE channel_id = ? AND agent_id = ?",
+                        (
+                            _required_text(payload, "agent_id"),
+                            _required_text(payload, "runtime_profile_id"),
+                            _required_text(payload, "agent_id"),
+                            _required_text(payload, "runtime_profile_id"),
+                            _required_text(payload, "agent_id"),
+                            _required_text(payload, "channel_id"),
+                            _required_text(payload, "agent_id"),
+                        ),
+                    )
+                else:
+                    await connection.execute(
+                        "UPDATE channel_agents SET sponsored_runtime_profile_id = "
+                        "COALESCE(sponsored_runtime_profile_id, ?), sponsor_principal_id = "
+                        "COALESCE(sponsor_principal_id, ("
+                        "SELECT owner.principal_id FROM channel_agent_runtime_assignments direct_ra "
+                        "JOIN channels direct_channel ON direct_channel.id = direct_ra.channel_id "
+                        "AND direct_channel.kind = 'direct' "
+                        "JOIN channel_memberships owner ON owner.channel_id = direct_channel.id "
+                        "AND owner.role = 'owner' "
+                        "WHERE direct_ra.runtime_profile_id = ? AND direct_ra.agent_id = ? "
+                        "ORDER BY direct_ra.created_event_position LIMIT 1)) "
+                        "WHERE channel_id = ? AND agent_id = ?",
+                        (
+                            _required_text(payload, "runtime_profile_id"),
+                            _required_text(payload, "runtime_profile_id"),
+                            _required_text(payload, "agent_id"),
+                            _required_text(payload, "channel_id"),
+                            _required_text(payload, "agent_id"),
+                        ),
+                    )
         elif envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_REASSIGNED:
             await _require_active_channel(
                 connection,

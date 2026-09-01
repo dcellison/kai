@@ -100,6 +100,7 @@ _AGENT_AUTHORITY_TABLES = {
     "channels",
     "principal_agent_enablements",
     "principals",
+    "runtime_profile_owners",
     "runs",
     "workshop_memberships",
 }
@@ -279,6 +280,60 @@ def workshop_agent_authority_status(db_path: Path) -> str:
             )
             handles = [str(row[0]) for row in connection.execute("SELECT handle FROM agent_definitions").fetchall()]
             invalid_handles = sum(not _AGENT_HANDLE_PATTERN.fullmatch(handle) for handle in handles)
+            owned_definitions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions WHERE owner_principal_id IS NOT NULL",
+            )
+            missing_owners = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions WHERE owner_principal_id IS NULL",
+            )
+            invalid_owners = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d "
+                "LEFT JOIN principals p ON p.id = d.owner_principal_id "
+                "LEFT JOIN workshop_memberships wm ON wm.workshop_id = d.workshop_id "
+                "AND wm.principal_id = d.owner_principal_id "
+                "WHERE d.owner_principal_id IS NOT NULL "
+                "AND (p.kind IS NULL OR p.kind != 'human' OR wm.id IS NULL)",
+            )
+            owner_runtime_authorities = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions WHERE lifecycle_state = 'active' "
+                "AND owner_principal_id IS NOT NULL AND owner_runtime_profile_id IS NOT NULL "
+                "AND owner_direct_channel_id IS NOT NULL",
+            )
+            missing_owner_runtimes = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d WHERE d.lifecycle_state = 'active' "
+                "AND EXISTS (SELECT 1 FROM principal_agent_enablements any_access "
+                "WHERE any_access.agent_definition_id = d.id "
+                "AND any_access.lifecycle_state = 'enabled') "
+                "AND (d.owner_principal_id IS NULL OR d.owner_runtime_profile_id IS NULL "
+                "OR d.owner_direct_channel_id IS NULL)",
+            )
+            invalid_owner_runtimes = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d "
+                "WHERE d.owner_runtime_profile_id IS NOT NULL AND ("
+                "NOT EXISTS (SELECT 1 FROM principal_agent_enablements e "
+                "WHERE e.agent_definition_id = d.id "
+                "AND e.principal_id = d.owner_principal_id "
+                "AND e.runtime_profile_id = d.owner_runtime_profile_id "
+                "AND e.direct_channel_id = d.owner_direct_channel_id "
+                "AND e.lifecycle_state = 'enabled') "
+                "OR NOT EXISTS (SELECT 1 FROM runtime_profile_owners ro "
+                "WHERE ro.runtime_profile_id = d.owner_runtime_profile_id "
+                "AND ro.principal_id = d.owner_principal_id))",
+            )
+            nonowner_access_lanes = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_agent_enablements e "
+                "JOIN agent_definitions d ON d.id = e.agent_definition_id "
+                "WHERE e.lifecycle_state = 'enabled' "
+                "AND d.owner_principal_id IS NOT NULL "
+                "AND e.principal_id != d.owner_principal_id",
+            )
 
             enablements = _scalar(connection, "SELECT COUNT(*) FROM principal_agent_enablements")
             enabled = _scalar(
@@ -363,12 +418,18 @@ def workshop_agent_authority_status(db_path: Path) -> str:
                 "d.id IS NULL OR d.workshop_id != c.workshop_id OR d.lifecycle_state != 'active' "
                 "OR ca.sponsor_principal_id IS NULL OR ca.sponsored_runtime_profile_id IS NULL "
                 "OR NOT EXISTS (SELECT 1 FROM principals p WHERE p.id = ca.sponsor_principal_id "
-                "AND p.kind = 'human') OR NOT EXISTS (SELECT 1 FROM channel_memberships owner "
-                "WHERE owner.channel_id = ca.channel_id AND owner.principal_id = ca.sponsor_principal_id "
-                "AND owner.role = 'owner') OR NOT EXISTS (SELECT 1 FROM "
-                "principal_agent_enablements e WHERE e.principal_id = ca.sponsor_principal_id "
+                "AND p.kind = 'human') OR ((d.owner_principal_id IS NOT NULL AND ("
+                "d.owner_principal_id != ca.sponsor_principal_id "
+                "OR d.owner_runtime_profile_id != ca.sponsored_runtime_profile_id "
+                "OR NOT EXISTS (SELECT 1 FROM principal_agent_enablements e "
+                "WHERE e.agent_definition_id = d.id AND e.principal_id = d.owner_principal_id "
+                "AND e.runtime_profile_id = d.owner_runtime_profile_id "
+                "AND e.direct_channel_id = d.owner_direct_channel_id "
+                "AND e.lifecycle_state = 'enabled'))) OR (d.owner_principal_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM principal_agent_enablements e "
+                "WHERE e.principal_id = ca.sponsor_principal_id "
                 "AND e.agent_id = ca.agent_id AND e.runtime_profile_id = "
-                "ca.sponsored_runtime_profile_id AND e.lifecycle_state = 'enabled') "
+                "ca.sponsored_runtime_profile_id AND e.lifecycle_state = 'enabled'))) "
                 "OR NOT EXISTS (SELECT 1 FROM channel_agent_runtime_assignments ra "
                 "WHERE ra.channel_id = ca.channel_id AND ra.agent_id = ca.agent_id "
                 "AND ra.runtime_profile_id = ca.sponsored_runtime_profile_id))",
@@ -431,6 +492,10 @@ def workshop_agent_authority_status(db_path: Path) -> str:
             orphaned_principals,
             definition_mismatches,
             invalid_handles,
+            missing_owners,
+            invalid_owners,
+            missing_owner_runtimes,
+            invalid_owner_runtimes,
             invalid_enablements,
             unauthorized_runtime_bindings,
             namespace_conflicts,
@@ -442,14 +507,18 @@ def workshop_agent_authority_status(db_path: Path) -> str:
     return (
         f"{prefix} {state}; definitions={definitions} "
         f"(active={active}, draft={drafts}, archived={archived}), revisions={revisions}, "
+        f"owners={owned_definitions}, owner runtimes={owner_runtime_authorities}, "
         f"enablements={enablements} (enabled={enabled}), direct channels={direct_channels}, "
+        f"nonowner access lanes={nonowner_access_lanes}, "
         f"attachments={attachments} (detached={detached_attachments}), "
         f"runtime sponsorships={runtime_sponsorships}, delegation trees={delegation_trees}, "
         f"delegations={delegations} (nonterminal={nonterminal_delegations}); "
         f"integrity gaps={integrity_gaps} (definitions={missing_definitions + definition_mismatches}, "
         f"missing revisions={missing_revisions}, stale revisions={stale_active_revisions}, "
         f"ambiguous revisions={ambiguous_revisions}, principals={orphaned_principals}, "
-        f"handles={invalid_handles}, enablements={invalid_enablements}, "
+        f"handles={invalid_handles}, owners={missing_owners + invalid_owners}, "
+        f"owner runtimes={missing_owner_runtimes + invalid_owner_runtimes}, "
+        f"enablements={invalid_enablements}, "
         f"runtime bindings={unauthorized_runtime_bindings}, namespaces={namespace_conflicts}, "
         f"attachments={dangling_attachments}, delegations={delegation_gaps}); authority=canonical"
     )

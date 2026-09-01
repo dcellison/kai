@@ -77,6 +77,9 @@ class PrincipalAgentEnablement:
     runtime_profile_id: RuntimeProfileId | None
     state_version: int | None
     eligible_runtimes: tuple[EligibleAgentRuntime, ...]
+    owner_principal_id: PrincipalId | None
+    owner_runtime_profile_id: RuntimeProfileId | None
+    can_manage: bool
 
 
 class WorkshopAgentEnablementService:
@@ -159,6 +162,7 @@ class WorkshopAgentEnablementService:
                 await connection.commit()
                 return replay
             definition = await self._active_definition(workshop_id, definition_id)
+            owner_principal_id = definition[4]
             current = await self._snapshot(principal_id, definition_id, eligible=eligible)
             self._check_version(current, expected_version)
             now = datetime.now(UTC)
@@ -249,6 +253,25 @@ class WorkshopAgentEnablementService:
             for event in events:
                 await self._store.append_in_transaction(event)
             await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            if principal_id == owner_principal_id:
+                authority_event = EventEnvelope.create(
+                    event_type=WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED,
+                    event_version=2,
+                    workshop_id=workshop_id,
+                    aggregate_type="agent_definition",
+                    aggregate_id=definition_id,
+                    actor_principal_id=principal_id,
+                    occurred_at=now,
+                    idempotency_key=(f"{operation_key}:authority:{runtime_profile_id}:{channel_id}"),
+                    payload={
+                        "owner_principal_id": principal_id,
+                        "runtime_profile_id": runtime_profile_id,
+                        "owner_direct_channel_id": channel_id,
+                    },
+                    metadata=metadata,
+                )
+                await self._store.append_in_transaction(authority_event)
+                await self._store.project_pending_in_transaction(CanonicalConversationProjection())
             result = await self._snapshot(principal_id, definition_id, eligible=eligible)
             await connection.commit()
             new_context = WorkshopInternalAPIExecutionContext(
@@ -315,6 +338,10 @@ class WorkshopAgentEnablementService:
             self._check_version(current, expected_version)
             if current.enablement_id is None or current.lifecycle_state != "enabled":
                 raise WorkshopAgentEnablementConflict("Agent is not enabled")
+            if current.can_manage:
+                raise WorkshopAgentEnablementConflict(
+                    "The owner runtime cannot be disabled while the agent definition is active"
+                )
             event = EventEnvelope.create(
                 event_type=WorkshopEventType.PRINCIPAL_AGENT_DISABLED,
                 event_version=1,
@@ -403,18 +430,35 @@ class WorkshopAgentEnablementService:
         self,
         workshop_id: WorkshopId,
         definition_id: AgentDefinitionId,
-    ) -> tuple[AgentId, PrincipalId, str, str]:
+    ) -> tuple[
+        AgentId,
+        PrincipalId,
+        str,
+        str,
+        PrincipalId,
+        RuntimeProfileId | None,
+        ChannelId | None,
+    ]:
         async with self._store.connection.execute(
-            "SELECT d.agent_id, a.principal_id, d.handle, d.display_name "
+            "SELECT d.agent_id, a.principal_id, d.handle, d.display_name, "
+            "d.owner_principal_id, d.owner_runtime_profile_id, d.owner_direct_channel_id "
             "FROM agent_definitions d JOIN agents a ON a.id = d.agent_id "
             "WHERE d.id = ? AND d.workshop_id = ? AND d.lifecycle_state = 'active' "
             "AND d.active_revision_id IS NOT NULL",
             (definition_id, workshop_id),
         ) as cursor:
             row = await cursor.fetchone()
-        if row is None:
+        if row is None or row[4] is None:
             raise WorkshopAgentEnablementAccessDenied("Active agent definition is unavailable")
-        return AgentId(str(row[0])), PrincipalId(str(row[1])), str(row[2]), str(row[3])
+        return (
+            AgentId(str(row[0])),
+            PrincipalId(str(row[1])),
+            str(row[2]),
+            str(row[3]),
+            PrincipalId(str(row[4])),
+            RuntimeProfileId(str(row[5])) if row[5] is not None else None,
+            ChannelId(str(row[6])) if row[6] is not None else None,
+        )
 
     async def _snapshot(
         self,
@@ -426,7 +470,8 @@ class WorkshopAgentEnablementService:
         workshop_id = await self._workshop_for(principal_id)
         async with self._store.connection.execute(
             "SELECT d.agent_id, d.handle, d.display_name, d.lifecycle_state, e.id, "
-            "e.direct_channel_id, e.runtime_profile_id, e.lifecycle_state, e.last_event_position "
+            "e.direct_channel_id, e.runtime_profile_id, e.lifecycle_state, e.last_event_position, "
+            "d.owner_principal_id, d.owner_runtime_profile_id "
             "FROM agent_definitions d LEFT JOIN principal_agent_enablements e "
             "ON e.agent_definition_id = d.id AND e.principal_id = ? "
             "WHERE d.id = ? AND d.workshop_id = ?",
@@ -435,6 +480,8 @@ class WorkshopAgentEnablementService:
             row = await cursor.fetchone()
         if row is None or str(row[3]) != "active":
             raise WorkshopAgentEnablementAccessDenied("Active agent definition is unavailable")
+        owner_principal_id = PrincipalId(str(row[9])) if row[9] is not None else None
+        can_manage = owner_principal_id == principal_id
         return PrincipalAgentEnablement(
             AgentEnablementId(str(row[4])) if row[4] is not None else None,
             definition_id,
@@ -446,6 +493,9 @@ class WorkshopAgentEnablementService:
             RuntimeProfileId(str(row[6])) if row[6] is not None else None,
             int(row[8]) if row[8] is not None else None,
             eligible if eligible is not None else await self._eligible_runtimes(principal_id),
+            owner_principal_id,
+            RuntimeProfileId(str(row[10])) if row[10] is not None else None,
+            can_manage,
         )
 
     def _creation_events(
@@ -453,7 +503,15 @@ class WorkshopAgentEnablementService:
         workshop_id: WorkshopId,
         principal_id: PrincipalId,
         definition_id: AgentDefinitionId,
-        definition: tuple[AgentId, PrincipalId, str, str],
+        definition: tuple[
+            AgentId,
+            PrincipalId,
+            str,
+            str,
+            PrincipalId,
+            RuntimeProfileId | None,
+            ChannelId | None,
+        ],
         enablement_id: AgentEnablementId,
         channel_id: ChannelId,
         runtime_profile_id: RuntimeProfileId,
@@ -461,7 +519,7 @@ class WorkshopAgentEnablementService:
         operation_key: str,
         metadata: dict[str, str],
     ) -> list[EventEnvelope]:
-        agent_id, agent_principal_id, _handle, display_name = definition
+        agent_id, agent_principal_id, _handle, display_name, _owner, _owner_runtime, _owner_channel = definition
         assignment_id = RuntimeAssignmentId.derived(channel_id, f"runtime-profile:{agent_id}")
         return [
             EventEnvelope.create(

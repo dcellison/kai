@@ -115,11 +115,13 @@ class TestAgentDefinitionBootstrap:
             assert await active_agent_definition_revision(store, agent_id) == revision
             assert workshop_agent_authority_status(tmp_path / "kai.db") == (
                 "Workshop agent authority: active; definitions=1 (active=1, draft=0, archived=0), "
-                "revisions=2, enablements=0 (enabled=0), direct channels=0, attachments=0 "
+                "revisions=2, owners=1, owner runtimes=0, enablements=0 (enabled=0), "
+                "direct channels=0, nonowner access lanes=0, attachments=0 "
                 "(detached=0), runtime sponsorships=0, delegation trees=0, delegations=0 "
                 "(nonterminal=0); integrity gaps=0 (definitions=0, missing revisions=0, "
                 "stale revisions=0, ambiguous revisions=0, principals=0, handles=0, "
-                "enablements=0, runtime bindings=0, namespaces=0, attachments=0, "
+                "owners=0, owner runtimes=0, enablements=0, runtime bindings=0, "
+                "namespaces=0, attachments=0, "
                 "delegations=0); authority=canonical"
             )
         finally:

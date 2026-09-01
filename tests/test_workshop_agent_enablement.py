@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -11,12 +12,17 @@ from kai.workshop.agent_enablement import (
     WorkshopAgentEnablementAccessDenied,
     WorkshopAgentEnablementService,
 )
-from kai.workshop.agent_lifecycle import WorkshopAgentLifecycleService
+from kai.workshop.agent_lifecycle import (
+    WorkshopAgentLifecycleAccessDenied,
+    WorkshopAgentLifecycleService,
+)
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_api import _read_agent_lifecycle_events
+from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.diagnostics import workshop_agent_authority_status
-from kai.workshop.domain import AgentDefinitionId, PrincipalId
+from kai.workshop.domain import AgentDefinitionId, MessageId, PrincipalId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
+from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
     WorkshopInternalAPIExecutionContext,
@@ -111,7 +117,7 @@ async def _service(path: Path):
     )
 
 
-async def test_two_principals_enable_same_definition_in_isolated_direct_lanes(tmp_path: Path) -> None:
+async def test_two_principals_share_one_owner_runtime_in_isolated_direct_lanes(tmp_path: Path) -> None:
     store, service, execution, contexts, runtime_pool = await _service(tmp_path / "kai.db")
     try:
         daniel = await _principal(store, "101")
@@ -146,6 +152,30 @@ async def test_two_principals_enable_same_definition_in_isolated_direct_lanes(tm
             (definition_id,),
         ) as cursor:
             assert [int(row[1]) for row in await cursor.fetchall()] == [1, 1]
+
+        resolutions = []
+        for subject in ("101", "202"):
+            recorded = await record_inbound_message(
+                store,
+                InboundMessage(
+                    transport="telegram",
+                    update_id=f"shared-owner-{subject}",
+                    message_id=f"shared-owner-message-{subject}",
+                    sender_subject=subject,
+                    channel_subject=subject,
+                    body="Use the single owner runtime.",
+                    occurred_at=datetime.now(UTC),
+                ),
+            )
+            message_id = recorded.event.envelope.aggregate_id
+            assert isinstance(message_id, MessageId)
+            resolutions.append(await resolve_canonical_conversation_run(store, message_id))
+        assert {resolution.target.requested_by_principal_id for resolution in resolutions} == {
+            daniel,
+            scott,
+        }
+        assert {resolution.sponsor_principal_id for resolution in resolutions} == {daniel}
+        assert {resolution.runtime_profile_id for resolution in resolutions} == {profile_id(101)}
     finally:
         await store.close()
 
@@ -167,6 +197,28 @@ async def test_runtime_authority_cannot_cross_principals(tmp_path: Path) -> None
             (definition_id,),
         ) as cursor:
             assert int((await cursor.fetchone())[0]) == 0
+    finally:
+        await store.close()
+
+
+async def test_nonowner_cannot_change_an_agent_definition(tmp_path: Path) -> None:
+    store, _service_instance, _execution, _contexts, _runtime_pool = await _service(tmp_path / "kai.db")
+    try:
+        daniel = await _principal(store, "101")
+        scott = await _principal(store, "202")
+        definition_id = await _active_specialist(store, daniel)
+        current = await WorkshopAgentLifecycleService(store).get_visible(scott, definition_id)
+
+        with pytest.raises(WorkshopAgentLifecycleAccessDenied, match="Only the agent owner"):
+            await WorkshopAgentLifecycleService(store).add_revision(
+                scott,
+                definition_id,
+                idempotency_key="nonowner-revision",
+                expected_version=current.state_version,
+                purpose="Attempted takeover",
+                instructions="Do not accept this revision.",
+                capabilities=["text_generation"],
+            )
     finally:
         await store.close()
 
@@ -200,24 +252,31 @@ async def test_disable_and_reenable_preserve_direct_channel(tmp_path: Path) -> N
     store, service, _execution, _contexts, runtime_pool = await _service(tmp_path / "kai.db")
     try:
         daniel = await _principal(store, "101")
+        scott = await _principal(store, "202")
         definition_id = await _active_specialist(store, daniel)
-        enabled = await service.enable(
+        await service.enable(
             daniel,
             definition_id,
             profile_id(101),
-            idempotency_key="enable-once",
+            idempotency_key="owner-enable",
+        )
+        enabled = await service.enable(
+            scott,
+            definition_id,
+            profile_id(202),
+            idempotency_key="access-enable-once",
         )
         disabled = await service.disable(
-            daniel,
+            scott,
             definition_id,
-            idempotency_key="disable-once",
+            idempotency_key="access-disable-once",
             expected_version=enabled.state_version,
         )
         restored = await service.enable(
-            daniel,
+            scott,
             definition_id,
-            profile_id(101),
-            idempotency_key="enable-again",
+            profile_id(202),
+            idempotency_key="access-enable-again",
             expected_version=disabled.state_version,
         )
 
