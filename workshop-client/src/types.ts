@@ -190,6 +190,24 @@ export interface WorkshopThreadUnreadMutation {
   state: WorkshopThreadUnreadState;
 }
 
+export interface WorkshopFollowedThread {
+  state: WorkshopThreadUnreadState;
+  channelName: string | null;
+  channelArchived: boolean;
+  rootAuthorDisplayName: string;
+  rootExcerpt: string;
+  rootCreatedAt: string;
+  latestReplyMessageId: string | null;
+  latestReplyAuthorDisplayName: string | null;
+  latestReplyExcerpt: string | null;
+  latestReplyCreatedAt: string | null;
+}
+
+export interface WorkshopFollowedThreadSnapshot {
+  threads: WorkshopFollowedThread[];
+  throughPosition: number;
+}
+
 export interface WorkshopThreadUnreadSignal {
   eventPosition: number;
   state: WorkshopThreadUnreadState;

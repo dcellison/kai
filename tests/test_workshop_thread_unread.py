@@ -154,6 +154,67 @@ async def _next_sse_event(response) -> dict[str, object]:
 
 
 class TestFollowedThreadUnreadAuthority:
+    async def test_followed_snapshot_is_private_contextual_and_access_bounded(self, tmp_path: Path) -> None:
+        context = await _context(tmp_path / "kai.db")
+        service = WorkshopThreadUnreadService(context.store)
+        lifecycle = WorkshopChannelLifecycleService(context.store)
+        try:
+            daniel_root = await _record(context, context.daniel_id, "daniel-root", "  Daniel's   root  ")
+            scott_root = await _record(
+                context,
+                context.scott_id,
+                "scott-root",
+                "Scott's root",
+                occurred_at=_NOW + timedelta(seconds=1),
+            )
+            reply = await _record(
+                context,
+                context.scott_id,
+                "scott-reply",
+                "  Latest   reply  ",
+                occurred_at=_NOW + timedelta(seconds=2),
+                thread_root_id=daniel_root,
+            )
+
+            daniel = await service.followed(context.daniel_id)
+            assert len(daniel.threads) == 1
+            summary = daniel.threads[0]
+            assert summary.state.thread_root_id == daniel_root
+            assert summary.state.unread_count == 1
+            assert summary.state.first_unread_message_id == reply
+            assert summary.channel_name == "Thread unread authority"
+            assert summary.channel_archived is False
+            assert summary.root_author_display_name == "Daniel"
+            assert summary.root_excerpt == "Daniel's root"
+            assert summary.latest_reply_message_id == reply
+            assert summary.latest_reply_author_display_name == "Scott"
+            assert summary.latest_reply_excerpt == "Latest reply"
+
+            scott = await service.followed(context.scott_id)
+            assert {thread.state.thread_root_id for thread in scott.threads} == {daniel_root, scott_root}
+            assert all(thread.state.unread_count == 0 for thread in scott.threads)
+
+            membership = await lifecycle.human_members(context.daniel_id, context.channel_id)
+            await lifecycle.remove_human_member(
+                context.daniel_id,
+                context.channel_id,
+                context.scott_id,
+                expected_state_version=membership.state_version,
+                client_operation_id="remove-scott-followed-list",
+            )
+            assert (await service.followed(context.scott_id)).threads == ()
+
+            await lifecycle.archive(
+                context.daniel_id,
+                context.channel_id,
+                client_operation_id="archive-followed-thread-channel",
+            )
+            archived = await service.followed(context.daniel_id)
+            assert len(archived.threads) == 1
+            assert archived.threads[0].channel_archived is True
+        finally:
+            await context.store.close()
+
     async def test_start_reply_and_mention_auto_follow_at_current_boundary(self, tmp_path: Path) -> None:
         context = await _context(tmp_path / "kai.db")
         service = WorkshopThreadUnreadService(context.store)
@@ -380,6 +441,23 @@ class TestFollowedThreadUnreadAuthority:
         try:
             root = await _record(context, context.daniel_id, "api-root", "API root")
             thread_path = f"/v1/channels/{context.channel_id}/threads/{root}"
+            unauthorized_list = await client.get("/v1/client/followed-threads")
+            assert unauthorized_list.status == 401
+            followed_response = await client.get(
+                "/v1/client/followed-threads",
+                headers={"Authorization": "Bearer daniel"},
+            )
+            assert followed_response.status == 200
+            followed_payload = await followed_response.json()
+            assert followed_payload["version"] == 1
+            assert followed_payload["threads"][0]["state"]["thread_root_id"] == root
+            assert followed_payload["threads"][0]["root_excerpt"] == "API root"
+            assert followed_payload["threads"][0]["latest_reply_message_id"] is None
+            malformed_list = await client.get(
+                "/v1/client/followed-threads?principal_id=someone-else",
+                headers={"Authorization": "Bearer daniel"},
+            )
+            assert malformed_list.status == 400
             unauthorized = await client.get(f"{thread_path}/unread")
             assert unauthorized.status == 401
             state_response = await client.get(f"{thread_path}/unread", headers={"Authorization": "Bearer daniel"})

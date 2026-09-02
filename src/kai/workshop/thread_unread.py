@@ -18,6 +18,7 @@ from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 
 MAX_THREAD_UNREAD_COUNT = 1000
+MAX_FOLLOWED_THREADS = 500
 
 
 class WorkshopThreadUnreadError(RuntimeError):
@@ -50,6 +51,26 @@ class ThreadUnreadState:
     unread_count_capped: bool
     first_unread_message_id: MessageId | None
     first_unread_event_position: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class FollowedThreadSummary:
+    state: ThreadUnreadState
+    channel_name: str | None
+    channel_archived: bool
+    root_author_display_name: str
+    root_excerpt: str
+    root_created_at: datetime
+    latest_reply_message_id: MessageId | None
+    latest_reply_author_display_name: str | None
+    latest_reply_excerpt: str | None
+    latest_reply_created_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class FollowedThreadSnapshot:
+    threads: tuple[FollowedThreadSummary, ...]
+    through_position: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +121,70 @@ class WorkshopThreadUnreadService:
 
     def __init__(self, store: WorkshopEventStore) -> None:
         self._store = store
+
+    async def followed(self, principal_id: PrincipalId) -> FollowedThreadSnapshot:
+        if not isinstance(principal_id, PrincipalId):
+            raise WorkshopThreadUnreadValidationError("Invalid thread unread principal")
+        async with self._store.connection.execute(
+            "SELECT c.workshop_id, c.id, c.name, c.archived_at, "
+            "root.id, root.created_event_position, root.body, root.created_at, root_author.display_name, "
+            "latest.id, latest.created_event_position, latest.body, latest.created_at, "
+            "latest_author.display_name "
+            "FROM thread_read_positions rp "
+            "JOIN channel_memberships cm ON cm.principal_id = rp.principal_id "
+            "AND cm.channel_id = rp.channel_id "
+            "JOIN channels c ON c.id = rp.channel_id "
+            "JOIN messages root ON root.id = rp.thread_root_id "
+            "AND root.channel_id = rp.channel_id AND root.thread_root_id IS NULL "
+            "JOIN principals root_author ON root_author.id = root.author_principal_id "
+            "LEFT JOIN messages latest ON latest.id = ("
+            "SELECT candidate.id FROM messages candidate "
+            "WHERE candidate.thread_root_id = root.id "
+            "ORDER BY candidate.created_event_position DESC LIMIT 1) "
+            "LEFT JOIN principals latest_author ON latest_author.id = latest.author_principal_id "
+            "WHERE rp.principal_id = ? AND rp.followed = 1 AND c.kind = 'group' "
+            "ORDER BY COALESCE(latest.created_event_position, root.created_event_position) DESC, root.id "
+            "LIMIT ?",
+            (principal_id, MAX_FOLLOWED_THREADS + 1),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        if len(rows) > MAX_FOLLOWED_THREADS:
+            raise WorkshopThreadUnreadValidationError("Too many followed threads")
+        summaries: list[FollowedThreadSummary] = []
+        for row in rows:
+            channel_id = ChannelId(str(row[1]))
+            root_id = MessageId(str(row[4]))
+            latest_id = MessageId(str(row[9])) if row[9] is not None else None
+            authority = _ThreadAuthority(
+                workshop_id=WorkshopId(str(row[0])),
+                channel_id=channel_id,
+                thread_root_id=root_id,
+                current_boundary_position=int(row[10]) if row[10] is not None else int(row[5]),
+                current_boundary_message_id=latest_id or root_id,
+            )
+            state = await self._state(principal_id, authority)
+            if not state.followed:
+                raise WorkshopThreadUnreadError("Followed-thread projection changed during snapshot")
+            summaries.append(
+                FollowedThreadSummary(
+                    state=state,
+                    channel_name=str(row[2]) if row[2] is not None else None,
+                    channel_archived=row[3] is not None,
+                    root_author_display_name=str(row[8]),
+                    root_excerpt=self._excerpt(row[6]),
+                    root_created_at=self._timestamp(row[7]),
+                    latest_reply_message_id=latest_id,
+                    latest_reply_author_display_name=(str(row[13]) if row[13] is not None else None),
+                    latest_reply_excerpt=(self._excerpt(row[11]) if row[11] is not None else None),
+                    latest_reply_created_at=(self._timestamp(row[12]) if row[12] is not None else None),
+                )
+            )
+        async with self._store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
+            tip_row = await cursor.fetchone()
+        return FollowedThreadSnapshot(
+            threads=tuple(summaries),
+            through_position=int(tip_row[0]) if tip_row is not None else 0,
+        )
 
     async def thread(
         self,
@@ -475,6 +560,21 @@ class WorkshopThreadUnreadService:
         if result.tzinfo is None or result.utcoffset() is None:
             raise WorkshopThreadUnreadValidationError("Thread unread time must be timezone-aware")
         return result.astimezone(UTC)
+
+    @staticmethod
+    def _timestamp(value: object) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise WorkshopThreadUnreadError("Canonical thread timestamp is malformed") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise WorkshopThreadUnreadError("Canonical thread timestamp is malformed")
+        return parsed.astimezone(UTC)
+
+    @staticmethod
+    def _excerpt(value: object) -> str:
+        normalized = " ".join(str(value).split())
+        return normalized[:280]
 
     @staticmethod
     def _validate_ids(

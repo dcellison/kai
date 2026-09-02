@@ -69,6 +69,7 @@ import type {
   WorkshopAppearancePreferences,
   WorkshopHumanMembership,
   WorkshopHumanNotification,
+  WorkshopFollowedThread,
   WorkshopReaction,
 } from "./types";
 import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN, MESSAGE_PATTERN } from "./types";
@@ -82,7 +83,9 @@ import { MemoryExplorer } from "./MemoryExplorer";
 import { SettingsWorkspace } from "./SettingsWorkspace";
 import { AgentWorkspace } from "./AgentWorkspace";
 import { MentionsInbox } from "./MentionsInbox";
+import { FollowingThreads } from "./FollowingThreads";
 import { useHumanNotifications } from "./useHumanNotifications";
+import { useFollowedThreads } from "./useFollowedThreads";
 import { useChannelUnread } from "./useChannelUnread";
 import { usePrincipalEvents } from "./usePrincipalEvents";
 import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
@@ -114,6 +117,7 @@ type WorkshopDestination =
     }
   | { kind: "memory"; memoryId: string | null }
   | { kind: "mentions" }
+  | { kind: "following" }
   | {
       kind: "settings";
       runtimeChannelId: string | null;
@@ -123,6 +127,9 @@ function destinationFromLocation(): WorkshopDestination {
   const parameters = new URLSearchParams(window.location.search);
   if (parameters.get("view") === "mentions") {
     return { kind: "mentions" };
+  }
+  if (parameters.get("view") === "following") {
+    return { kind: "following" };
   }
   if (parameters.get("view") === "settings") {
     const runtimeChannelId = parameters.get("runtime");
@@ -210,6 +217,8 @@ function writeDestination(
     }
   } else if (destination.kind === "mentions") {
     url.searchParams.set("view", "mentions");
+  } else if (destination.kind === "following") {
+    url.searchParams.set("view", "following");
   } else if (destination.kind === "conversation") {
     if (destination.messageId) {
       url.searchParams.set("message", destination.messageId);
@@ -2246,6 +2255,8 @@ function WorkshopView({
   memoryDestination,
   memoryToken,
   mentionsDestination,
+  followingDestination,
+  following,
   inbox,
   unread,
   principalEvents,
@@ -2253,6 +2264,7 @@ function WorkshopView({
   readActivatedInitially,
   focusedMessage,
   focusedThreadRoot,
+  requestedThreadRootId,
   focusedMessageError,
   settingsDestination,
   settingsRuntimeLabel,
@@ -2288,6 +2300,8 @@ function WorkshopView({
   onMemoryAuthenticationFailure,
   onOpenMemory,
   onOpenMentions,
+  onOpenFollowing,
+  onOpenFollowedThread,
   onOpenHumanNotification,
   onCreateAgent,
   onOpenAgentDefinition,
@@ -2318,6 +2332,8 @@ function WorkshopView({
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
   mentionsDestination: boolean;
+  followingDestination: boolean;
+  following: ReturnType<typeof useFollowedThreads>;
   inbox: ReturnType<typeof useHumanNotifications>;
   unread: ReturnType<typeof useChannelUnread>;
   principalEvents: WorkshopPrincipalEvents;
@@ -2325,6 +2341,7 @@ function WorkshopView({
   readActivatedInitially: boolean;
   focusedMessage: TimelineMessage | null;
   focusedThreadRoot: TimelineMessage | null;
+  requestedThreadRootId: string | null;
   focusedMessageError: string | null;
   settingsDestination: boolean;
   settingsRuntimeLabel: string;
@@ -2382,6 +2399,8 @@ function WorkshopView({
   onMemoryAuthenticationFailure: (message: string) => void;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
+  onOpenFollowing: () => void;
+  onOpenFollowedThread: (thread: WorkshopFollowedThread) => boolean;
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onCreateAgent: () => void;
   onOpenAgentDefinition: (definitionId: string) => Promise<void>;
@@ -2417,8 +2436,10 @@ function WorkshopView({
   const agentsOpen = agentDestination !== null;
   const memoryOpen = memoryDestination !== null;
   const mentionsOpen = mentionsDestination;
+  const followingOpen = followingDestination;
   const settingsOpen = settingsDestination;
-  const auxiliaryWorkspaceOpen = agentsOpen || memoryOpen || mentionsOpen || settingsOpen;
+  const auxiliaryWorkspaceOpen =
+    agentsOpen || memoryOpen || mentionsOpen || followingOpen || settingsOpen;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
@@ -2552,6 +2573,11 @@ function WorkshopView({
       setThreadRootMessageId(focusedMessage.threadRootId);
     }
   }, [focusedMessage]);
+  useEffect(() => {
+    if (focusedThreadRoot?.messageId === requestedThreadRootId) {
+      setThreadRootMessageId(requestedThreadRootId);
+    }
+  }, [focusedThreadRoot, requestedThreadRootId]);
   useEffect(() => {
     if (!focusedMessage || focusedMessage.threadRootId !== null) return;
     const frame = window.requestAnimationFrame(() => {
@@ -3368,7 +3394,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${followingOpen ? "following-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -3426,6 +3452,26 @@ function WorkshopView({
             {inbox.counts.unread > 0 && (
               <span className="mention-count" aria-hidden="true">
                 {inbox.counts.unread > 99 ? "99+" : inbox.counts.unread}
+              </span>
+            )}
+          </button>
+          <button
+            className={`channel-link following-link ${followingOpen ? "active" : ""}`}
+            type="button"
+            aria-label={`Following${following.totalUnread > 0 ? `, ${following.totalUnread} unread` : ""}`}
+            title="Following"
+            onClick={onOpenFollowing}
+          >
+            <span aria-hidden="true"><ThreadFollowIcon followed /></span>
+            <span>Following</span>
+            {(following.totalUnread > 0 || followingOpen) && (
+              <span className="channel-link-status">
+                {following.totalUnread > 0 && (
+                  <span className="mention-count" aria-hidden="true">
+                    {following.totalUnread > 99 ? "99+" : following.totalUnread}
+                  </span>
+                )}
+                {followingOpen && <span className="live-pip" aria-label="Open" />}
               </span>
             )}
           </button>
@@ -3736,6 +3782,12 @@ function WorkshopView({
           inbox={inbox}
           onClose={() => onSelectChannel(channelId)}
           onOpen={onOpenHumanNotification}
+        />
+      ) : followingOpen ? (
+        <FollowingThreads
+          following={following}
+          onClose={() => onSelectChannel(channelId)}
+          onOpen={onOpenFollowedThread}
         />
       ) : (
         <>
@@ -4462,6 +4514,8 @@ function ActiveWorkshopClient({
   onOpenAgentChannel,
   onOpenMemory,
   onOpenMentions,
+  onOpenFollowing,
+  onOpenFollowedThread,
   onOpenHumanNotification,
   onOpenSettings,
   onRestoreChannel,
@@ -4485,6 +4539,8 @@ function ActiveWorkshopClient({
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
+  onOpenFollowing: () => void;
+  onOpenFollowedThread: (thread: WorkshopFollowedThread) => boolean;
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onOpenSettings: () => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
@@ -4536,6 +4592,11 @@ function ActiveWorkshopClient({
   );
   const subscribePrincipalEvents = principalEvents.subscribe;
   const inbox = useHumanNotifications(
+    session.token,
+    principalEvents,
+    onAuthenticationFailure,
+  );
+  const following = useFollowedThreads(
     session.token,
     principalEvents,
     onAuthenticationFailure,
@@ -4824,6 +4885,8 @@ function ActiveWorkshopClient({
       threadMessages={threadMessages}
       memoryDestination={destination.kind === "memory" ? destination : null}
       mentionsDestination={destination.kind === "mentions"}
+      followingDestination={destination.kind === "following"}
+      following={following}
       inbox={inbox}
       unread={unread}
       principalEvents={principalEvents}
@@ -4833,6 +4896,9 @@ function ActiveWorkshopClient({
       readActivatedInitially={readActivationChannelId === session.channelId}
       focusedMessage={focusedMessage}
       focusedThreadRoot={focusedThreadRoot}
+      requestedThreadRootId={
+        destination.kind === "conversation" ? destination.threadRootId ?? null : null
+      }
       focusedMessageError={focusedMessageError}
       memoryToken={session.token}
       settingsDestination={destination.kind === "settings"}
@@ -4872,6 +4938,8 @@ function ActiveWorkshopClient({
       onOpenAgentDefinition={onOpenAgentDefinition}
       onOpenMemory={onOpenMemory}
       onOpenMentions={onOpenMentions}
+      onOpenFollowing={onOpenFollowing}
+      onOpenFollowedThread={onOpenFollowedThread}
       onOpenHumanNotification={onOpenHumanNotification}
       onOpenSettings={onOpenSettings}
       onRestoreChannel={onRestoreChannel}
@@ -5131,6 +5199,41 @@ function WorkshopApp(): React.JSX.Element {
     writeDestination(nextDestination, "push");
   };
 
+  const openFollowing = async (): Promise<void> => {
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !await confirm("Discard unsaved preference changes?")
+    ) {
+      return;
+    }
+    const nextDestination: WorkshopDestination = { kind: "following" };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
+  const openFollowedThread = (thread: WorkshopFollowedThread): boolean => {
+    const channelId = thread.state.channelId;
+    if (!session || !navigation || !findNavigationChannel(navigation, channelId)) {
+      return false;
+    }
+    const nextSession = { ...session, channelId };
+    setReadActivationChannelId(null);
+    storeWorkshopAccess(nextSession);
+    setSession(nextSession);
+    const nextDestination: WorkshopDestination = {
+      kind: "conversation",
+      messageId:
+        thread.state.firstUnreadMessageId ??
+        thread.latestReplyMessageId ??
+        thread.state.threadRootId,
+      threadRootId: thread.state.threadRootId,
+    };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+    return true;
+  };
+
   const openHumanNotification = (
     notification: WorkshopHumanNotification,
   ): boolean => {
@@ -5360,6 +5463,8 @@ function WorkshopApp(): React.JSX.Element {
       onOpenAgentDefinition={openAgentDefinition}
       onOpenMemory={() => void openMemory()}
       onOpenMentions={() => void openMentions()}
+      onOpenFollowing={() => void openFollowing()}
+      onOpenFollowedThread={openFollowedThread}
       onOpenHumanNotification={openHumanNotification}
       onOpenSettings={openSettings}
       onRestoreChannel={(channelId, clientOperationId) =>
