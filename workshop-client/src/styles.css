@@ -1945,7 +1945,7 @@ button:disabled {
 
 .thread-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 0.8rem;
   border-bottom: 1px solid var(--color-border);
@@ -1958,9 +1958,20 @@ button:disabled {
   font-size: 1rem;
 }
 
-.thread-follow-button {
-  align-self: center;
+.thread-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
   margin-left: auto;
+}
+
+.thread-header-actions .panel-icon-button svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.thread-follow-button.followed {
+  color: var(--color-accent);
 }
 
 .thread-scroll {
