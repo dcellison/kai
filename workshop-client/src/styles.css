@@ -1974,6 +1974,10 @@ button:disabled {
   color: var(--color-accent);
 }
 
+.thread-follow-button svg {
+  transform: translateY(0.08rem);
+}
+
 .thread-scroll {
   min-height: 0;
   overflow-y: auto;
