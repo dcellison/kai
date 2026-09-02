@@ -1772,6 +1772,33 @@ function AddReactionIcon(): React.JSX.Element {
   );
 }
 
+function ThreadFollowIcon({ followed }: { followed: boolean }): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill={followed ? "currentColor" : "none"}
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path
+        d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+      <path
+        d="M13.73 21a2 2 0 0 1-3.46 0"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
 function ManageAgentsIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
@@ -2087,26 +2114,34 @@ function ThreadPane({
           <p className="overline">Thread in {channelName}</p>
           <h2>{replies.length} {replies.length === 1 ? "reply" : "replies"}</h2>
         </div>
-        {unreadState && !readOnly && (
+        <div className="thread-header-actions">
+          {unreadState && !readOnly && (
+            <button
+              className={`panel-icon-button thread-follow-button${unreadState.followed ? " followed" : ""}`}
+              type="button"
+              aria-label={unreadState.followed ? "Unfollow thread" : "Follow thread"}
+              aria-pressed={unreadState.followed}
+              title={followBusy
+                ? "Updating thread follow state"
+                : unreadState.followed
+                  ? "Unfollow thread"
+                  : "Follow thread"}
+              disabled={followBusy}
+              onClick={() => void toggleFollow()}
+            >
+              <ThreadFollowIcon followed={unreadState.followed} />
+            </button>
+          )}
           <button
-            className="quiet-button thread-follow-button"
+            className="panel-icon-button"
             type="button"
-            aria-pressed={unreadState.followed}
-            disabled={followBusy}
-            onClick={() => void toggleFollow()}
+            aria-label="Close thread"
+            title="Close thread"
+            onClick={onClose}
           >
-            {followBusy ? "Saving…" : unreadState.followed ? "Following" : "Follow"}
+            <span aria-hidden="true">×</span>
           </button>
-        )}
-        <button
-          className="panel-icon-button"
-          type="button"
-          aria-label="Close thread"
-          title="Close thread"
-          onClick={onClose}
-        >
-          <span aria-hidden="true">×</span>
-        </button>
+        </div>
       </header>
       <div className="thread-scroll">
         <ol className="thread-message-list">

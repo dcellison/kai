@@ -2577,9 +2577,18 @@ describe("Workshop React client", () => {
     await user.click(threadButton);
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();
-    expect(within(context).getByRole("button", { name: "Following" })).toHaveAttribute(
+    const followThread = within(context).getByRole("button", {
+      name: "Unfollow thread",
+    });
+    expect(followThread).toHaveAttribute(
       "aria-pressed",
       "true",
+    );
+    expect(followThread).toHaveTextContent("");
+    expect(followThread.querySelector("svg")).not.toBeNull();
+    expect(followThread).toHaveClass("panel-icon-button", "followed");
+    expect(followThread.nextElementSibling).toBe(
+      within(context).getByRole("button", { name: "Close thread" }),
     );
     expect(within(context).getByRole("separator", { name: "First unread reply" })).toBeVisible();
     await waitFor(() => expect(advanceThreadReadPosition).toHaveBeenCalledWith(
@@ -2589,6 +2598,17 @@ describe("Workshop React client", () => {
       0,
       expect.stringMatching(/^browser-/),
     ));
+    await user.click(followThread);
+    await waitFor(() => expect(setThreadFollowed).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      root.messageId,
+      false,
+      expect.any(Number),
+      expect.stringMatching(/^browser-/),
+    ));
+    expect(within(context).getByRole("button", { name: "Follow thread" })).not.toHaveClass(
+      "followed",
+    );
     const closeThread = within(context).getByRole("button", { name: "Close thread" });
     expect(closeThread).toHaveClass("panel-icon-button");
     expect(closeThread).toHaveTextContent("×");
