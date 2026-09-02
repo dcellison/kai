@@ -3585,7 +3585,7 @@ function parseHumanNotification(value: unknown): WorkshopHumanNotification | nul
     (channelName !== null && typeof channelName !== "string") ||
     typeof createdAt !== "string" ||
     !Number.isSafeInteger(createdEventPosition) ||
-    kind !== "mention" ||
+    (kind !== "mention" && kind !== "reply" && kind !== "message") ||
     !Number.isSafeInteger(lastEventPosition) ||
     typeof notificationId !== "string" ||
     !HUMAN_NOTIFICATION_PATTERN.test(notificationId) ||
@@ -3610,7 +3610,7 @@ function parseHumanNotification(value: unknown): WorkshopHumanNotification | nul
     channelName,
     createdAt,
     createdEventPosition: createdEventPosition as number,
-    kind: "mention",
+    kind,
     lastEventPosition: lastEventPosition as number,
     notificationId,
     read,

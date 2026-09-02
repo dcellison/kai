@@ -96,7 +96,7 @@ export interface WorkshopHumanNotification {
   channelName: string | null;
   createdAt: string;
   createdEventPosition: number;
-  kind: "mention";
+  kind: "mention" | "reply" | "message";
   lastEventPosition: number;
   notificationId: string;
   read: boolean;

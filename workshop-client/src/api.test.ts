@@ -2316,16 +2316,33 @@ describe("Workshop client API", () => {
     };
     const counts = {
       read: 0,
-      total: 1,
-      unread: 1,
-      unread_by_channel: { [channelId]: 1 },
+      total: 3,
+      unread: 3,
+      unread_by_channel: { [channelId]: 3 },
+    };
+    const replyNotification = {
+      ...notification,
+      created_event_position: 81,
+      kind: "reply",
+      last_event_position: 81,
+      notification_id: "ntf_00000000000000000000000000000002",
+      source_message_id: "msg_00000000000000000000000000000081",
+      source_thread_root_id: notification.source_message_id,
+    };
+    const messageNotification = {
+      ...notification,
+      created_event_position: 82,
+      kind: "message",
+      last_event_position: 82,
+      notification_id: "ntf_00000000000000000000000000000003",
+      source_message_id: "msg_00000000000000000000000000000082",
     };
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
         counts,
         next_cursor: "older",
-        notifications: [notification],
-        through_position: 80,
+        notifications: [notification, replyNotification, messageNotification],
+        through_position: 82,
         version: 1,
       }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ ...counts, version: 1 }), { status: 200 }))
@@ -2352,18 +2369,58 @@ describe("Workshop client API", () => {
       "read-one",
     );
 
-    expect(page.counts.unreadByChannel).toEqual({ [channelId]: 1 });
+    expect(page.counts.unreadByChannel).toEqual({ [channelId]: 3 });
+    expect(page.notifications.map((item) => item.kind)).toEqual([
+      "mention",
+      "reply",
+      "message",
+    ]);
     expect(page.notifications[0]).toMatchObject({
       notificationId: notification.notification_id,
       sourceAuthorDisplayName: "Scott",
     });
-    expect(loadedCounts.unread).toBe(1);
+    expect(loadedCounts.unread).toBe(3);
     expect(mutation.notification.read).toBe(true);
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
       "/v1/client/notifications?limit=25",
       "/v1/client/notifications/counts",
       `/v1/client/notifications/${notification.notification_id}/read`,
     ]);
+  });
+
+  it("rejects unknown human notification kinds", async () => {
+    const notification = {
+      channel_name: "General",
+      created_at: "2026-08-31T15:00:00Z",
+      created_event_position: 80,
+      kind: "future_kind",
+      last_event_position: 80,
+      notification_id: "ntf_00000000000000000000000000000001",
+      read: false,
+      read_at: null,
+      source_author_display_name: "Scott",
+      source_author_principal_id: "prn_00000000000000000000000000000003",
+      source_channel_id: channelId,
+      source_message_id: "msg_00000000000000000000000000000080",
+      source_thread_root_id: null,
+      state_version: 0,
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      counts: {
+        read: 0,
+        total: 1,
+        unread: 1,
+        unread_by_channel: { [channelId]: 1 },
+      },
+      next_cursor: null,
+      notifications: [notification],
+      through_position: 80,
+      version: 1,
+    }), { status: 200 })));
+
+    await expect(loadHumanNotifications("session-secret")).rejects.toThrow(
+      "Kai returned an unsupported Mentions inbox.",
+    );
   });
 
   it("streams typed human notification changes over a distinct live connection", async () => {
