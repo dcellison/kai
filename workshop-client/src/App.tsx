@@ -3476,40 +3476,6 @@ function WorkshopView({
             )}
           </button>
 
-          {workshop.channels.some(
-            (availableChannel) => availableChannel.kind === "direct",
-          ) && (
-            <>
-              <p className="nav-heading">Direct messages</p>
-              {workshop.channels
-                .filter((availableChannel) => availableChannel.kind === "direct")
-                .map((availableChannel) => {
-                  const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
-                  return (
-                  <button
-                    className={`channel-link ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
-                    type="button"
-                    aria-label={`${channelDisplayName(availableChannel)}${channelUnreadLabel(unread.byChannel[availableChannel.channelId])}`}
-                    title={channelDisplayName(availableChannel)}
-                    onClick={() => onSelectChannel(availableChannel.channelId)}
-                    key={availableChannel.channelId}
-                  >
-                    <span>{channelSymbol(availableChannel)}</span>
-                    <span>{channelDisplayName(availableChannel)}</span>
-                    {(unreadCount > 0 || (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
-                      <span className="channel-link-status">
-                        {unreadCount > 0 && <span className="unread-pip" aria-hidden="true" />}
-                        {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
-                          <span className="live-pip" aria-label="Live" />
-                        )}
-                      </span>
-                    )}
-                  </button>
-                  );
-                })}
-            </>
-          )}
-
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
               <p className="nav-heading">Channels</p>
@@ -3585,6 +3551,40 @@ function WorkshopView({
               </button>
               );
             })}
+
+          {workshop.channels.some(
+            (availableChannel) => availableChannel.kind === "direct",
+          ) && (
+            <>
+              <p className="nav-heading">Direct messages</p>
+              {workshop.channels
+                .filter((availableChannel) => availableChannel.kind === "direct")
+                .map((availableChannel) => {
+                  const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
+                  return (
+                  <button
+                    className={`channel-link ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                    type="button"
+                    aria-label={`${channelDisplayName(availableChannel)}${channelUnreadLabel(unread.byChannel[availableChannel.channelId])}`}
+                    title={channelDisplayName(availableChannel)}
+                    onClick={() => onSelectChannel(availableChannel.channelId)}
+                    key={availableChannel.channelId}
+                  >
+                    <span>{channelSymbol(availableChannel)}</span>
+                    <span>{channelDisplayName(availableChannel)}</span>
+                    {(unreadCount > 0 || (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
+                      <span className="channel-link-status">
+                        {unreadCount > 0 && <span className="unread-pip" aria-hidden="true" />}
+                        {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
+                          <span className="live-pip" aria-label="Live" />
+                        )}
+                      </span>
+                    )}
+                  </button>
+                  );
+                })}
+            </>
+          )}
 
           {workshop.channels.some(
             (availableChannel) => availableChannel.kind === "notification",

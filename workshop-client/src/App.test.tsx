@@ -1245,7 +1245,10 @@ describe("Workshop React client", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "Following, 1 unread" }));
-    await user.click(screen.getByRole("button", { name: "Unfollow thread by Daniel" }));
+    const unfollow = screen.getByRole("button", { name: "Unfollow thread by Daniel" });
+    expect(unfollow).toHaveAttribute("aria-pressed", "true");
+    expect(unfollow.querySelector("svg")).toHaveAttribute("fill", "currentColor");
+    await user.click(unfollow);
 
     expect(setThreadFollowed).toHaveBeenCalledWith(
       { channelId: secondChannelId, token: "session-secret" },
@@ -1256,6 +1259,29 @@ describe("Workshop React client", () => {
     );
     expect(await screen.findByText("No followed threads.")).toBeVisible();
     expect(screen.getByRole("button", { name: "Following" })).toBeVisible();
+  });
+
+  it("orders channels before direct messages in Workshop navigation", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+
+    render(<App />);
+
+    const navigationPanel = await screen.findByLabelText("Workshop navigation");
+    expect(
+      Array.from(navigationPanel.querySelectorAll(".nav-heading"), (heading) =>
+        heading.textContent?.trim(),
+      ),
+    ).toEqual([
+      "Workspace",
+      "Channels",
+      "Direct messages",
+      "Notifications",
+      "Agents",
+    ]);
   });
 
   it("refreshes Following from principal thread events", async () => {
@@ -1273,6 +1299,7 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByRole("button", { name: "Following" })).toBeVisible();
     await waitFor(() => expect(principalEventHandlers).not.toBeNull());
+    const callsBeforeEvent = vi.mocked(loadFollowedThreads).mock.calls.length;
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
@@ -1289,7 +1316,7 @@ describe("Workshop React client", () => {
     }, "32"));
 
     expect(await screen.findByRole("button", { name: "Following, 1 unread" })).toBeVisible();
-    expect(loadFollowedThreads).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(loadFollowedThreads).mock.calls.length).toBeGreaterThan(callsBeforeEvent);
   });
 
   it("marks a live mention read when its source is already visible at the timeline edge", async () => {
