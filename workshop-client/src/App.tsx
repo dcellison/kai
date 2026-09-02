@@ -4091,11 +4091,6 @@ function WorkshopView({
               </button>
             </div>
           )}
-          {!activeRun && channel.canSubmitCommands && (
-            <span className="composer-mode" role="status">
-              Canonical Workshop command
-            </span>
-          )}
         </footer>
       </section>
 
@@ -4176,24 +4171,17 @@ function WorkshopView({
 
           <section className="context-section">
             <span className="section-number">02</span>
-            <h3>Canonical identity</h3>
-            <code title={channelId}>{channelId}</code>
-            <p>The channel—not a Telegram chat—is the collaboration boundary.</p>
-          </section>
-
-          <section className="context-section">
-            <span className="section-number">03</span>
             <h3>Channel authority</h3>
             <p>
               {channel.canSubmitCommands
-                ? "You can read this channel and submit commands to its assigned agent."
-                : "You can read this outbound channel; command submission is disabled."}
+                ? "You can read and send messages in this channel. Mention an agent to direct a request to it."
+                : "You can read this outbound channel, but you cannot send messages here."}
             </p>
           </section>
 
           {channel.kind === "group" && (
             <section className="context-section agent-attention-section">
-              <span className="section-number">04</span>
+              <span className="section-number">03</span>
               <div className="context-section-heading">
                 <h3>People</h3>
                 {(channel.role === "owner" || workshop.role === "admin") && !channelIsArchived(channel) && (
@@ -4235,7 +4223,7 @@ function WorkshopView({
 
           {channel.kind === "group" && (
             <section className="context-section agent-attention-section">
-              <span className="section-number">05</span>
+              <span className="section-number">04</span>
               <div className="context-section-heading">
                 <h3>Agent attention</h3>
                 {channel.role === "owner" && !channelIsArchived(channel) && (
@@ -4296,7 +4284,7 @@ function WorkshopView({
 
           <section className="context-section trace-section">
             <span className="section-number">
-              {channel.kind === "group" ? "06" : "04"}
+              {channel.kind === "group" ? "05" : "03"}
             </span>
             <h3>Runtime and workspace</h3>
             {settingsWorkspace ? (
@@ -4341,7 +4329,7 @@ function WorkshopView({
 
           <section className="context-section trace-section">
             <span className="section-number">
-              {channel.kind === "group" ? "07" : "05"}
+              {channel.kind === "group" ? "06" : "04"}
             </span>
             <h3>Run inspector</h3>
             <RunTraceCard
