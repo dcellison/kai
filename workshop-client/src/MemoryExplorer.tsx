@@ -52,6 +52,20 @@ const EMPTY_FILTERS: ExplorerFilters = {
   tag: "",
 };
 
+function SearchIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2" />
+      <path
+        d="m16.25 16.25 4 4"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
 function apiFilters(filters: ExplorerFilters): WorkshopMemoryFilters {
   return {
     kind: filters.kind || undefined,
@@ -850,7 +864,15 @@ function MemoryExplorerContent({
             <h1>Memory</h1>
           </div>
           <div className="memory-header-actions">
-            <button type="button" onClick={() => setEditorDetail("create")}>Add fact…</button>
+            <button
+              className="nav-add-button memory-add-button"
+              type="button"
+              aria-label="Add fact"
+              title="Add fact"
+              onClick={() => setEditorDetail("create")}
+            >
+              <span aria-hidden="true" />
+            </button>
             <button className="quiet-button memory-mobile-back" type="button" onClick={onClose}>
               Back to conversation
             </button>
@@ -885,7 +907,14 @@ function MemoryExplorerContent({
                 onChange={(event) => setQueryDraft(event.target.value)}
                 placeholder="Describe what you remember…"
               />
-              <button type="submit">Search</button>
+              <button
+                className="memory-search-submit"
+                type="submit"
+                aria-label="Search"
+                title="Search"
+              >
+                <SearchIcon />
+              </button>
               {searchQuery && (
                 <button
                   type="button"

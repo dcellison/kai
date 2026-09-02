@@ -3449,9 +3449,14 @@ function WorkshopView({
           >
             <span aria-hidden="true">@</span>
             <span>Mentions</span>
-            {inbox.counts.unread > 0 && (
-              <span className="mention-count" aria-hidden="true">
-                {inbox.counts.unread > 99 ? "99+" : inbox.counts.unread}
+            {(inbox.counts.unread > 0 || mentionsOpen) && (
+              <span className="channel-link-status">
+                {inbox.counts.unread > 0 && (
+                  <span className="mention-count" aria-hidden="true">
+                    {inbox.counts.unread > 99 ? "99+" : inbox.counts.unread}
+                  </span>
+                )}
+                {mentionsOpen && <span className="live-pip" aria-label="Open" />}
               </span>
             )}
           </button>
@@ -3649,9 +3654,10 @@ function WorkshopView({
             const engaged = engagedAgents.some(
               (candidate) => candidate.agentId === agent.agentId,
             );
+            const selected = agentsOpen && agentDestination?.definitionId === agent.definitionId;
             return (
               <button
-                className={`agent-link ${engaged ? "engaged" : ""}`}
+                className={`agent-link ${engaged ? "engaged" : ""} ${selected ? "active" : ""}`}
                 type="button"
                 title={`Manage ${agent.displayName}`}
                 aria-label={`Manage ${agent.displayName}`}
@@ -3664,6 +3670,7 @@ function WorkshopView({
                 <span>
                   <strong>{agent.displayName}</strong>
                 </span>
+                {selected && <span className="live-pip" aria-label="Open" />}
               </button>
             );
           })}

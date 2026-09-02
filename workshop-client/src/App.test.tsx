@@ -1071,6 +1071,7 @@ describe("Workshop React client", () => {
     expect(screen.getByRole("button", { name: /Wake policy qualification/ })).toHaveTextContent("1");
     await user.click(mentionsButton);
     expect(await screen.findByRole("heading", { name: "Mentions" })).toBeVisible();
+    expect(within(mentionsButton).getByLabelText("Open")).toHaveClass("live-pip");
     const sourceButton = screen.getByRole("button", { name: /Scott mentioned you/ });
     expect(sourceButton).toBeVisible();
     await user.click(sourceButton);
@@ -3066,9 +3067,11 @@ describe("Workshop React client", () => {
     ).toBeVisible();
     expect(window.location.search).toBe("?view=agents&new=1");
     await user.click(screen.getAllByRole("button", { name: "Cancel" })[0]);
-    await user.click(screen.getByRole("button", { name: "Manage Kai" }));
+    const manageKai = screen.getByRole("button", { name: "Manage Kai" });
+    await user.click(manageKai);
 
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
+    expect(within(manageKai).getByLabelText("Open")).toHaveClass("live-pip");
     expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
     expect(screen.getByText("Runtime active")).toBeVisible();
     expect(screen.getByText("You own and manage this agent.")).toBeVisible();
