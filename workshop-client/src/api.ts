@@ -73,6 +73,8 @@ import type {
   WorkshopThreadUnreadMutation,
   WorkshopThreadUnreadSignal,
   WorkshopThreadUnreadState,
+  WorkshopFollowedThread,
+  WorkshopFollowedThreadSnapshot,
   WorkshopPrincipalEventBatch,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
@@ -3967,6 +3969,78 @@ function parseThreadUnreadState(value: unknown): WorkshopThreadUnreadState | nul
     unreadCountCapped,
     firstUnreadMessageId,
     firstUnreadEventPosition: firstUnreadEventPosition as number | null,
+  };
+}
+
+function parseFollowedThread(value: unknown): WorkshopFollowedThread | null {
+  if (!isRecord(value)) return null;
+  const state = parseThreadUnreadState(value.state);
+  const {
+    channel_name: channelName,
+    channel_archived: channelArchived,
+    root_author_display_name: rootAuthorDisplayName,
+    root_excerpt: rootExcerpt,
+    root_created_at: rootCreatedAt,
+    latest_reply_message_id: latestReplyMessageId,
+    latest_reply_author_display_name: latestReplyAuthorDisplayName,
+    latest_reply_excerpt: latestReplyExcerpt,
+    latest_reply_created_at: latestReplyCreatedAt,
+  } = value;
+  if (
+    !state || !state.followed ||
+    (channelName !== null && typeof channelName !== "string") ||
+    typeof channelArchived !== "boolean" ||
+    typeof rootAuthorDisplayName !== "string" ||
+    typeof rootExcerpt !== "string" || rootExcerpt.length > 280 ||
+    typeof rootCreatedAt !== "string" ||
+    (latestReplyMessageId !== null &&
+      (typeof latestReplyMessageId !== "string" || !MESSAGE_PATTERN.test(latestReplyMessageId))) ||
+    (latestReplyAuthorDisplayName !== null && typeof latestReplyAuthorDisplayName !== "string") ||
+    (latestReplyExcerpt !== null &&
+      (typeof latestReplyExcerpt !== "string" || latestReplyExcerpt.length > 280)) ||
+    (latestReplyCreatedAt !== null && typeof latestReplyCreatedAt !== "string") ||
+    (latestReplyMessageId === null) !== (latestReplyAuthorDisplayName === null) ||
+    (latestReplyMessageId === null) !== (latestReplyExcerpt === null) ||
+    (latestReplyMessageId === null) !== (latestReplyCreatedAt === null)
+  ) return null;
+  return {
+    state,
+    channelName,
+    channelArchived,
+    rootAuthorDisplayName,
+    rootExcerpt,
+    rootCreatedAt,
+    latestReplyMessageId,
+    latestReplyAuthorDisplayName,
+    latestReplyExcerpt,
+    latestReplyCreatedAt,
+  };
+}
+
+export async function loadFollowedThreads(
+  token: string,
+  signal?: AbortSignal,
+): Promise<WorkshopFollowedThreadSnapshot> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/followed-threads",
+    { signal },
+  );
+  const payload = await responsePayload(response);
+  const threads = isRecord(payload) && Array.isArray(payload.threads)
+    ? payload.threads.map(parseFollowedThread)
+    : [];
+  if (
+    !response.ok || !isRecord(payload) || payload.version !== 1 ||
+    !Array.isArray(payload.threads) || threads.some((thread) => thread === null) ||
+    !Number.isSafeInteger(payload.through_position) ||
+    (payload.through_position as number) < 0
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not load followed threads."));
+  }
+  return {
+    threads: threads as WorkshopFollowedThread[],
+    throughPosition: payload.through_position as number,
   };
 }
 

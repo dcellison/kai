@@ -25,6 +25,7 @@ import {
   loadChannelUnread,
   loadHumanNotificationCounts,
   loadHumanNotifications,
+  loadFollowedThreads,
   loadNavigation,
   loadNotificationPreferences,
   loadMemoryDetail,
@@ -65,6 +66,7 @@ import type {
   WorkshopHumanNotification,
   WorkshopChannelUnreadState,
   WorkshopThreadUnreadState,
+  WorkshopFollowedThread,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -87,6 +89,7 @@ vi.mock("./api", async (importOriginal) => {
     loadChannelUnread: vi.fn(),
     loadHumanNotificationCounts: vi.fn(),
     loadHumanNotifications: vi.fn(),
+    loadFollowedThreads: vi.fn(),
     loadAppearancePreferences: vi.fn(),
     loadAgentDefinitions: vi.fn(),
     loadAgentEnablements: vi.fn(),
@@ -323,6 +326,27 @@ function threadUnreadState(
     ...overrides,
   };
 }
+
+const followedThread: WorkshopFollowedThread = {
+  state: threadUnreadState(historyMessage.messageId, {
+    channelId: secondChannelId,
+    firstUnreadEventPosition: 32,
+    firstUnreadMessageId: "msg_00000000000000000000000000000032",
+    lastEventPosition: 32,
+    readThroughEventPosition: 31,
+    stateVersion: 2,
+    unreadCount: 1,
+  }),
+  channelName: "Wake policy qualification",
+  channelArchived: false,
+  rootAuthorDisplayName: "Daniel",
+  rootExcerpt: "Please review the qualification output.",
+  rootCreatedAt: "2026-09-01T12:00:00Z",
+  latestReplyMessageId: "msg_00000000000000000000000000000032",
+  latestReplyAuthorDisplayName: "Scott",
+  latestReplyExcerpt: "The qualification passed.",
+  latestReplyCreatedAt: "2026-09-01T12:05:00Z",
+};
 
 const agentDefinition: WorkshopAgentDefinition = {
   activeRevisionId: revisionId,
@@ -642,6 +666,10 @@ describe("Workshop React client", () => {
       counts: { read: 0, total: 0, unread: 0, unreadByChannel: {} },
       nextCursor: null,
       notifications: [],
+      throughPosition: 25,
+    });
+    vi.mocked(loadFollowedThreads).mockResolvedValue({
+      threads: [],
       throughPosition: 25,
     });
     vi.mocked(loadChannelUnread).mockResolvedValue({
@@ -1136,6 +1164,132 @@ describe("Workshop React client", () => {
     await waitFor(() => expect(
       screen.getByRole("button", { name: "Mentions" }),
     ).toBeVisible());
+  });
+
+  it("lists followed threads and opens one at its unread reply", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    const root: TimelineMessage = {
+      ...historyMessage,
+      body: followedThread.rootExcerpt,
+      channelId: secondChannelId,
+      messageId: followedThread.state.threadRootId,
+      replyCount: 1,
+    };
+    const reply: TimelineMessage = {
+      ...historyMessage,
+      authorDisplayName: "Scott",
+      authorPrincipalId: "prn_00000000000000000000000000000003",
+      body: followedThread.latestReplyExcerpt ?? "",
+      channelId: secondChannelId,
+      eventPosition: 32,
+      messageId: followedThread.latestReplyMessageId ?? "",
+      replyToMessageId: root.messageId,
+      threadRootId: root.messageId,
+    };
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadFollowedThreads).mockResolvedValue({
+      threads: [followedThread],
+      throughPosition: 32,
+    });
+    vi.mocked(loadTimeline).mockImplementation(async (activeSession) => ({
+      messages: activeSession.channelId === secondChannelId ? [] : [historyMessage],
+      previousCursor: null,
+      throughPosition: 32,
+    }));
+    vi.mocked(loadChannelMessage).mockImplementation(async (_session, messageId) => {
+      if (messageId === root.messageId) return root;
+      if (messageId === reply.messageId) return reply;
+      throw new Error("Message not found");
+    });
+    vi.mocked(loadThreadTimeline).mockResolvedValue({
+      messages: [reply],
+      nextCursor: null,
+      root,
+      throughPosition: 32,
+    });
+
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Following, 1 unread" }));
+    expect(await screen.findByRole("heading", { name: "Following" })).toBeVisible();
+    expect(screen.getByText("Please review the qualification output.")).toBeVisible();
+    expect(screen.getByText("1 unread")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: /Please review the qualification output/ }));
+
+    await waitFor(() => expect(loadChannelMessage).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "session-secret" },
+      reply.messageId,
+      expect.any(AbortSignal),
+    ));
+    expect(await screen.findByText("Thread in Wake policy qualification")).toBeVisible();
+    expect(window.location.search).toContain(`message=${reply.messageId}`);
+    expect(window.location.search).toContain(`thread=${root.messageId}`);
+  });
+
+  it("unfollows a thread from the Following workspace", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadFollowedThreads).mockResolvedValue({
+      threads: [followedThread],
+      throughPosition: 32,
+    });
+
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Following, 1 unread" }));
+    await user.click(screen.getByRole("button", { name: "Unfollow thread by Daniel" }));
+
+    expect(setThreadFollowed).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "session-secret" },
+      followedThread.state.threadRootId,
+      false,
+      followedThread.state.stateVersion,
+      expect.stringMatching(/^following-unfollow-/),
+    );
+    expect(await screen.findByText("No followed threads.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Following" })).toBeVisible();
+  });
+
+  it("refreshes Following from principal thread events", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadFollowedThreads)
+      .mockReset()
+      .mockResolvedValueOnce({ threads: [], throughPosition: 31 })
+      .mockResolvedValue({ threads: [followedThread], throughPosition: 32 });
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: "Following" })).toBeVisible();
+    await waitFor(() => expect(principalEventHandlers).not.toBeNull());
+    act(() => principalEventHandlers?.onBatch({
+      changes: [{
+        agentChanges: [],
+        eventPosition: 32,
+        notificationChanges: [],
+        threadChanges: [{
+          eventPosition: 32,
+          state: followedThread.state,
+          transition: "message.created",
+        }],
+        unreadChanges: [],
+      }],
+      throughPosition: 32,
+    }, "32"));
+
+    expect(await screen.findByRole("button", { name: "Following, 1 unread" })).toBeVisible();
+    expect(loadFollowedThreads).toHaveBeenCalledTimes(2);
   });
 
   it("marks a live mention read when its source is already visible at the timeline edge", async () => {

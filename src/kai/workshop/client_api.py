@@ -235,6 +235,8 @@ from kai.workshop.settings_workspaces import (
 )
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.thread_unread import (
+    FollowedThreadSnapshot,
+    FollowedThreadSummary,
     ThreadUnreadMutation,
     ThreadUnreadState,
     WorkshopThreadUnreadAccessDenied,
@@ -318,6 +320,7 @@ _CHANNEL_UNREAD_EVENTS_PATH = "/v1/client/unread/events"
 _CHANNEL_UNREAD_DETAIL_PATH = "/v1/channels/{channel_id}/unread"
 _CHANNEL_READ_POSITION_PATH = "/v1/channels/{channel_id}/read-position"
 _THREAD_UNREAD_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/unread"
+_FOLLOWED_THREADS_PATH = "/v1/client/followed-threads"
 _THREAD_FOLLOW_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/follow"
 _THREAD_UNFOLLOW_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/unfollow"
 _THREAD_READ_POSITION_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}/read-position"
@@ -3345,6 +3348,33 @@ def _serialize_thread_unread(state: ThreadUnreadState) -> dict[str, object]:
     }
 
 
+def _serialize_followed_thread(thread: FollowedThreadSummary) -> dict[str, object]:
+    return {
+        "state": _serialize_thread_unread(thread.state),
+        "channel_name": thread.channel_name,
+        "channel_archived": thread.channel_archived,
+        "root_author_display_name": thread.root_author_display_name,
+        "root_excerpt": thread.root_excerpt,
+        "root_created_at": _format_timestamp(thread.root_created_at),
+        "latest_reply_message_id": (
+            str(thread.latest_reply_message_id) if thread.latest_reply_message_id is not None else None
+        ),
+        "latest_reply_author_display_name": thread.latest_reply_author_display_name,
+        "latest_reply_excerpt": thread.latest_reply_excerpt,
+        "latest_reply_created_at": (
+            _format_timestamp(thread.latest_reply_created_at) if thread.latest_reply_created_at is not None else None
+        ),
+    }
+
+
+def _serialize_followed_threads(snapshot: FollowedThreadSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "threads": [_serialize_followed_thread(thread) for thread in snapshot.threads],
+        "through_position": snapshot.through_position,
+    }
+
+
 def _serialize_thread_unread_mutation(mutation: ThreadUnreadMutation) -> dict[str, object]:
     return {"state": _serialize_thread_unread(mutation.state), "replayed": mutation.replayed}
 
@@ -5326,6 +5356,26 @@ async def _handle_thread_unread(
     return _json_response({"version": 1, "state": _serialize_thread_unread(state)}, status=200)
 
 
+async def _handle_followed_threads(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopThreadUnreadService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid followed-thread request")
+    try:
+        snapshot = await service.followed(principal_id)
+    except WorkshopThreadUnreadValidationError:
+        return _error_response(status=400, code="invalid_request", message="Invalid followed-thread request")
+    return _json_response(_serialize_followed_threads(snapshot), status=200)
+
+
 async def _handle_thread_follow_state(
     request: web.Request,
     *,
@@ -6849,6 +6899,14 @@ def register_workshop_read_routes(
                 service=thread_unread,
             )
 
+    async def handle_followed_threads(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_followed_threads(
+                request,
+                authenticator=authenticator,
+                service=thread_unread,
+            )
+
     async def handle_thread_follow(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_thread_follow_state(
@@ -6950,6 +7008,7 @@ def register_workshop_read_routes(
     app.router.add_get(_CHANNEL_UNREAD_DETAIL_PATH, handle_channel_unread_detail)
     app.router.add_post(_CHANNEL_READ_POSITION_PATH, handle_channel_read_position)
     app.router.add_get(_THREAD_UNREAD_PATH, handle_thread_unread)
+    app.router.add_get(_FOLLOWED_THREADS_PATH, handle_followed_threads)
     app.router.add_post(_THREAD_FOLLOW_PATH, handle_thread_follow)
     app.router.add_post(_THREAD_UNFOLLOW_PATH, handle_thread_unfollow)
     app.router.add_post(_THREAD_READ_POSITION_PATH, handle_thread_read_position)

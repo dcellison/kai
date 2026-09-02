@@ -51,6 +51,7 @@ import {
   loadChannelMessage,
   loadHumanNotificationCounts,
   loadHumanNotifications,
+  loadFollowedThreads,
   loadWorkspaceConfig,
   moveMemoriesScope,
   moveMemoryScope,
@@ -2700,6 +2701,58 @@ describe("Workshop client API", () => {
       `/v1/channels/${channelId}/threads/${rootMessageId}/unfollow`,
       `/v1/channels/${channelId}/threads/${rootMessageId}/read-position`,
     ]);
+  });
+
+  it("loads the principal's followed-thread workspace", async () => {
+    const rootMessageId = "msg_00000000000000000000000000000080";
+    const replyMessageId = "msg_00000000000000000000000000000081";
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      version: 1,
+      through_position: 81,
+      threads: [{
+        state: {
+          channel_id: channelId,
+          thread_root_id: rootMessageId,
+          followed: true,
+          follow_baseline_event_position: 80,
+          read_through_event_position: 80,
+          read_through_message_id: rootMessageId,
+          state_version: 1,
+          last_event_position: 81,
+          unread_count: 1,
+          unread_count_capped: false,
+          first_unread_message_id: replyMessageId,
+          first_unread_event_position: 81,
+        },
+        channel_name: "General",
+        channel_archived: false,
+        root_author_display_name: "Daniel",
+        root_excerpt: "Review this output.",
+        root_created_at: "2026-09-01T12:00:00Z",
+        latest_reply_message_id: replyMessageId,
+        latest_reply_author_display_name: "Scott",
+        latest_reply_excerpt: "Looks good.",
+        latest_reply_created_at: "2026-09-01T12:05:00Z",
+      }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadFollowedThreads("principal-token")).resolves.toMatchObject({
+      throughPosition: 81,
+      threads: [{
+        channelName: "General",
+        rootExcerpt: "Review this output.",
+        latestReplyMessageId: replyMessageId,
+        state: { threadRootId: rootMessageId, unreadCount: 1 },
+      }],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/client/followed-threads",
+      expect.objectContaining({
+        cache: "no-store",
+        headers: expect.any(Headers),
+      }),
+    );
   });
 
   it("loads one exact authorized channel message", async () => {
