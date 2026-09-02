@@ -808,6 +808,17 @@ describe("Workshop React client", () => {
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(screen.queryByLabelText("Task route")).toBeNull();
     expect(screen.queryByLabelText("Workshop switcher")).toBeNull();
+    expect(screen.queryByText("Canonical Workshop command")).toBeNull();
+    const channelContext = screen.getByLabelText("Channel context");
+    expect(within(channelContext).queryByText("Canonical identity")).toBeNull();
+    expect(within(channelContext).getByText(
+      "You can read and send messages in this channel. Mention an agent to direct a request to it.",
+    )).toBeVisible();
+    expect(
+      Array.from(channelContext.querySelectorAll(".section-number"), (section) =>
+        section.textContent,
+      ),
+    ).toEqual(["01", "02", "03", "04"]);
     const navigationPanel = screen.getByLabelText("Workshop navigation");
     expect(navigationPanel).toBeVisible();
     expect(navigationPanel.querySelector(".sidebar-title")).toHaveTextContent(
@@ -2207,6 +2218,11 @@ describe("Workshop React client", () => {
     expect(document.querySelector(".notification-row")).not.toBeNull();
     expect(screen.queryByLabelText("Message Kai")).toBeNull();
     expect(screen.getByText(/outbound-only/)).toBeVisible();
+    expect(
+      screen.getByText(
+        "You can read this outbound channel, but you cannot send messages here.",
+      ),
+    ).toBeVisible();
     expect(sessionStorage.getItem("kai.workshop.active-channel.v1")).toContain(
       notificationChannelId,
     );
