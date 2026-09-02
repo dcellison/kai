@@ -244,7 +244,10 @@ describe("Workshop Memory explorer", () => {
     ));
 
     await user.type(screen.getByLabelText("Search memories"), "concise output");
-    await user.click(screen.getByRole("button", { name: "Search" }));
+    const search = screen.getByRole("button", { name: "Search" });
+    expect(search).toHaveTextContent("");
+    expect(search.querySelector("svg")).not.toBeNull();
+    await user.click(search);
     await waitFor(() => expect(searchMemories).toHaveBeenCalledWith(
       "session-secret",
       "concise output",
@@ -413,7 +416,10 @@ describe("Workshop Memory explorer", () => {
     );
 
     await screen.findByText("Kai deployment episode");
-    await user.click(screen.getByRole("button", { name: "Add fact…" }));
+    const addFact = screen.getByRole("button", { name: "Add fact" });
+    expect(addFact).toHaveTextContent("");
+    expect(addFact.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+    await user.click(addFact);
     const dialog = screen.getByRole("dialog", { name: "Create fact" });
     await user.type(screen.getByLabelText(/Content/), "A deliberately explicit fact.");
     await user.type(screen.getByLabelText(/Tags/), "qualification, explicit");
