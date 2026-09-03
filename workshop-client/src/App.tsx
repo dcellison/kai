@@ -3436,7 +3436,7 @@ function WorkshopView({
             title="Memory"
             onClick={onOpenMemory}
           >
-            <span aria-hidden="true">◇</span>
+            <span className="workspace-nav-icon memory-nav-icon" aria-hidden="true">◇</span>
             <span>Memory</span>
             {memoryOpen && <span className="live-pip" aria-label="Open" />}
           </button>
@@ -3447,7 +3447,7 @@ function WorkshopView({
             title="Mentions"
             onClick={onOpenMentions}
           >
-            <span aria-hidden="true">@</span>
+            <span className="workspace-nav-icon mentions-nav-icon" aria-hidden="true">@</span>
             <span>Mentions</span>
             {(inbox.counts.unread > 0 || mentionsOpen) && (
               <span className="channel-link-status">
@@ -3467,7 +3467,9 @@ function WorkshopView({
             title="Following"
             onClick={onOpenFollowing}
           >
-            <span aria-hidden="true"><ThreadFollowIcon followed /></span>
+            <span className="workspace-nav-icon following-nav-icon" aria-hidden="true">
+              <ThreadFollowIcon followed={false} />
+            </span>
             <span>Following</span>
             {(following.totalUnread > 0 || followingOpen) && (
               <span className="channel-link-status">

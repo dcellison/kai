@@ -618,6 +618,15 @@ button:disabled {
   font-family: var(--mono);
 }
 
+.workspace-nav-icon {
+  display: inline-grid;
+  width: 1.25rem;
+  height: 1.25rem;
+  align-self: center;
+  place-items: center;
+  line-height: 1;
+}
+
 .channel-link.active {
   background: color-mix(in srgb, var(--color-accent) 10%, transparent);
   color: var(--color-text-strong);
@@ -2575,9 +2584,10 @@ button:disabled {
 /* Principal-private followed-thread workspace */
 
 .following-link > span:first-child svg {
+  display: block;
   width: 0.9rem;
   height: 0.9rem;
-  vertical-align: -0.08rem;
+  transform: translateY(0.08rem);
 }
 
 .following-workspace {
