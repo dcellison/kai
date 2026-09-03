@@ -15,6 +15,7 @@ import {
   createChannel,
   detachChannelAgent,
   dismissChannelAgent,
+  enableAgentDefinition,
   loadAppearancePreferences,
   loadAgentDefinitions,
   loadAgentEnablements,
@@ -82,6 +83,7 @@ vi.mock("./api", async (importOriginal) => {
     createChannel: vi.fn(),
     detachChannelAgent: vi.fn(),
     dismissChannelAgent: vi.fn(),
+    enableAgentDefinition: vi.fn(),
     loadEarlierTimeline: vi.fn(),
     loadArtifactBlob: vi.fn(),
     loadChannelMembers: vi.fn(),
@@ -621,6 +623,7 @@ describe("Workshop React client", () => {
     });
     vi.mocked(loadAgentDefinitions).mockResolvedValue([agentDefinition]);
     vi.mocked(loadAgentEnablements).mockResolvedValue([agentEnablement]);
+    vi.mocked(enableAgentDefinition).mockResolvedValue(agentEnablement);
     vi.mocked(startAgentConversation).mockResolvedValue({
       ...agentEnablement,
       conversationStarted: true,
@@ -3341,7 +3344,7 @@ describe("Workshop React client", () => {
       await screen.findByRole("heading", { name: "Qualification agent", level: 2 }),
     ).toBeVisible();
     expect(screen.queryByLabelText("Agent catalogue")).toBeNull();
-    expect(screen.getByText("Conversation available")).toBeVisible();
+    expect(screen.getByText("Unavailable to this Workshop account")).toBeVisible();
 
     await user.click(
       sidebar.getByRole("button", { name: "Drafts and archived agents" }),
@@ -3376,6 +3379,90 @@ describe("Workshop React client", () => {
       await screen.findByRole("heading", { name: "Archived specialist", level: 2 }),
     ).toBeVisible();
     expect(screen.getByText(/This definition is archived/)).toBeVisible();
+  });
+
+  it("starts a nonowner conversation without exposing enablement plumbing", async () => {
+    const user = userEvent.setup();
+    const accessRuntimeProfileId = "rtp_22222222222222222222222222222222";
+    const available: WorkshopAgentEnablement = {
+      ...agentEnablement,
+      canManage: false,
+      directChannelId: null,
+      eligibleRuntimes: [
+        {
+          backendOptions: ["codex:openai"],
+          displayName: "Scott's runtime",
+          runtimeProfileId: accessRuntimeProfileId,
+        },
+      ],
+      enablementId: null,
+      lifecycleState: "available",
+      ownerPrincipalId: agentDefinition.ownerPrincipalId,
+      ownerRuntimeProfileId: runtimeProfileId,
+      runtimeProfileId: null,
+      stateVersion: null,
+    };
+    const enabled: WorkshopAgentEnablement = {
+      ...available,
+      directChannelId: channelId,
+      enablementId: "aen_22222222222222222222222222222222",
+      lifecycleState: "enabled",
+      runtimeProfileId: accessRuntimeProfileId,
+      stateVersion: 1,
+    };
+    const started = {
+      ...enabled,
+      conversationStarted: true,
+      stateVersion: 2,
+    };
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      principal: {
+        displayName: "Scott",
+        handle: "scott",
+        principalId: "prn_99999999999999999999999999999999",
+      },
+    });
+    let conversationProvisioned = false;
+    vi.mocked(loadAgentEnablements).mockImplementation(async () => [
+      conversationProvisioned ? started : available,
+    ]);
+    vi.mocked(enableAgentDefinition).mockImplementation(async () => {
+      conversationProvisioned = true;
+      return enabled;
+    });
+    vi.mocked(startAgentConversation).mockResolvedValue(started);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Manage Kai" }));
+
+    expect(screen.queryByText("Enable conversation")).toBeNull();
+    expect(screen.queryByText("Conversation access")).toBeNull();
+    await user.click(
+      await screen.findByRole("button", { name: "Start conversation with Kai" }),
+    );
+
+    await waitFor(() => expect(enableAgentDefinition).toHaveBeenCalledOnce());
+    expect(enableAgentDefinition).toHaveBeenCalledWith(
+      "existing-session",
+      definitionId,
+      expect.objectContaining({
+        expectedVersion: null,
+        runtimeProfileId: accessRuntimeProfileId,
+      }),
+    );
+    expect(startAgentConversation).toHaveBeenCalledWith(
+      "existing-session",
+      definitionId,
+      expect.objectContaining({ expectedVersion: 1 }),
+    );
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(window.location.search).toBe("");
   });
 
   it("shows one shared agent definition without owner controls to another principal", async () => {
@@ -3413,7 +3500,7 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("button", { name: "Manage Kai" }));
 
     expect(await screen.findByText("Owned and managed by Daniel.")).toBeVisible();
-    expect(screen.getByText("Available to you")).toBeVisible();
+    expect(screen.queryByText("Conversation access")).toBeNull();
     expect(
       screen.getByRole("button", { name: "Start conversation with Kai" }),
     ).toBeVisible();
