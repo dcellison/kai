@@ -1,4 +1,4 @@
-"""Admin-authorized lifecycle operations for Workshop agent definitions."""
+"""Principal-owned lifecycle operations for canonical Workshop agent definitions."""
 
 from __future__ import annotations
 
