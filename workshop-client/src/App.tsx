@@ -28,6 +28,7 @@ import {
   loadChannelMessage,
   loadAgentDefinitions,
   loadAgentEnablements,
+  loadWorkshopHumans,
   loadNavigation,
   loadNotificationPreferences,
   loadArtifactBlob,
@@ -40,6 +41,7 @@ import {
   restoreChannel,
   setMessageReaction,
   setThreadFollowed,
+  startHumanConversation,
   submitCommand,
   switchWorkspace,
 } from "./api";
@@ -68,6 +70,7 @@ import type {
   WorkshopAgentEnablement,
   WorkshopAppearancePreferences,
   WorkshopHumanMembership,
+  WorkshopHumanPeer,
   WorkshopHumanNotification,
   WorkshopFollowedThread,
   WorkshopReaction,
@@ -1188,6 +1191,13 @@ function channelIsArchived(channel: WorkshopChannelSummary): boolean {
   return typeof channel.archivedAt === "string";
 }
 
+function channelIsHumanDirect(channel: WorkshopChannelSummary): boolean {
+  return channel.kind === "direct" &&
+    channel.agents.length === 0 &&
+    channel.participants.length === 1 &&
+    channel.participants[0].kind === "human";
+}
+
 function workshopRoleLabel(role: string): string {
   if (role === "admin") {
     return "Workshop administrator";
@@ -1320,6 +1330,123 @@ function ChannelCreationDialog({
             </button>
           </div>
         </form>
+      </section>
+    </div>
+  );
+}
+
+function HumanConversationDialog({
+  onCancel,
+  onLoad,
+  onOpen,
+}: {
+  onCancel: () => void;
+  onLoad: () => Promise<WorkshopHumanPeer[]>;
+  onOpen: (principalId: string) => Promise<void>;
+}): React.JSX.Element {
+  const [people, setPeople] = useState<WorkshopHumanPeer[] | null>(null);
+  const [busyPrincipalId, setBusyPrincipalId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void onLoad()
+      .then((loaded) => {
+        if (!cancelled) {
+          setPeople(loaded);
+        }
+      })
+      .catch((caught: unknown) => {
+        if (!cancelled) {
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : "Could not load Workshop people.",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onLoad]);
+
+  const open = async (principalId: string): Promise<void> => {
+    if (busyPrincipalId) {
+      return;
+    }
+    setBusyPrincipalId(principalId);
+    setError(null);
+    try {
+      await onOpen(principalId);
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not start this conversation.",
+      );
+      setBusyPrincipalId(null);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        className="channel-creation-dialog human-conversation-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="human-conversation-title"
+      >
+        <header className="channel-archive-header">
+          <div>
+            <p className="overline">Direct messages</p>
+            <h2 id="human-conversation-title">Start a conversation</h2>
+          </div>
+          <button
+            className="panel-icon-button"
+            type="button"
+            aria-label="Close people picker"
+            title="Close"
+            disabled={busyPrincipalId !== null}
+            onClick={onCancel}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        {people === null && !error && (
+          <p className="human-conversation-state" role="status">Loading people…</p>
+        )}
+        {people?.length === 0 && (
+          <p className="human-conversation-state">No other people are available in this Workshop.</p>
+        )}
+        {people && people.length > 0 && (
+          <ul className="human-conversation-list">
+            {people.map((person) => (
+              <li key={person.principalId}>
+                <button
+                  type="button"
+                  disabled={busyPrincipalId !== null}
+                  aria-label={`${person.displayName}, @${person.handle}${
+                    person.conversationChannelId ? ", conversation started" : ""
+                  }`}
+                  onClick={() => void open(person.principalId)}
+                >
+                  <span>
+                    <strong>{person.displayName}</strong>
+                    <small>@{person.handle}</small>
+                  </span>
+                  <small>
+                    {busyPrincipalId === person.principalId
+                      ? "Opening…"
+                      : person.conversationChannelId
+                        ? "Open"
+                        : "Message"}
+                  </small>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {error && <p className="form-error" role="alert">{error}</p>}
       </section>
     </div>
   );
@@ -2313,6 +2440,7 @@ function WorkshopView({
   onJumpLatest,
   onLoadArtifact,
   onLoadChannelMembers,
+  onLoadHumanPeers,
   onLoadRun,
   onLoadRunTrace,
   onLoadSettingsWorkspace,
@@ -2337,6 +2465,7 @@ function WorkshopView({
   onSelectChannel,
   onSetReaction,
   onSubmitCommand,
+  onStartHumanConversation,
   onSwitchWorkspace,
   onSettingsDirtyChange,
   onSettingsAccessFailure,
@@ -2390,6 +2519,7 @@ function WorkshopView({
   onJumpLatest: () => void;
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onLoadChannelMembers: () => Promise<WorkshopHumanMembership>;
+  onLoadHumanPeers: () => Promise<WorkshopHumanPeer[]>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onLoadSettingsWorkspace: () => Promise<WorkshopSettingsWorkspace>;
@@ -2448,6 +2578,7 @@ function WorkshopView({
     artifact: File | null,
     threadRootId: string | null,
   ) => Promise<CommandSubmissionResult>;
+  onStartHumanConversation: (principalId: string) => Promise<void>;
   onSwitchWorkspace: (
     path: string,
     revision: string,
@@ -2466,6 +2597,7 @@ function WorkshopView({
     agentsOpen || memoryOpen || mentionsOpen || followingOpen || settingsOpen;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
+  const humanDirect = channelIsHumanDirect(channel);
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
   const [submissionError, setSubmissionError] = useState<string | null>(null);
@@ -2499,6 +2631,7 @@ function WorkshopView({
   } | null>(null);
   const [archivedChannelsOpen, setArchivedChannelsOpen] = useState(false);
   const [archivedAgentsOpen, setArchivedAgentsOpen] = useState(false);
+  const [humanConversationOpen, setHumanConversationOpen] = useState(false);
   const [channelLifecycleBusy, setChannelLifecycleBusy] = useState<string | null>(null);
   const [agentCatalogue, setAgentCatalogue] = useState<WorkshopAgentEnablement[]>([]);
   const [agentDefinitions, setAgentDefinitions] = useState<WorkshopAgentDefinition[]>([]);
@@ -3012,7 +3145,7 @@ function WorkshopView({
     let cancelled = false;
     setSettingsWorkspace(null);
     setSettingsWorkspaceError(null);
-    if (!channel.canSubmitCommands) {
+    if (!channel.canSubmitCommands || humanDirect) {
       return () => {
         cancelled = true;
       };
@@ -3035,7 +3168,7 @@ function WorkshopView({
     return () => {
       cancelled = true;
     };
-  }, [channel.canSubmitCommands, channelId, onLoadSettingsWorkspace]);
+  }, [channel.canSubmitCommands, channelId, humanDirect, onLoadSettingsWorkspace]);
 
   const selectWorkspace = async (path: string): Promise<void> => {
     if (!settingsWorkspace || path === settingsWorkspace.workspace) {
@@ -3634,10 +3767,21 @@ function WorkshopView({
               );
             })}
 
-          {visibleDirectChannels.length > 0 && (
-            <>
+          {!sidebarLayout.collapsed && (
+            <div className="nav-heading-row">
               <p className="nav-heading">Direct messages</p>
-              {visibleDirectChannels.map((availableChannel) => {
+              <button
+                className="nav-add-button"
+                type="button"
+                aria-label="Start direct message"
+                title="Start direct message"
+                onClick={() => setHumanConversationOpen(true)}
+              >
+                <span aria-hidden="true" />
+              </button>
+            </div>
+          )}
+          {visibleDirectChannels.map((availableChannel) => {
                   const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
                   return (
                   <button
@@ -3661,8 +3805,6 @@ function WorkshopView({
                   </button>
                   );
                 })}
-            </>
-          )}
 
           {workshop.channels.some(
             (availableChannel) => availableChannel.kind === "notification",
@@ -3922,7 +4064,9 @@ function WorkshopView({
                   ? "This channel is archived. Its history remains available, but it is read-only until restored."
                   : channel.kind === "notification"
                   ? "Authenticated GitHub activity appears here live and is delivered to every configured client."
-                  : "Messages below come from Kai’s durable conversation history across every connected client."}
+                  : humanDirect
+                    ? `Messages here are private to you and ${channelName}.`
+                    : "Messages below come from Kai’s durable conversation history across every connected client."}
               </p>
               {channel.kind === "notification" && notificationPreferences && (
                 <p className="notification-routing-summary">
@@ -3984,14 +4128,14 @@ function WorkshopView({
                     onMessageVisible={markVisibleMessageRead}
                     onSetReaction={!channelIsArchived(channel) ? onSetReaction : undefined}
                     onOpenThread={
-                      channel.kind === "group" && !channelIsArchived(channel)
+                      (channel.kind === "group" || humanDirect) && !channelIsArchived(channel)
                         ? setThreadRootMessageId
                         : undefined
                     }
                   />
                 </Fragment>
               ))}
-              {runPreview && channel.kind !== "notification" && (
+              {runPreview && channel.kind !== "notification" && !humanDirect && (
                 /* The preview payload carries no author; direct channels
                    have a single agent today, so the first agent's name is
                    the correct attribution until previews learn authorship. */
@@ -4042,7 +4186,7 @@ function WorkshopView({
                   : `${unseenMessageCount} new messages`}
             </button>
           )}
-          {activeRun && (
+          {activeRun && !humanDirect && (
             <section
               className={`run-activity ${activeRun.status}`}
               aria-label="Agent run activity"
@@ -4307,18 +4451,22 @@ function WorkshopView({
             <span className="section-number">02</span>
             <h3>Channel authority</h3>
             <p>
-              {channel.canSubmitCommands
+              {humanDirect
+                ? `Only you and ${channelName} can read and send messages here.`
+                : channel.canSubmitCommands
                 ? "You can read and send messages in this channel. Mention an agent to direct a request to it."
                 : "You can read this outbound channel, but you cannot send messages here."}
             </p>
           </section>
 
-          {channel.kind === "group" && (
+          {(channel.kind === "group" || humanDirect) && (
             <section className="context-section agent-attention-section">
               <span className="section-number">03</span>
               <div className="context-section-heading">
                 <h3>People</h3>
-                {(channel.role === "owner" || workshop.role === "admin") && !channelIsArchived(channel) && (
+                {channel.kind === "group" &&
+                  (channel.role === "owner" || workshop.role === "admin") &&
+                  !channelIsArchived(channel) && (
                   <button
                     className="panel-icon-button"
                     type="button"
@@ -4336,8 +4484,8 @@ function WorkshopView({
                   <span>
                     <strong>{navigation.principal.displayName}</strong>
                     <small>
-                      {navigation.principal.handle ? `@${navigation.principal.handle} · ` : ""}
-                      {channel.role}
+                      {navigation.principal.handle ? `@${navigation.principal.handle}` : ""}
+                      {!humanDirect && ` · ${channel.role}`}
                     </small>
                   </span>
                 </li>
@@ -4347,7 +4495,11 @@ function WorkshopView({
                     <li key={participant.principalId}>
                       <span>
                         <strong>{participant.displayName}</strong>
-                        {participant.handle && <small>@{participant.handle} · participant</small>}
+                        {participant.handle && (
+                          <small>
+                            @{participant.handle}{!humanDirect && " · participant"}
+                          </small>
+                        )}
                       </span>
                     </li>
                   ))}
@@ -4416,7 +4568,7 @@ function WorkshopView({
             </section>
           )}
 
-          <section className="context-section trace-section">
+          {!humanDirect && <section className="context-section trace-section">
             <span className="section-number">
               {channel.kind === "group" ? "05" : "03"}
             </span>
@@ -4459,9 +4611,9 @@ function WorkshopView({
             ) : (
               <p>No agent runtime is assigned to this channel.</p>
             )}
-          </section>
+          </section>}
 
-          <section className="context-section trace-section">
+          {!humanDirect && <section className="context-section trace-section">
             <span className="section-number">
               {channel.kind === "group" ? "06" : "04"}
             </span>
@@ -4472,7 +4624,7 @@ function WorkshopView({
               loaded={traceLoaded}
               runId={inspectedRunId}
             />
-          </section>
+          </section>}
 
         </div>
         )}
@@ -4537,6 +4689,16 @@ function WorkshopView({
           }}
         />
       )}
+      {humanConversationOpen && (
+        <HumanConversationDialog
+          onCancel={() => setHumanConversationOpen(false)}
+          onLoad={onLoadHumanPeers}
+          onOpen={async (principalId) => {
+            await onStartHumanConversation(principalId);
+            setHumanConversationOpen(false);
+          }}
+        />
+      )}
     </main>
   );
 }
@@ -4591,6 +4753,7 @@ function ActiveWorkshopClient({
   onArchiveChannel,
   onChannelAccessFailure,
   onCreateChannel,
+  onStartHumanConversation,
   onForget,
   onAgentNavigationChanged,
   onCreateAgent,
@@ -4616,6 +4779,10 @@ function ActiveWorkshopClient({
   onArchiveChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onChannelAccessFailure: (message: string) => void;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
+  onStartHumanConversation: (
+    workshopId: string,
+    principalId: string,
+  ) => Promise<void>;
   onForget: () => void;
   onAgentNavigationChanged: () => Promise<void>;
   onCreateAgent: () => void;
@@ -4649,6 +4816,7 @@ function ActiveWorkshopClient({
           (availableChannel) =>
             availableChannel.channelId === destination.runtimeChannelId &&
             availableChannel.kind === "direct" &&
+            availableChannel.agents.length > 0 &&
             availableChannel.canSubmitCommands,
         )
       : undefined;
@@ -4657,6 +4825,7 @@ function ActiveWorkshopClient({
     availableChannels.find(
       (availableChannel) =>
         availableChannel.kind === "direct" &&
+        availableChannel.agents.length > 0 &&
         availableChannel.canSubmitCommands,
     ) ??
     availableChannels.find(
@@ -4803,6 +4972,26 @@ function ActiveWorkshopClient({
       }
     },
     [onAuthenticationFailure, onChannelAccessFailure],
+  );
+  const loadSelectedHumanPeers = useCallback(() => {
+    if (!selected) {
+      throw new Error("Workshop access changed.");
+    }
+    return withAccessHandling(() =>
+      loadWorkshopHumans(session.token, selected.workshop.workshopId)
+    );
+  }, [selected, session.token, withAccessHandling]);
+  const startSelectedHumanConversation = useCallback(
+    (principalId: string) => {
+      if (!selected) {
+        throw new Error("Workshop access changed.");
+      }
+      return onStartHumanConversation(
+        selected.workshop.workshopId,
+        principalId,
+      );
+    },
+    [onStartHumanConversation, selected],
   );
   const loadSelectedRun = useCallback(
     (runId: string) => withAccessHandling(() => loadRun(session, runId)),
@@ -4995,6 +5184,7 @@ function ActiveWorkshopClient({
       onDownloadArtifact={downloadSelectedArtifact}
       onLoadArtifact={loadSelectedArtifact}
       onLoadChannelMembers={loadSelectedChannelMembers}
+      onLoadHumanPeers={loadSelectedHumanPeers}
       runActivity={runActivity}
       runPreview={runPreview}
       runTrace={runTrace}
@@ -5032,6 +5222,7 @@ function ActiveWorkshopClient({
       onSelectChannel={onSelectChannel}
       onSetReaction={setSelectedMessageReaction}
       onSubmitCommand={submitSelectedCommand}
+      onStartHumanConversation={startSelectedHumanConversation}
       onSwitchWorkspace={switchSelectedWorkspace}
       onSettingsAccessFailure={onChannelAccessFailure}
       onSettingsDirtyChange={onSettingsDirtyChange}
@@ -5477,6 +5668,43 @@ function WorkshopApp(): React.JSX.Element {
     }
   };
 
+  const startWorkshopHumanConversation = async (
+    workshopId: string,
+    principalId: string,
+  ): Promise<void> => {
+    if (!session) {
+      throw new Error("Workshop is not connected.");
+    }
+    try {
+      const conversation = await startHumanConversation(
+        session.token,
+        workshopId,
+        principalId,
+      );
+      const [discovered, appearance] = await Promise.all([
+        loadNavigation(session.token),
+        loadAppearancePreferences({ token: session.token }),
+      ]);
+      adoptNavigation(
+        session.token,
+        discovered,
+        conversation.channelId,
+        appearance,
+      );
+      setReadActivationChannelId(conversation.channelId);
+      const nextDestination: WorkshopDestination = { kind: "conversation" };
+      setDestination(nextDestination);
+      writeDestination(nextDestination, "push");
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        handleAuthenticationFailure(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        handleChannelAccessFailure(caught.message);
+      }
+      throw caught;
+    }
+  };
+
   const changeWorkshopChannelLifecycle = async (
     channelId: string,
     clientOperationId: string,
@@ -5540,6 +5768,7 @@ function WorkshopApp(): React.JSX.Element {
       }
       onChannelAccessFailure={handleChannelAccessFailure}
       onCreateChannel={createWorkshopChannel}
+      onStartHumanConversation={startWorkshopHumanConversation}
       onForget={() => forgetSession()}
       onAgentNavigationChanged={refreshAgentNavigation}
       onCreateAgent={() => void openAgents(null, true)}

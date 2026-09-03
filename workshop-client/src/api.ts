@@ -60,7 +60,9 @@ import type {
   WorkshopAgentEnablement,
   WorkshopAgentSummary,
   WorkshopHumanChannelMember,
+  WorkshopHumanConversation,
   WorkshopHumanMembership,
+  WorkshopHumanPeer,
   WorkshopHumanNotification,
   WorkshopHumanNotificationCounts,
   WorkshopHumanNotificationMutation,
@@ -1068,6 +1070,110 @@ export async function createChannel(
     throw new Error("Kai returned an unsupported channel creation response.");
   }
   return payload.channel.channel_id;
+}
+
+function parseHumanPeer(value: unknown): WorkshopHumanPeer | null {
+  if (
+    !isRecord(value) ||
+    typeof value.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(value.principal_id) ||
+    typeof value.display_name !== "string" ||
+    typeof value.handle !== "string" ||
+    !HUMAN_HANDLE_PATTERN.test(value.handle) ||
+    (value.conversation_channel_id !== null &&
+      (typeof value.conversation_channel_id !== "string" ||
+        !CHANNEL_PATTERN.test(value.conversation_channel_id)))
+  ) {
+    return null;
+  }
+  return {
+    conversationChannelId: value.conversation_channel_id,
+    displayName: value.display_name,
+    handle: value.handle,
+    principalId: value.principal_id,
+  };
+}
+
+export async function loadWorkshopHumans(
+  token: string,
+  workshopId: string,
+): Promise<WorkshopHumanPeer[]> {
+  if (!WORKSHOP_PATTERN.test(workshopId)) {
+    throw new Error("Invalid Workshop identity.");
+  }
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/workshops/${encodeURIComponent(workshopId)}/humans`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load Workshop people."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.workshop_id !== workshopId ||
+    !Array.isArray(payload.humans)
+  ) {
+    throw new Error("Kai returned unsupported Workshop people.");
+  }
+  const humans = payload.humans.map(parseHumanPeer);
+  if (humans.some((human) => human === null)) {
+    throw new Error("Kai returned unsupported Workshop people.");
+  }
+  return humans as WorkshopHumanPeer[];
+}
+
+export async function startHumanConversation(
+  token: string,
+  workshopId: string,
+  principalId: string,
+): Promise<WorkshopHumanConversation> {
+  if (!WORKSHOP_PATTERN.test(workshopId)) {
+    throw new Error("Invalid Workshop identity.");
+  }
+  if (!PRINCIPAL_PATTERN.test(principalId)) {
+    throw new Error("Invalid human identity.");
+  }
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/workshops/${encodeURIComponent(workshopId)}/humans/${encodeURIComponent(principalId)}/conversation`,
+    { method: "POST" },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not start this conversation."));
+  }
+  const rawConversation = isRecord(payload) ? payload.conversation : null;
+  const rawPeer = isRecord(rawConversation) && isRecord(rawConversation.peer)
+    ? rawConversation.peer
+    : null;
+  const peer = rawPeer && isRecord(rawConversation)
+    ? parseHumanPeer({
+        ...rawPeer,
+        conversation_channel_id: rawConversation.channel_id,
+      })
+    : null;
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.created !== "boolean" ||
+    !isRecord(rawConversation) ||
+    rawConversation.workshop_id !== workshopId ||
+    typeof rawConversation.channel_id !== "string" ||
+    !CHANNEL_PATTERN.test(rawConversation.channel_id) ||
+    rawConversation.kind !== "direct" ||
+    !peer ||
+    peer.principalId !== principalId
+  ) {
+    throw new Error("Kai returned an unsupported human conversation response.");
+  }
+  return {
+    channelId: rawConversation.channel_id,
+    created: payload.created,
+    peer,
+    workshopId,
+  };
 }
 
 async function mutateChannelLifecycle(

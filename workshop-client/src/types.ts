@@ -45,6 +45,20 @@ export interface WorkshopHumanChannelMember {
   role: "owner" | "participant" | null;
 }
 
+export interface WorkshopHumanPeer {
+  conversationChannelId: string | null;
+  displayName: string;
+  handle: string;
+  principalId: string;
+}
+
+export interface WorkshopHumanConversation {
+  channelId: string;
+  created: boolean;
+  peer: WorkshopHumanPeer;
+  workshopId: string;
+}
+
 export interface WorkshopHumanMembership {
   archived: boolean;
   canManage: boolean;

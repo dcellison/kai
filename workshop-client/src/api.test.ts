@@ -51,6 +51,7 @@ import {
   loadChannelMessage,
   loadHumanNotificationCounts,
   loadHumanNotifications,
+  loadWorkshopHumans,
   loadFollowedThreads,
   loadWorkspaceConfig,
   moveMemoriesScope,
@@ -64,6 +65,7 @@ import {
   setMessageReaction,
   setThreadFollowed,
   startAgentConversation,
+  startHumanConversation,
   submitCommand,
   streamTimeline,
   streamAgentChanges,
@@ -1576,6 +1578,75 @@ describe("Workshop client API", () => {
       name: "Release planning",
       origin_channel_id: channelId,
     });
+  });
+
+  it("discovers Workshop humans and starts or reuses a private conversation", async () => {
+    const workshopId = "wsp_00000000000000000000000000000001";
+    const principalId = "prn_00000000000000000000000000000003";
+    const humanChannelId = "chn_33333333333333333333333333333333";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({
+        version: 1,
+        workshop_id: workshopId,
+        humans: [{
+          principal_id: principalId,
+          display_name: "Scott",
+          handle: "scott",
+          conversation_channel_id: humanChannelId,
+        }],
+      }))
+      .mockResolvedValueOnce(Response.json({
+        version: 1,
+        created: false,
+        conversation: {
+          workshop_id: workshopId,
+          channel_id: humanChannelId,
+          kind: "direct",
+          peer: {
+            principal_id: principalId,
+            display_name: "Scott",
+            handle: "scott",
+          },
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadWorkshopHumans("session-secret", workshopId)).resolves.toEqual([
+      {
+        conversationChannelId: humanChannelId,
+        displayName: "Scott",
+        handle: "scott",
+        principalId,
+      },
+    ]);
+    await expect(
+      startHumanConversation("session-secret", workshopId, principalId),
+    ).resolves.toEqual({
+      channelId: humanChannelId,
+      created: false,
+      peer: {
+        conversationChannelId: humanChannelId,
+        displayName: "Scott",
+        handle: "scott",
+        principalId,
+      },
+      workshopId,
+    });
+
+    const [peoplePath, peopleOptions] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [conversationPath, conversationOptions] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(peoplePath).toBe(`/v1/workshops/${workshopId}/humans`);
+    expect(conversationPath).toBe(
+      `/v1/workshops/${workshopId}/humans/${principalId}/conversation`,
+    );
+    expect(conversationOptions.method).toBe("POST");
+    expect(new Headers(peopleOptions.headers).get("Authorization")).toBe(
+      "Bearer session-secret",
+    );
+    expect(new Headers(conversationOptions.headers).get("Authorization")).toBe(
+      "Bearer session-secret",
+    );
   });
 
   it("dismisses an engaged channel agent under session authority", async () => {
