@@ -676,27 +676,38 @@ export function AgentWorkspace({
   };
 
   const startConversation = (): Promise<void> => {
-    if (
-      !selected ||
-      !enablement ||
-      !enablement.directChannelId ||
-      enablement.stateVersion === null
-    ) {
+    if (!selected || !enablement) {
       return Promise.resolve();
     }
-    const directChannelId = enablement.directChannelId;
-    const stateVersion = enablement.stateVersion;
     const definitionId = selected.definitionId;
     return runMutation(async () => {
-      if (!enablement.conversationStarted) {
-        await startAgentConversation(token, definitionId, {
-          expectedVersion: stateVersion,
+      let conversation = enablement;
+      if (conversation.lifecycleState !== "enabled") {
+        const eligibleRuntime = conversation.eligibleRuntimes[0];
+        if (conversation.canManage || !eligibleRuntime) {
+          throw new Error("This agent conversation is not available.");
+        }
+        conversation = await enableAgentDefinition(token, definitionId, {
+          expectedVersion: conversation.stateVersion,
+          idempotencyKey: operationKey("conversation-access"),
+          runtimeProfileId: eligibleRuntime.runtimeProfileId,
+        });
+      }
+      if (!conversation.directChannelId || conversation.stateVersion === null) {
+        throw new Error("This agent conversation is not available.");
+      }
+      if (!conversation.conversationStarted) {
+        conversation = await startAgentConversation(token, definitionId, {
+          expectedVersion: conversation.stateVersion,
           idempotencyKey: operationKey("conversation"),
         });
-        await refresh();
-        await onNavigationChanged();
       }
-      await onOpenChannel(directChannelId);
+      if (!conversation.directChannelId) {
+        throw new Error("This agent conversation is not available.");
+      }
+      await refresh();
+      await onNavigationChanged();
+      await onOpenChannel(conversation.directChannelId);
     }, "Could not open this agent conversation.");
   };
 
@@ -805,8 +816,13 @@ export function AgentWorkspace({
                       {selected.lifecycleState}
                     </span>
                     {selected.lifecycleState === "active" &&
-                      enablement?.lifecycleState === "enabled" &&
-                      enablement.directChannelId && (
+                      enablement &&
+                      ((enablement.lifecycleState === "enabled" &&
+                        enablement.directChannelId) ||
+                        (!enablement.canManage &&
+                          enablement.lifecycleState !== "enabled" &&
+                          enablement.ownerRuntimeProfileId &&
+                          enablement.eligibleRuntimes.length > 0)) && (
                         <button
                           className="panel-icon-button agent-conversation-button"
                           type="button"
@@ -842,31 +858,21 @@ export function AgentWorkspace({
 
               {selected.lifecycleState === "active" &&
                 enablement &&
-                !enablement.canManage && (
-                <section className="agent-enablement-card">
-                  <div>
-                    <p className="overline">Conversation access</p>
-                    <h3>
-                      {enablement.lifecycleState === "enabled"
-                        ? "Available to you"
-                        : "Conversation available"}
-                    </h3>
-                  </div>
-                  {enablement.lifecycleState !== "enabled" &&
-                    enablement.eligibleRuntimes.length > 0 && (
-                      <div className="form-actions">
-                        <button
-                          className="primary-button"
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void enable()}
-                        >
-                          Enable conversation
-                        </button>
-                      </div>
-                    )}
-                </section>
-              )}
+                !enablement.canManage &&
+                enablement.lifecycleState !== "enabled" &&
+                (!enablement.ownerRuntimeProfileId ||
+                  enablement.eligibleRuntimes.length === 0) && (
+                  <section className="agent-enablement-card">
+                    <div>
+                      <p className="overline">Conversation unavailable</p>
+                      <h3>
+                        {!enablement.ownerRuntimeProfileId
+                          ? "Waiting for the agent owner’s runtime"
+                          : "Unavailable to this Workshop account"}
+                      </h3>
+                    </div>
+                  </section>
+                )}
 
               {selected.lifecycleState === "active" &&
                 enablement?.canManage &&
