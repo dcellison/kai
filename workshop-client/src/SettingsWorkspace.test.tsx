@@ -546,6 +546,19 @@ describe("Settings workspace", () => {
     expect(await screen.findByText("Display name saved.")).toBeVisible();
   });
 
+  it("stacks the profile and preference editor in the settings content column", async () => {
+    renderSettings();
+
+    const profile = (await screen.findByText("Profile")).closest(".settings-card");
+    const preferences = screen.getByLabelText("Preference Markdown").closest(
+      ".preference-editor-card",
+    );
+    const content = profile?.closest(".settings-personal-preferences");
+
+    expect(content).not.toBeNull();
+    expect(preferences?.parentElement).toBe(content);
+  });
+
   it("keeps agent model refresh available in a compact catalogue for members", async () => {
     const user = userEvent.setup();
     renderAgentRuntime(false, vi.fn(), false);

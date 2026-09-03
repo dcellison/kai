@@ -2730,9 +2730,11 @@ describe("Workshop React client", () => {
       (await screen.findAllByText(/direct message is archived for you/i)).length,
     ).toBeGreaterThan(0);
 
-    await user.click(
-      screen.getByRole("button", { name: "Archived direct messages" }),
-    );
+    const archivedDirectMessages = screen.getByRole("button", {
+      name: "Archived direct messages",
+    });
+    expect(archivedDirectMessages).toHaveClass("nav-tool-button");
+    await user.click(archivedDirectMessages);
     const archiveDialog = screen.getByRole("dialog", { name: "Archive" });
     expect(archiveDialog).toHaveTextContent("Scott");
     await user.click(

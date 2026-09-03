@@ -3915,7 +3915,7 @@ function WorkshopView({
               <p className="nav-heading">Direct messages</p>
               <div className="nav-heading-actions">
                 <button
-                  className="nav-archive-button"
+                  className="nav-tool-button"
                   type="button"
                   aria-label="Archived direct messages"
                   title="Archived direct messages"
