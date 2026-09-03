@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1106,7 +1107,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 24
+    version = 25
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1227,6 +1228,42 @@ class CanonicalConversationProjection:
                 raise ValueError("Workshop human-handle assignment requires a typed principal aggregate")
             _require_exact_payload(payload, {"handle"})
             await _insert_human_handle(connection, event, payload.get("handle"))
+        elif envelope.event_type == WorkshopEventType.PRINCIPAL_DISPLAY_NAME_CHANGED:
+            if envelope.event_version != 1:
+                raise ValueError("Unsupported Workshop display-name event version")
+            if (
+                not isinstance(envelope.aggregate_id, PrincipalId)
+                or envelope.aggregate_type != "principal_profile"
+                or envelope.actor_principal_id != envelope.aggregate_id
+            ):
+                raise ValueError("Workshop display-name changes require a self-owned principal profile")
+            _require_exact_payload(payload, {"display_name", "expected_state_version"})
+            display_name = _required_text(payload, "display_name")
+            expected_state_version = payload.get("expected_state_version")
+            if (
+                display_name != display_name.strip()
+                or len(display_name) > 200
+                or any(unicodedata.category(character).startswith("C") for character in display_name)
+                or not isinstance(expected_state_version, int)
+                or isinstance(expected_state_version, bool)
+                or expected_state_version < 0
+            ):
+                raise ValueError("Workshop display-name change payload is invalid")
+            cursor = await connection.execute(
+                "UPDATE principals SET display_name = ?, display_name_state_version = display_name_state_version + 1, "
+                "display_name_event_position = ? WHERE id = ? AND kind = 'human' "
+                "AND display_name_state_version = ? AND EXISTS (SELECT 1 FROM workshop_memberships "
+                "WHERE principal_id = principals.id AND workshop_id = ?)",
+                (
+                    display_name,
+                    event.position,
+                    envelope.aggregate_id,
+                    expected_state_version,
+                    envelope.workshop_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Workshop display-name change is stale or unauthorized")
         elif envelope.event_type == WorkshopEventType.EXTERNAL_IDENTITY_BOUND:
             await connection.execute(
                 "INSERT INTO external_identities "

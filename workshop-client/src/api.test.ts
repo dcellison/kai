@@ -52,6 +52,7 @@ import {
   loadChannelMessage,
   loadHumanNotificationCounts,
   loadHumanNotifications,
+  loadHumanProfile,
   loadWorkshopHumans,
   loadFollowedThreads,
   loadWorkspaceConfig,
@@ -78,6 +79,7 @@ import {
   updateRuntimeSettings,
   updateRoutingPolicy,
   updateGitHubSettings,
+  updateHumanDisplayName,
   updateNotificationPreference,
   updateChannelNotificationPolicy,
   updateClientPreference,
@@ -1286,6 +1288,45 @@ describe("Workshop client API", () => {
     expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
       revision: "apr_current",
       theme_id: "atom-one-dark",
+    });
+  });
+
+  it("loads and updates the authenticated human profile without changing its handle", async () => {
+    const payload = {
+      version: 1,
+      principal_id: "prn_00000000000000000000000000000001",
+      display_name: "Daniel",
+      handle: "daniel",
+      state_version: 2,
+      mutation: null,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(payload))
+      .mockResolvedValueOnce(Response.json({
+        ...payload,
+        display_name: "Daniel Example",
+        state_version: 3,
+        mutation: { changed: true, replayed: false },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadHumanProfile(session)).resolves.toMatchObject({
+      displayName: "Daniel",
+      handle: "daniel",
+      stateVersion: 2,
+    });
+    await expect(
+      updateHumanDisplayName(session, "Daniel Example", 2, "profile-op-1"),
+    ).resolves.toMatchObject({
+      displayName: "Daniel Example",
+      handle: "daniel",
+      stateVersion: 3,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/v1/settings/profile");
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      display_name: "Daniel Example",
+      expected_state_version: 2,
+      client_operation_id: "profile-op-1",
     });
   });
 

@@ -611,6 +611,14 @@ export interface WorkshopAppearancePreferences {
   }[];
 }
 
+export interface WorkshopHumanProfile {
+  principalId: string;
+  displayName: string;
+  handle: string;
+  stateVersion: number;
+  mutation: { changed: boolean; replayed: boolean } | null;
+}
+
 export type WorkshopClientPreferenceChange =
   | {
       field: "mode";

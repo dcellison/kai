@@ -5270,3 +5270,101 @@ async def test_appearance_preferences_api_is_principal_scoped_and_revision_check
     finally:
         await client.close()
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_profile_api_changes_only_the_authenticated_display_name(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+    )
+    alice_headers = {"Authorization": "Bearer alice-token"}
+    bob_headers = {"Authorization": "Bearer bob-token"}
+    try:
+        loaded = await client.get("/v1/settings/profile", headers=alice_headers)
+        payload = await loaded.json()
+        assert loaded.status == 200
+        assert payload == {
+            "version": 1,
+            "principal_id": str(alice_id),
+            "display_name": "Alice",
+            "handle": "alice",
+            "state_version": 0,
+            "mutation": None,
+        }
+
+        request = {
+            "display_name": "aLiCe Example",
+            "expected_state_version": 0,
+            "client_operation_id": "profile-rename-1",
+        }
+        async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
+            before = int((await cursor.fetchone())[0])
+        changed = await client.patch("/v1/settings/profile", headers=alice_headers, json=request)
+        changed_payload = await changed.json()
+        assert changed.status == 200
+        assert changed_payload["display_name"] == "aLiCe Example"
+        assert changed_payload["handle"] == "alice"
+        assert changed_payload["state_version"] == 1
+        assert changed_payload["mutation"] == {"changed": True, "replayed": False}
+
+        stream = await client.get(
+            f"/v1/client/agents/events?after_position={before}",
+            headers={
+                **bob_headers,
+                "X-Kai-Stream-ID": "display-name-navigation-test",
+            },
+        )
+        event_name = ""
+        live_payload: dict[str, object] | None = None
+        for _ in range(20):
+            line = (await stream.content.readline()).decode().strip()
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ")
+            if line.startswith("data: "):
+                candidate = json.loads(line.removeprefix("data: "))
+                if candidate["event_type"] == "principal.display_name_changed":
+                    live_payload = candidate
+                    break
+        assert event_name == "workshop.navigation.changed"
+        assert live_payload is not None
+        assert live_payload["definition_id"] is None
+        stream.close()
+
+        replay = await client.patch("/v1/settings/profile", headers=alice_headers, json=request)
+        assert replay.status == 200
+        assert (await replay.json())["mutation"] == {"changed": True, "replayed": True}
+
+        stale = await client.patch(
+            "/v1/settings/profile",
+            headers=alice_headers,
+            json={**request, "display_name": "Stale", "client_operation_id": "profile-rename-2"},
+        )
+        invalid = await client.patch(
+            "/v1/settings/profile",
+            headers=alice_headers,
+            json={
+                "display_name": "bad\nname",
+                "expected_state_version": 1,
+                "client_operation_id": "profile-rename-3",
+            },
+        )
+        bob = await client.get("/v1/settings/profile", headers=bob_headers)
+        anonymous = await client.get("/v1/settings/profile")
+        assert stale.status == 409
+        assert invalid.status == 400
+        assert (await bob.json())["display_name"] == "Bob"
+        assert anonymous.status == 401
+
+        await store.rebuild_projection(CanonicalConversationProjection())
+        rebuilt = await client.get("/v1/settings/profile", headers=alice_headers)
+        rebuilt_payload = await rebuilt.json()
+        assert rebuilt_payload["display_name"] == "aLiCe Example"
+        assert rebuilt_payload["handle"] == "alice"
+        assert rebuilt_payload["state_version"] == 1
+    finally:
+        await client.close()
+        await store.close()

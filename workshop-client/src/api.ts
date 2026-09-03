@@ -34,6 +34,7 @@ import type {
   WorkshopClientPreferences,
   WorkshopClientPreferenceChange,
   WorkshopAppearancePreferences,
+  WorkshopHumanProfile,
   WorkshopRuntimeSettingsChange,
   WorkshopWorkspaceSettingChange,
   WorkshopMemoryPage,
@@ -2290,6 +2291,38 @@ function parseAppearancePreferences(payload: unknown): WorkshopAppearancePrefere
   };
 }
 
+function parseHumanProfile(payload: unknown): WorkshopHumanProfile {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(payload.principal_id) ||
+    typeof payload.display_name !== "string" ||
+    typeof payload.handle !== "string" ||
+    !HUMAN_HANDLE_PATTERN.test(payload.handle) ||
+    !Number.isSafeInteger(payload.state_version) ||
+    (payload.state_version as number) < 0 ||
+    (payload.mutation !== null &&
+      (!isRecord(payload.mutation) ||
+        typeof payload.mutation.changed !== "boolean" ||
+        typeof payload.mutation.replayed !== "boolean"))
+  ) {
+    throw new Error("Kai returned an unsupported human profile.");
+  }
+  return {
+    principalId: payload.principal_id,
+    displayName: payload.display_name,
+    handle: payload.handle,
+    stateVersion: payload.state_version as number,
+    mutation: payload.mutation === null
+      ? null
+      : {
+          changed: payload.mutation.changed as boolean,
+          replayed: payload.mutation.replayed as boolean,
+        },
+  };
+}
+
 function parseWorkspaceConfig(payload: unknown): WorkshopWorkspaceConfig {
   if (
     !isRecord(payload) ||
@@ -3316,6 +3349,51 @@ export async function updateAppearancePreference(
     throw new Error(safeErrorMessage(payload, "Could not update appearance preferences."));
   }
   return parseAppearancePreferences(payload);
+}
+
+export async function loadHumanProfile(
+  session: Pick<WorkshopSession, "token">,
+): Promise<WorkshopHumanProfile> {
+  const response = await authorizedFetch(
+    { channelId: "", token: session.token },
+    "/v1/settings/profile",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load your profile."));
+  }
+  return parseHumanProfile(payload);
+}
+
+export async function updateHumanDisplayName(
+  session: Pick<WorkshopSession, "token">,
+  displayName: string,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopHumanProfile> {
+  const response = await authorizedFetch(
+    { channelId: "", token: session.token },
+    "/v1/settings/profile",
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        display_name: displayName,
+        expected_state_version: expectedStateVersion,
+        client_operation_id: clientOperationId,
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Your profile changed since it was loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not update your profile."));
+  }
+  return parseHumanProfile(payload);
 }
 
 export async function updateClientPreference(
