@@ -1618,9 +1618,6 @@ class Config:
     # PR review agent: per-user toggle lives in users.yaml `pr_review`
     # (or the per-chat /github reviews command). Global resource
     # controls stay on Config.
-    # Minimum seconds between reviews of the same PR. Absorbs force-push bursts
-    # so rapid pushes to an open PR don't trigger a review for each one.
-    pr_review_cooldown: int = 300
     # Subprocess timeout for a single PR review, in seconds. Sonnet with
     # extended thinking on a large diff with prior review context can take
     # a long time; the default gives thinking-heavy reviews room while
@@ -3341,12 +3338,8 @@ def load_config() -> Config:
         codex_turn_deadline_seconds = turn_deadline_seconds
 
     # PR review agent config. The global `pr_review` toggle now lives
-    # per-user in users.yaml; PR_REVIEW_COOLDOWN / PR_REVIEW_TIMEOUT_S
-    # remain as global resource controls.
-    try:
-        pr_review_cooldown = int(os.environ.get("PR_REVIEW_COOLDOWN", "300"))
-    except ValueError:
-        raise SystemExit("PR_REVIEW_COOLDOWN must be an integer") from None
+    # per-user in users.yaml; the subprocess timeout remains a global
+    # resource control.
     try:
         pr_review_timeout_s = int(os.environ.get("PR_REVIEW_TIMEOUT_S", "900"))
         if pr_review_timeout_s <= 0:
@@ -3881,7 +3874,6 @@ def load_config() -> Config:
         model_catalogue_refresh_interval_s=model_catalogue_refresh_interval_s,
         model_catalogue_refresh_timeout_s=model_catalogue_refresh_timeout_s,
         memory_projects=memory_projects,
-        pr_review_cooldown=pr_review_cooldown,
         pr_review_timeout_s=pr_review_timeout_s,
         github_repo=os.getenv("GITHUB_REPO", ""),
         spec_dir=os.getenv("SPEC_DIR", "specs"),

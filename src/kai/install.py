@@ -2848,24 +2848,10 @@ def _cmd_config() -> None:
     print()
 
     # -- PR review agent --
-    # PR_REVIEW_COOLDOWN and PR_REVIEW_TIMEOUT_S are global resource
-    # controls for the review subprocess: any review by any user
-    # counts against the same cooldown and the same subprocess
-    # timeout. Both fire on every wizard run. The per-user
-    # `pr_review` toggle lives in users.yaml (or /github reviews).
+    # PR_REVIEW_TIMEOUT_S is a global resource control for the review
+    # subprocess. It fires on every wizard run. The per-user `pr_review`
+    # toggle lives in users.yaml (or /github reviews).
     print("-- PR review agent --")
-
-    # Global cooldown always prompts: any opted-in user can drive
-    # reviews, so the cooldown must be configurable for any install
-    # that has any opted-in user.
-    while True:
-        pr_review_cooldown = _prompt(
-            "Review cooldown in seconds (prevents spam from rapid pushes)",
-            existing_env.get("PR_REVIEW_COOLDOWN", "300"),
-        )
-        if _validate_positive_int(pr_review_cooldown):
-            break
-        print("  Must be a positive integer.")
 
     # Timeout for the review subprocess. Always collectable: it
     # applies to any review whether or not the global env flag is set.
@@ -3281,12 +3267,6 @@ def _cmd_config() -> None:
     # emitted when set, regardless of users.yaml presence.
     if workspace_base:
         env["WORKSPACE_BASE"] = workspace_base
-
-    # PR_REVIEW_COOLDOWN is a global resource control. Always written
-    # when non-default because any user can drive reviews via users.yaml
-    # or /github reviews on|off.
-    if pr_review_cooldown != "300":
-        env["PR_REVIEW_COOLDOWN"] = pr_review_cooldown
 
     # ALLOWED_WORKSPACES is an inheritable installation default.
     if allowed_workspaces:

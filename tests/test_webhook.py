@@ -265,12 +265,6 @@ class TestFmtPullRequestReview:
         assert _fmt_pull_request_review(_review_payload("edited", "approved")) is None
 
 
-# ── _should_skip_review / _record_review ────────────────────────────
-
-
-# ── _prune_expired / cooldown dict cleanup ───────────────────────────
-
-
 # ── PR review routing (integration tests) ──────────────────────────
 
 
@@ -308,7 +302,6 @@ def _default_github_token_lookup():
 
 
 def _build_test_app(
-    cooldown: int = 300,
     config: object | None = None,
 ) -> web.Application:
     """Build a minimal aiohttp app with _handle_github wired up.
@@ -651,7 +644,6 @@ class TestNotificationChatIdMutations:
         config.telegram_webhook_secret = None
         config.github_webhook_secret = None
         config.generic_webhook_secret = None
-        config.pr_review_cooldown = 0
         config.pr_review_timeout_s = 0
         config.webhook_port = 0
         config.workshop_lan_host = ""
@@ -720,7 +712,6 @@ class TestNotificationChatIdMutations:
         config.telegram_webhook_secret = None
         config.github_webhook_secret = "configured-but-telegram-owned"
         config.generic_webhook_secret = "configured-but-telegram-owned"
-        config.pr_review_cooldown = 0
         config.pr_review_timeout_s = 0
         config.webhook_port = 8080
         config.workshop_lan_host = ""
@@ -788,7 +779,6 @@ class TestNotificationChatIdMutations:
         config.telegram_webhook_secret = None
         config.github_webhook_secret = None
         config.generic_webhook_secret = None
-        config.pr_review_cooldown = 0
         config.pr_review_timeout_s = 0
         config.webhook_port = 8080
         config.workshop_lan_host = "10.0.0.36"

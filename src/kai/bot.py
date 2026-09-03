@@ -4163,8 +4163,8 @@ async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TY
     timestamped copy is staged under the human actor's canonical file area via
     ``_save_upload()``, and the staged copy is uploaded to Telegram
     as a document attachment so phone-only use can read the full
-    review. No GitHub comment is posted; the webhook cooldown map is
-    untouched.
+    review. No GitHub comment is posted and no canonical webhook
+    automation work is created.
     """
     assert update.message is not None
 

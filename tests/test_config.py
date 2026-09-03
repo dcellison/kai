@@ -53,7 +53,6 @@ _CONFIG_ENV_VARS = [
     "CLAUDE_USER",
     "FILE_RETENTION_DAYS",
     "PR_REVIEW_ENABLED",
-    "PR_REVIEW_COOLDOWN",
     "PR_REVIEW_TIMEOUT_S",
     "MODEL_CATALOGUE_REFRESH_INTERVAL_S",
     "MODEL_CATALOGUE_REFRESH_TIMEOUT_S",
@@ -1040,21 +1039,14 @@ class TestPRReviewConfig:
         """PR review resource controls take dataclass defaults when env is empty."""
         _set_required(monkeypatch)
         config = load_config()
-        assert config.pr_review_cooldown == 300
         assert config.pr_review_timeout_s == 900
 
-    def test_custom_cooldown(self, monkeypatch):
-        """PR_REVIEW_COOLDOWN is picked up from env."""
+    def test_retired_cooldown_is_ignored(self, monkeypatch):
+        """A stale cooldown value cannot affect or break configuration loading."""
         _set_required(monkeypatch)
-        monkeypatch.setenv("PR_REVIEW_COOLDOWN", "60")
-        assert load_config().pr_review_cooldown == 60
-
-    def test_cooldown_invalid_raises(self, monkeypatch):
-        """Non-numeric PR_REVIEW_COOLDOWN raises SystemExit."""
-        _set_required(monkeypatch)
-        monkeypatch.setenv("PR_REVIEW_COOLDOWN", "not_a_number")
-        with pytest.raises(SystemExit, match="PR_REVIEW_COOLDOWN"):
-            load_config()
+        monkeypatch.setenv("PR_REVIEW_COOLDOWN", "not-a-number")
+        config = load_config()
+        assert not hasattr(config, "pr_review_cooldown")
 
     def test_timeout_override(self, monkeypatch):
         """PR_REVIEW_TIMEOUT_S parses to an int and reaches the Config."""
