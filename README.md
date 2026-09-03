@@ -43,13 +43,13 @@ Each Kai backend is a full coding harness with its own protocol, tools, and auth
 
 | Backend | Runtime | Model Selection Shape | Notes |
 |---|---|---|---|
-| Claude Code | `claude` CLI | Claude aliases and full model IDs | The default. Uses Claude Code's local authentication. |
+| Claude Code | `claude` CLI | Claude aliases and full model IDs | Uses Claude Code's local authentication. |
 | OpenAI Codex CLI | `codex` CLI | Codex CLI model IDs | Uses Codex's own model catalog. |
 | Goose | `goose acp` | Provider-native model IDs | ACP backend; provider selected through Goose configuration. |
 | OpenCode | `opencode acp` | `provider/model` IDs | ACP backend; model resolution owned by OpenCode. |
 | Pi | `pi --mode rpc` | `provider/model[:thinking]` IDs | JSONL RPC backend; bounded one-shot tasks disable tools. |
 
-Between them the backends cover providers like OpenAI, Google, DeepSeek, OpenRouter, GitHub Copilot, and local models via Ollama. Only the backends you actually select need to be installed and authenticated. [Multiple Backends](https://github.com/dcellison/kai/wiki/Multiple-Backends) explains the architecture and the case for provider diversity.
+Between them the backends cover providers like OpenAI, Google, DeepSeek, OpenRouter, GitHub Copilot, and local models via Ollama. Kai ships no built-in default: the wizard discovers what is installed and the admin picks the installation default from that list. Only the backends you actually select need to be installed and authenticated. [Multiple Backends](https://github.com/dcellison/kai/wiki/Multiple-Backends) explains the architecture and the case for provider diversity.
 
 ## Core Capabilities
 
