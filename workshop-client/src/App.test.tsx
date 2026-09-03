@@ -2538,6 +2538,37 @@ describe("Workshop React client", () => {
     ).toBeVisible();
   });
 
+  it("opens channel creation immediately from auxiliary Workshop views", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Memory" }));
+    expect(
+      await screen.findByRole("heading", { name: "Memory", level: 1 }),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Create channel" }));
+    let creationDialog = screen.getByRole("dialog", { name: "Create channel" });
+    expect(creationDialog).toBeVisible();
+    await user.click(
+      within(creationDialog).getByRole("button", { name: "Cancel" }),
+    );
+    expect(screen.queryByRole("dialog", { name: "Create channel" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Manage Kai" }));
+    expect(
+      await screen.findByRole("heading", { name: "Agents", level: 1 }),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Create channel" }));
+    creationDialog = screen.getByRole("dialog", { name: "Create channel" });
+    expect(creationDialog).toBeVisible();
+  });
+
   it("archives a group channel read-only and restores it from the archive", async () => {
     const user = userEvent.setup();
     const active = navigationWithGroup({

@@ -4477,19 +4477,6 @@ function WorkshopView({
         </div>
         )}
       </aside>
-      {channelCreation && (
-        <ChannelCreationDialog
-          agents={availableAgents}
-          initialAgentIds={channelCreation.initialAgentIds}
-          originChannelId={channelCreation.originChannelId}
-          originName={channelCreation.originName}
-          onCancel={() => setChannelCreation(null)}
-          onCreate={async (input) => {
-            await onCreateChannel(input);
-            setChannelCreation(null);
-          }}
-        />
-      )}
       {archivedChannelsOpen && (
         <ArchivedChannelsDialog
           channels={workshop.channels.filter(
@@ -4534,6 +4521,19 @@ function WorkshopView({
           onView={(definitionId) => {
             setArchivedAgentsOpen(false);
             void onOpenAgentDefinition(definitionId);
+          }}
+        />
+      )}
+      {channelCreation && (
+        <ChannelCreationDialog
+          agents={availableAgents}
+          initialAgentIds={channelCreation.initialAgentIds}
+          originChannelId={channelCreation.originChannelId}
+          originName={channelCreation.originName}
+          onCancel={() => setChannelCreation(null)}
+          onCreate={async (input) => {
+            await onCreateChannel(input);
+            setChannelCreation(null);
           }}
         />
       )}
