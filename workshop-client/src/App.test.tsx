@@ -2815,6 +2815,9 @@ describe("Workshop React client", () => {
     );
     expect(composer).toHaveValue("@scott ");
     expect(screen.queryByRole("option", { name: /Daniel/ })).toBeNull();
+    const channelPeople = screen.getByRole("heading", { name: "People" }).closest("section");
+    expect(channelPeople).not.toBeNull();
+    expect(channelPeople?.querySelectorAll(".context-person-avatar")).toHaveLength(2);
   });
 
   it("lets a channel owner add an eligible human member", async () => {
@@ -3157,7 +3160,9 @@ describe("Workshop React client", () => {
     expect(screen.getByRole("heading", { name: "Conversation with Scott" })).toBeVisible();
     expect(screen.queryByRole("heading", { name: "Welcome to Scott" })).toBeNull();
     expect(screen.getByText("Messages here are private to you and Scott.")).toBeVisible();
-    expect(screen.getByRole("heading", { name: "People" })).toBeVisible();
+    const directPeople = screen.getByRole("heading", { name: "People" }).closest("section");
+    expect(directPeople).not.toBeNull();
+    expect(directPeople?.querySelectorAll(".context-person-avatar")).toHaveLength(2);
     expect(await screen.findByRole("button", { name: "Reply to message" })).toBeVisible();
     expect(screen.queryByRole("heading", { name: "Runtime and workspace" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Run inspector" })).toBeNull();

@@ -19,6 +19,7 @@ from kai.workshop.domain import (
     MessageReactionSummary,
     PrincipalId,
 )
+from kai.workshop.human_avatars import human_avatar_descriptors
 from kai.workshop.message_reactions import load_message_reactions
 from kai.workshop.store import WorkshopEventStore
 
@@ -68,6 +69,8 @@ class TimelineMessage:
     reactions: tuple[MessageReactionSummary, ...] = ()
     reply_count: int = 0
     latest_reply_at: datetime | None = None
+    author_avatar_state_version: int = 0
+    author_avatar_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +336,8 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
                 mentions=parse_message_mentions_json(row[10]),
                 reply_count=int(row[12]),
                 latest_reply_at=(_parse_timestamp(str(row[13])) if row[13] is not None else None),
+                author_avatar_state_version=(int(row[14]) if len(row) > 14 else 0),
+                author_avatar_active=(bool(row[15]) if len(row) > 15 else False),
             )
         )
     return tuple(messages)
@@ -352,11 +357,23 @@ async def attach_message_details(
         message_ids=tuple(message.message_id for message in messages),
         viewer_principal_id=principal_id,
     )
+    avatar_map = await human_avatar_descriptors(
+        store,
+        (message.author_principal_id for message in messages if message.author_kind == "human"),
+    )
     return tuple(
         replace(
             message,
             artifacts=artifact_map.get(message.message_id, ()),
             reactions=reaction_map.get(message.message_id, ()),
+            author_avatar_state_version=(
+                avatar_map[message.author_principal_id].state_version
+                if message.author_principal_id in avatar_map
+                else 0
+            ),
+            author_avatar_active=(
+                avatar_map[message.author_principal_id].active if message.author_principal_id in avatar_map else False
+            ),
         )
         for message in messages
     )

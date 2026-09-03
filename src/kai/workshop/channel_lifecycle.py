@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from kai.workshop.domain import (
@@ -18,6 +18,7 @@ from kai.workshop.domain import (
     WorkshopEventType,
     WorkshopId,
 )
+from kai.workshop.human_avatars import HumanAvatarDescriptor, human_avatar_descriptors
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import StoredEvent, WorkshopEventStore
 
@@ -80,6 +81,8 @@ class WorkshopHumanChannelMember:
     display_name: str
     handle: str
     role: str | None
+    avatar_state_version: int = 0
+    avatar_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +201,12 @@ class WorkshopChannelLifecycleService:
             ) as cursor:
                 eligible_rows = list(await cursor.fetchall())
             eligible = tuple(self._human_member_from_row(row, with_role=False) for row in eligible_rows)
+        descriptors = await human_avatar_descriptors(
+            self._store,
+            (member.principal_id for member in (*members, *eligible)),
+        )
+        members = tuple(self._with_human_avatar(member, descriptors) for member in members)
+        eligible = tuple(self._with_human_avatar(member, descriptors) for member in eligible)
         return WorkshopHumanMembershipSnapshot(
             channel_id,
             workshop_id,
@@ -385,7 +394,9 @@ class WorkshopChannelLifecycleService:
             row = await cursor.fetchone()
         if row is None:
             raise WorkshopChannelLifecycleValidationError("Human is not eligible for this Workshop channel")
-        return self._human_member_from_row(row, with_role=False)
+        member = self._human_member_from_row(row, with_role=False)
+        descriptors = await human_avatar_descriptors(self._store, (member.principal_id,))
+        return self._with_human_avatar(member, descriptors)
 
     @staticmethod
     def _human_member_from_row(
@@ -399,6 +410,20 @@ class WorkshopChannelLifecycleService:
             str(values[1]),
             str(values[2]),
             str(values[3]) if with_role else None,
+        )
+
+    @staticmethod
+    def _with_human_avatar(
+        member: WorkshopHumanChannelMember,
+        descriptors: dict[PrincipalId, HumanAvatarDescriptor],
+    ) -> WorkshopHumanChannelMember:
+        descriptor = descriptors.get(member.principal_id)
+        if descriptor is None:
+            return member
+        return replace(
+            member,
+            avatar_state_version=descriptor.state_version,
+            avatar_active=descriptor.active,
         )
 
     @staticmethod

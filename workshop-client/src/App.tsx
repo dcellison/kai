@@ -96,6 +96,11 @@ import { usePrincipalEvents } from "./usePrincipalEvents";
 import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
+import {
+  HumanAvatar,
+  HumanAvatarCacheProvider,
+  useHumanAvatarOverride,
+} from "./HumanAvatar";
 
 const BROWSER_CREDENTIAL_KEY = "kai.workshop.client-credential.v1";
 const TAB_CHANNEL_KEY = "kai.workshop.active-channel.v1";
@@ -111,6 +116,7 @@ const DEFAULT_SIDEBAR_WIDTH_PX = MIN_SIDEBAR_WIDTH_PX;
 const MAX_SIDEBAR_WIDTH_PX = 420 * UI_SCALE;
 const COLLAPSED_SIDEBAR_WIDTH_PX = 56 * UI_SCALE;
 const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
+const INACTIVE_HUMAN_AVATAR = { active: false, stateVersion: 0, url: null } as const;
 
 type WorkshopDestination =
   | { kind: "conversation"; messageId?: string; threadRootId?: string | null }
@@ -918,9 +924,18 @@ function MessageItem({
       className={`message-row ${isAgent ? "agent" : "human"} ${highlighted ? "focused-message" : ""}`}
       data-message-id={message.messageId}
     >
-      <span className="message-avatar" aria-hidden="true">
-        {displayName.slice(0, 1).toUpperCase()}
-      </span>
+      {isAgent ? (
+        <span className="message-avatar" aria-hidden="true">
+          {displayName.slice(0, 1).toUpperCase()}
+        </span>
+      ) : (
+        <HumanAvatar
+          avatar={message.authorAvatar ?? INACTIVE_HUMAN_AVATAR}
+          className="message-avatar human"
+          displayName={displayName}
+          principalId={message.authorPrincipalId}
+        />
+      )}
       <article>
         {(onOpenThread || onSetReaction) && (
           <div className="message-actions" role="group" aria-label={`Actions for message from ${displayName}`}>
@@ -1437,6 +1452,12 @@ function HumanConversationDialog({
                   }`}
                   onClick={() => void open(person.principalId)}
                 >
+                  <HumanAvatar
+                    avatar={person.avatar ?? INACTIVE_HUMAN_AVATAR}
+                    className="human-picker-avatar"
+                    displayName={person.displayName}
+                    principalId={person.principalId}
+                  />
                   <span>
                     <strong>{person.displayName}</strong>
                     <small>@{person.handle}</small>
@@ -1664,6 +1685,12 @@ function ChannelMemberManagementDialog({
                         : current.filter((principalId) => principalId !== member.principalId),
                     )
                   }
+                />
+                <HumanAvatar
+                  avatar={member.avatar ?? INACTIVE_HUMAN_AVATAR}
+                  className="human-picker-avatar"
+                  displayName={member.displayName}
+                  principalId={member.principalId}
                 />
                 <span>
                   {member.displayName}
@@ -2678,6 +2705,7 @@ function WorkshopView({
   onSettingsAccessFailure: (message: string) => void;
 }): React.JSX.Element {
   const confirm = useConfirmation();
+  const setHumanAvatarOverride = useHumanAvatarOverride();
   const channelId = channel.channelId;
   const agentsOpen = agentDestination !== null;
   const memoryOpen = memoryDestination !== null;
@@ -3937,6 +3965,9 @@ function WorkshopView({
           )}
           {visibleDirectChannels.map((availableChannel) => {
                   const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
+                  const humanPeer = availableChannel.agents.length === 0
+                    ? availableChannel.participants.find((participant) => participant.kind === "human")
+                    : undefined;
                   return (
                   <button
                     className={`channel-link ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
@@ -3946,7 +3977,16 @@ function WorkshopView({
                     onClick={() => onSelectChannel(availableChannel.channelId)}
                     key={availableChannel.channelId}
                   >
-                    <span>{channelSymbol(availableChannel)}</span>
+                    {humanPeer ? (
+                      <HumanAvatar
+                        avatar={humanPeer.avatar ?? INACTIVE_HUMAN_AVATAR}
+                        className="channel-human-avatar"
+                        displayName={humanPeer.displayName}
+                        principalId={humanPeer.principalId}
+                      />
+                    ) : (
+                      <span>{channelSymbol(availableChannel)}</span>
+                    )}
                     <span>{channelDisplayName(availableChannel)}</span>
                     {(unreadCount > 0 || (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
                       <span className="channel-link-status">
@@ -4086,9 +4126,12 @@ function WorkshopView({
             title={`${humanName} — ${humanRole}`}
             onClick={() => setProfileMenuOpen((open) => !open)}
           >
-            <span className="mini-avatar human">
-              {humanName.slice(0, 1).toUpperCase()}
-            </span>
+            <HumanAvatar
+              avatar={navigation.principal.avatar ?? INACTIVE_HUMAN_AVATAR}
+              className="mini-avatar human"
+              displayName={humanName}
+              principalId={navigation.principal.principalId}
+            />
             <span className="profile-copy">
               <strong>{humanName}</strong>
               <small>{humanRole}</small>
@@ -4140,6 +4183,7 @@ function WorkshopView({
           onChannelAccessFailure={onSettingsAccessFailure}
           onClose={() => onSelectChannel(channelId)}
           onDirtyChange={onSettingsDirtyChange}
+          onHumanAvatarChanged={setHumanAvatarOverride}
           onNavigationChanged={onAgentNavigationChanged}
           isAdministrator={workshop.role === "admin"}
           principalName={humanName}
@@ -4672,6 +4716,12 @@ function WorkshopView({
               </div>
               <ul>
                 <li>
+                  <HumanAvatar
+                    avatar={navigation.principal.avatar ?? INACTIVE_HUMAN_AVATAR}
+                    className="context-person-avatar"
+                    displayName={navigation.principal.displayName}
+                    principalId={navigation.principal.principalId}
+                  />
                   <span>
                     <strong>{navigation.principal.displayName}</strong>
                     <small>
@@ -4684,6 +4734,12 @@ function WorkshopView({
                   .filter((participant) => participant.kind === "human")
                   .map((participant) => (
                     <li key={participant.principalId}>
+                      <HumanAvatar
+                        avatar={participant.avatar ?? INACTIVE_HUMAN_AVATAR}
+                        className="context-person-avatar"
+                        displayName={participant.displayName}
+                        principalId={participant.principalId}
+                      />
                       <span>
                         <strong>{participant.displayName}</strong>
                         {participant.handle && (
@@ -5360,7 +5416,8 @@ function ActiveWorkshopClient({
   }
 
   return (
-    <WorkshopView
+    <HumanAvatarCacheProvider token={session.token}>
+      <WorkshopView
       agentDestination={destination.kind === "agents" ? destination : null}
       agentToken={session.token}
       channel={selected.channel}
@@ -5441,7 +5498,8 @@ function ActiveWorkshopClient({
       onSwitchWorkspace={switchSelectedWorkspace}
       onSettingsAccessFailure={onChannelAccessFailure}
       onSettingsDirtyChange={onSettingsDirtyChange}
-    />
+      />
+    </HumanAvatarCacheProvider>
   );
 }
 

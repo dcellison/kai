@@ -1079,7 +1079,7 @@ def _animated_gif_avatar_bytes() -> bytes:
 async def test_human_avatar_api_normalizes_versions_authorizes_and_clears(
     tmp_path: Path,
 ) -> None:
-    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
     async with store.connection.execute("SELECT id FROM principals WHERE kind = 'agent' ORDER BY id LIMIT 1") as cursor:
         agent_row = await cursor.fetchone()
     assert agent_row is not None
@@ -1130,6 +1130,58 @@ async def test_human_avatar_api_normalizes_versions_authorizes_and_clears(
         assert payload["height"] == 128
         assert payload["mutation"] == {"changed": True, "replayed": False}
         assert payload["url"] == f"/v1/principals/{alice_id}/avatar/1"
+
+        descriptor = {
+            "state_version": 1,
+            "active": True,
+            "url": f"/v1/principals/{alice_id}/avatar/1",
+        }
+        profile = await client.get("/v1/settings/profile", headers=alice_headers)
+        navigation = await client.get("/v1/client/navigation", headers=alice_headers)
+        bob_peers = await client.get(
+            f"/v1/workshops/{(await navigation.json())['workshops'][0]['workshop_id']}/humans",
+            headers=bob_headers,
+        )
+        await _record_messages(store, 1)
+        timeline = await client.get(
+            f"/v1/channels/{alice_channel}/timeline",
+            headers=alice_headers,
+        )
+        group_channel = await _create_group_channel(store, alice_id, alice_channel)
+        lifecycle = WorkshopChannelLifecycleService(store)
+        membership = await lifecycle.human_members(alice_id, group_channel)
+        await lifecycle.add_human_member(
+            alice_id,
+            group_channel,
+            bob_id,
+            expected_state_version=membership.state_version,
+            client_operation_id="avatar-add-bob",
+        )
+        members = await client.get(
+            f"/v1/channels/{group_channel}/members",
+            headers=alice_headers,
+        )
+        await _record_client_message(
+            store,
+            alice_id,
+            group_channel,
+            "avatar-notification",
+            "@bob avatar notification",
+        )
+        notifications = await client.get(
+            "/v1/client/notifications",
+            headers=bob_headers,
+        )
+        assert (await profile.json())["avatar"] == descriptor
+        assert (await navigation.json())["principal"]["avatar"] == descriptor
+        alice_peer = next(peer for peer in (await bob_peers.json())["humans"] if peer["principal_id"] == alice_id)
+        assert alice_peer["avatar"] == descriptor
+        assert (await timeline.json())["messages"][-1]["author_avatar"] == descriptor
+        alice_member = next(
+            member for member in (await members.json())["members"] if member["principal_id"] == alice_id
+        )
+        assert alice_member["avatar"] == descriptor
+        assert (await notifications.json())["notifications"][0]["source_author_avatar"] == descriptor
 
         content = await client.get(payload["url"], headers=bob_headers)
         normalized = await content.read()
@@ -1696,6 +1748,7 @@ class TestWorkshopNavigationHTTPContract:
                 "principal_id": alice_id,
                 "display_name": "Alice",
                 "handle": "alice",
+                "avatar": {"state_version": 0, "active": False, "url": None},
             }
             assert len(payload["workshops"]) == 1
             workshop = payload["workshops"][0]
@@ -1810,6 +1863,7 @@ class TestWorkshopNavigationHTTPContract:
                     "kind": "human",
                     "display_name": "Bob",
                     "handle": "bob",
+                    "avatar": {"state_version": 0, "active": False, "url": None},
                 }
             ]
             assert direct["agents"] == []
@@ -1835,6 +1889,7 @@ class TestWorkshopNavigationHTTPContract:
                     "display_name": "Bob",
                     "handle": "bob",
                     "conversation_channel_id": None,
+                    "avatar": {"state_version": 0, "active": False, "url": None},
                 }
             ]
 
@@ -1872,6 +1927,7 @@ class TestWorkshopNavigationHTTPContract:
                     "kind": "human",
                     "display_name": "Alice",
                     "handle": "alice",
+                    "avatar": {"state_version": 0, "active": False, "url": None},
                 }
             ]
             assert human_direct["can_submit_commands"] is True
@@ -4088,6 +4144,11 @@ class TestWorkshopTimelineHTTPContract:
                         "author_principal_id": alice_id,
                         "author_kind": "human",
                         "author_display_name": "Alice",
+                        "author_avatar": {
+                            "state_version": 0,
+                            "active": False,
+                            "url": None,
+                        },
                         "reply_to_message_id": None,
                         "thread_root_id": None,
                         "body": "Message 1",
@@ -4675,6 +4736,11 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "author_principal_id": alice_id,
                     "author_kind": "human",
                     "author_display_name": "Alice",
+                    "author_avatar": {
+                        "state_version": 0,
+                        "active": False,
+                        "url": None,
+                    },
                     "reply_to_message_id": None,
                     "thread_root_id": None,
                     "body": "Message 1",
@@ -5723,6 +5789,7 @@ async def test_human_profile_api_changes_only_the_authenticated_display_name(
             "handle": "alice",
             "state_version": 0,
             "mutation": None,
+            "avatar": {"state_version": 0, "active": False, "url": None},
         }
 
         request = {

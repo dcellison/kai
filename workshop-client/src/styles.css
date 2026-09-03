@@ -720,6 +720,38 @@ button:disabled {
   color: var(--color-accent);
 }
 
+.mini-avatar img,
+.message-avatar img,
+.mention-avatar img,
+.channel-human-avatar img,
+.context-person-avatar img,
+.human-picker-avatar img,
+.profile-avatar-preview img {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+
+.channel-human-avatar,
+.context-person-avatar,
+.human-picker-avatar {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--color-accent) 15%, transparent);
+  color: var(--color-accent);
+  font-weight: 720;
+}
+
+.channel-human-avatar {
+  width: 1.35rem;
+  height: 1.35rem;
+  font-size: 0.64rem;
+}
+
 .agent-link strong,
 .sidebar-footer strong {
   display: block;
@@ -1118,6 +1150,11 @@ button:disabled {
   font-family: var(--serif);
   font-size: 0.88rem;
   font-weight: 720;
+}
+
+.message-avatar.human {
+  overflow: hidden;
+  border-radius: 50%;
 }
 
 .message-row.agent .message-avatar {
@@ -2152,6 +2189,16 @@ button:disabled {
   gap: 0.6rem;
 }
 
+.context-person-avatar {
+  width: 1.65rem;
+  height: 1.65rem;
+  font-size: 0.7rem;
+}
+
+.agent-attention-section li > .context-person-avatar + span {
+  margin-right: auto;
+}
+
 .agent-attention-section strong,
 .agent-attention-section small {
   display: block;
@@ -2220,6 +2267,16 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 0.55rem;
+}
+
+.human-picker-avatar {
+  width: 1.8rem;
+  height: 1.8rem;
+  font-size: 0.72rem;
+}
+
+.human-picker-avatar + span {
+  margin-right: auto;
 }
 
 .channel-agent-choice span,
@@ -3783,6 +3840,60 @@ button:disabled {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.profile-avatar-editor {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-bottom: 0.9rem;
+}
+
+.profile-avatar-preview {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 4rem;
+  height: 4rem;
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--color-accent) 15%, transparent);
+  color: var(--color-accent);
+  font: 720 1.35rem var(--serif);
+}
+
+.profile-avatar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.profile-avatar-actions > span {
+  margin-left: 0.3rem;
+  color: var(--color-text-muted);
+  font-size: 0.65rem;
+}
+
+.profile-avatar-actions .panel-icon-button svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
 }
 
 .policy-card dl {

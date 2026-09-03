@@ -35,6 +35,8 @@ import type {
   WorkshopClientPreferenceChange,
   WorkshopAppearancePreferences,
   WorkshopHumanProfile,
+  WorkshopHumanAvatar,
+  WorkshopHumanAvatarDescriptor,
   WorkshopRuntimeSettingsChange,
   WorkshopWorkspaceSettingChange,
   WorkshopMemoryPage,
@@ -182,6 +184,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function inactiveHumanAvatar(): WorkshopHumanAvatarDescriptor {
+  return { active: false, stateVersion: 0, url: null };
+}
+
+function parseHumanAvatarDescriptor(
+  value: unknown,
+  principalId: string,
+): WorkshopHumanAvatarDescriptor {
+  if (!isRecord(value)) {
+    return inactiveHumanAvatar();
+  }
+  const { active, state_version: stateVersion, url } = value;
+  if (
+    typeof active !== "boolean" ||
+    !Number.isSafeInteger(stateVersion) ||
+    (stateVersion as number) < 0 ||
+    (active && (stateVersion as number) < 1) ||
+    (active
+      ? url !== `/v1/principals/${principalId}/avatar/${stateVersion}`
+      : url !== null)
+  ) {
+    return inactiveHumanAvatar();
+  }
+  return {
+    active,
+    stateVersion: stateVersion as number,
+    url: url as string | null,
+  };
+}
+
 function safeErrorMessage(payload: unknown, fallback: string): string {
   if (!isRecord(payload) || !isRecord(payload.error)) {
     return fallback;
@@ -255,6 +287,7 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
   }
   const {
     author_display_name: authorDisplayName,
+    author_avatar: authorAvatar,
     author_kind: authorKind,
     author_principal_id: authorPrincipalId,
     body,
@@ -368,6 +401,9 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
   }
   return {
     artifacts,
+    authorAvatar: authorKind === "human"
+      ? parseHumanAvatarDescriptor(authorAvatar, authorPrincipalId)
+      : null,
     authorDisplayName,
     authorKind,
     authorPrincipalId,
@@ -597,6 +633,14 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           throw new Error("Kai returned unsupported Workshop navigation.");
         }
         return {
+          ...(rawParticipant.kind === "human"
+            ? {
+                avatar: parseHumanAvatarDescriptor(
+                  rawParticipant.avatar,
+                  rawParticipant.principal_id,
+                ),
+              }
+            : {}),
           displayName: rawParticipant.display_name,
           handle: rawParticipant.handle,
           kind: rawParticipant.kind,
@@ -637,6 +681,10 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
   });
   return {
     principal: {
+      avatar: parseHumanAvatarDescriptor(
+        payload.principal.avatar,
+        payload.principal.principal_id,
+      ),
       displayName: payload.principal.display_name,
       handle: payload.principal.handle,
       principalId: payload.principal.principal_id,
@@ -1106,6 +1154,7 @@ function parseHumanPeer(value: unknown): WorkshopHumanPeer | null {
     return null;
   }
   return {
+    avatar: parseHumanAvatarDescriptor(value.avatar, value.principal_id),
     conversationChannelId: value.conversation_channel_id,
     displayName: value.display_name,
     handle: value.handle,
@@ -1320,6 +1369,7 @@ function parseHumanChannelMember(value: unknown): WorkshopHumanChannelMember | n
     return null;
   }
   return {
+    avatar: parseHumanAvatarDescriptor(value.avatar, value.principal_id),
     displayName: value.display_name,
     handle: value.handle,
     principalId: value.principal_id,
@@ -2310,6 +2360,7 @@ function parseHumanProfile(payload: unknown): WorkshopHumanProfile {
     throw new Error("Kai returned an unsupported human profile.");
   }
   return {
+    avatar: parseHumanAvatarDescriptor(payload.avatar, payload.principal_id),
     principalId: payload.principal_id,
     displayName: payload.display_name,
     handle: payload.handle,
@@ -2320,6 +2371,61 @@ function parseHumanProfile(payload: unknown): WorkshopHumanProfile {
           changed: payload.mutation.changed as boolean,
           replayed: payload.mutation.replayed as boolean,
         },
+  };
+}
+
+function parseHumanAvatar(payload: unknown): WorkshopHumanAvatar {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(payload.principal_id) ||
+    typeof payload.active !== "boolean" ||
+    !Number.isSafeInteger(payload.state_version) ||
+    (payload.state_version as number) < 0 ||
+    (payload.mutation !== null &&
+      (!isRecord(payload.mutation) ||
+        typeof payload.mutation.changed !== "boolean" ||
+        typeof payload.mutation.replayed !== "boolean"))
+  ) {
+    throw new Error("Kai returned an unsupported human avatar.");
+  }
+  const descriptor = parseHumanAvatarDescriptor(payload, payload.principal_id);
+  if (descriptor.active !== payload.active || descriptor.stateVersion !== payload.state_version) {
+    throw new Error("Kai returned an unsupported human avatar.");
+  }
+  const metadata = [payload.media_type, payload.byte_size, payload.width, payload.height, payload.sha256];
+  if (payload.active) {
+    if (
+      payload.media_type !== "image/png" ||
+      !Number.isSafeInteger(payload.byte_size) ||
+      (payload.byte_size as number) < 1 ||
+      !Number.isSafeInteger(payload.width) ||
+      (payload.width as number) < 1 ||
+      !Number.isSafeInteger(payload.height) ||
+      (payload.height as number) < 1 ||
+      typeof payload.sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(payload.sha256)
+    ) {
+      throw new Error("Kai returned an unsupported human avatar.");
+    }
+  } else if (metadata.some((value) => value !== null)) {
+    throw new Error("Kai returned an unsupported human avatar.");
+  }
+  return {
+    ...descriptor,
+    byteSize: payload.byte_size as number | null,
+    height: payload.height as number | null,
+    mediaType: payload.media_type as string | null,
+    mutation: payload.mutation === null
+      ? null
+      : {
+          changed: payload.mutation.changed as boolean,
+          replayed: payload.mutation.replayed as boolean,
+        },
+    principalId: payload.principal_id,
+    sha256: payload.sha256 as string | null,
+    width: payload.width as number | null,
   };
 }
 
@@ -3365,6 +3471,76 @@ export async function loadHumanProfile(
   return parseHumanProfile(payload);
 }
 
+export async function loadHumanAvatar(
+  session: Pick<WorkshopSession, "token">,
+): Promise<WorkshopHumanAvatar> {
+  const response = await authorizedFetch(
+    { channelId: "", token: session.token },
+    "/v1/settings/profile/avatar",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load your avatar."));
+  }
+  return parseHumanAvatar(payload);
+}
+
+export async function uploadHumanAvatar(
+  session: Pick<WorkshopSession, "token">,
+  file: File,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopHumanAvatar> {
+  const body = new FormData();
+  body.append("expected_state_version", String(expectedStateVersion));
+  body.append("client_operation_id", clientOperationId);
+  body.append("file", file, file.name);
+  const response = await authorizedFetch(
+    { channelId: "", token: session.token },
+    "/v1/settings/profile/avatar",
+    { method: "POST", body },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Your avatar changed since it was loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not save your avatar."));
+  }
+  return parseHumanAvatar(payload);
+}
+
+export async function clearHumanAvatar(
+  session: Pick<WorkshopSession, "token">,
+  expectedStateVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopHumanAvatar> {
+  const response = await authorizedFetch(
+    { channelId: "", token: session.token },
+    "/v1/settings/profile/avatar",
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_state_version: expectedStateVersion,
+        client_operation_id: clientOperationId,
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Your avatar changed since it was loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not clear your avatar."));
+  }
+  return parseHumanAvatar(payload);
+}
+
 export async function updateHumanDisplayName(
   session: Pick<WorkshopSession, "token">,
   displayName: string,
@@ -3833,6 +4009,7 @@ function parseHumanNotification(value: unknown): WorkshopHumanNotification | nul
     read,
     read_at: readAt,
     source_author_display_name: sourceAuthorDisplayName,
+    source_author_avatar: sourceAuthorAvatar,
     source_author_principal_id: sourceAuthorPrincipalId,
     source_channel_id: sourceChannelId,
     source_message_id: sourceMessageId,
@@ -3874,6 +4051,10 @@ function parseHumanNotification(value: unknown): WorkshopHumanNotification | nul
     read,
     readAt,
     sourceAuthorDisplayName,
+    sourceAuthorAvatar: parseHumanAvatarDescriptor(
+      sourceAuthorAvatar,
+      sourceAuthorPrincipalId,
+    ),
     sourceAuthorPrincipalId,
     sourceChannelId,
     sourceMessageId,

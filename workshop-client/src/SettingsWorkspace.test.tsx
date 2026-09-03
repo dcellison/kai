@@ -8,6 +8,7 @@ import {
   loadAppearancePreferences,
   loadGitHubSettings,
   loadHumanProfile,
+  loadHumanAvatar,
   loadNotificationPreferences,
   loadChannelNotificationPolicy,
   loadClientPreferences,
@@ -17,6 +18,7 @@ import {
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
+  SettingsRevisionConflictError,
   refreshAllModelCatalogues,
   refreshModelCatalogue,
   restorePreferenceRevision,
@@ -25,6 +27,8 @@ import {
   upsertOperatorModel,
   updateGitHubSettings,
   updateHumanDisplayName,
+  uploadHumanAvatar,
+  clearHumanAvatar,
   updateNotificationPreference,
   updateChannelNotificationPolicy,
   updateClientPreference,
@@ -33,6 +37,7 @@ import {
   updateWorkspaceConfig,
 } from "./api";
 import { AgentRuntimeControls, SettingsWorkspace } from "./SettingsWorkspace";
+import { HumanAvatarCacheProvider } from "./HumanAvatar";
 import { WORKSHOP_THEME_CATALOG } from "./theme";
 import type {
   WorkshopPreferenceDocument,
@@ -43,6 +48,7 @@ import type {
   WorkshopClientPreferences,
   WorkshopAppearancePreferences,
   WorkshopHumanProfile,
+  WorkshopHumanAvatar,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
 } from "./types";
@@ -54,6 +60,7 @@ vi.mock("./api", async (importOriginal) => {
     loadPreferenceDocument: vi.fn(),
     loadGitHubSettings: vi.fn(),
     loadHumanProfile: vi.fn(),
+    loadHumanAvatar: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadChannelNotificationPolicy: vi.fn(),
     loadClientPreferences: vi.fn(),
@@ -71,6 +78,8 @@ vi.mock("./api", async (importOriginal) => {
     deactivateOperatorModel: vi.fn(),
     updateGitHubSettings: vi.fn(),
     updateHumanDisplayName: vi.fn(),
+    uploadHumanAvatar: vi.fn(),
+    clearHumanAvatar: vi.fn(),
     updateNotificationPreference: vi.fn(),
     updateChannelNotificationPolicy: vi.fn(),
     updateClientPreference: vi.fn(),
@@ -98,6 +107,32 @@ const humanProfile: WorkshopHumanProfile = {
   handle: "daniel",
   stateVersion: 0,
   mutation: null,
+};
+
+const humanAvatar: WorkshopHumanAvatar = {
+  active: false,
+  byteSize: null,
+  height: null,
+  mediaType: null,
+  mutation: null,
+  principalId: humanProfile.principalId,
+  sha256: null,
+  stateVersion: 0,
+  url: null,
+  width: null,
+};
+
+const activeHumanAvatar: WorkshopHumanAvatar = {
+  active: true,
+  byteSize: 1234,
+  height: 128,
+  mediaType: "image/png",
+  mutation: { changed: true, replayed: false },
+  principalId: humanProfile.principalId,
+  sha256: "a".repeat(64),
+  stateVersion: 1,
+  url: `/v1/principals/${humanProfile.principalId}/avatar/1`,
+  width: 128,
 };
 
 const preference: WorkshopPreferenceDocument = {
@@ -368,19 +403,21 @@ function renderSettings(
   onNavigationChanged = vi.fn().mockResolvedValue(undefined),
 ): void {
   render(
-    <SettingsWorkspace
-      onAuthenticationFailure={vi.fn()}
-      onChannelAccessFailure={onChannelAccessFailure}
-      onClose={vi.fn()}
-      onDirtyChange={onDirtyChange}
-      onNavigationChanged={onNavigationChanged}
-      isAdministrator={isAdministrator}
-      principalName="Daniel"
-      roleLabel="Workshop administrator"
-      runtimeLabel="Kai"
-      runActive={runActive}
-      session={session}
-    />,
+    <HumanAvatarCacheProvider token={session.token}>
+      <SettingsWorkspace
+        onAuthenticationFailure={vi.fn()}
+        onChannelAccessFailure={onChannelAccessFailure}
+        onClose={vi.fn()}
+        onDirtyChange={onDirtyChange}
+        onNavigationChanged={onNavigationChanged}
+        isAdministrator={isAdministrator}
+        principalName="Daniel"
+        roleLabel="Workshop administrator"
+        runtimeLabel="Kai"
+        runActive={runActive}
+        session={session}
+      />
+    </HumanAvatarCacheProvider>,
   );
 }
 
@@ -430,6 +467,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadHumanProfile).mockResolvedValue(humanProfile);
+    vi.mocked(loadHumanAvatar).mockResolvedValue(humanAvatar);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadChannelNotificationPolicy).mockResolvedValue(channelNotificationPolicy);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
@@ -544,6 +582,88 @@ describe("Settings workspace", () => {
     ));
     expect(onNavigationChanged).toHaveBeenCalledOnce();
     expect(await screen.findByText("Display name saved.")).toBeVisible();
+  });
+
+  it("validates, uploads, and clears the authenticated principal avatar", async () => {
+    const user = userEvent.setup();
+    const onNavigationChanged = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(uploadHumanAvatar).mockResolvedValue(activeHumanAvatar);
+    vi.mocked(clearHumanAvatar).mockResolvedValue({
+      ...humanAvatar,
+      mutation: { changed: true, replayed: false },
+      stateVersion: 2,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 404 })));
+    renderSettings(vi.fn(), false, vi.fn(), true, onNavigationChanged);
+
+    const chooser = await screen.findByLabelText("Choose avatar image");
+    expect(screen.getByRole("img", { name: "Your profile avatar" })).toHaveTextContent("D");
+    fireEvent.change(chooser, {
+      target: { files: [new File(["svg"], "avatar.svg", { type: "image/svg+xml" })] },
+    });
+    expect(await screen.findByText("Choose a PNG, JPEG, GIF, or WebP image.")).toBeVisible();
+    expect(uploadHumanAvatar).not.toHaveBeenCalled();
+
+    fireEvent.change(chooser, {
+      target: { files: [new File(["png"], "avatar.png", { type: "image/png" })] },
+    });
+    await waitFor(() => expect(uploadHumanAvatar).toHaveBeenCalledWith(
+      session,
+      expect.objectContaining({ name: "avatar.png", type: "image/png" }),
+      0,
+      expect.any(String),
+    ));
+    expect(await screen.findByText("Avatar saved.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Change avatar" })).toBeVisible();
+    expect(onNavigationChanged).toHaveBeenCalledOnce();
+
+    await user.click(screen.getByRole("button", { name: "Clear avatar" }));
+    await waitFor(() => expect(clearHumanAvatar).toHaveBeenCalledWith(
+      session,
+      1,
+      expect.any(String),
+    ));
+    expect(await screen.findByText("Avatar cleared.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Add avatar" })).toBeVisible();
+    expect(onNavigationChanged).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects an oversized avatar before making a request", async () => {
+    renderSettings();
+
+    fireEvent.change(await screen.findByLabelText("Choose avatar image"), {
+      target: {
+        files: [
+          new File(
+            [new Uint8Array(256 * 1024 + 1)],
+            "large.png",
+            { type: "image/png" },
+          ),
+        ],
+      },
+    });
+
+    expect(await screen.findByText("Avatar images must be no larger than 256 KiB.")).toBeVisible();
+    expect(uploadHumanAvatar).not.toHaveBeenCalled();
+  });
+
+  it("reloads the avatar after a concurrent update conflict", async () => {
+    vi.mocked(uploadHumanAvatar).mockRejectedValue(
+      new SettingsRevisionConflictError("Avatar changed elsewhere."),
+    );
+    renderSettings();
+
+    fireEvent.change(await screen.findByLabelText("Choose avatar image"), {
+      target: {
+        files: [new File(["png"], "avatar.png", { type: "image/png" })],
+      },
+    });
+
+    expect(await screen.findByText(
+      "Your avatar changed elsewhere. The latest image has been reloaded.",
+    )).toBeVisible();
+    expect(loadHumanProfile).toHaveBeenCalledTimes(2);
+    expect(loadHumanAvatar).toHaveBeenCalledTimes(2);
   });
 
   it("stacks the profile and preference editor in the settings content column", async () => {

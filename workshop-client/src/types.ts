@@ -32,6 +32,7 @@ export interface WorkshopAgentSummary {
 }
 
 export interface WorkshopParticipantSummary {
+  avatar?: WorkshopHumanAvatarDescriptor | null;
   displayName: string;
   handle: string | null;
   kind: string;
@@ -39,6 +40,7 @@ export interface WorkshopParticipantSummary {
 }
 
 export interface WorkshopHumanChannelMember {
+  avatar?: WorkshopHumanAvatarDescriptor;
   displayName: string;
   handle: string;
   principalId: string;
@@ -46,6 +48,7 @@ export interface WorkshopHumanChannelMember {
 }
 
 export interface WorkshopHumanPeer {
+  avatar?: WorkshopHumanAvatarDescriptor;
   conversationChannelId: string | null;
   displayName: string;
   handle: string;
@@ -94,6 +97,7 @@ export interface WorkshopSummary {
 
 export interface WorkshopNavigation {
   principal: {
+    avatar?: WorkshopHumanAvatarDescriptor;
     displayName: string;
     handle: string | null;
     principalId: string;
@@ -118,6 +122,7 @@ export interface WorkshopHumanNotification {
   read: boolean;
   readAt: string | null;
   sourceAuthorDisplayName: string;
+  sourceAuthorAvatar?: WorkshopHumanAvatarDescriptor;
   sourceAuthorPrincipalId: string;
   sourceChannelId: string;
   sourceMessageId: string;
@@ -612,11 +617,28 @@ export interface WorkshopAppearancePreferences {
 }
 
 export interface WorkshopHumanProfile {
+  avatar?: WorkshopHumanAvatarDescriptor;
   principalId: string;
   displayName: string;
   handle: string;
   stateVersion: number;
   mutation: { changed: boolean; replayed: boolean } | null;
+}
+
+export interface WorkshopHumanAvatarDescriptor {
+  active: boolean;
+  stateVersion: number;
+  url: string | null;
+}
+
+export interface WorkshopHumanAvatar extends WorkshopHumanAvatarDescriptor {
+  byteSize: number | null;
+  height: number | null;
+  mediaType: string | null;
+  mutation: { changed: boolean; replayed: boolean } | null;
+  principalId: string;
+  sha256: string | null;
+  width: number | null;
 }
 
 export type WorkshopClientPreferenceChange =
@@ -788,6 +810,7 @@ export interface WorkshopMemorySearch {
 export interface TimelineMessage {
   artifacts: WorkshopArtifactSummary[];
   authorDisplayName: string;
+  authorAvatar?: WorkshopHumanAvatarDescriptor | null;
   authorKind: string;
   authorPrincipalId: string;
   body: string;

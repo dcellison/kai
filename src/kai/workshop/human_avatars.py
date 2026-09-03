@@ -8,10 +8,12 @@ import io
 import os
 import tempfile
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from aiosqlite import OperationalError
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from kai.workshop.domain import EventEnvelope, PrincipalId, WorkshopEventType, WorkshopId
@@ -77,6 +79,15 @@ class HumanAvatarSnapshot:
 class HumanAvatarBytes:
     snapshot: HumanAvatarSnapshot
     path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class HumanAvatarDescriptor:
+    """Public, immutable routing metadata for a canonical human avatar."""
+
+    principal_id: PrincipalId
+    state_version: int
+    active: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +158,35 @@ def _normalize_avatar(raw: bytes, claimed_media_type: str) -> _NormalizedAvatar:
         height=normalized.height,
         sha256=hashlib.sha256(content).hexdigest(),
     )
+
+
+async def human_avatar_descriptors(
+    store: WorkshopEventStore,
+    principal_ids: Iterable[PrincipalId],
+) -> dict[PrincipalId, HumanAvatarDescriptor]:
+    """Load current descriptors for already-authorized human identities."""
+    unique = tuple(dict.fromkeys(principal_ids))
+    if not unique:
+        return {}
+    placeholders = ", ".join("?" for _ in unique)
+    try:
+        async with store.connection.execute(
+            f"SELECT principal_id, state_version, active FROM principal_avatars WHERE principal_id IN ({placeholders})",
+            unique,
+        ) as cursor:
+            rows = await cursor.fetchall()
+    except OperationalError as exc:
+        if "no such table: principal_avatars" not in str(exc):
+            raise
+        return {}
+    return {
+        PrincipalId(str(row[0])): HumanAvatarDescriptor(
+            PrincipalId(str(row[0])),
+            int(row[1]),
+            bool(row[2]),
+        )
+        for row in rows
+    }
 
 
 class WorkshopHumanAvatarService:
