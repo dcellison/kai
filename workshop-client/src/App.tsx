@@ -1633,13 +1633,24 @@ function ArchivedChannelsDialog({
   );
 }
 
+interface InactiveAgentEntry {
+  agentId: string;
+  conversationChannelId: string | null;
+  definitionId: string | null;
+  displayName: string;
+  handle: string;
+  lifecycleState: WorkshopAgentDefinition["lifecycleState"];
+}
+
 function InactiveAgentsDialog({
   agents,
   onClose,
+  onOpenConversation,
   onView,
 }: {
-  agents: WorkshopAgentDefinition[];
+  agents: InactiveAgentEntry[];
   onClose: () => void;
+  onOpenConversation: (channelId: string) => void;
   onView: (definitionId: string) => void;
 }): React.JSX.Element {
   return (
@@ -1670,23 +1681,36 @@ function InactiveAgentsDialog({
         ) : (
           <ul className="channel-archive-list">
             {agents.map((agent) => (
-              <li key={agent.definitionId}>
+              <li key={agent.agentId}>
                 <span>
                   <strong>{agent.displayName}</strong>
                   <small>@{agent.handle} · {agent.lifecycleState}</small>
                 </span>
                 <span className="channel-archive-actions">
-                  <button
-                    className="panel-icon-button"
-                    type="button"
-                    aria-label={
-                      `View ${agent.lifecycleState} agent ${agent.displayName}`
-                    }
-                    title={`View ${agent.lifecycleState} agent`}
-                    onClick={() => onView(agent.definitionId)}
-                  >
-                    <ViewIcon />
-                  </button>
+                  {agent.conversationChannelId && (
+                    <button
+                      className="panel-icon-button"
+                      type="button"
+                      aria-label={`Open archived conversation with ${agent.displayName}`}
+                      title="Open archived conversation"
+                      onClick={() => onOpenConversation(agent.conversationChannelId!)}
+                    >
+                      <ReplyIcon />
+                    </button>
+                  )}
+                  {agent.definitionId && (
+                    <button
+                      className="panel-icon-button"
+                      type="button"
+                      aria-label={
+                        `View ${agent.lifecycleState} agent ${agent.displayName}`
+                      }
+                      title={`View ${agent.lifecycleState} agent`}
+                      onClick={() => onView(agent.definitionId!)}
+                    >
+                      <ViewIcon />
+                    </button>
+                  )}
                 </span>
               </li>
             ))}
@@ -2604,15 +2628,56 @@ function WorkshopView({
     ),
     [agentCatalogue],
   );
-  const ownedInactiveAgents = useMemo(
-    () => agentDefinitions
-      .filter(
-        (agent) =>
-          agent.lifecycleState !== "active" &&
-          agent.ownerPrincipalId === navigation.principal.principalId,
-      )
-      .sort((left, right) => left.displayName.localeCompare(right.displayName)),
-    [agentDefinitions, navigation.principal.principalId],
+  const inactiveAgentEntries = useMemo(() => {
+    const entries = new Map<string, InactiveAgentEntry>();
+    for (const agent of agentDefinitions) {
+      if (
+        agent.lifecycleState === "active" ||
+        agent.ownerPrincipalId !== navigation.principal.principalId
+      ) {
+        continue;
+      }
+      entries.set(agent.agentId, {
+        agentId: agent.agentId,
+        conversationChannelId: null,
+        definitionId: agent.definitionId,
+        displayName: agent.displayName,
+        handle: agent.handle,
+        lifecycleState: agent.lifecycleState,
+      });
+    }
+    for (const channel of workshop.channels) {
+      if (channel.kind !== "direct") {
+        continue;
+      }
+      for (const agent of channel.agents) {
+        if (agent.lifecycleState !== "archived") {
+          continue;
+        }
+        const existing = entries.get(agent.agentId);
+        entries.set(agent.agentId, {
+          agentId: agent.agentId,
+          conversationChannelId: channel.channelId,
+          definitionId: existing?.definitionId ?? null,
+          displayName: existing?.displayName ?? agent.name,
+          handle: existing?.handle ?? agent.handle,
+          lifecycleState: existing?.lifecycleState ?? "archived",
+        });
+      }
+    }
+    return Array.from(entries.values()).sort((left, right) =>
+      left.displayName.localeCompare(right.displayName),
+    );
+  }, [agentDefinitions, navigation.principal.principalId, workshop.channels]);
+  const visibleDirectChannels = useMemo(
+    () => workshop.channels.filter(
+      (availableChannel) =>
+        availableChannel.kind === "direct" &&
+        !availableChannel.agents.some(
+          (agent) => agent.lifecycleState === "archived",
+        ),
+    ),
+    [workshop.channels],
   );
   const mentionCandidates = useMemo(() => {
     if (channel.kind !== "group" || !mentionTrigger) {
@@ -3569,14 +3634,10 @@ function WorkshopView({
               );
             })}
 
-          {workshop.channels.some(
-            (availableChannel) => availableChannel.kind === "direct",
-          ) && (
+          {visibleDirectChannels.length > 0 && (
             <>
               <p className="nav-heading">Direct messages</p>
-              {workshop.channels
-                .filter((availableChannel) => availableChannel.kind === "direct")
-                .map((availableChannel) => {
+              {visibleDirectChannels.map((availableChannel) => {
                   const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
                   return (
                   <button
@@ -3641,7 +3702,7 @@ function WorkshopView({
             <div className="nav-heading-row">
               <p className="nav-heading">Agents</p>
               <div className="nav-heading-actions">
-                {ownedInactiveAgents.length > 0 && (
+                {inactiveAgentEntries.length > 0 && (
                   <button
                     className="nav-tool-button"
                     type="button"
@@ -4464,8 +4525,12 @@ function WorkshopView({
       )}
       {archivedAgentsOpen && (
         <InactiveAgentsDialog
-          agents={ownedInactiveAgents}
+          agents={inactiveAgentEntries}
           onClose={() => setArchivedAgentsOpen(false)}
+          onOpenConversation={(archivedChannelId) => {
+            setArchivedAgentsOpen(false);
+            void onOpenAgentChannel(archivedChannelId);
+          }}
           onView={(definitionId) => {
             setArchivedAgentsOpen(false);
             void onOpenAgentDefinition(definitionId);
