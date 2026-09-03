@@ -13,11 +13,9 @@ def test_client_sources_and_generated_assets_use_only_client_lane() -> None:
 
 
 def test_documentation_only_change_needs_no_runtime_lane() -> None:
-    assert classify_paths(["README.md", "docs/design.md", "home/docs/specs/workshop.md"]) == ChangeScope(
-        client=False,
-        full=False,
-        dependency=False,
-    )
+    assert classify_paths(
+        ["README.md", "docs/design.md", "home/docs/specs/workshop.md", ".github/CI.md"]
+    ) == ChangeScope(client=False, full=False, dependency=False)
 
 
 def test_unknown_and_mixed_paths_fail_closed_to_complete_validation() -> None:
