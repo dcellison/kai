@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from kai.workshop.domain import ChannelId, PrincipalId
+from kai.workshop.human_direct_messages import is_canonical_human_direct_channel
 from kai.workshop.store import WorkshopEventStore
 
 
@@ -30,6 +31,8 @@ class CanonicalChannelAuthorizer:
         """Authorize a human in one executable conversational channel."""
         if not isinstance(principal_id, PrincipalId) or not isinstance(channel_id, ChannelId):
             return False
+        if await is_canonical_human_direct_channel(self._store, channel_id):
+            return await self.can_read_channel(principal_id, channel_id)
         async with self._store.connection.execute(
             "SELECT 1 FROM channel_memberships cm "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "

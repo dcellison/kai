@@ -875,6 +875,8 @@ class TestNotificationChatIdMutations:
                 "/v1/client/notifications/read",
                 "/v1/client/notifications/{notification_id}/read",
                 "/v1/client/notifications/{notification_id}/unread",
+                "/v1/workshops/{workshop_id}/humans",
+                "/v1/workshops/{workshop_id}/humans/{principal_id}/conversation",
                 "/v1/channels",
                 "/v1/channels/{channel_id}/archive",
                 "/v1/channels/{channel_id}/restore",
