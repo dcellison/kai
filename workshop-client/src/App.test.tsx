@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import {
   archiveChannel,
+  archiveDirectMessage,
   advanceChannelReadPosition,
   advanceThreadReadPosition,
   attachChannelAgent,
@@ -45,6 +46,7 @@ import {
   loadWorkspaceConfig,
   redeemEnrollment,
   restoreChannel,
+  restoreDirectMessage,
   markHumanNotificationRead,
   markHumanNotificationUnread,
   markHumanNotificationsRead,
@@ -78,6 +80,7 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     attachChannelAgent: vi.fn(),
     archiveChannel: vi.fn(),
+    archiveDirectMessage: vi.fn(),
     advanceChannelReadPosition: vi.fn(),
     advanceThreadReadPosition: vi.fn(),
     cancelRun: vi.fn(),
@@ -115,6 +118,7 @@ vi.mock("./api", async (importOriginal) => {
     loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
     restoreChannel: vi.fn(),
+    restoreDirectMessage: vi.fn(),
     markHumanNotificationRead: vi.fn(),
     markHumanNotificationUnread: vi.fn(),
     markHumanNotificationsRead: vi.fn(),
@@ -607,10 +611,12 @@ describe("Workshop React client", () => {
     vi.mocked(redeemEnrollment).mockResolvedValue("redeemed-session-token");
     vi.mocked(attachChannelAgent).mockResolvedValue(undefined);
     vi.mocked(archiveChannel).mockResolvedValue(undefined);
+    vi.mocked(archiveDirectMessage).mockResolvedValue(undefined);
     vi.mocked(createChannel).mockResolvedValue(secondChannelId);
     vi.mocked(detachChannelAgent).mockResolvedValue(undefined);
     vi.mocked(dismissChannelAgent).mockResolvedValue(undefined);
     vi.mocked(restoreChannel).mockResolvedValue(undefined);
+    vi.mocked(restoreDirectMessage).mockResolvedValue(undefined);
     vi.mocked(setMessageReaction).mockResolvedValue([]);
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
@@ -2667,6 +2673,81 @@ describe("Workshop React client", () => {
       await screen.findByRole("button", { name: "Lifecycle qualification" }),
     ).toBeVisible();
     expect(screen.getByLabelText("Message Lifecycle qualification")).toBeVisible();
+  });
+
+  it("archives a direct message personally and restores it from the archive", async () => {
+    const user = userEvent.setup();
+    const archived: WorkshopNavigation = {
+      ...navigation,
+      workshops: navigation.workshops.map((workshop) => ({
+        ...workshop,
+        channels: workshop.channels.map((candidate) =>
+          candidate.channelId === humanDirectChannelId
+            ? {
+                ...candidate,
+                canSubmitCommands: false,
+                directMessageArchiveEventPosition: 601,
+                directMessageArchivedAt: "2026-09-03T15:00:00Z",
+              }
+            : candidate,
+        ),
+      })),
+    };
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({
+        channelId: humanDirectChannelId,
+        token: "existing-session",
+      }),
+    );
+    vi.mocked(loadNavigation)
+      .mockResolvedValueOnce(navigation)
+      .mockResolvedValueOnce(archived)
+      .mockResolvedValueOnce(navigation);
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: humanDirectChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Archive direct message" }));
+    await user.click(
+      within(screen.getByRole("dialog", { name: "Continue?" })).getByRole(
+        "button",
+        { name: "Continue" },
+      ),
+    );
+
+    await waitFor(() => expect(archiveDirectMessage).toHaveBeenCalledOnce());
+    expect(vi.mocked(archiveDirectMessage).mock.calls[0]?.slice(0, 2)).toEqual([
+      "existing-session",
+      humanDirectChannelId,
+    ]);
+    expect(screen.queryByRole("button", { name: "Scott" })).toBeNull();
+    expect(
+      (await screen.findAllByText(/direct message is archived for you/i)).length,
+    ).toBeGreaterThan(0);
+
+    await user.click(
+      screen.getByRole("button", { name: "Archived direct messages" }),
+    );
+    const archiveDialog = screen.getByRole("dialog", { name: "Archive" });
+    expect(archiveDialog).toHaveTextContent("Scott");
+    await user.click(
+      within(archiveDialog).getByRole("button", {
+        name: "Restore direct message Scott",
+      }),
+    );
+
+    await waitFor(() => expect(restoreDirectMessage).toHaveBeenCalledOnce());
+    expect(vi.mocked(restoreDirectMessage).mock.calls[0]?.slice(0, 2)).toEqual([
+      "existing-session",
+      humanDirectChannelId,
+    ]);
+    expect(await screen.findByRole("button", { name: "Scott" })).toBeVisible();
+    expect(screen.getByLabelText("Message Scott")).toBeVisible();
   });
 
   it("inserts member mentions as plain text and submits them canonically", async () => {

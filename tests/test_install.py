@@ -55,6 +55,7 @@ from kai.install import (
     _DarwinServiceGeneration,
     _deployed_adapter_policy_status,
     _deployed_webhook_secret_migration_status,
+    _direct_message_archive_status,
     _explicit_task_routing_status,
     _file_checksum,
     _finish_stopping_darwin_generation,
@@ -5390,6 +5391,38 @@ class TestCmdStatus:
             "Workshop channel lifecycle: active; group channels=2, active=1, "
             "archived=1, human members=2 (owners=2, participants=0), "
             "human DMs=0 (invalid=0), integrity gaps=0; authority=canonical"
+        )
+
+    def test_status_reports_canonical_direct_message_archive_integrity(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.executescript(
+            "CREATE TABLE channels (id TEXT PRIMARY KEY, kind TEXT, archived_at TEXT);"
+            "CREATE TABLE principals (id TEXT PRIMARY KEY, kind TEXT);"
+            "CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT);"
+            "CREATE TABLE event_log (position INTEGER PRIMARY KEY, event_type TEXT, "
+            "aggregate_id TEXT, actor_principal_id TEXT);"
+            "CREATE TABLE messages (channel_id TEXT, author_principal_id TEXT, "
+            "created_event_position INTEGER);"
+            "CREATE TABLE principal_direct_message_archives (principal_id TEXT, channel_id TEXT, "
+            "archived_at TEXT, archived_event_position INTEGER);"
+            "INSERT INTO channels VALUES ('chn_one','direct',NULL),('chn_two','direct',NULL);"
+            "INSERT INTO principals VALUES ('prn_one','human'),('prn_two','human');"
+            "INSERT INTO channel_memberships VALUES ('chn_one','prn_one'),('chn_two','prn_one');"
+            "INSERT INTO event_log VALUES "
+            "(7,'principal_direct_message.archived','chn_one','prn_one'),"
+            "(8,'principal_direct_message.archived','chn_two','prn_one');"
+            "INSERT INTO principal_direct_message_archives VALUES "
+            "('prn_one','chn_one','2026-09-03T15:00:00Z',7),"
+            "('prn_one','chn_two','2026-09-03T15:01:00Z',8);"
+            "INSERT INTO messages VALUES ('chn_two','prn_two',9);"
+        )
+        connection.commit()
+        connection.close()
+
+        assert _direct_message_archive_status(db_path) == (
+            "Workshop direct-message archive: active; preferences=2, archived=1, "
+            "resurfaced=1, integrity gaps=0; authority=canonical"
         )
 
     def test_status_reports_canonical_internal_api_context_coverage(self, tmp_path):

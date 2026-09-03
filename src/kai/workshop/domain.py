@@ -29,6 +29,8 @@ class WorkshopEventType(StrEnum):
     CHANNEL_CREATED = "channel.created"
     CHANNEL_ARCHIVED = "channel.archived"
     CHANNEL_RESTORED = "channel.restored"
+    PRINCIPAL_DIRECT_MESSAGE_ARCHIVED = "principal_direct_message.archived"
+    PRINCIPAL_DIRECT_MESSAGE_RESTORED = "principal_direct_message.restored"
     CHANNEL_MEMBER_ADDED = "channel.member_added"
     CHANNEL_MEMBER_REMOVED = "channel.member_removed"
     TRANSPORT_CHANNEL_BOUND = "transport.channel_bound"

@@ -523,6 +523,15 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           rawChannel.lifecycle_event_position !== null &&
           (typeof rawChannel.lifecycle_event_position !== "number" ||
             !Number.isSafeInteger(rawChannel.lifecycle_event_position))) ||
+        (rawChannel.direct_message_archived_at !== undefined &&
+          rawChannel.direct_message_archived_at !== null &&
+          typeof rawChannel.direct_message_archived_at !== "string") ||
+        (rawChannel.direct_message_archive_event_position !== undefined &&
+          rawChannel.direct_message_archive_event_position !== null &&
+          (typeof rawChannel.direct_message_archive_event_position !== "number" ||
+            !Number.isSafeInteger(
+              rawChannel.direct_message_archive_event_position,
+            ))) ||
         typeof rawChannel.can_submit_commands !== "boolean" ||
         !Array.isArray(rawChannel.agents) ||
         !Array.isArray(rawChannel.participants)
@@ -600,6 +609,15 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
           : { archivedAt: rawChannel.archived_at }),
         canSubmitCommands: rawChannel.can_submit_commands,
         channelId: rawChannel.channel_id,
+        ...(rawChannel.direct_message_archive_event_position === undefined
+          ? {}
+          : {
+              directMessageArchiveEventPosition:
+                rawChannel.direct_message_archive_event_position,
+            }),
+        ...(rawChannel.direct_message_archived_at === undefined
+          ? {}
+          : { directMessageArchivedAt: rawChannel.direct_message_archived_at }),
         kind: rawChannel.kind as "direct" | "group" | "notification",
         ...(rawChannel.lifecycle_event_position === undefined
           ? {}
@@ -1230,6 +1248,62 @@ export async function restoreChannel(
   clientOperationId: string,
 ): Promise<void> {
   await mutateChannelLifecycle(token, channelId, "restore", clientOperationId);
+}
+
+async function mutateDirectMessageArchive(
+  token: string,
+  channelId: string,
+  operation: "archive" | "restore",
+  clientOperationId: string,
+): Promise<void> {
+  if (!CHANNEL_PATTERN.test(channelId)) {
+    throw new Error("Invalid channel identity.");
+  }
+  const response = await authorizedFetch(
+    { channelId, token },
+    `/v1/direct-messages/${encodeURIComponent(channelId)}/${operation}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_operation_id: clientOperationId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.direct_message) ||
+    payload.direct_message.channel_id !== channelId ||
+    payload.direct_message.archived !== (operation === "archive") ||
+    typeof payload.direct_message.changed !== "boolean" ||
+    typeof payload.direct_message.occurred_at !== "string"
+  ) {
+    throw new Error(
+      safeErrorMessage(
+        payload,
+        operation === "archive"
+          ? "Could not archive this direct message."
+          : "Could not restore this direct message.",
+      ),
+    );
+  }
+}
+
+export async function archiveDirectMessage(
+  token: string,
+  channelId: string,
+  clientOperationId: string,
+): Promise<void> {
+  await mutateDirectMessageArchive(token, channelId, "archive", clientOperationId);
+}
+
+export async function restoreDirectMessage(
+  token: string,
+  channelId: string,
+  clientOperationId: string,
+): Promise<void> {
+  await mutateDirectMessageArchive(token, channelId, "restore", clientOperationId);
 }
 
 function parseHumanChannelMember(value: unknown): WorkshopHumanChannelMember | null {

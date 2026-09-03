@@ -16,6 +16,7 @@ import {
   AuthenticationError,
   advanceThreadReadPosition,
   archiveChannel,
+  archiveDirectMessage,
   attachChannelAgent,
   cancelRun,
   ChannelAccessError,
@@ -39,6 +40,7 @@ import {
   loadThreadUnread,
   redeemEnrollment,
   restoreChannel,
+  restoreDirectMessage,
   setMessageReaction,
   setThreadFollowed,
   startHumanConversation,
@@ -1191,6 +1193,11 @@ function channelIsArchived(channel: WorkshopChannelSummary): boolean {
   return typeof channel.archivedAt === "string";
 }
 
+function directMessageIsArchived(channel: WorkshopChannelSummary): boolean {
+  return channel.kind === "direct" &&
+    typeof channel.directMessageArchivedAt === "string";
+}
+
 function channelIsHumanDirect(channel: WorkshopChannelSummary): boolean {
   return channel.kind === "direct" &&
     channel.agents.length === 0 &&
@@ -1750,6 +1757,86 @@ function ArchivedChannelsDialog({
                       <RestoreIcon />
                     </button>
                   )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ArchivedDirectMessagesDialog({
+  channels,
+  busyChannelId,
+  onClose,
+  onRestore,
+  onView,
+}: {
+  channels: WorkshopChannelSummary[];
+  busyChannelId: string | null;
+  onClose: () => void;
+  onRestore: (channelId: string) => Promise<void>;
+  onView: (channelId: string) => void;
+}): React.JSX.Element {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        className="channel-creation-dialog channel-archive-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="direct-message-archive-title"
+      >
+        <header className="channel-archive-header">
+          <div>
+            <p className="overline">Direct messages</p>
+            <h2 id="direct-message-archive-title">Archive</h2>
+          </div>
+          <button
+            className="panel-icon-button"
+            type="button"
+            aria-label="Close direct-message archive"
+            title="Close direct-message archive"
+            onClick={onClose}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        {channels.length === 0 ? (
+          <p className="channel-archive-empty">No archived direct messages.</p>
+        ) : (
+          <ul className="channel-archive-list">
+            {channels.map((channel) => (
+              <li key={channel.channelId}>
+                <span>
+                  <strong>@ {channelDisplayName(channel)}</strong>
+                  <small>
+                    Archived {channel.directMessageArchivedAt
+                      ? formatTimestamp(channel.directMessageArchivedAt)
+                      : ""}
+                  </small>
+                </span>
+                <span className="channel-archive-actions">
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label={`View archived direct message ${channelDisplayName(channel)}`}
+                    title="View archived direct message"
+                    onClick={() => onView(channel.channelId)}
+                  >
+                    <ViewIcon />
+                  </button>
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label={`Restore direct message ${channelDisplayName(channel)}`}
+                    title="Restore direct message"
+                    disabled={busyChannelId !== null}
+                    onClick={() => void onRestore(channel.channelId)}
+                  >
+                    <RestoreIcon />
+                  </button>
                 </span>
               </li>
             ))}
@@ -2429,6 +2516,7 @@ function WorkshopView({
   onForget,
   onAgentNavigationChanged,
   onArchiveChannel,
+  onArchiveDirectMessage,
   onAttachAgent,
   onCancelRun,
   onCreateChannel,
@@ -2460,6 +2548,7 @@ function WorkshopView({
   onOpenAgentChannel,
   onOpenSettings,
   onRestoreChannel,
+  onRestoreDirectMessage,
   onSelectAgent,
   onSelectMemory,
   onSelectChannel,
@@ -2508,6 +2597,7 @@ function WorkshopView({
   onForget: () => void;
   onAgentNavigationChanged: () => Promise<void>;
   onArchiveChannel: (channelId: string, clientOperationId: string) => Promise<void>;
+  onArchiveDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onAttachAgent: (agentId: string, clientOperationId: string) => Promise<void>;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
@@ -2561,6 +2651,7 @@ function WorkshopView({
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenSettings: () => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
+  onRestoreDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectAgent: (
     definitionId: string | null,
     section?: "runtime" | null,
@@ -2598,6 +2689,8 @@ function WorkshopView({
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const humanDirect = channelIsHumanDirect(channel);
+  const directMessageArchived = directMessageIsArchived(channel);
+  const conversationReadOnly = channelIsArchived(channel) || directMessageArchived;
   const [draft, setDraft] = useState(() => restoreDraft(channelId));
   const [pendingMessageId, setPendingMessageId] = useState<string | null>(null);
   const [submissionError, setSubmissionError] = useState<string | null>(null);
@@ -2630,9 +2723,11 @@ function WorkshopView({
     originName: string | null;
   } | null>(null);
   const [archivedChannelsOpen, setArchivedChannelsOpen] = useState(false);
+  const [archivedDirectMessagesOpen, setArchivedDirectMessagesOpen] = useState(false);
   const [archivedAgentsOpen, setArchivedAgentsOpen] = useState(false);
   const [humanConversationOpen, setHumanConversationOpen] = useState(false);
   const [channelLifecycleBusy, setChannelLifecycleBusy] = useState<string | null>(null);
+  const [directMessageArchiveBusy, setDirectMessageArchiveBusy] = useState<string | null>(null);
   const [agentCatalogue, setAgentCatalogue] = useState<WorkshopAgentEnablement[]>([]);
   const [agentDefinitions, setAgentDefinitions] = useState<WorkshopAgentDefinition[]>([]);
   const [agentManagement, setAgentManagement] = useState<WorkshopAgentEnablement[] | null>(null);
@@ -2704,7 +2799,7 @@ function WorkshopView({
       auxiliaryWorkspaceOpen ||
       !readActivated ||
       document.visibilityState !== "visible" ||
-      channelIsArchived(channel)
+      conversationReadOnly
     ) return;
     const message = displayedMessages.find((candidate) => candidate.messageId === messageId);
     if (message) {
@@ -2806,6 +2901,7 @@ function WorkshopView({
     () => workshop.channels.filter(
       (availableChannel) =>
         availableChannel.kind === "direct" &&
+        !directMessageIsArchived(availableChannel) &&
         !availableChannel.agents.some(
           (agent) => agent.lifecycleState === "archived",
         ),
@@ -3087,6 +3183,53 @@ function WorkshopView({
       );
     } finally {
       setChannelLifecycleBusy(null);
+    }
+  };
+
+  const archiveSelectedDirectMessage = async (): Promise<void> => {
+    if (
+      channel.kind !== "direct" ||
+      directMessageIsArchived(channel) ||
+      directMessageArchiveBusy ||
+      channel.agents.some((agent) => agent.lifecycleState === "archived") ||
+      !await confirm(
+        `Archive your conversation with ${channelName}? Its history will remain available and new activity will return it to Direct messages.`,
+      )
+    ) {
+      return;
+    }
+    setDirectMessageArchiveBusy(channelId);
+    setSubmissionError(null);
+    try {
+      await onArchiveDirectMessage(channelId, createClientMessageId());
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not archive this direct message.",
+      );
+    } finally {
+      setDirectMessageArchiveBusy(null);
+    }
+  };
+
+  const restoreArchivedDirectMessage = async (archivedChannelId: string): Promise<void> => {
+    if (directMessageArchiveBusy) {
+      return;
+    }
+    setDirectMessageArchiveBusy(archivedChannelId);
+    setSubmissionError(null);
+    try {
+      await onRestoreDirectMessage(archivedChannelId, createClientMessageId());
+      setArchivedDirectMessagesOpen(false);
+    } catch (caught) {
+      setSubmissionError(
+        caught instanceof Error
+          ? caught.message
+          : "Could not restore this direct message.",
+      );
+    } finally {
+      setDirectMessageArchiveBusy(null);
     }
   };
 
@@ -3770,15 +3913,26 @@ function WorkshopView({
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
               <p className="nav-heading">Direct messages</p>
-              <button
-                className="nav-add-button"
-                type="button"
-                aria-label="Start direct message"
-                title="Start direct message"
-                onClick={() => setHumanConversationOpen(true)}
-              >
-                <span aria-hidden="true" />
-              </button>
+              <div className="nav-heading-actions">
+                <button
+                  className="nav-archive-button"
+                  type="button"
+                  aria-label="Archived direct messages"
+                  title="Archived direct messages"
+                  onClick={() => setArchivedDirectMessagesOpen(true)}
+                >
+                  <ArchiveIcon />
+                </button>
+                <button
+                  className="nav-add-button"
+                  type="button"
+                  aria-label="Start direct message"
+                  title="Start direct message"
+                  onClick={() => setHumanConversationOpen(true)}
+                >
+                  <span aria-hidden="true" />
+                </button>
+              </div>
             </div>
           )}
           {visibleDirectChannels.map((availableChannel) => {
@@ -4066,6 +4220,8 @@ function WorkshopView({
               <p>
                 {channelIsArchived(channel)
                   ? "This channel is archived. Its history remains available, but it is read-only until restored."
+                  : directMessageArchived
+                    ? "This direct message is archived for you. Its history remains available, but it is read-only until restored."
                   : channel.kind === "notification"
                   ? "Authenticated GitHub activity appears here live and is delivered to every configured client."
                   : humanDirect
@@ -4130,9 +4286,9 @@ function WorkshopView({
                     onDownloadArtifact={onDownloadArtifact}
                     onLoadArtifact={onLoadArtifact}
                     onMessageVisible={markVisibleMessageRead}
-                    onSetReaction={!channelIsArchived(channel) ? onSetReaction : undefined}
+                    onSetReaction={!conversationReadOnly ? onSetReaction : undefined}
                     onOpenThread={
-                      (channel.kind === "group" || humanDirect) && !channelIsArchived(channel)
+                      (channel.kind === "group" || humanDirect) && !conversationReadOnly
                         ? setThreadRootMessageId
                         : undefined
                     }
@@ -4347,6 +4503,8 @@ function WorkshopView({
             <p className="read-only-channel-notice">
               {channel.kind === "notification"
                 ? "This channel is outbound-only. Kai records delivery here, but it does not accept conversation commands."
+                : directMessageArchived
+                  ? "This direct message is archived for you. Restore it to send messages."
                 : channel.kind === "direct" &&
                     channel.agents.some((agent) => agent.lifecycleState === "archived")
                   ? "This agent has been archived. This conversation is read-only."
@@ -4407,7 +4565,7 @@ function WorkshopView({
             onSubmitCommand={onSubmitCommand}
             reactionUpdates={reactionUpdates}
             principalEvents={principalEvents}
-            readOnly={channelIsArchived(channel)}
+            readOnly={conversationReadOnly}
             rootMessage={threadRootMessage}
             runActive={isRunActive(activeRun)}
           />
@@ -4434,6 +4592,27 @@ function WorkshopView({
                 {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
               </button>
             )}
+            {channel.kind === "direct" &&
+              !channel.agents.some((agent) => agent.lifecycleState === "archived") && (
+              <button
+                className="panel-icon-button"
+                type="button"
+                aria-label={directMessageArchived
+                  ? "Restore direct message"
+                  : "Archive direct message"}
+                title={directMessageArchived
+                  ? "Restore direct message"
+                  : "Archive direct message"}
+                disabled={directMessageArchiveBusy !== null || isRunActive(activeRun)}
+                onClick={() => void (
+                  directMessageArchived
+                    ? restoreArchivedDirectMessage(channelId)
+                    : archiveSelectedDirectMessage()
+                )}
+              >
+                {directMessageArchived ? <RestoreIcon /> : <ArchiveIcon />}
+              </button>
+            )}
           </header>
 
           {channelIsArchived(channel) && (
@@ -4441,6 +4620,13 @@ function WorkshopView({
               <span className="section-number">00</span>
               <h3>Archived</h3>
               <p>This channel is preserved and read-only. Restore it to resume activity.</p>
+            </section>
+          )}
+          {directMessageArchived && (
+            <section className="context-section archived-channel-state">
+              <span className="section-number">00</span>
+              <h3>Archived for you</h3>
+              <p>This conversation is preserved and hidden from your normal list. Restore it to send messages.</p>
             </section>
           )}
 
@@ -4649,6 +4835,24 @@ function WorkshopView({
           }}
         />
       )}
+      {archivedDirectMessagesOpen && (
+        <ArchivedDirectMessagesDialog
+          channels={workshop.channels.filter(
+            (availableChannel) =>
+              directMessageIsArchived(availableChannel) &&
+              !availableChannel.agents.some(
+                (agent) => agent.lifecycleState === "archived",
+              ),
+          )}
+          busyChannelId={directMessageArchiveBusy}
+          onClose={() => setArchivedDirectMessagesOpen(false)}
+          onRestore={restoreArchivedDirectMessage}
+          onView={(archivedChannelId) => {
+            setArchivedDirectMessagesOpen(false);
+            onSelectChannel(archivedChannelId);
+          }}
+        />
+      )}
       {agentManagement && (
         <ChannelAgentManagementDialog
           attachedAgents={channel.agents}
@@ -4755,6 +4959,7 @@ function ActiveWorkshopClient({
   readActivationChannelId,
   onAuthenticationFailure,
   onArchiveChannel,
+  onArchiveDirectMessage,
   onChannelAccessFailure,
   onCreateChannel,
   onStartHumanConversation,
@@ -4770,6 +4975,7 @@ function ActiveWorkshopClient({
   onOpenHumanNotification,
   onOpenSettings,
   onRestoreChannel,
+  onRestoreDirectMessage,
   onSelectChannel,
   onSelectAgent,
   onSelectMemory,
@@ -4781,6 +4987,7 @@ function ActiveWorkshopClient({
   readActivationChannelId: string | null;
   onAuthenticationFailure: (message: string) => void;
   onArchiveChannel: (channelId: string, clientOperationId: string) => Promise<void>;
+  onArchiveDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onChannelAccessFailure: (message: string) => void;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
   onStartHumanConversation: (
@@ -4799,6 +5006,7 @@ function ActiveWorkshopClient({
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onOpenSettings: () => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
+  onRestoreDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectChannel: (channelId: string) => void;
   onSelectAgent: (
     definitionId: string | null,
@@ -5197,6 +5405,7 @@ function ActiveWorkshopClient({
       onForget={onForget}
       onAgentNavigationChanged={onAgentNavigationChanged}
       onArchiveChannel={onArchiveChannel}
+      onArchiveDirectMessage={onArchiveDirectMessage}
       onAttachAgent={attachSelectedAgent}
       onCreateAgent={onCreateAgent}
       onCancelRun={cancelSelectedRun}
@@ -5221,6 +5430,7 @@ function ActiveWorkshopClient({
       onOpenHumanNotification={onOpenHumanNotification}
       onOpenSettings={onOpenSettings}
       onRestoreChannel={onRestoreChannel}
+      onRestoreDirectMessage={onRestoreDirectMessage}
       onSelectMemory={onSelectMemory}
       onSelectAgent={onSelectAgent}
       onSelectChannel={onSelectChannel}
@@ -5743,6 +5953,34 @@ function WorkshopApp(): React.JSX.Element {
     }
   };
 
+  const changeWorkshopDirectMessageArchive = async (
+    channelId: string,
+    clientOperationId: string,
+    operation: "archive" | "restore",
+  ): Promise<void> => {
+    if (!session) {
+      throw new Error("Workshop is not connected.");
+    }
+    try {
+      if (operation === "archive") {
+        await archiveDirectMessage(session.token, channelId, clientOperationId);
+      } else {
+        await restoreDirectMessage(session.token, channelId, clientOperationId);
+      }
+      const discovered = await loadNavigation(session.token);
+      adoptNavigation(session.token, discovered, channelId, await loadAppearancePreferences({
+        token: session.token,
+      }));
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        handleAuthenticationFailure(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        handleChannelAccessFailure(caught.message);
+      }
+      throw caught;
+    }
+  };
+
   if (view === "enrollment") {
     return (
       <EnrollmentView
@@ -5770,6 +6008,9 @@ function WorkshopApp(): React.JSX.Element {
       onArchiveChannel={(channelId, clientOperationId) =>
         changeWorkshopChannelLifecycle(channelId, clientOperationId, "archive")
       }
+      onArchiveDirectMessage={(channelId, clientOperationId) =>
+        changeWorkshopDirectMessageArchive(channelId, clientOperationId, "archive")
+      }
       onChannelAccessFailure={handleChannelAccessFailure}
       onCreateChannel={createWorkshopChannel}
       onStartHumanConversation={startWorkshopHumanConversation}
@@ -5786,6 +6027,9 @@ function WorkshopApp(): React.JSX.Element {
       onOpenSettings={openSettings}
       onRestoreChannel={(channelId, clientOperationId) =>
         changeWorkshopChannelLifecycle(channelId, clientOperationId, "restore")
+      }
+      onRestoreDirectMessage={(channelId, clientOperationId) =>
+        changeWorkshopDirectMessageArchive(channelId, clientOperationId, "restore")
       }
       onSelectChannel={(channelId) => void selectChannel(channelId)}
       onSelectAgent={selectAgent}

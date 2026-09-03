@@ -1106,7 +1106,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 23
+    version = 24
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1131,6 +1131,7 @@ class CanonicalConversationProjection:
             "human_notification_adapter_delivery_decisions",
             "human_notification_publications",
             "human_notifications",
+            "principal_direct_message_archives",
             "thread_read_positions",
             "channel_read_positions",
             "messages",
@@ -1299,6 +1300,49 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop channel lifecycle transition is invalid")
+        elif envelope.event_type in {
+            WorkshopEventType.PRINCIPAL_DIRECT_MESSAGE_ARCHIVED,
+            WorkshopEventType.PRINCIPAL_DIRECT_MESSAGE_RESTORED,
+        }:
+            if envelope.event_version != 1 or envelope.payload:
+                raise ValueError("Workshop direct-message archive events require an empty v1 payload")
+            if envelope.actor_principal_id is None:
+                raise ValueError("Workshop direct-message archive events require a human actor")
+            if not isinstance(envelope.aggregate_id, ChannelId):
+                raise ValueError("Workshop direct-message archive events require a channel aggregate")
+            async with connection.execute(
+                "SELECT 1 FROM channels c JOIN channel_memberships cm ON cm.channel_id = c.id "
+                "WHERE c.id = ? AND c.workshop_id = ? AND c.kind = 'direct' "
+                "AND c.archived_at IS NULL AND cm.principal_id = ?",
+                (
+                    envelope.aggregate_id,
+                    envelope.workshop_id,
+                    envelope.actor_principal_id,
+                ),
+            ) as direct_cursor:
+                if await direct_cursor.fetchone() is None:
+                    raise ValueError("Workshop direct-message archive transition is invalid")
+            if envelope.event_type == WorkshopEventType.PRINCIPAL_DIRECT_MESSAGE_ARCHIVED:
+                await connection.execute(
+                    "INSERT INTO principal_direct_message_archives "
+                    "(principal_id, channel_id, archived_at, archived_event_position) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(principal_id, channel_id) DO UPDATE SET "
+                    "archived_at = excluded.archived_at, "
+                    "archived_event_position = excluded.archived_event_position",
+                    (
+                        envelope.actor_principal_id,
+                        envelope.aggregate_id,
+                        occurred_at,
+                        event.position,
+                    ),
+                )
+            else:
+                cursor = await connection.execute(
+                    "DELETE FROM principal_direct_message_archives WHERE principal_id = ? AND channel_id = ?",
+                    (envelope.actor_principal_id, envelope.aggregate_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Workshop direct message is not archived for this principal")
         elif envelope.event_type == WorkshopEventType.CHANNEL_MEMBER_ADDED:
             role = _required_text(payload, "role")
             if role not in {"owner", "participant"}:
