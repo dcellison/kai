@@ -2604,6 +2604,16 @@ function WorkshopView({
     ),
     [agentCatalogue],
   );
+  const ownedInactiveAgents = useMemo(
+    () => agentDefinitions
+      .filter(
+        (agent) =>
+          agent.lifecycleState !== "active" &&
+          agent.ownerPrincipalId === navigation.principal.principalId,
+      )
+      .sort((left, right) => left.displayName.localeCompare(right.displayName)),
+    [agentDefinitions, navigation.principal.principalId],
+  );
   const mentionCandidates = useMemo(() => {
     if (channel.kind !== "group" || !mentionTrigger) {
       return [];
@@ -3631,15 +3641,17 @@ function WorkshopView({
             <div className="nav-heading-row">
               <p className="nav-heading">Agents</p>
               <div className="nav-heading-actions">
-                <button
-                  className="nav-tool-button"
-                  type="button"
-                  aria-label="Drafts and archived agents"
-                  title="Drafts and archived agents"
-                  onClick={() => setArchivedAgentsOpen(true)}
-                >
-                  <ArchiveIcon />
-                </button>
+                {ownedInactiveAgents.length > 0 && (
+                  <button
+                    className="nav-tool-button"
+                    type="button"
+                    aria-label="Your drafts and archived agents"
+                    title="Your drafts and archived agents"
+                    onClick={() => setArchivedAgentsOpen(true)}
+                  >
+                    <ArchiveIcon />
+                  </button>
+                )}
                 <button
                   className="nav-add-button"
                   type="button"
@@ -4452,9 +4464,7 @@ function WorkshopView({
       )}
       {archivedAgentsOpen && (
         <InactiveAgentsDialog
-          agents={agentDefinitions
-            .filter((agent) => agent.lifecycleState !== "active")
-            .sort((left, right) => left.displayName.localeCompare(right.displayName))}
+          agents={ownedInactiveAgents}
           onClose={() => setArchivedAgentsOpen(false)}
           onView={(definitionId) => {
             setArchivedAgentsOpen(false);

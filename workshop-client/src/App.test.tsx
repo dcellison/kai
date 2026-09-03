@@ -3347,7 +3347,7 @@ describe("Workshop React client", () => {
     expect(screen.getByText("Unavailable to this Workshop account")).toBeVisible();
 
     await user.click(
-      sidebar.getByRole("button", { name: "Drafts and archived agents" }),
+      sidebar.getByRole("button", { name: "Your drafts and archived agents" }),
     );
     let archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
     expect(within(archive).getByText("Archived specialist")).toBeVisible();
@@ -3367,7 +3367,7 @@ describe("Workshop React client", () => {
     expect(screen.getByRole("button", { name: "Activate" })).toBeVisible();
 
     await user.click(
-      sidebar.getByRole("button", { name: "Drafts and archived agents" }),
+      sidebar.getByRole("button", { name: "Your drafts and archived agents" }),
     );
     archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
     await user.click(
@@ -3467,6 +3467,15 @@ describe("Workshop React client", () => {
 
   it("shows one shared agent definition without owner controls to another principal", async () => {
     const user = userEvent.setup();
+    const danielArchivedDefinition: WorkshopAgentDefinition = {
+      ...agentDefinition,
+      activeRevisionId: null,
+      agentId: "agt_88888888888888888888888888888888",
+      definitionId: "adf_88888888888888888888888888888888",
+      displayName: "Daniel archived agent",
+      handle: "daniel_archived_agent",
+      lifecycleState: "archived",
+    };
     vi.mocked(loadNavigation).mockResolvedValue({
       ...navigation,
       principal: {
@@ -3490,6 +3499,10 @@ describe("Workshop React client", () => {
         runtimeProfileId: "rtp_22222222222222222222222222222222",
       },
     ]);
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([
+      agentDefinition,
+      danielArchivedDefinition,
+    ]);
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "existing-session" }),
@@ -3509,6 +3522,9 @@ describe("Workshop React client", () => {
     expect(screen.queryByLabelText("Authorized runtime")).toBeNull();
     expect(screen.queryByRole("button", { name: "New revision" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Disable" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Your drafts and archived agents" }),
+    ).toBeNull();
   });
 
   it("opens runtime settings for the exact enabled agent lane", async () => {
