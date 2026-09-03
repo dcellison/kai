@@ -2239,6 +2239,55 @@ button:disabled {
   gap: 0.55rem;
 }
 
+.human-conversation-state {
+  margin: 1rem 0 0;
+  color: var(--color-text-muted);
+}
+
+.human-conversation-list {
+  display: grid;
+  gap: 0.35rem;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.human-conversation-list button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.72rem 0.8rem;
+  background: var(--color-panel);
+  color: var(--color-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.human-conversation-list button:hover,
+.human-conversation-list button:focus-visible {
+  border-color: var(--color-accent);
+  outline: none;
+}
+
+.human-conversation-list button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.human-conversation-list strong,
+.human-conversation-list small {
+  display: block;
+}
+
+.human-conversation-list small {
+  margin-top: 0.12rem;
+  color: var(--color-text-muted);
+}
+
 .channel-archive-header,
 .context-channel-header {
   display: flex;

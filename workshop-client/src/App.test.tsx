@@ -26,6 +26,7 @@ import {
   loadChannelUnread,
   loadHumanNotificationCounts,
   loadHumanNotifications,
+  loadWorkshopHumans,
   loadFollowedThreads,
   loadNavigation,
   loadNotificationPreferences,
@@ -52,6 +53,7 @@ import {
   setMessageReaction,
   setThreadFollowed,
   startAgentConversation,
+  startHumanConversation,
   submitCommand,
   switchWorkspace,
 } from "./api";
@@ -91,6 +93,7 @@ vi.mock("./api", async (importOriginal) => {
     loadChannelUnread: vi.fn(),
     loadHumanNotificationCounts: vi.fn(),
     loadHumanNotifications: vi.fn(),
+    loadWorkshopHumans: vi.fn(),
     loadFollowedThreads: vi.fn(),
     loadAppearancePreferences: vi.fn(),
     loadAgentDefinitions: vi.fn(),
@@ -120,6 +123,7 @@ vi.mock("./api", async (importOriginal) => {
     setMessageReaction: vi.fn(),
     setThreadFollowed: vi.fn(),
     startAgentConversation: vi.fn(),
+    startHumanConversation: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
   };
@@ -205,7 +209,7 @@ const navigation: WorkshopNavigation = {
         },
         {
           agents: [],
-          canSubmitCommands: false,
+          canSubmitCommands: true,
           channelId: humanDirectChannelId,
           kind: "direct",
           name: "Direct",
@@ -628,6 +632,25 @@ describe("Workshop React client", () => {
       ...agentEnablement,
       conversationStarted: true,
       stateVersion: 4,
+    });
+    vi.mocked(loadWorkshopHumans).mockResolvedValue([
+      {
+        conversationChannelId: humanDirectChannelId,
+        displayName: "Scott",
+        handle: "scott",
+        principalId: "prn_00000000000000000000000000000003",
+      },
+    ]);
+    vi.mocked(startHumanConversation).mockResolvedValue({
+      channelId: humanDirectChannelId,
+      created: false,
+      peer: {
+        conversationChannelId: humanDirectChannelId,
+        displayName: "Scott",
+        handle: "scott",
+        principalId: "prn_00000000000000000000000000000003",
+      },
+      workshopId: "wsp_00000000000000000000000000000001",
     });
     vi.mocked(loadNotificationPreferences).mockResolvedValue({
       destinations: [
@@ -3018,7 +3041,7 @@ describe("Workshop React client", () => {
     expect(attachChannelAgent).not.toHaveBeenCalled();
   });
 
-  it("groups direct messages and names agent and human conversations by participant", async () => {
+  it("groups direct messages and presents human conversations without agent controls", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -3046,12 +3069,79 @@ describe("Workshop React client", () => {
     expect(
       (await screen.findAllByRole("heading", { name: "@ Scott" })).length,
     ).toBeGreaterThan(0);
+    expect(screen.getByRole("textbox", { name: "Message Scott" })).toBeEnabled();
+    expect(screen.getByText("Messages here are private to you and Scott.")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "People" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "Reply to message" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Runtime and workspace" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Run inspector" })).toBeNull();
+  });
+
+  it("discovers a human from Direct messages and reuses the canonical conversation", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadTimeline).mockImplementation(async (selectedSession) => ({
+      messages: [{ ...historyMessage, channelId: selectedSession.channelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    }));
+
+    render(<App />);
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Start direct message" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Start a conversation" });
+    expect(within(dialog).getByText("@scott")).toBeVisible();
+    await user.click(
+      within(dialog).getByRole("button", {
+        name: "Scott, @scott, conversation started",
+      }),
+    );
+
+    await waitFor(() => expect(startHumanConversation).toHaveBeenCalledWith(
+      "existing-session",
+      "wsp_00000000000000000000000000000001",
+      "prn_00000000000000000000000000000003",
+    ));
+    expect(screen.queryByRole("dialog", { name: "Start a conversation" })).toBeNull();
+    expect(await screen.findByRole("textbox", { name: "Message Scott" })).toBeEnabled();
+    expect(window.location.search).toBe("");
+  });
+
+  it("clears a failed people picker when it is closed and reopened", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadWorkshopHumans)
+      .mockRejectedValueOnce(new Error("People are temporarily unavailable."))
+      .mockResolvedValueOnce([
+        {
+          conversationChannelId: null,
+          displayName: "Scott",
+          handle: "scott",
+          principalId: "prn_00000000000000000000000000000003",
+        },
+      ]);
+
+    render(<App />);
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Start direct message" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "People are temporarily unavailable.",
+    );
+    await user.click(screen.getByRole("button", { name: "Close people picker" }));
+    expect(screen.queryByRole("dialog", { name: "Start a conversation" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Start direct message" }));
     expect(
-      screen.getByText(
-        "Sending messages from Workshop is not available for this conversation yet.",
-      ),
+      await screen.findByRole("button", { name: "Scott, @scott" }),
     ).toBeVisible();
-    expect(screen.getByText("Agents")).toBeVisible();
+    expect(screen.queryByText("People are temporarily unavailable.")).toBeNull();
   });
 
   it("explains that an archived agent conversation is permanently read-only", async () => {
