@@ -5,73 +5,104 @@
 [![License](https://img.shields.io/github/license/dcellison/kai)](LICENSE)
 [![Version](https://img.shields.io/github/v/tag/dcellison/kai?label=version)](https://github.com/dcellison/kai/releases)
 
-Kai is a local, multi-client personal engineering system: a persistent AI collaborator with repo-aware coding, memory, scheduling, PR review, and multi-backend operation.
+**A workshop on your own hardware where people and AI agents work together.**
 
-Run Kai on your own machine, reach it through the Workshop browser or Telegram, and give it real access to your local workspaces. Kai can inspect repositories, run shell commands, write code, review pull requests, triage issues, remember durable context, handle files, and run scheduled jobs while staying under your control. Your machine, your data, your rules.
+Kai is a self-hosted service that gives coding agents a durable home: persistent processes with shell, filesystem, git, and web access to the machine you run it on. You reach it through the Workshop, a browser client where people and agents share channels, or through Telegram from your phone. Agents remember you between sessions, review your pull requests when you push, triage issues when they open, run scheduled jobs while you sleep, and work in any project directory you authorize.
 
-For full setup and operations guides, see the [Kai Wiki](https://github.com/dcellison/kai/wiki).
+Everything runs locally. Conversations never transit a relay server. Your machine, your data, your rules.
+
+New here? The [wiki](https://github.com/dcellison/kai/wiki) has the full guides; the [Quick Start](#quick-start) below gets you running.
 
 ## Why Kai Exists
 
-Most AI coding tools are either interactive terminals or hosted chat surfaces. Kai is built for a different operating model: a long-running local service available through authenticated client adapters.
+Most AI coding tools are a terminal session or a hosted chat tab: you open them, work, and everything evaporates when you close them. Kai is built for a different operating model, an always-on local service where agents are long-lived participants rather than disposable sessions.
 
-- **Local-first authority:** Kai runs on hardware you control and works against your local filesystem, shell, git repos, and tools.
-- **Multiple client surfaces:** Workshop provides the native browser experience; Telegram remains an optional mobile client with files, voice notes, commands, and notifications.
-- **Persistent agent sessions:** Each user gets a lazily-created subprocess with durable context and idle eviction.
-- **Memory across sessions:** Kai preserves identity, personal memory, and conversation history so useful context survives restarts and workspace switches.
-- **Background engineering workflows:** PR review, issue triage, webhooks, reminders, and condition-monitoring jobs run outside the active chat session.
-- **Multi-backend operation:** Each user can run through any installed supported backend, with an explicit installation default and optional per-user overrides.
-- **Multi-user isolation:** One Kai instance can serve multiple Workshop humans and optional Telegram identities with isolated history, files, settings, and OS-level process separation.
+- **Agents are teammates, not tabs.** Each agent is a persistent process with its own identity, memory, and conversation history that survive restarts, upgrades, and workspace switches.
+- **Real authority.** Agents run on hardware you control, against your actual repositories, shell, and tools, with a security model built around the fact that they can take real action.
+- **A shared room.** The Workshop puts people and agents in the same channels, with threads, mentions, reactions, file artifacts, and live streaming runs you can inspect tool call by tool call.
+- **Work happens without you.** PR review, issue triage, reminders, recurring jobs, condition monitors, and webhook reactions all run in the background and land in your notification feed.
+- **No vendor holds the keys.** Five interchangeable agent backends mean the provider is a configuration choice, not a structural dependency. When one has a bad day, route around it.
+- **One instance, many people.** Multiple users share a single install with isolated conversations, memory, files, workspaces, and optionally separate OS accounts per agent.
+
+## The Workshop
+
+The Workshop is Kai's native surface: a real-time browser client served by the same local process.
+
+- **Channels, direct messages, notification feeds**, with threads, mentions, reactions, unread tracking, and file artifacts that render inline.
+- **Agent runs stream live.** A working agent shows a status banner and a writing preview; the run inspector shows every tool call as it happens, and Stop actually stops it.
+- **Build your own agents in the browser.** Give an agent a handle, a purpose, instructions, and declared capabilities. Definitions are versioned and immutable; draft a revision, activate it when ready, roll back by activating an older one.
+- **Shared definitions, private conversations.** Anyone can enable an agent someone else built, but each person gets their own private lane and the agent keeps a separate memory of each person. Same instructions, nothing else crosses over.
+- **Agents delegate to agents.** An agent with the delegation capability can hand bounded sub-tasks to other agents in a shared channel, under server-enforced limits, with every delegated run visible like any other.
+- **A memory explorer.** Browse, search, and curate what Kai remembers about you.
+
+Telegram is the optional second surface: chat with your agents from your phone, with voice notes, file exchange, streaming replies, and slash commands. Enable either surface or both; a person provisioned on one keeps their history when the other is linked later.
+
+## Choose Your Backend
+
+Each Kai backend is a full coding harness with its own protocol, tools, and authentication. Kai normalizes lifecycle and routing around those harnesses and lets each user, even each channel agent, run on a different one. Switch models mid-conversation with a command or a click.
+
+| Backend | Runtime | Model Selection Shape | Notes |
+|---|---|---|---|
+| Claude Code | `claude` CLI | Claude aliases and full model IDs | The default. Uses Claude Code's local authentication. |
+| OpenAI Codex CLI | `codex` CLI | Codex CLI model IDs | Uses Codex's own model catalog. |
+| Goose | `goose acp` | Provider-native model IDs | ACP backend; provider selected through Goose configuration. |
+| OpenCode | `opencode acp` | `provider/model` IDs | ACP backend; model resolution owned by OpenCode. |
+| Pi | `pi --mode rpc` | `provider/model[:thinking]` IDs | JSONL RPC backend; bounded one-shot tasks disable tools. |
+
+Between them the backends cover providers like OpenAI, Google, DeepSeek, OpenRouter, GitHub Copilot, and local models via Ollama. Only the backends you actually select need to be installed and authenticated. [Multiple Backends](https://github.com/dcellison/kai/wiki/Multiple-Backends) explains the architecture and the case for provider diversity.
 
 ## Core Capabilities
 
 | Capability | What Kai Does |
 |---|---|
-| Repo-aware coding | Runs an agent inside local workspaces with shell, filesystem, git, and web access. |
-| Workspaces | Switches between projects by name and keeps per-workspace settings. |
-| Memory | Maintains identity, durable user memory, semantic recall, and searchable conversation history. |
-| Scheduling | Runs canonical reminders, recurring jobs, and condition monitors from any authorized client or internal API caller. |
+| Repo-aware coding | Runs agents inside local workspaces with shell, filesystem, git, and web access. |
+| Workspaces | Switches between projects by name, with per-workspace model, environment, and prompt settings. |
+| Memory | Extracts facts and episode summaries into a local vector store and recalls them by relevance, scoped per person and per project. |
+| Scheduling | Runs reminders, recurring jobs, and condition monitors that remove themselves when the condition fires. |
 | GitHub automation | Reviews PRs, triages issues, routes notifications, and reacts to webhook events. |
-| File exchange | Accepts artifacts through Workshop or a capable client adapter, exposes authorized local paths to the agent, and publishes results. |
-| Voice | Supports local voice transcription and optional text-to-speech responses. |
-| Multi-user operation | Isolates canonical principals, runtime profiles, workspaces, files, history, jobs, settings, and OS accounts. |
+| File exchange | Accepts uploads from any surface, exposes authorized local paths to agents, and publishes results back. |
+| Voice | Transcribes voice notes locally with whisper.cpp and can answer aloud with Piper text-to-speech. |
+| External services | Proxies third-party APIs (search, weather, notifications) so keys never enter conversation context. |
+| Multi-user operation | Isolates principals, runtime profiles, workspaces, files, history, jobs, settings, and OS accounts. |
 
 ## How It Works
 
 ```text
-Workshop browser -----\
-Optional adapters -----+-> Kai core -> per-user agent backend
-Webhooks/internal API -/                  -> local workspace, shell, git, files, web, services
+People (browser)         People (Telegram)        GitHub / webhooks
+      |                        |                        |
+      v                        v                        v
+Workshop client API      Telegram adapter         webhook ingress
+      \                        |                        /
+       +--------- canonical core (kai.db) -------------+
+       |  append-only event store -> projections       |
+       |  principals, channels, runs, delivery outbox  |
+       +----------------------+------------------------+
+                              |
+                              v
+                runtime pool (one lane per channel agent)
+                Claude Code and other backends, stream-json
 ```
 
-Kai has two layers. The outer Python service owns client adapters, HTTP, scheduling, authentication, persistence, webhooks, file exchange, and per-user routing. The inner agent backend does the thinking and acting inside a local workspace. Backend subprocesses are created lazily per user and evicted after an idle timeout, so resource use follows active users rather than registered users.
+At the center is an event-sourced core: one SQLite database holding an append-only event log, with everything else (channels, messages, runs, memory, delivery) derived from it. That buys properties most chat bots never have. Derived state is disposable and rebuilds from the log. Commands are durably acknowledged before execution, so a dropped connection never loses a message. Execution grants and deliveries are fenced with epochs, so crashes and restarts cannot double-run a task or double-send a reply. Delivery goes through a durable outbox; if Telegram is down, the conversation is already recorded and delivery retries under lease.
 
-This is not an API relay bot. The inner backend is a full coding-agent runtime with local tools and project context. Kai gives that runtime a durable home, authenticated client surfaces, scheduled execution, event-driven inputs, memory, and a security model designed around the fact that it can take real action.
+Agents execute as backend subprocesses speaking stream-json, created lazily per channel agent and evicted when idle, so resource use follows active conversations. The whole service is one Python process on one event loop, running as a LaunchDaemon on macOS or a systemd service on Linux.
 
-## Backend Options
+[System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture) has the full tour.
 
-In Kai, a backend is more than a model provider. Each backend is a full coding harness with its own protocol, tool behavior, authentication path, context handling, model surface, and failure modes. Kai normalizes lifecycle and routing around those harnesses while preserving the differences that matter.
+## Memory
 
-| Backend | Runtime | Model Selection Shape | Notes |
-|---|---|---|---|
-| Claude Code | `claude` CLI | Claude aliases and full model IDs | Uses Claude Code's local authentication. |
-| OpenAI Codex CLI | `codex` CLI | Codex CLI model IDs | Uses Codex's own model catalog, separate from OpenAI API model lists. |
-| Goose | `goose acp` | Provider-native model IDs | ACP backend with provider selected through Goose configuration or env. |
-| OpenCode | `opencode acp` | `provider/model` IDs | ACP backend with model resolution owned by OpenCode. |
-| Pi | `pi --mode rpc` | `provider/model[:thinking]` IDs | JSONL RPC backend using the target OS user's Pi authentication; bounded one-shot tasks disable tools and project resources. |
-
-Kai does not require every supported backend to exist on every machine. Every backend selected as the installation default or in a user's configuration must be installed and authenticated for the OS account that will run it.
+Kai separates rules (identity files injected every session), facts (what it knows about you), and conversation history. In semantic memory mode, facts live in an embedded local vector store: after each exchange, a one-shot extractor writes structured facts and episode summaries, and every message triggers a relevance-ranked recall scoped to the person and the active project. No external services, no Docker, no open ports; the embedding model runs on your machine. A curated markdown mode is available instead, with a migration path between the two. See [Memory](https://github.com/dcellison/kai/wiki/Memory).
 
 ## Quick Start
 
 Requirements:
 
 - Python 3.13+
-- A Telegram bot token and Telegram user ID only if enabling the optional Telegram client
 - At least one supported agent backend installed and authenticated
-- Sudo 1.9.3+ for protected multi-user installs (`CWD`/`-D` support)
+- A Telegram bot token only if enabling the optional Telegram adapter
+- Sudo 1.9.3+ for protected multi-user installs
 
-Install Kai for local development:
+Install for local development:
 
 ```bash
 git clone git@github.com:dcellison/kai.git
@@ -82,32 +113,16 @@ pip install -e '.[dev]'
 make config
 ```
 
-`make config` runs without `sudo`. It discovers the supported backend CLIs installed on the machine, requires an explicit installation default when more than one is available, and writes `install.conf` as the configuration artifact for the selected deployment and client modes. It does not accept user-supplied backend executable paths. Model defaults come from Kai's backend/provider/role model registry. In protected installs, conversational model baselines belong to `runtime-profiles.yaml`; operator-set PR-review and issue-triage baselines remain in each human's `models:` map in `users.yaml`. Users can change their active conversational model with `/model`.
+`make config` discovers the backend CLIs installed on the machine and walks you through client mode (Workshop, Telegram, or both), backends, and deployment style. On a fresh Workshop-only configuration it provisions your admin account and prints a one-time browser enrollment token; the token is shown once and only its hash is stored.
 
-The client-mode choices are explicit and reversible:
-
-- `hybrid` enables Workshop and Telegram and is the upgrade-safe default;
-- `workshop-only` runs the browser client without constructing a Telegram application, contacting Telegram, or requiring a bot token;
-- `telegram-only` runs Telegram without publishing Workshop client routes.
-
-Re-run `make config`, select a different client mode, and apply the installation to change modes. Existing configurations without an explicit client-mode setting remain hybrid. `make install-status` reports both the deployed policy and the current `install.conf` artifact without exposing the Telegram token.
-
-On a fresh Workshop-only configuration, the wizard creates one canonical admin,
-the Kai agent and direct channel, and a protected runtime profile and assignment.
-It prints a one-time browser enrollment token after single-user configuration or
-after a protected install reaches full readiness. The token is shown once; Kai
-stores only its hash. Enabling Telegram later links the configured Telegram
-identity to that same canonical human, channel, and runtime profile rather than
-creating a second account. Disabling Telegram again leaves that canonical state
-intact.
-
-For a `single_user` deployment, `make config` also writes the runtime files under the operator's account. Start Kai from the checkout:
+For a single-user deployment, start Kai from the checkout and open the Workshop:
 
 ```bash
 make run
+# then visit http://127.0.0.1:8080/workshop/
 ```
 
-For a `protected` deployment, preview and apply the staged configuration:
+For a protected multi-user deployment, preview and apply the staged install:
 
 ```bash
 make DRY_RUN=1 install
@@ -115,102 +130,34 @@ make install
 make install-status
 ```
 
-`make install` invokes `sudo` internally and installs source, data, and secrets under separate protected system directories. It also generates the admin-owned `/etc/kai/backends.yaml` registry containing the discovered executable paths, allowed model surfaces, and selected default backend. Runtime configuration names backend identifiers; it cannot redirect a protected backend to an arbitrary executable. After a successful protected install, `install.conf` may be deleted because it can contain secrets; re-run `make config` before a later reconfiguration.
+`make install` invokes `sudo` internally and separates source, data, and secrets into protected system directories, generates the admin-owned backend registry, and can run each person's agent under its own OS account. `make install-status` reports deployed state without exposing secrets.
 
-On the first protected install, Kai seeds `/etc/kai/runtime-profiles.yaml`
-from the canonical Workshop admin or configured Telegram humans. After that
-file exists, it is the independent
-authority for each Workshop runtime's backend, provider, model baseline,
-timeout, OS execution user, service grants, and workspace policy. Later edits
-to duplicated execution fields in `users.yaml` do not replace or veto the
-protected profile. `users.yaml` is optional when Telegram is disabled. When
-Telegram is enabled, it defines Telegram authorization and links those external
-identities to canonical Workshop runtime profiles.
-
-Edit an installed runtime profile with `sudoedit`, validate it with
-`make install-status`, then run `make install` to reconcile OS-owned storage
-and restart Kai. The installer preserves explicit profile values and fails
-closed if a configured compatibility identity has lost its profile mapping or
-if the protected policy references an unavailable backend or invalid model.
-
-Workshop remains loopback-only by default. To reach its browser client directly
-from a trusted private network, enter one private IPv4 interface address at the
-optional `Workshop LAN address` prompt. Kai then creates a second listener on
-the webhook port containing only the Workshop shell, enrollment, timeline,
-event-stream, and authenticated command-submission routes; internal agent APIs
-and webhook ingress remain bound to loopback. This direct listener uses HTTP,
-so use a trusted LAN or put a trusted TLS terminator in front of it.
-
-Protected mode requires every configured Telegram user to have a unique `os_user` that differs from the Kai service account; this keeps persistent agents from inheriting the daemon's protected-config capabilities. Single-user mode runs the agent as the operator account.
-
-Kai-managed per-user identity has one editable source: `<DATA_DIR>/home/<principal_id>/AGENTS.md`. Codex, Goose, OpenCode, and Pi consume that file directly. Claude Code receives a generated `.claude/CLAUDE.md` adapter containing only `@../AGENTS.md`. On upgrade, `make install` migrates existing customized Claude identity content into `AGENTS.md`; if both files contain different customizations, installation stops without choosing or overwriting either one. Instruction files owned by individual project repositories remain independent.
-
-Protected Linux installations that use Codex image input also require `setfacl` (normally provided by the distribution's `acl` package). Kai uses a read-only named ACL so an image can remain private to the service and its intended `os_user`; if ACL support is unavailable, that image is dropped with a user-visible notice instead of being made world-readable.
-
-For full installation details, see [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started), [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup), and [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture).
+The wiki covers every step in depth: [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started) for your first conversation, [Configuration Wizard](https://github.com/dcellison/kai/wiki/Configuration-Wizard) for every prompt explained, [Installing Agent Binaries](https://github.com/dcellison/kai/wiki/Installing-Agent-Binaries), [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup), and [Protected Installation](https://github.com/dcellison/kai/wiki/Protected-Installation).
 
 ## Security Model
 
 Kai has real local authority, so the security model is part of the product rather than an afterthought.
 
-- **Optional Telegram allowlist:** When the Telegram adapter is enabled, only configured Telegram user IDs can interact with it.
-- **Optional TOTP gate:** Time-based one-time passwords can protect the chat surface after idle timeout.
-- **Local execution:** Kai runs on your machine. Conversations do not pass through a Kai-hosted relay.
-- **Path confinement:** File exchange is constrained to allowed workspace and file-storage paths.
-- **Protected backend registry:** Protected installs resolve backend identifiers through admin-owned `/etc/kai/backends.yaml`; executable paths and allowed model surfaces are installation state, not user input.
-- **Service proxy:** Third-party API keys live in server-side config and are injected only for services explicitly allowed by the protected runtime profile (or compatibility configuration outside a protected install); keys are never placed in conversation context.
-- **GitHub operation boundary:** PR review and issue triage run only for repositories explicitly authorized to that user in admin-controlled `users.yaml`. Protected installs require the user's stored GitHub token, and notification subscriptions cannot grant operation access.
-- **Per-user isolation:** Users have separate history, files, workspaces, jobs, settings, and agent subprocesses.
-- **Principal-bound internal API:** Agent API credentials resolve to a fixed user and explicit scopes in the outer service; request data cannot select another principal.
-- **Separated webhook credentials:** GitHub, generic, and Telegram ingress use distinct secrets that are not exposed to persistent agent subprocesses.
-- **Optional OS isolation:** A user's backend subprocess can run under a dedicated OS account through generated sudoers rules.
+- **Local execution.** Kai runs on your machine, loopback-only by default. Conversations do not pass through a Kai-hosted relay.
+- **Authenticated surfaces.** Workshop access uses single-use enrollment tokens redeemed for hashed session credentials; Telegram uses a per-user allowlist with an optional TOTP gate.
+- **Per-principal isolation.** Separate history, memory, files, workspaces, jobs, settings, and agent subprocesses per person; every read and command path checks one authorization authority.
+- **OS-level separation.** In protected installs, the daemon runs as a service account and each persistent agent can run under its own OS user through generated sudoers rules.
+- **Protected backend registry.** Backend executable paths and allowed model surfaces are admin-owned installation state, never user input.
+- **Key custody.** Third-party API keys live in server-side configuration and are injected only for explicitly allowed services; they never appear in conversation context.
+- **Bounded ingress.** GitHub, generic, and Telegram webhooks use distinct named secrets, stay loopback-only behind your tunnel, and webhook payload text is wrapped in untrusted-content delimiters before any agent sees it.
+- **Path confinement.** File exchange is constrained to allowed workspace and storage paths, with size limits and per-principal access checks on every download.
 
-The former shared `WEBHOOK_SECRET` is no longer supported and never
-authenticates a runtime route. `make config` omits it from regenerated
-configuration, and `make install` strips it from older artifacts before writing
-the deployed environment. If an older artifact lacks either named replacement,
-installation fails before stopping Kai and asks for a one-time `make config`.
-GitHub and generic callers must use their dedicated named secrets.
-
-Run `make install-status` to inspect the authoritative deployed migration
-state in `/etc/kai/env`. The command uses sudo because that file is root-only;
-it reports only whether the unsupported and named variables are configured,
-never their values. It also labels the separate `install.conf` artifact state so
-configuration drift is visible rather than mistaken for deployed truth.
-
-The current remediation status and compatibility exceptions are tracked in
-[Security Remediation Status](SECURITY_REMEDIATION_STATUS.md).
-
-See [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authentication), [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing), and [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet) for the detailed operational docs.
-
-## Common Workflows
-
-- Send a message in Workshop or an enabled conversational adapter to have Kai work in the current workspace.
-- Use Workshop settings or adapter commands such as `/workspace` to move between projects.
-- Use Workshop settings or adapter commands such as `/model` to change the active model.
-- Use the Workshop memory editor or adapter memory commands to inspect durable memory.
-- Ask Kai to remind you later, run a recurring check, or monitor a condition.
-- Subscribe a GitHub repo so pushes, PRs, issues, comments, and reviews can reach Kai.
-- Enable PR review or issue triage per user when you want background GitHub automation.
-- Attach files in Workshop or a capable adapter so the agent can inspect or transform them locally.
-- Use each client surface's own help and controls; Telegram commands are adapter presentation, not core APIs.
+Remediation history and compatibility exceptions are tracked in [Security Remediation Status](SECURITY_REMEDIATION_STATUS.md). For operations, see [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authentication) and [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet).
 
 ## Documentation
 
-Most operational documentation lives in the wiki so it can grow without turning the README into a control panel manual.
+The [wiki](https://github.com/dcellison/kai/wiki) is the operational reference. A map:
 
-- [Changelog](CHANGELOG.md)
-- [Wiki Home](https://github.com/dcellison/kai/wiki)
-- [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started)
-- [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture)
-- [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup)
-- [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs)
-- [PR Review Agent](https://github.com/dcellison/kai/wiki/PR-Review-Agent)
-- [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent)
-- [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing)
-- [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet)
-- [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup)
-- [TOTP Authentication](https://github.com/dcellison/kai/wiki/TOTP-Authentication)
+- **Workshop:** [Collaboration Basics](https://github.com/dcellison/kai/wiki/Workshop-Collaboration-Basics) · [Agents](https://github.com/dcellison/kai/wiki/Workshop-Agents) · [Memory Explorer](https://github.com/dcellison/kai/wiki/Workshop-Memory-Explorer) · [Settings](https://github.com/dcellison/kai/wiki/Workshop-Settings) · [Operator Guide](https://github.com/dcellison/kai/wiki/Workshop-Operator-Guide)
+- **Setup:** [Getting Started](https://github.com/dcellison/kai/wiki/Getting-Started) · [Configuration Wizard](https://github.com/dcellison/kai/wiki/Configuration-Wizard) · [Multiple Backends](https://github.com/dcellison/kai/wiki/Multiple-Backends) · [Installing Agent Binaries](https://github.com/dcellison/kai/wiki/Installing-Agent-Binaries) · [Multi-User Setup](https://github.com/dcellison/kai/wiki/Multi-User-Setup) · [Protected Installation](https://github.com/dcellison/kai/wiki/Protected-Installation) · [Exposing Kai to the Internet](https://github.com/dcellison/kai/wiki/Exposing-Kai-to-the-Internet) · [Voice Setup](https://github.com/dcellison/kai/wiki/Voice-Setup) · [Browser Automation](https://github.com/dcellison/kai/wiki/Browser-Automation)
+- **Features:** [PR Review Agent](https://github.com/dcellison/kai/wiki/PR-Review-Agent) · [Issue Triage Agent](https://github.com/dcellison/kai/wiki/Issue-Triage-Agent) · [Scheduling and Conditional Jobs](https://github.com/dcellison/kai/wiki/Scheduling-and-Conditional-Jobs) · [Workspaces](https://github.com/dcellison/kai/wiki/Workspaces) · [Memory](https://github.com/dcellison/kai/wiki/Memory) · [External Services](https://github.com/dcellison/kai/wiki/External-Services) · [GitHub Notification Routing](https://github.com/dcellison/kai/wiki/GitHub-Notification-Routing) · [Webhook Examples](https://github.com/dcellison/kai/wiki/Webhook-Examples)
+- **Design:** [System Architecture](https://github.com/dcellison/kai/wiki/System-Architecture) · [Agent Context Sequence](https://github.com/dcellison/kai/wiki/Agent-Context-Sequence) · [Testing](https://github.com/dcellison/kai/wiki/Testing)
+- **Reference:** [Slash Commands](https://github.com/dcellison/kai/wiki/Slash-Commands) · [Troubleshooting](https://github.com/dcellison/kai/wiki/Troubleshooting) · [Changelog](CHANGELOG.md)
 
 ## Development
 
@@ -230,19 +177,9 @@ make test       # Run pytest
 make run        # Start Kai locally
 ```
 
-For rapid Workshop UI iteration, leave the installed Kai service running and
-start `make workshop-dev` in the foreground. Open
-`http://<kai-host>:5173/workshop/` and enroll that development origin once.
-Vite serves only the Workshop client and proxies `/v1` to
-`http://127.0.0.1:8080`; browser credentials remain isolated from the installed
-Workshop origin. The server binds to the LAN only while this command is running.
-Stop it with Control-C immediately after visual review and verify that no Vite
-process remains.
+The Workshop client is a React application in `workshop-client/`, but operators never need Node: the built bundle is committed and served directly, and CI fails if the committed output is stale. For rapid UI iteration, `make workshop-dev` runs a Vite dev server against a running install; see the [Workshop Operator Guide](https://github.com/dcellison/kai/wiki/Workshop-Operator-Guide) for the details.
 
-Client-only pull requests run the client typecheck, tests, build, and generated
-asset verification. Backend or mixed changes retain the complete Python and
-client validation, and every push to `main` runs the full suite. Unknown paths
-fail closed to the full lane.
+Client-only pull requests run the client lane; backend or mixed changes run the complete Python and client validation, and every push to `main` runs the full suite. Unknown paths fail closed to the full lane.
 
 Pull requests are currently restricted to collaborators while the architecture is moving quickly. Issues, bug reports, design feedback, and focused proposals are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
