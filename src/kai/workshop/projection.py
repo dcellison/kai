@@ -1107,7 +1107,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 25
+    version = 26
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1132,6 +1132,7 @@ class CanonicalConversationProjection:
             "human_notification_adapter_delivery_decisions",
             "human_notification_publications",
             "human_notifications",
+            "principal_avatars",
             "principal_direct_message_archives",
             "thread_read_positions",
             "channel_read_positions",
@@ -1264,6 +1265,102 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop display-name change is stale or unauthorized")
+        elif envelope.event_type == WorkshopEventType.PRINCIPAL_AVATAR_CHANGED:
+            if envelope.event_version != 1:
+                raise ValueError("Unsupported Workshop avatar event version")
+            if (
+                not isinstance(envelope.aggregate_id, PrincipalId)
+                or envelope.aggregate_type != "principal_profile"
+                or envelope.actor_principal_id != envelope.aggregate_id
+            ):
+                raise ValueError("Workshop avatar changes require a self-owned principal profile")
+            expected_state_version = payload.get("expected_state_version")
+            if (
+                not isinstance(expected_state_version, int)
+                or isinstance(expected_state_version, bool)
+                or expected_state_version < 0
+            ):
+                raise ValueError("Workshop avatar expected version is invalid")
+            active = not payload.get("cleared", False)
+            if active:
+                _require_exact_payload(
+                    payload,
+                    {
+                        "expected_state_version",
+                        "media_type",
+                        "byte_size",
+                        "width",
+                        "height",
+                        "sha256",
+                    },
+                )
+                media_type = _required_text(payload, "media_type")
+                byte_size = payload.get("byte_size")
+                width = payload.get("width")
+                height = payload.get("height")
+                sha256 = _required_text(payload, "sha256")
+                if (
+                    media_type != "image/png"
+                    or not isinstance(byte_size, int)
+                    or isinstance(byte_size, bool)
+                    or byte_size <= 0
+                    or byte_size > 512 * 1024
+                    or not isinstance(width, int)
+                    or isinstance(width, bool)
+                    or width <= 0
+                    or width > 256
+                    or not isinstance(height, int)
+                    or isinstance(height, bool)
+                    or height <= 0
+                    or height > 256
+                    or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+                ):
+                    raise ValueError("Workshop avatar metadata is invalid")
+            else:
+                _require_exact_payload(payload, {"expected_state_version", "cleared"})
+                if payload.get("cleared") is not True:
+                    raise ValueError("Workshop avatar clear payload is invalid")
+                media_type = None
+                byte_size = None
+                width = None
+                height = None
+                sha256 = None
+            async with connection.execute(
+                "SELECT state_version FROM principal_avatars WHERE principal_id = ?",
+                (envelope.aggregate_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            current_version = int(row[0]) if row is not None else 0
+            if current_version != expected_state_version:
+                raise ValueError("Workshop avatar change is stale")
+            async with connection.execute(
+                "SELECT 1 FROM principals p JOIN workshop_memberships wm ON wm.principal_id = p.id "
+                "WHERE p.id = ? AND p.kind = 'human' AND wm.workshop_id = ?",
+                (envelope.aggregate_id, envelope.workshop_id),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    raise ValueError("Workshop avatar change is unauthorized")
+            next_version = expected_state_version + 1
+            await connection.execute(
+                "INSERT INTO principal_avatars "
+                "(principal_id, state_version, active, media_type, byte_size, width, height, sha256, event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(principal_id) DO UPDATE SET state_version = excluded.state_version, "
+                "active = excluded.active, media_type = excluded.media_type, byte_size = excluded.byte_size, "
+                "width = excluded.width, height = excluded.height, sha256 = excluded.sha256, "
+                "event_position = excluded.event_position",
+                (
+                    envelope.aggregate_id,
+                    next_version,
+                    int(active),
+                    media_type,
+                    byte_size,
+                    width,
+                    height,
+                    sha256,
+                    event.position,
+                ),
+            )
         elif envelope.event_type == WorkshopEventType.EXTERNAL_IDENTITY_BOUND:
             await connection.execute(
                 "INSERT INTO external_identities "

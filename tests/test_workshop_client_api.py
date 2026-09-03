@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
+from PIL import Image
 
 from kai.workshop.agent_enablement import EligibleAgentRuntime, PrincipalAgentEnablement
 from kai.workshop.appearance_preferences import (
@@ -49,6 +51,7 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
+from kai.workshop.diagnostics import workshop_human_avatar_status
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentId,
@@ -74,6 +77,7 @@ from kai.workshop.github_settings import (
     WorkshopGitHubSettingsAccessDenied,
     WorkshopGitHubSettingsConflict,
 )
+from kai.workshop.human_avatars import WorkshopHumanAvatarService
 from kai.workshop.inbound import (
     ClientInboundMessage,
     InboundBindingNotFoundError,
@@ -866,6 +870,7 @@ async def _open_client(
     client_preferences=None,
     appearance_preferences=None,
     agent_enablement=None,
+    human_avatars=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -888,6 +893,7 @@ async def _open_client(
         client_preferences=client_preferences,
         appearance_preferences=appearance_preferences,
         agent_enablement=agent_enablement,
+        human_avatars=human_avatars,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -1030,6 +1036,429 @@ async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
         )
         assert foreign.status == 404
         assert await foreign.json() == {"error": {"code": "memory_not_found", "message": "Memory not found"}}
+    finally:
+        await client.close()
+        await store.close()
+
+
+def _avatar_form(content: bytes, *, media_type: str, expected_version: int, operation_id: str) -> FormData:
+    form = FormData()
+    form.add_field("client_operation_id", operation_id)
+    form.add_field("file", content, filename="avatar", content_type=media_type)
+    form.add_field("expected_state_version", str(expected_version))
+    return form
+
+
+def _jpeg_avatar_bytes(color: tuple[int, int, int] = (32, 96, 160)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (640, 320), color).save(
+        output,
+        format="JPEG",
+        exif=b"Exif\x00\x00private metadata",
+    )
+    return output.getvalue()
+
+
+def _avatar_bytes(image_format: str, *, size: tuple[int, int] = (96, 48)) -> bytes:
+    output = io.BytesIO()
+    mode = "RGB" if image_format == "JPEG" else "RGBA"
+    color = (220, 40, 60) if mode == "RGB" else (220, 40, 60, 255)
+    Image.new(mode, size, color).save(output, format=image_format)
+    return output.getvalue()
+
+
+def _animated_gif_avatar_bytes() -> bytes:
+    output = io.BytesIO()
+    first = Image.new("RGB", (32, 32), (255, 0, 0))
+    second = Image.new("RGB", (32, 32), (0, 0, 255))
+    first.save(output, format="GIF", save_all=True, append_images=[second], duration=100, loop=0)
+    return output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_human_avatar_api_normalizes_versions_authorizes_and_clears(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    async with store.connection.execute("SELECT id FROM principals WHERE kind = 'agent' ORDER BY id LIMIT 1") as cursor:
+        agent_row = await cursor.fetchone()
+    assert agent_row is not None
+    agent_principal_id = PrincipalId(str(agent_row[0]))
+    service = WorkshopHumanAvatarService(store, data_dir=tmp_path)
+    client = await _open_client(
+        store,
+        _Authenticator(
+            {
+                "alice-token": alice_id,
+                "bob-token": bob_id,
+                "agent-token": agent_principal_id,
+            }
+        ),
+        human_avatars=service,
+    )
+    alice_headers = {"Authorization": "Bearer alice-token"}
+    bob_headers = {"Authorization": "Bearer bob-token"}
+    source = _jpeg_avatar_bytes()
+    try:
+        initial = await client.get("/v1/settings/profile/avatar", headers=alice_headers)
+        assert initial.status == 200
+        assert await initial.json() == {
+            "version": 1,
+            "principal_id": str(alice_id),
+            "state_version": 0,
+            "active": False,
+            "media_type": None,
+            "byte_size": None,
+            "width": None,
+            "height": None,
+            "sha256": None,
+            "url": None,
+            "mutation": None,
+        }
+
+        uploaded = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            data=_avatar_form(source, media_type="image/jpeg", expected_version=0, operation_id="avatar-1"),
+        )
+        payload = await uploaded.json()
+        assert uploaded.status == 200
+        assert payload["state_version"] == 1
+        assert payload["active"] is True
+        assert payload["media_type"] == "image/png"
+        assert payload["width"] == 256
+        assert payload["height"] == 128
+        assert payload["mutation"] == {"changed": True, "replayed": False}
+        assert payload["url"] == f"/v1/principals/{alice_id}/avatar/1"
+
+        content = await client.get(payload["url"], headers=bob_headers)
+        normalized = await content.read()
+        assert content.status == 200
+        assert content.headers["Content-Type"].startswith("image/png")
+        assert content.headers["Cache-Control"] == "private, max-age=31536000, immutable"
+        assert content.headers["X-Content-Type-Options"] == "nosniff"
+        assert len(normalized) == payload["byte_size"]
+        with Image.open(io.BytesIO(normalized)) as decoded:
+            assert decoded.format == "PNG"
+            assert decoded.size == (256, 128)
+            assert decoded.info == {}
+        nonhuman = await client.get(
+            payload["url"],
+            headers={"Authorization": "Bearer agent-token"},
+        )
+        assert nonhuman.status == 404
+
+        conflicting_replay = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            data=_avatar_form(
+                _jpeg_avatar_bytes((160, 96, 32)),
+                media_type="image/jpeg",
+                expected_version=0,
+                operation_id="avatar-1",
+            ),
+        )
+        assert conflicting_replay.status == 409
+
+        replay = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            data=_avatar_form(source, media_type="image/jpeg", expected_version=0, operation_id="avatar-1"),
+        )
+        assert replay.status == 200
+        assert (await replay.json())["mutation"] == {"changed": True, "replayed": True}
+        stale = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            data=_avatar_form(source, media_type="image/jpeg", expected_version=0, operation_id="avatar-2"),
+        )
+        assert stale.status == 409
+
+        cleared = await client.delete(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            json={"expected_state_version": 1, "client_operation_id": "avatar-clear-1"},
+        )
+        cleared_payload = await cleared.json()
+        assert cleared.status == 200
+        assert cleared_payload["state_version"] == 2
+        assert cleared_payload["active"] is False
+        assert cleared_payload["url"] is None
+        assert (await client.get(payload["url"], headers=bob_headers)).status == 404
+
+        replay_clear = await client.delete(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            json={"expected_state_version": 1, "client_operation_id": "avatar-clear-1"},
+        )
+        assert replay_clear.status == 200
+        assert (await replay_clear.json())["mutation"] == {"changed": True, "replayed": True}
+
+        await store.rebuild_projection(CanonicalConversationProjection())
+        rebuilt = await client.get("/v1/settings/profile/avatar", headers=alice_headers)
+        rebuilt_payload = await rebuilt.json()
+        assert rebuilt_payload["state_version"] == 2
+        assert rebuilt_payload["active"] is False
+
+        reuploaded = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            data=_avatar_form(source, media_type="image/jpeg", expected_version=2, operation_id="avatar-2"),
+        )
+        reuploaded_payload = await reuploaded.json()
+        assert reuploaded.status == 200
+        assert reuploaded_payload["state_version"] == 3
+        assert (await client.get(reuploaded_payload["url"], headers=bob_headers)).status == 200
+        assert (await client.get("/v1/settings/profile/avatar")).status == 401
+        status = workshop_human_avatar_status(tmp_path / "kai.db", service.storage_root)
+        assert "active; states=1, active=1, cleared=0" in status
+        assert "missing files=0, orphaned files=0, corrupt files=0, malformed=0" in status
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_avatar_api_rejects_mismatched_and_oversized_uploads(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        human_avatars=WorkshopHumanAvatarService(store, data_dir=tmp_path),
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        mismatch = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=headers,
+            data=_avatar_form(
+                _jpeg_avatar_bytes(),
+                media_type="image/png",
+                expected_version=0,
+                operation_id="mismatch",
+            ),
+        )
+        oversized = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=headers,
+            data=_avatar_form(
+                b"x" * (256 * 1024 + 1),
+                media_type="image/png",
+                expected_version=0,
+                operation_id="oversized",
+            ),
+        )
+        malformed = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=headers,
+            data=_avatar_form(
+                b"not an image",
+                media_type="image/png",
+                expected_version=0,
+                operation_id="malformed",
+            ),
+        )
+        svg = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=headers,
+            data=_avatar_form(
+                b'<svg xmlns="http://www.w3.org/2000/svg"/>',
+                media_type="image/svg+xml",
+                expected_version=0,
+                operation_id="svg",
+            ),
+        )
+        dangerous_dimensions = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=headers,
+            data=_avatar_form(
+                _avatar_bytes("PNG", size=(4097, 1)),
+                media_type="image/png",
+                expected_version=0,
+                operation_id="dimensions",
+            ),
+        )
+        assert mismatch.status == 415
+        assert oversized.status == 413
+        assert malformed.status == 400
+        assert svg.status == 415
+        assert dangerous_dimensions.status == 413
+        async with store.connection.execute("SELECT COUNT(*) FROM principal_avatars") as cursor:
+            assert int((await cursor.fetchone())[0]) == 0
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("image_format", "media_type"),
+    (("PNG", "image/png"), ("JPEG", "image/jpeg"), ("GIF", "image/gif"), ("WEBP", "image/webp")),
+)
+async def test_human_avatar_api_accepts_every_bounded_raster_format(
+    tmp_path: Path,
+    image_format: str,
+    media_type: str,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    service = WorkshopHumanAvatarService(store, data_dir=tmp_path)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        human_avatars=service,
+    )
+    try:
+        uploaded = await client.post(
+            "/v1/settings/profile/avatar",
+            headers={"Authorization": "Bearer alice-token"},
+            data=_avatar_form(
+                _avatar_bytes(image_format),
+                media_type=media_type,
+                expected_version=0,
+                operation_id=f"format-{image_format.lower()}",
+            ),
+        )
+        payload = await uploaded.json()
+        assert uploaded.status == 200
+        assert payload["media_type"] == "image/png"
+        normalized = await client.get(
+            payload["url"],
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        with Image.open(io.BytesIO(await normalized.read())) as decoded:
+            assert decoded.format == "PNG"
+            assert decoded.size == (96, 48)
+            assert decoded.info == {}
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_avatar_api_flattens_animation_to_the_first_frame(tmp_path: Path) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    service = WorkshopHumanAvatarService(store, data_dir=tmp_path)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        human_avatars=service,
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        uploaded = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=headers,
+            data=_avatar_form(
+                _animated_gif_avatar_bytes(),
+                media_type="image/gif",
+                expected_version=0,
+                operation_id="animated-gif",
+            ),
+        )
+        payload = await uploaded.json()
+        normalized = await client.get(payload["url"], headers=headers)
+        with Image.open(io.BytesIO(await normalized.read())) as decoded:
+            assert getattr(decoded, "n_frames", 1) == 1
+            assert decoded.convert("RGB").getpixel((0, 0)) == (255, 0, 0)
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_human_avatar_api_isolates_workshops_and_reports_storage_damage(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    foreign_workshop_id = WorkshopId.new()
+    foreign_principal_id = PrincipalId.new()
+    await store.connection.execute(
+        "INSERT INTO workshops (id, name, created_at) VALUES (?, ?, ?)",
+        (foreign_workshop_id, "Foreign", _NOW.isoformat()),
+    )
+    await store.connection.execute(
+        "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, 'human', ?, ?)",
+        (foreign_principal_id, "Foreign human", _NOW.isoformat()),
+    )
+    await store.connection.execute(
+        "INSERT INTO workshop_memberships (id, workshop_id, principal_id, role, created_at) "
+        "VALUES (?, ?, ?, 'member', ?)",
+        (WorkshopMembershipId.new(), foreign_workshop_id, foreign_principal_id, _NOW.isoformat()),
+    )
+    await store.connection.commit()
+    service = WorkshopHumanAvatarService(store, data_dir=tmp_path)
+    client = await _open_client(
+        store,
+        _Authenticator(
+            {
+                "alice-token": alice_id,
+                "bob-token": bob_id,
+                "foreign-token": foreign_principal_id,
+            }
+        ),
+        human_avatars=service,
+    )
+    alice_headers = {"Authorization": "Bearer alice-token"}
+    try:
+        uploaded = await client.post(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            data=_avatar_form(
+                _avatar_bytes("PNG"),
+                media_type="image/png",
+                expected_version=0,
+                operation_id="storage-check",
+            ),
+        )
+        payload = await uploaded.json()
+        assert uploaded.status == 200
+        assert (
+            await client.get(
+                payload["url"],
+                headers={"Authorization": "Bearer foreign-token"},
+            )
+        ).status == 404
+        cross_principal_mutation = await client.delete(
+            "/v1/settings/profile/avatar",
+            headers=alice_headers,
+            json={
+                "expected_state_version": 1,
+                "client_operation_id": "foreign-clear",
+                "principal_id": str(bob_id),
+            },
+        )
+        assert cross_principal_mutation.status == 400
+
+        path = service.storage_root / str(alice_id) / "1.png"
+        original = path.read_bytes()
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+        path.unlink()
+        assert (await client.get(payload["url"], headers=alice_headers)).status == 503
+        assert "missing files=1" in workshop_human_avatar_status(tmp_path / "kai.db", service.storage_root)
+
+        path.write_bytes(original)
+        path.chmod(0o600)
+        path.write_bytes(bytes((original[0] ^ 0xFF,)) + original[1:])
+        assert (await client.get(payload["url"], headers=alice_headers)).status == 503
+        assert "corrupt files=1" in workshop_human_avatar_status(tmp_path / "kai.db", service.storage_root)
+
+        path.write_bytes(original)
+        orphan = path.parent / "999.png"
+        orphan.write_bytes(b"orphan")
+        assert "orphaned files=1" in workshop_human_avatar_status(tmp_path / "kai.db", service.storage_root)
+        orphan.unlink()
+
+        await store.connection.execute(
+            "UPDATE principal_avatars SET sha256 = ? WHERE principal_id = ?",
+            ("z" * 64, alice_id),
+        )
+        await store.connection.commit()
+        malformed_status = workshop_human_avatar_status(tmp_path / "kai.db", service.storage_root)
+        assert "INCOMPLETE" in malformed_status
+        assert "malformed=1" in malformed_status
     finally:
         await client.close()
         await store.close()

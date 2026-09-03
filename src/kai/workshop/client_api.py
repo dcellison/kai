@@ -146,6 +146,18 @@ from kai.workshop.github_settings import (
     WorkshopGitHubSettingsStorageError,
     WorkshopGitHubSettingsValidationError,
 )
+from kai.workshop.human_avatars import (
+    MAX_AVATAR_UPLOAD_BYTES,
+    HumanAvatarSnapshot,
+    WorkshopHumanAvatarAccessDenied,
+    WorkshopHumanAvatarConflict,
+    WorkshopHumanAvatarError,
+    WorkshopHumanAvatarService,
+    WorkshopHumanAvatarStorageError,
+    WorkshopHumanAvatarTooLarge,
+    WorkshopHumanAvatarUnsupportedType,
+    WorkshopHumanAvatarValidationError,
+)
 from kai.workshop.human_direct_messages import (
     WorkshopHumanDirectConversation,
     WorkshopHumanDirectMessageAccessDenied,
@@ -340,6 +352,8 @@ _CHANNEL_NOTIFICATION_POLICY_PATH = "/v1/settings/channel-notifications"
 _CLIENT_PREFERENCES_PATH = "/v1/settings/clients"
 _APPEARANCE_PREFERENCES_PATH = "/v1/settings/appearance"
 _HUMAN_PROFILE_PATH = "/v1/settings/profile"
+_HUMAN_AVATAR_PATH = "/v1/settings/profile/avatar"
+_PRINCIPAL_AVATAR_PATH = "/v1/principals/{principal_id}/avatar/{state_version}"
 _HUMAN_NOTIFICATIONS_PATH = "/v1/client/notifications"
 _HUMAN_NOTIFICATION_COUNTS_PATH = "/v1/client/notifications/counts"
 _HUMAN_NOTIFICATION_EVENTS_PATH = "/v1/client/notifications/events"
@@ -401,6 +415,9 @@ _APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
 _MAX_APPEARANCE_PREFERENCE_BODY_BYTES = 1_024
 _HUMAN_PROFILE_REQUEST_FIELDS = frozenset({"display_name", "expected_state_version", "client_operation_id"})
 _MAX_HUMAN_PROFILE_BODY_BYTES = 2_048
+_HUMAN_AVATAR_CLEAR_FIELDS = frozenset({"expected_state_version", "client_operation_id"})
+_HUMAN_AVATAR_MULTIPART_FIELDS = frozenset({"file", "expected_state_version", "client_operation_id"})
+_MAX_HUMAN_AVATAR_REQUEST_BYTES = MAX_AVATAR_UPLOAD_BYTES + 64 * 1024
 _MAX_HUMAN_NOTIFICATION_BODY_BYTES = 32_768
 _HUMAN_NOTIFICATION_STATE_FIELDS = frozenset({"expected_state_version", "client_operation_id"})
 _HUMAN_NOTIFICATION_BULK_FIELDS = frozenset({"notifications", "client_operation_id"})
@@ -801,6 +818,26 @@ def _serialize_human_profile(snapshot: HumanProfileSnapshot) -> dict[str, object
                 "changed": snapshot.mutation_changed,
                 "replayed": snapshot.replayed,
             }
+            if snapshot.mutation_changed is not None
+            else None
+        ),
+    }
+
+
+def _serialize_human_avatar(snapshot: HumanAvatarSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "principal_id": str(snapshot.principal_id),
+        "state_version": snapshot.state_version,
+        "active": snapshot.active,
+        "media_type": snapshot.media_type,
+        "byte_size": snapshot.byte_size,
+        "width": snapshot.width,
+        "height": snapshot.height,
+        "sha256": snapshot.sha256,
+        "url": (f"/v1/principals/{snapshot.principal_id}/avatar/{snapshot.state_version}" if snapshot.active else None),
+        "mutation": (
+            {"changed": snapshot.mutation_changed, "replayed": snapshot.replayed}
             if snapshot.mutation_changed is not None
             else None
         ),
@@ -2652,6 +2689,191 @@ async def _handle_human_profile_update(
     except WorkshopHumanProfileError as exc:
         return _human_profile_error_response(exc)
     return _json_response(_serialize_human_profile(snapshot), status=200)
+
+
+def _human_avatar_error_response(exc: WorkshopHumanAvatarError) -> web.Response:
+    if isinstance(exc, WorkshopHumanAvatarConflict):
+        return _error_response(status=409, code="avatar_conflict", message=str(exc))
+    if isinstance(exc, WorkshopHumanAvatarTooLarge):
+        return _error_response(status=413, code="avatar_too_large", message=str(exc))
+    if isinstance(exc, WorkshopHumanAvatarUnsupportedType):
+        return _error_response(status=415, code="unsupported_avatar_type", message=str(exc))
+    if isinstance(exc, WorkshopHumanAvatarValidationError):
+        return _error_response(status=400, code="invalid_avatar", message=str(exc))
+    if isinstance(exc, WorkshopHumanAvatarAccessDenied):
+        return _error_response(status=404, code="avatar_not_found", message="Avatar not found")
+    if isinstance(exc, WorkshopHumanAvatarStorageError):
+        return _error_response(status=503, code="avatar_unavailable", message="Avatar is temporarily unavailable")
+    return _error_response(status=503, code="avatar_unavailable", message="Avatar is temporarily unavailable")
+
+
+async def _authenticate_human_avatar_request(
+    request: web.Request,
+    authenticator: WorkshopClientAuthenticator,
+) -> tuple[PrincipalId | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if isinstance(principal_id, PrincipalId):
+        return principal_id, None
+    response = _error_response(status=401, code="authentication_required", message="Authentication required")
+    response.headers["WWW-Authenticate"] = "Bearer"
+    return None, response
+
+
+async def _handle_human_avatar(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanAvatarService,
+) -> web.Response:
+    principal_id, error = await _authenticate_human_avatar_request(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid avatar request")
+    try:
+        snapshot = await service.inspect(principal_id)
+    except WorkshopHumanAvatarError as exc:
+        return _human_avatar_error_response(exc)
+    return _json_response(_serialize_human_avatar(snapshot), status=200)
+
+
+async def _read_bounded_multipart_part(part: BodyPartReader, limit: int) -> bytes:
+    content = bytearray()
+    while True:
+        chunk = await part.read_chunk(size=64 * 1024)
+        if not chunk:
+            return bytes(content)
+        content.extend(chunk)
+        if len(content) > limit:
+            raise WorkshopHumanAvatarTooLarge("Avatar multipart field is too large")
+
+
+async def _handle_human_avatar_upload(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanAvatarService,
+) -> web.Response:
+    principal_id, error = await _authenticate_human_avatar_request(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid avatar request")
+    try:
+        if request.content_type != "multipart/form-data":
+            raise WorkshopHumanAvatarValidationError("Content-Type must be multipart/form-data")
+        if request.content_length is not None and request.content_length > _MAX_HUMAN_AVATAR_REQUEST_BYTES:
+            raise WorkshopHumanAvatarTooLarge("Avatar request is too large")
+        reader = await request.multipart()
+        fields: dict[str, object] = {}
+        while (part := await reader.next()) is not None:
+            if not isinstance(part, BodyPartReader) or part.name not in _HUMAN_AVATAR_MULTIPART_FIELDS:
+                raise WorkshopHumanAvatarValidationError("Avatar multipart fields are invalid")
+            if part.name in fields:
+                raise WorkshopHumanAvatarValidationError("Avatar multipart fields must not be repeated")
+            if part.name == "file":
+                content = await _read_bounded_multipart_part(part, MAX_AVATAR_UPLOAD_BYTES)
+                media_type = part.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+                fields[part.name] = (content, media_type)
+            else:
+                raw_value = await _read_bounded_multipart_part(part, 512)
+                try:
+                    fields[part.name] = raw_value.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise WorkshopHumanAvatarValidationError("Avatar metadata must be UTF-8") from exc
+        if set(fields) != _HUMAN_AVATAR_MULTIPART_FIELDS:
+            raise WorkshopHumanAvatarValidationError("Avatar multipart fields are incomplete")
+        expected_text = fields["expected_state_version"]
+        operation_id = fields["client_operation_id"]
+        file_value = fields["file"]
+        if not isinstance(expected_text, str) or re.fullmatch(r"[0-9]{1,20}", expected_text) is None:
+            raise WorkshopHumanAvatarValidationError("expected_state_version must be a non-negative integer")
+        if not isinstance(operation_id, str) or not isinstance(file_value, tuple):
+            raise WorkshopHumanAvatarValidationError("Avatar multipart fields are invalid")
+        file_content, media_type = file_value
+        if not isinstance(file_content, bytes) or not isinstance(media_type, str):
+            raise WorkshopHumanAvatarValidationError("Avatar file field is invalid")
+        snapshot = await service.upload(
+            principal_id,
+            file_content,
+            media_type,
+            expected_state_version=int(expected_text),
+            client_operation_id=operation_id,
+        )
+    except WorkshopHumanAvatarError as exc:
+        return _human_avatar_error_response(exc)
+    except (ValueError, OSError):
+        return _human_avatar_error_response(WorkshopHumanAvatarValidationError("Invalid avatar request"))
+    return _json_response(_serialize_human_avatar(snapshot), status=200)
+
+
+async def _handle_human_avatar_clear(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanAvatarService,
+) -> web.Response:
+    principal_id, error = await _authenticate_human_avatar_request(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid avatar request")
+    try:
+        if request.content_type != "application/json":
+            raise WorkshopHumanAvatarValidationError("Content-Type must be application/json")
+        if request.content_length is not None and request.content_length > _MAX_HUMAN_PROFILE_BODY_BYTES:
+            raise WorkshopHumanAvatarValidationError("Avatar request is too large")
+        raw = await request.content.read(_MAX_HUMAN_PROFILE_BODY_BYTES + 1)
+        if len(raw) > _MAX_HUMAN_PROFILE_BODY_BYTES:
+            raise WorkshopHumanAvatarValidationError("Avatar request is too large")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) != _HUMAN_AVATAR_CLEAR_FIELDS:
+            raise WorkshopHumanAvatarValidationError("Invalid avatar request")
+        snapshot = await service.clear(
+            principal_id,
+            expected_state_version=payload.get("expected_state_version"),
+            client_operation_id=payload.get("client_operation_id"),
+        )
+    except (UnicodeDecodeError, ValueError):
+        return _human_avatar_error_response(WorkshopHumanAvatarValidationError("Invalid avatar request"))
+    except WorkshopHumanAvatarError as exc:
+        return _human_avatar_error_response(exc)
+    return _json_response(_serialize_human_avatar(snapshot), status=200)
+
+
+async def _handle_principal_avatar(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanAvatarService,
+) -> web.StreamResponse:
+    requester, error = await _authenticate_human_avatar_request(request, authenticator)
+    if error is not None:
+        return error
+    assert requester is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid avatar request")
+    try:
+        target = PrincipalId(request.match_info["principal_id"])
+        state_version = int(request.match_info["state_version"])
+        content = await service.retrieve(requester, target, state_version)
+    except (TypeError, ValueError):
+        return _error_response(status=404, code="avatar_not_found", message="Avatar not found")
+    except WorkshopHumanAvatarError as exc:
+        return _human_avatar_error_response(exc)
+    assert content.snapshot.sha256 is not None
+    return web.FileResponse(
+        content.path,
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Content-Type": "image/png",
+            "ETag": f'"{content.snapshot.sha256}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 async def _handle_runtime_settings(
@@ -6995,6 +7217,7 @@ def register_workshop_read_routes(
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
+    human_avatars: WorkshopHumanAvatarService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -7487,6 +7710,43 @@ def register_workshop_read_routes(
 
     app.router.add_get(_HUMAN_PROFILE_PATH, handle_human_profile)
     app.router.add_patch(_HUMAN_PROFILE_PATH, handle_human_profile_update)
+    if human_avatars is not None:
+
+        async def handle_human_avatar(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_human_avatar(
+                    request,
+                    authenticator=authenticator,
+                    service=human_avatars,
+                )
+
+        async def handle_human_avatar_upload(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_human_avatar_upload(
+                    request,
+                    authenticator=authenticator,
+                    service=human_avatars,
+                )
+
+        async def handle_human_avatar_clear(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_human_avatar_clear(
+                    request,
+                    authenticator=authenticator,
+                    service=human_avatars,
+                )
+
+        async def handle_principal_avatar(request: web.Request) -> web.StreamResponse:
+            return await _handle_principal_avatar(
+                request,
+                authenticator=authenticator,
+                service=human_avatars,
+            )
+
+        app.router.add_get(_HUMAN_AVATAR_PATH, handle_human_avatar)
+        app.router.add_post(_HUMAN_AVATAR_PATH, handle_human_avatar_upload)
+        app.router.add_delete(_HUMAN_AVATAR_PATH, handle_human_avatar_clear)
+        app.router.add_get(_PRINCIPAL_AVATAR_PATH, handle_principal_avatar)
     if preference_documents is not None:
 
         async def handle_preference_document(request: web.Request) -> web.Response:

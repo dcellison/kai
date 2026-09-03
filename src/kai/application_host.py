@@ -41,6 +41,7 @@ from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.github_automation import WorkshopGitHubAutomationService
 from kai.workshop.github_settings import WorkshopGitHubSettingsService
 from kai.workshop.goose_model_discovery import GooseModelDiscoveryAdapter
+from kai.workshop.human_avatars import WorkshopHumanAvatarService
 from kai.workshop.integration_notifications import WorkshopIntegrationNotificationService
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIContextRegistry
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
@@ -201,6 +202,7 @@ class KaiCoreServices:
     channel_notification_policy: WorkshopChannelNotificationPolicyService
     client_preferences: WorkshopClientPreferenceService
     appearance_preferences: WorkshopAppearancePreferenceService
+    human_avatars: WorkshopHumanAvatarService
     agent_enablement: WorkshopAgentEnablementService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
@@ -394,6 +396,10 @@ class KaiApplicationHost:
                 principal_storage=self._principal_storage,
                 runtime_profiles=self._runtime_profiles,
             )
+            human_avatars = WorkshopHumanAvatarService(
+                client_store,
+                data_dir=Path(self._config.session_db_path).parent,
+            )
             settings_workspaces = WorkshopSettingsWorkspaceService(
                 self._config,
                 runtime_pool,
@@ -484,6 +490,7 @@ class KaiApplicationHost:
                 run_previews=run_previews,
                 scheduler=scheduler,
                 artifacts=artifacts,
+                human_avatars=human_avatars,
                 settings_workspaces=settings_workspaces,
                 memory_queries=memory_queries,
                 preference_documents=preference_documents,
