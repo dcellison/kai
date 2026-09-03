@@ -150,8 +150,26 @@ function AgentCreationForm({
   onCancel: () => void;
   onCreate: (form: DefinitionFormState) => Promise<void>;
 }): React.JSX.Element {
+  const confirm = useConfirmation();
   const [form, setForm] = useState(EMPTY_DEFINITION);
   const [error, setError] = useState<string | null>(null);
+  const dirty =
+    form.avatar !== EMPTY_DEFINITION.avatar ||
+    form.description !== EMPTY_DEFINITION.description ||
+    form.displayName !== EMPTY_DEFINITION.displayName ||
+    form.handle !== EMPTY_DEFINITION.handle ||
+    form.instructions !== EMPTY_DEFINITION.instructions ||
+    form.purpose !== EMPTY_DEFINITION.purpose ||
+    form.capabilities.length !== EMPTY_DEFINITION.capabilities.length ||
+    form.capabilities.some(
+      (capability, index) => capability !== EMPTY_DEFINITION.capabilities[index],
+    );
+
+  const close = async (): Promise<void> => {
+    if (busy) return;
+    if (dirty && !await confirm("Discard your unsaved agent changes?")) return;
+    onCancel();
+  };
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -168,115 +186,139 @@ function AgentCreationForm({
   };
 
   return (
-    <form className="agent-editor" onSubmit={(event) => void submit(event)}>
-      <div className="agent-editor-heading">
-        <div>
-          <p className="overline">New software participant</p>
-          <h2>Create agent</h2>
-        </div>
-        <button className="quiet-button" type="button" onClick={onCancel} disabled={busy}>
-          Cancel
-        </button>
-      </div>
-      <div className="agent-editor-grid">
-        <label>
-          Stable handle
-          <span className="agent-field-hint">Lowercase letters, numbers, and underscores</span>
-          <div className="agent-handle-input">
-            <span aria-hidden="true">@</span>
-            <input
-              autoFocus
-              maxLength={32}
-              pattern="[a-z][a-z0-9_]{0,31}"
-              required
-              value={form.handle}
+    <div className="modal-backdrop" role="presentation">
+      <section
+        className="channel-creation-dialog agent-creation-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-agent-title"
+      >
+        <form className="agent-editor" onSubmit={(event) => void submit(event)}>
+          <div className="agent-creation-header">
+            <div>
+              <p className="overline">New software participant</p>
+              <h2 id="create-agent-title">Create agent</h2>
+            </div>
+            <button
+              className="panel-icon-button"
+              type="button"
+              aria-label="Close agent creation"
+              title="Close agent creation"
+              onClick={() => void close()}
+              disabled={busy}
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          </div>
+          <div className="agent-editor-grid">
+            <label>
+              Stable handle
+              <span className="agent-field-hint">
+                Lowercase letters, numbers, and underscores
+              </span>
+              <div className="agent-handle-input">
+                <span aria-hidden="true">@</span>
+                <input
+                  autoFocus
+                  maxLength={32}
+                  pattern="[a-z][a-z0-9_]{0,31}"
+                  required
+                  value={form.handle}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      handle: event.target.value.toLowerCase(),
+                    }))
+                  }
+                />
+              </div>
+            </label>
+            <label>
+              Display name
+              <input
+                maxLength={80}
+                required
+                value={form.displayName}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    displayName: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <label>
+              Avatar text
+              <span className="agent-field-hint">Optional, up to 16 characters</span>
+              <input
+                maxLength={16}
+                value={form.avatar}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, avatar: event.target.value }))
+                }
+              />
+            </label>
+          </div>
+          <label>
+            Description
+            <textarea
+              maxLength={1000}
+              rows={3}
+              value={form.description}
               onChange={(event) =>
                 setForm((current) => ({
                   ...current,
-                  handle: event.target.value.toLowerCase(),
+                  description: event.target.value,
                 }))
               }
             />
+          </label>
+          <label>
+            Purpose
+            <textarea
+              maxLength={2000}
+              required
+              rows={3}
+              value={form.purpose}
+              onChange={(event) =>
+                setForm((current) => ({ ...current, purpose: event.target.value }))
+              }
+            />
+          </label>
+          <label>
+            Instructions
+            <span className="agent-field-hint">
+              Behavioral guidance only. Instructions cannot grant authority.
+            </span>
+            <textarea
+              maxLength={20000}
+              required
+              rows={10}
+              value={form.instructions}
+              onChange={(event) =>
+                setForm((current) => ({
+                  ...current,
+                  instructions: event.target.value,
+                }))
+              }
+            />
+          </label>
+          <CapabilityChoices
+            disabled={busy}
+            selected={form.capabilities}
+            onChange={(capabilities) =>
+              setForm((current) => ({ ...current, capabilities }))
+            }
+          />
+          {error && <p className="form-error" role="alert">{error}</p>}
+          <div className="form-actions">
+            <button className="primary-button" type="submit" disabled={busy}>
+              {busy ? "Creating…" : "Create draft"}
+            </button>
           </div>
-        </label>
-        <label>
-          Display name
-          <input
-            maxLength={80}
-            required
-            value={form.displayName}
-            onChange={(event) =>
-              setForm((current) => ({ ...current, displayName: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          Avatar text
-          <span className="agent-field-hint">Optional, up to 16 characters</span>
-          <input
-            maxLength={16}
-            value={form.avatar}
-            onChange={(event) =>
-              setForm((current) => ({ ...current, avatar: event.target.value }))
-            }
-          />
-        </label>
-      </div>
-      <label>
-        Description
-        <textarea
-          maxLength={1000}
-          rows={3}
-          value={form.description}
-          onChange={(event) =>
-            setForm((current) => ({ ...current, description: event.target.value }))
-          }
-        />
-      </label>
-      <label>
-        Purpose
-        <textarea
-          maxLength={2000}
-          required
-          rows={3}
-          value={form.purpose}
-          onChange={(event) =>
-            setForm((current) => ({ ...current, purpose: event.target.value }))
-          }
-        />
-      </label>
-      <label>
-        Instructions
-        <span className="agent-field-hint">
-          Behavioral guidance only. Instructions cannot grant authority.
-        </span>
-        <textarea
-          maxLength={20000}
-          required
-          rows={10}
-          value={form.instructions}
-          onChange={(event) =>
-            setForm((current) => ({ ...current, instructions: event.target.value }))
-          }
-        />
-      </label>
-      <CapabilityChoices
-        disabled={busy}
-        selected={form.capabilities}
-        onChange={(capabilities) =>
-          setForm((current) => ({ ...current, capabilities }))
-        }
-      />
-      {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="form-actions">
-        <button className="primary-button" type="submit" disabled={busy}>
-          {busy ? "Creating…" : "Create draft"}
-        </button>
-        <button className="quiet-button" type="button" onClick={onCancel} disabled={busy}>
-          Cancel
-        </button>
-      </div>
-    </form>
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -682,18 +724,7 @@ export function AgentWorkspace({
 
       <div className="agent-workspace-body">
         <section className="agent-detail" aria-live="polite">
-          {creating ? (
-            <AgentCreationForm
-              busy={busy}
-              onCancel={() => {
-                setCreating(false);
-                if (selectedDefinitionId) {
-                  onSelectAgent(selectedDefinitionId);
-                }
-              }}
-              onCreate={create}
-            />
-          ) : selected ? (
+          {selected ? (
             <>
               <div className="agent-detail-identity">
                 <span className="agent-detail-avatar" aria-hidden="true">
@@ -932,6 +963,16 @@ export function AgentWorkspace({
           {error && <p className="agent-workspace-error" role="alert">{error}</p>}
         </section>
       </div>
+      {creating && (
+        <AgentCreationForm
+          busy={busy}
+          onCancel={() => {
+            setCreating(false);
+            onSelectAgent(selectedDefinitionId);
+          }}
+          onCreate={create}
+        />
+      )}
     </main>
   );
 }

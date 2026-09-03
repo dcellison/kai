@@ -2833,7 +2833,7 @@ button:disabled {
 .agent-detail-title-row,
 .agent-section-heading,
 .agent-archive-row,
-.agent-editor-heading {
+.agent-creation-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3031,9 +3031,19 @@ button:disabled {
 }
 
 .agent-section-heading,
-.agent-editor-heading {
+.agent-creation-header {
   align-items: flex-start;
   margin-bottom: 0.75rem;
+}
+
+.agent-creation-dialog {
+  width: min(62rem, 100%);
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+}
+
+.agent-creation-dialog .form-actions {
+  margin-top: 1rem;
 }
 
 .agent-revision-list li {
@@ -5130,8 +5140,7 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
-  .agent-archive-row,
-  .agent-editor-heading {
+  .agent-archive-row {
     align-items: flex-start;
     flex-direction: column;
   }
