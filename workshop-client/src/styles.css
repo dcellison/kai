@@ -2910,6 +2910,16 @@ button:disabled {
   font-size: 1.5rem;
 }
 
+.agent-conversation-button {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.agent-conversation-button svg {
+  width: 1rem;
+  height: 1rem;
+}
+
 .agent-detail h2,
 .agent-detail h3 {
   margin: 0;
@@ -2980,7 +2990,6 @@ button:disabled {
   font-size: 0.68rem;
 }
 
-.agent-enablement-card label,
 .agent-editor > label,
 .agent-editor-grid > label,
 .agent-revision-editor > label {
@@ -2992,7 +3001,6 @@ button:disabled {
   font-weight: 680;
 }
 
-.agent-enablement-card select,
 .agent-editor input,
 .agent-editor textarea,
 .agent-revision-editor textarea {
@@ -3005,7 +3013,6 @@ button:disabled {
   font: inherit;
 }
 
-.agent-enablement-card select:focus-visible,
 .agent-editor input:focus-visible,
 .agent-editor textarea:focus-visible,
 .agent-revision-editor textarea:focus-visible {
@@ -3044,6 +3051,27 @@ button:disabled {
 
 .agent-creation-dialog .form-actions {
   margin-top: 1rem;
+}
+
+.agent-execution-profile-card > summary {
+  color: var(--color-text-strong);
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 680;
+}
+
+.agent-execution-profile-card > p {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.agent-execution-profile-card > label {
+  margin-top: 0.8rem;
+}
+
+.agent-runtime-setup-card > p:not(.settings-card-label) {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
 }
 
 .agent-creation-dialog .agent-editor input,

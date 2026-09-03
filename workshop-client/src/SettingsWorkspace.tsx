@@ -1,4 +1,12 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  FormEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import {
   AuthenticationError,
@@ -176,6 +184,7 @@ function errorText(caught: unknown, fallback: string): string {
 
 type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
+  executionProfileControl?: ReactNode;
   nativeAgentRuntime?: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
@@ -191,6 +200,7 @@ type SettingsWorkspaceContentProps = {
 
 function SettingsWorkspaceContent({
   agentRuntime = false,
+  executionProfileControl,
   nativeAgentRuntime = false,
   onAuthenticationFailure,
   onChannelAccessFailure,
@@ -1232,6 +1242,7 @@ function SettingsWorkspaceContent({
             <p role="status">Loading runtime policy…</p>
           ) : runtime ? (
             <div className="settings-card-stack">
+              {executionProfileControl}
               <div className="settings-card-columns">
                 <div className="settings-card-column">
                 {runtimeBackendCapability && (

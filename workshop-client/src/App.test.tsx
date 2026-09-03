@@ -3094,7 +3094,9 @@ describe("Workshop React client", () => {
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
     expect(within(manageKai).getByLabelText("Open")).toHaveClass("live-pip");
     expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
-    expect(screen.getByText("Runtime active")).toBeVisible();
+    expect(screen.queryByText("Owner runtime")).toBeNull();
+    expect(screen.queryByText("Runtime active")).toBeNull();
+    expect(screen.queryByLabelText("Authorized runtime")).toBeNull();
     expect(screen.getByText("You own and manage this agent.")).toBeVisible();
     const agentWorkspace = within(screen.getByLabelText("Agents workspace"));
     const createAgent = agentWorkspace.getByRole("button", {
@@ -3112,9 +3114,86 @@ describe("Workshop React client", () => {
     expect(closeAgents.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(streamPrincipalEvents).toHaveBeenCalledTimes(1);
 
-    await user.click(screen.getByRole("button", { name: "Start conversation" }));
+    const startConversation = screen.getByRole("button", {
+      name: "Start conversation with Kai",
+    });
+    expect(startConversation).toHaveClass("agent-conversation-button");
+    expect(startConversation.querySelector("svg")).toBeInTheDocument();
+    await user.click(startConversation);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
+  });
+
+  it("uses the sole eligible execution profile without exposing a redundant selector", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadAgentEnablements).mockResolvedValue([
+      {
+        ...agentEnablement,
+        directChannelId: null,
+        enablementId: null,
+        lifecycleState: "available",
+        runtimeProfileId: null,
+        stateVersion: null,
+      },
+    ]);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Manage Kai" }));
+
+    expect(
+      await screen.findByText(
+        "Your authorized execution profile will be used automatically.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Enable agent" })).toBeVisible();
+    expect(screen.queryByText("Owner runtime")).toBeNull();
+    expect(screen.queryByText("Advanced execution profile")).toBeNull();
+    expect(screen.queryByLabelText("Execution profile")).toBeNull();
+  });
+
+  it("keeps multiple eligible execution profiles behind an advanced disclosure", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadAgentEnablements).mockResolvedValue([
+      {
+        ...agentEnablement,
+        directChannelId: null,
+        eligibleRuntimes: [
+          ...agentEnablement.eligibleRuntimes,
+          {
+            backendOptions: ["codex:openai"],
+            displayName: "Daniel's alternate runtime",
+            runtimeProfileId: "rtp_22222222222222222222222222222222",
+          },
+        ],
+        enablementId: null,
+        lifecycleState: "available",
+        runtimeProfileId: null,
+        stateVersion: null,
+      },
+    ]);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Manage Kai" }));
+
+    const disclosure = await screen.findByText("Advanced execution profile");
+    expect(disclosure).toBeVisible();
+    await user.click(disclosure);
+    expect(screen.getByLabelText("Execution profile")).toHaveValue(runtimeProfileId);
+    expect(screen.getByRole("option", { name: "Daniel's runtime" })).toBeVisible();
+    expect(
+      screen.getByRole("option", { name: "Daniel's alternate runtime" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("option", { name: /claude|codex/i })).toBeNull();
   });
 
   it("offers principal-owned agent creation to Workshop members", async () => {
@@ -3335,7 +3414,9 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText("Owned and managed by Daniel.")).toBeVisible();
     expect(screen.getByText("Available to you")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Start conversation" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Start conversation with Kai" }),
+    ).toBeVisible();
     expect(screen.queryByText("Owner controls")).toBeNull();
     expect(screen.queryByText("Runtime active")).toBeNull();
     expect(screen.queryByLabelText("Authorized runtime")).toBeNull();
