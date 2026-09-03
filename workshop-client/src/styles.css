@@ -3579,7 +3579,7 @@ button:disabled {
 }
 
 .preference-conflict {
-  grid-column: 2;
+  grid-column: auto;
   border-color: color-mix(in srgb, var(--color-warning) 35%, transparent);
 }
 
@@ -3628,7 +3628,7 @@ button:disabled {
 }
 
 .preference-history {
-  grid-column: 2;
+  grid-column: auto;
   overflow: hidden;
 }
 

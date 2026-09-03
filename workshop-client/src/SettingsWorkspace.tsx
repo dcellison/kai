@@ -1177,6 +1177,7 @@ function SettingsWorkspaceContent({
               Your Workshop profile and principal-wide guidance supplied to your agents.
             </p>
           </div>
+          <div className="settings-card-stack settings-personal-preferences">
           {profileLoading ? (
             <p role="status">Loading profile…</p>
           ) : profile ? (
@@ -1325,6 +1326,7 @@ function SettingsWorkspaceContent({
               </ol>
             </details>
           )}
+          </div>
           </section>
         )}
 
