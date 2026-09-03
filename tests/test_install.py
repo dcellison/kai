@@ -1683,7 +1683,6 @@ class TestCmdConfig:
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
-                "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
@@ -1786,7 +1785,6 @@ class TestCmdConfig:
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
-                "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
@@ -1872,7 +1870,6 @@ class TestCmdConfig:
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
-                "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
                 "false",  # issue triage enabled
                 "",  # github notify chat id
@@ -1946,7 +1943,6 @@ class TestCmdConfig:
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
                 "false",
-                "300",  # pr review cooldown (global resource control)
                 "900",
                 "1.0",
                 "false",
@@ -2011,7 +2007,6 @@ class TestCmdConfig:
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
-                "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
@@ -2149,7 +2144,6 @@ class TestCmdConfig:
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
                 "false",  # pr review enabled
-                "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout (seconds)
                 "false",  # issue triage enabled
                 "",  # github notify chat id (empty)
@@ -2386,7 +2380,6 @@ class TestCmdConfig:
             "",  # allowed workspaces
             model_catalogue_refresh_interval,
             model_catalogue_refresh_timeout,
-            "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
             *telegram_features,
             *memory_block,
@@ -3025,7 +3018,6 @@ class TestCmdConfig:
                 "",  # allowed workspaces
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
-                "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
                 "false",  # voice
                 "false",  # tts
@@ -3371,7 +3363,6 @@ class TestCmdConfig:
                 "",  # allowed workspaces
                 "0",  # periodic model-catalogue refresh disabled
                 "30",  # model-catalogue refresh timeout
-                "300",  # pr review cooldown (global resource control)
                 "900",  # pr review timeout
                 "false",  # voice
                 "false",  # tts
@@ -3968,10 +3959,9 @@ class TestCmdConfigDefaultModelDispatch:
         """Input chain for the users_yaml_exists=True + claude path.
 
         Post-tranche-B, the global-default prompts fire unconditionally
-        even when users.yaml exists, so the chain feeds timeout,
-        workspace_base, and pr_review_cooldown
-        values that the pre-tranche-B users-yaml-exists branch had
-        skipped silently.
+        even when users.yaml exists, so the chain feeds timeout and
+        workspace_base values that the pre-tranche-B users-yaml-exists
+        branch had skipped silently.
         """
         return [
             "protected",  # deployment mode
@@ -3998,7 +3988,6 @@ class TestCmdConfigDefaultModelDispatch:
             "",  # allowed workspaces (global default, empty)
             "0",  # periodic model-catalogue refresh disabled
             "30",  # model-catalogue refresh timeout
-            "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "false",  # voice
             "false",  # tts
@@ -4045,7 +4034,6 @@ class TestCmdConfigDefaultModelDispatch:
             "",  # allowed workspaces (global default, empty)
             "0",  # periodic model-catalogue refresh disabled
             "30",  # model-catalogue refresh timeout
-            "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "false",  # voice
             "false",  # tts
@@ -4084,7 +4072,6 @@ class TestCmdConfigDefaultModelDispatch:
             "",  # allowed workspaces (global default, empty)
             "0",  # periodic model-catalogue refresh disabled
             "30",  # model-catalogue refresh timeout
-            "300",  # pr review cooldown (global resource control)
             "900",  # pr review subprocess timeout
             "false",  # voice
             "false",  # tts
@@ -11104,7 +11091,7 @@ class TestStripInstallConfKeys:
 
 class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
     """Pins the contract that installation-wide defaults (DEFAULT_MODEL,
-    DEFAULT_TIMEOUT, WORKSPACE_BASE, PR_REVIEW_COOLDOWN) prompt
+    DEFAULT_TIMEOUT, WORKSPACE_BASE) prompt
     on every wizard run and land in install.conf's env regardless of
     users.yaml presence.
 
@@ -11173,6 +11160,35 @@ class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         assert "CLAUDE_MAX_CONTEXT_WINDOW" not in env
 
+    def test_retired_pr_review_cooldown_dropped_on_regenerate(self, tmp_path, monkeypatch):
+        """Regenerating config drops the retired review cooldown key."""
+        prior_conf = {
+            "install_dir": "/opt/kai",
+            "data_dir": "/var/lib/kai",
+            "service_user": "kai",
+            "platform": "darwin",
+            "env": {
+                "TELEGRAM_BOT_TOKEN": "fake-token",
+                "PR_REVIEW_COOLDOWN": "450",
+            },
+        }
+        (tmp_path / "install.conf").write_text(json.dumps(prior_conf))
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
+        self._existing_etc_users(monkeypatch)
+
+        inputs = iter(TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
+        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+        monkeypatch.setattr(
+            "kai.install._prompt_default_model",
+            lambda backend, prov, default: "sonnet",
+        )
+        _cmd_config()
+
+        env = json.loads((tmp_path / "install.conf").read_text())["env"]
+        assert "PR_REVIEW_COOLDOWN" not in env
+
     def test_retired_scoped_recall_keys_dropped_on_regenerate(self, tmp_path, monkeypatch):
         """A regenerate over an install.conf carrying the retired
         scoped-recall and shadow flags drops them: the runtime no
@@ -11224,33 +11240,6 @@ class TestCmdConfigGlobalDefaultsRegardlessOfUsersYaml:
 
         env = json.loads((tmp_path / "install.conf").read_text())["env"]
         assert env["WORKSPACE_BASE"] == "~/Projects"
-
-    def test_pr_review_cooldown_always_prompts(self, tmp_path, monkeypatch):
-        """PR_REVIEW_COOLDOWN is a global resource control: the prompt
-        fires whether users.yaml exists or pr_review_enabled is true,
-        and a non-default value lands in env.
-        """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
-        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
-        self._existing_etc_users(monkeypatch)
-
-        # Override the cooldown slot in the claude chain to a non-default
-        # value so the env-emission assertion is meaningful (the default
-        # "300" is suppressed by the delta-from-default check).
-        base = list(TestCmdConfigDefaultModelDispatch._inputs_for_claude_backend())
-        cooldown_idx = base.index("300")
-        base[cooldown_idx] = "450"
-        inputs = iter(base)
-        monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-        monkeypatch.setattr(
-            "kai.install._prompt_default_model",
-            lambda backend, prov, default: "sonnet",
-        )
-        _cmd_config()
-
-        env = json.loads((tmp_path / "install.conf").read_text())["env"]
-        assert env["PR_REVIEW_COOLDOWN"] == "450"
 
     def test_allowed_workspaces_lands_with_users_yaml(self, tmp_path, monkeypatch):
         """ALLOWED_WORKSPACES reaches env when users.yaml is present.
@@ -11336,7 +11325,6 @@ class TestCmdConfigCanonicalUsersYaml:
             "0",  # periodic model-catalogue refresh disabled
             "30",  # model-catalogue refresh timeout
             "false",
-            "300",  # pr review cooldown (global resource control)
             "900",
             "1.0",
             "false",
@@ -11805,7 +11793,6 @@ class TestCmdConfigSingleUserMode:
             "0",  # periodic model-catalogue refresh disabled
             "30",  # model-catalogue refresh timeout
             "false",  # pr_review_enabled
-            "300",  # pr_review_cooldown
             "900",  # pr_review_timeout_s
             "false",  # issue_triage
             "",  # github_notify_chat_id
@@ -13304,7 +13291,6 @@ class TestOpenCodeConfigWizard:
             "",  # allowed workspaces
             "0",  # periodic model-catalogue refresh disabled
             "30",  # model-catalogue refresh timeout
-            "300",  # pr review cooldown (global resource control)
             "900",  # pr review timeout
             "false",  # voice
             "false",  # tts
