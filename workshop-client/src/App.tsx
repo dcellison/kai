@@ -4058,7 +4058,11 @@ function WorkshopView({
                     ? "Direct conversation"
                     : "Canonical conversation"}
               </p>
-              <h3>Welcome to {channelName}</h3>
+              <h3>
+                {humanDirect
+                  ? `Conversation with ${channelName}`
+                  : `Welcome to ${channelName}`}
+              </h3>
               <p>
                 {channelIsArchived(channel)
                   ? "This channel is archived. Its history remains available, but it is read-only until restored."

@@ -3063,6 +3063,7 @@ describe("Workshop React client", () => {
     expect(screen.getByText("Direct messages")).toBeVisible();
     expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Welcome to Kai" })).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Scott" }));
 
@@ -3070,6 +3071,8 @@ describe("Workshop React client", () => {
       (await screen.findAllByRole("heading", { name: "@ Scott" })).length,
     ).toBeGreaterThan(0);
     expect(screen.getByRole("textbox", { name: "Message Scott" })).toBeEnabled();
+    expect(screen.getByRole("heading", { name: "Conversation with Scott" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Welcome to Scott" })).toBeNull();
     expect(screen.getByText("Messages here are private to you and Scott.")).toBeVisible();
     expect(screen.getByRole("heading", { name: "People" })).toBeVisible();
     expect(await screen.findByRole("button", { name: "Reply to message" })).toBeVisible();
