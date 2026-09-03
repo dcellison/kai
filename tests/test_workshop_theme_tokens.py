@@ -11,7 +11,7 @@ _ROOT = Path(__file__).parents[1]
 _COMPONENT_CSS = _ROOT / "workshop-client" / "src" / "styles.css"
 _THEME_CSS = _ROOT / "workshop-client" / "src" / "themes.css"
 _THEME_TYPESCRIPT = _ROOT / "workshop-client" / "src" / "theme.ts"
-_THEME_SOURCES = _ROOT / "home" / "docs" / "specs" / "workshop-theme-catalog.md"
+_THEME_SOURCES = _ROOT / "workshop-client" / "THEME_SOURCES.md"
 _THEME_SCHEMES = {
     "atom-one-dark": "dark",
     "atom-one-light": "light",

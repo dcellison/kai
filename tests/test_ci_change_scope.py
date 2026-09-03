@@ -1,4 +1,8 @@
+from pathlib import Path
+
 from scripts.ci_change_scope import ChangeScope, classify_paths
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_client_sources_and_generated_assets_use_only_client_lane() -> None:
@@ -13,9 +17,21 @@ def test_client_sources_and_generated_assets_use_only_client_lane() -> None:
 
 
 def test_documentation_only_change_needs_no_runtime_lane() -> None:
-    assert classify_paths(
-        ["README.md", "docs/design.md", "home/docs/specs/workshop.md", ".github/CI.md"]
-    ) == ChangeScope(client=False, full=False, dependency=False)
+    assert classify_paths(["README.md", "SECURITY.md", "CONTRIBUTING.md", ".github/CI.md"]) == ChangeScope(
+        client=False, full=False, dependency=False
+    )
+
+
+def test_repository_root_home_is_not_shipped() -> None:
+    assert not (REPOSITORY_ROOT / "home").exists()
+
+
+def test_repository_root_home_path_fails_closed_to_complete_validation() -> None:
+    assert classify_paths(["home/docs/specs/workshop.md"]) == ChangeScope(
+        client=True,
+        full=True,
+        dependency=False,
+    )
 
 
 def test_unknown_and_mixed_paths_fail_closed_to_complete_validation() -> None:

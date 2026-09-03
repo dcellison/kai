@@ -33,6 +33,8 @@ Follow the existing pattern exactly:
 
 - Don't manually re-register the Telegram webhook. Just restart the service.
 - Don't add features or refactor beyond what was asked.
-- Spec files go in `home/docs/specs/`, not the project root.
+- Specification drafts are private operator artifacts. Never create or track them
+  inside this repository; use the operator's canonical Kai home `docs/specs/`
+  directory, or `/tmp` when no personal home is available.
 - Kai (the inner agent, on any backend) must NEVER modify source files in this repo. Read, review, and report only.
 - Don't push follow-up commits until the current CI run has completed.

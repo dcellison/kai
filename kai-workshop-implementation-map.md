@@ -2261,13 +2261,12 @@ implementation modules. The composition root loads the adapter dynamically
 only when configured. Delivery capabilities live in an SDK-free adapter
 contract, so transport-neutral tests no longer import the Telegram runtime.
 
-The final reference classification is maintained in
-`home/docs/specs/telegram-adapter-boundary.md`. Remaining Telegram references
-are limited to adapter lifecycle, ingress, authentication, presentation,
-delivery, optional identity/channel binding, deployment configuration,
-retained non-authoritative archives, and adapter tests. Retained bindings are
-ineligible when Telegram is disabled, and multi-adapter delivery outcomes are
-independent.
+The final reference classification was completed under issue #1107 and its
+corrective follow-ups. Remaining Telegram references are limited to adapter
+lifecycle, ingress, authentication, presentation, delivery, optional
+identity/channel binding, deployment configuration, retained non-authoritative
+archives, and adapter tests. Retained bindings are ineligible when Telegram is
+disabled, and multi-adapter delivery outcomes are independent.
 
 Installed qualification covers Workshop-only and hybrid operation using the
 backends configured on the qualification host, including ordinary execution,
