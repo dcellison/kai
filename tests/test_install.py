@@ -5367,6 +5367,9 @@ class TestCmdStatus:
             "CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT, role TEXT);"
             "CREATE TABLE workshop_memberships (workshop_id TEXT, principal_id TEXT);"
             "CREATE TABLE human_handles (workshop_id TEXT, principal_id TEXT);"
+            "CREATE TABLE channel_agents (channel_id TEXT);"
+            "CREATE TABLE channel_agent_runtime_assignments (channel_id TEXT);"
+            "CREATE TABLE channel_bindings (channel_id TEXT);"
             "CREATE TABLE event_log (position INTEGER PRIMARY KEY, aggregate_id TEXT, "
             "aggregate_type TEXT, event_type TEXT);"
             "INSERT INTO channels VALUES "
@@ -5386,7 +5389,7 @@ class TestCmdStatus:
         assert _channel_lifecycle_status(db_path) == (
             "Workshop channel lifecycle: active; group channels=2, active=1, "
             "archived=1, human members=2 (owners=2, participants=0), "
-            "integrity gaps=0; authority=canonical"
+            "human DMs=0 (invalid=0), integrity gaps=0; authority=canonical"
         )
 
     def test_status_reports_canonical_internal_api_context_coverage(self, tmp_path):

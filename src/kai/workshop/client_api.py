@@ -125,6 +125,7 @@ from kai.workshop.domain import (
     RunId,
     RuntimeProfileId,
     WorkshopEventType,
+    WorkshopId,
 )
 from kai.workshop.execution_coordinator import CanonicalCancellationDisposition
 from kai.workshop.github_settings import (
@@ -136,6 +137,15 @@ from kai.workshop.github_settings import (
     WorkshopGitHubSettingsService,
     WorkshopGitHubSettingsStorageError,
     WorkshopGitHubSettingsValidationError,
+)
+from kai.workshop.human_direct_messages import (
+    WorkshopHumanDirectConversation,
+    WorkshopHumanDirectMessageAccessDenied,
+    WorkshopHumanDirectMessageConflict,
+    WorkshopHumanDirectMessageService,
+    WorkshopHumanDirectMessageStorageError,
+    WorkshopHumanPeerSnapshot,
+    is_canonical_human_direct_channel,
 )
 from kai.workshop.human_notifications import (
     HumanNotification,
@@ -273,6 +283,8 @@ _CHANNEL_RESTORATION_PATH = "/v1/channels/{channel_id}/restore"
 _CHANNEL_MEMBERS_PATH = "/v1/channels/{channel_id}/members"
 _CHANNEL_MEMBER_ADDITION_PATH = "/v1/channels/{channel_id}/members/{principal_id}/add"
 _CHANNEL_MEMBER_REMOVAL_PATH = "/v1/channels/{channel_id}/members/{principal_id}/remove"
+_WORKSHOP_HUMANS_PATH = "/v1/workshops/{workshop_id}/humans"
+_HUMAN_CONVERSATION_PATH = "/v1/workshops/{workshop_id}/humans/{principal_id}/conversation"
 _AGENT_DEFINITIONS_PATH = "/v1/client/agents"
 _AGENT_EVENTS_PATH = "/v1/client/agents/events"
 _AGENT_DEFINITION_PATH = "/v1/client/agents/{definition_id}"
@@ -841,6 +853,39 @@ def _serialize_human_membership_mutation(
             "display_name": mutation.member.display_name,
             "handle": mutation.member.handle,
             "role": mutation.member.role,
+        },
+    }
+
+
+def _serialize_human_peers(snapshot: WorkshopHumanPeerSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "workshop_id": str(snapshot.workshop_id),
+        "humans": [
+            {
+                "principal_id": str(peer.principal_id),
+                "display_name": peer.display_name,
+                "handle": peer.handle,
+                "conversation_channel_id": str(peer.channel_id) if peer.channel_id is not None else None,
+            }
+            for peer in snapshot.peers
+        ],
+    }
+
+
+def _serialize_human_conversation(conversation: WorkshopHumanDirectConversation) -> dict[str, object]:
+    return {
+        "version": 1,
+        "created": conversation.created,
+        "conversation": {
+            "workshop_id": str(conversation.workshop_id),
+            "channel_id": str(conversation.channel_id),
+            "kind": "direct",
+            "peer": {
+                "principal_id": str(conversation.peer.principal_id),
+                "display_name": conversation.peer.display_name,
+                "handle": conversation.peer.handle,
+            },
         },
     }
 
@@ -3665,7 +3710,15 @@ async def _handle_client_navigation(
                 raise RuntimeError("Workshop navigation capability assembly failed")
             if channel["kind"] == "direct" and enablement is not None and not conversation_started:
                 continue
-            channel["can_submit_commands"] = (
+            human_direct = (
+                channel["kind"] == "direct"
+                and not agents
+                and await is_canonical_human_direct_channel(
+                    store,
+                    ChannelId(str(channel["channel_id"])),
+                )
+            )
+            channel["can_submit_commands"] = human_direct or (
                 channel["archived_at"] is None
                 and channel["kind"] in {"direct", "group"}
                 and len(agents) >= 1
@@ -3794,6 +3847,77 @@ async def _handle_channel_creation(
             message="Channel creation conflicted with current state",
         )
     return _json_response(_serialize_created_channel(created), status=201)
+
+
+async def _handle_workshop_humans(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanDirectMessageService,
+) -> web.Response:
+    """List only the authenticated human's same-Workshop peers."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid Workshop humans request")
+    try:
+        snapshot = await service.list_peers(principal_id, WorkshopId(request.match_info["workshop_id"]))
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid Workshop humans request")
+    except WorkshopHumanDirectMessageAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopHumanDirectMessageConflict:
+        return _error_response(
+            status=409,
+            code="human_conversation_conflict",
+            message="Human conversation state is inconsistent",
+        )
+    return _json_response(_serialize_human_peers(snapshot), status=200)
+
+
+async def _handle_human_conversation_start(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanDirectMessageService,
+) -> web.Response:
+    """Start or reuse one private same-Workshop human conversation."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid human conversation request")
+    try:
+        conversation = await service.start(
+            principal_id,
+            WorkshopId(request.match_info["workshop_id"]),
+            PrincipalId(request.match_info["principal_id"]),
+        )
+    except (TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid human conversation request")
+    except WorkshopHumanDirectMessageAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopHumanDirectMessageConflict:
+        return _error_response(
+            status=409,
+            code="human_conversation_conflict",
+            message="Human conversation state is inconsistent",
+        )
+    except WorkshopHumanDirectMessageStorageError:
+        return _error_response(
+            status=503,
+            code="human_conversation_unavailable",
+            message="Human conversation creation is temporarily unavailable",
+        )
+    return _json_response(
+        _serialize_human_conversation(conversation),
+        status=201 if conversation.created else 200,
+    )
 
 
 async def _handle_channel_lifecycle_operation(
@@ -6650,6 +6774,7 @@ def register_workshop_read_routes(
         raise ValueError("Event-stream intervals must be positive")
     stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
     channel_lifecycle = WorkshopChannelLifecycleService(store)
+    human_direct_messages = WorkshopHumanDirectMessageService(store)
     agent_lifecycle = WorkshopAgentLifecycleService(store)
     human_notifications = WorkshopHumanNotificationService(store)
     channel_unread = WorkshopChannelUnreadService(store)
@@ -6692,6 +6817,22 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=channel_lifecycle,
+            )
+
+    async def handle_workshop_humans(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_workshop_humans(
+                request,
+                authenticator=authenticator,
+                service=human_direct_messages,
+            )
+
+    async def handle_human_conversation_start(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_conversation_start(
+                request,
+                authenticator=authenticator,
+                service=human_direct_messages,
             )
 
     async def handle_channel_archival(request: web.Request) -> web.Response:
@@ -7019,6 +7160,8 @@ def register_workshop_read_routes(
     app.router.add_post(_HUMAN_NOTIFICATION_READ_PATH, handle_human_notification_read)
     app.router.add_post(_HUMAN_NOTIFICATION_UNREAD_PATH, handle_human_notification_unread)
     app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
+    app.router.add_get(_WORKSHOP_HUMANS_PATH, handle_workshop_humans)
+    app.router.add_post(_HUMAN_CONVERSATION_PATH, handle_human_conversation_start)
     app.router.add_post(_CHANNEL_ARCHIVAL_PATH, handle_channel_archival)
     app.router.add_post(_CHANNEL_RESTORATION_PATH, handle_channel_restoration)
     app.router.add_get(_CHANNEL_MEMBERS_PATH, handle_channel_members)

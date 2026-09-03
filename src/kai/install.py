@@ -10240,18 +10240,37 @@ def _channel_lifecycle_status(db_path: Path) -> str:
                     "AND e.event_type IN ('channel.member_added', 'channel.member_removed'))))"
                 ).fetchone()[0]
             )
+            human_dm_counts = connection.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN "
+                "(SELECT COUNT(*) FROM channel_memberships cm WHERE cm.channel_id = c.id) = 2 "
+                "AND (SELECT COUNT(*) FROM channel_memberships cm JOIN principals p "
+                "ON p.id = cm.principal_id AND p.kind = 'human' WHERE cm.channel_id = c.id) = 2 "
+                "AND (SELECT COUNT(*) FROM channel_memberships cm JOIN workshop_memberships wm "
+                "ON wm.principal_id = cm.principal_id AND wm.workshop_id = c.workshop_id "
+                "WHERE cm.channel_id = c.id) = 2 "
+                "AND (SELECT COUNT(*) FROM channel_memberships cm "
+                "WHERE cm.channel_id = c.id AND cm.role = 'owner') = 2 "
+                "AND c.archived_at IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM channel_agent_runtime_assignments cara "
+                "WHERE cara.channel_id = c.id) THEN 1 ELSE 0 END) "
+                "FROM channels c WHERE c.kind = 'direct' "
+                "AND NOT EXISTS (SELECT 1 FROM channel_agents ca WHERE ca.channel_id = c.id) "
+                "AND NOT EXISTS (SELECT 1 FROM channel_bindings cb WHERE cb.channel_id = c.id)"
+            ).fetchone()
         finally:
             connection.close()
     except sqlite3.Error as exc:
         return f"{prefix} NOT VERIFIED ({exc})"
     total, active, archived = tuple(int(value or 0) for value in (totals or (0, 0, 0)))
     humans, owners, participants = tuple(int(value or 0) for value in (human_counts or (0, 0, 0)))
-    gaps = invalid + membership_invalid
+    human_dms, valid_human_dms = tuple(int(value or 0) for value in (human_dm_counts or (0, 0)))
+    human_dm_gaps = human_dms - valid_human_dms
+    gaps = invalid + membership_invalid + human_dm_gaps
     status = "active" if gaps == 0 else "INCOMPLETE"
     return (
         f"{prefix} {status}; group channels={total}, active={active}, "
         f"archived={archived}, human members={humans} (owners={owners}, participants={participants}), "
-        f"integrity gaps={gaps}; authority=canonical"
+        f"human DMs={human_dms} (invalid={human_dm_gaps}), integrity gaps={gaps}; authority=canonical"
     )
 
 

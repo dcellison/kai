@@ -1382,7 +1382,74 @@ class TestWorkshopNavigationHTTPContract:
                 }
             ]
             assert direct["agents"] == []
-            assert direct["can_submit_commands"] is False
+            assert direct["can_submit_commands"] is True
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_human_peer_discovery_and_conversation_start_are_principal_bound(self, tmp_path: Path):
+        store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute("SELECT id FROM workshops LIMIT 1") as cursor:
+            workshop_id = WorkshopId(str((await cursor.fetchone())[0]))
+        client = await _open_client(store, _Authenticator({"alice": alice_id, "bob": bob_id}))
+        try:
+            peers = await client.get(
+                f"/v1/workshops/{workshop_id}/humans",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert peers.status == 200
+            assert (await peers.json())["humans"] == [
+                {
+                    "principal_id": bob_id,
+                    "display_name": "Bob",
+                    "handle": "bob",
+                    "conversation_channel_id": None,
+                }
+            ]
+
+            created = await client.post(
+                f"/v1/workshops/{workshop_id}/humans/{bob_id}/conversation",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert created.status == 201
+            created_payload = await created.json()
+            channel_id = created_payload["conversation"]["channel_id"]
+            assert created_payload["created"] is True
+            assert created_payload["conversation"]["peer"]["principal_id"] == bob_id
+
+            reused = await client.post(
+                f"/v1/workshops/{workshop_id}/humans/{alice_id}/conversation",
+                headers={"Authorization": "Bearer bob"},
+            )
+            assert reused.status == 200
+            assert (await reused.json())["conversation"]["channel_id"] == channel_id
+
+            bob_navigation = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer bob"},
+            )
+            assert bob_navigation.status == 200
+            human_direct = next(
+                channel
+                for channel in (await bob_navigation.json())["workshops"][0]["channels"]
+                if channel["channel_id"] == channel_id
+            )
+            assert human_direct["agents"] == []
+            assert human_direct["participants"] == [
+                {
+                    "principal_id": alice_id,
+                    "kind": "human",
+                    "display_name": "Alice",
+                    "handle": "alice",
+                }
+            ]
+            assert human_direct["can_submit_commands"] is True
+
+            rejected = await client.post(
+                f"/v1/workshops/{workshop_id}/humans/{bob_id}/conversation?principal_id={alice_id}",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert rejected.status == 400
         finally:
             await client.close()
             await store.close()

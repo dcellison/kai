@@ -16,6 +16,7 @@ from kai.workshop.domain import (
     WorkshopEventType,
     WorkshopId,
 )
+from kai.workshop.human_direct_messages import is_canonical_human_direct_channel
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import AppendResult, WorkshopEventStore
 
@@ -234,6 +235,8 @@ async def resolve_message_wake_targets(
     ) as cursor:
         attached = [(AgentId(str(item[0])), PrincipalId(str(item[1]))) for item in await cursor.fetchall()]
     if kind == "direct":
+        if not attached and await is_canonical_human_direct_channel(store, channel_id):
+            return WakeDecision(())
         if len(attached) != 1:
             raise WakePolicyError("Inbound message must resolve to one human channel member and one attached agent")
         return WakeDecision((attached[0][0],))
