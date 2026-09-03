@@ -1283,6 +1283,14 @@ describe("Workshop React client", () => {
       "Notifications",
       "Agents",
     ]);
+    for (const name of ["Memory", "Mentions", "Following"]) {
+      expect(
+        within(navigationPanel).getByRole("button", { name }).querySelector(".workspace-nav-icon"),
+      ).toBeInTheDocument();
+    }
+    expect(
+      within(navigationPanel).getByRole("button", { name: "Following" }).querySelector("svg"),
+    ).toHaveAttribute("fill", "none");
   });
 
   it("refreshes Following from principal thread events", async () => {

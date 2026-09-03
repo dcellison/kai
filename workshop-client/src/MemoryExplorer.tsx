@@ -280,7 +280,16 @@ function MemoryEditorDialog({
               {editing ? `Correct ${isEpisode ? "episode" : "fact"}` : "Create fact"}
             </h2>
           </div>
-          <button type="button" className="quiet-button" disabled={saving} onClick={() => void closeSafely()}>Close</button>
+          <button
+            type="button"
+            className="panel-icon-button"
+            aria-label="Close memory editor"
+            title="Close memory editor"
+            disabled={saving}
+            onClick={() => void closeSafely()}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
         </header>
         <form onSubmit={(event) => void submit(event)}>
           {isEpisode ? (

@@ -421,6 +421,10 @@ describe("Workshop Memory explorer", () => {
     expect(addFact.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     await user.click(addFact);
     const dialog = screen.getByRole("dialog", { name: "Create fact" });
+    const closeEditor = within(dialog).getByRole("button", { name: "Close memory editor" });
+    expect(closeEditor).toHaveClass("panel-icon-button");
+    expect(closeEditor).toHaveAttribute("title", "Close memory editor");
+    expect(closeEditor.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     await user.type(screen.getByLabelText(/Content/), "A deliberately explicit fact.");
     await user.type(screen.getByLabelText(/Tags/), "qualification, explicit");
     await user.selectOptions(screen.getByLabelText("Recall scope"), "project:kai");
