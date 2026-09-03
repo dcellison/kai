@@ -63,8 +63,11 @@ users:
     # initial notification list. Omission grants no review/triage authority,
     # even to admins. `/github add` can add notification subscriptions but
     # never expands this operations allowlist. pr_review and issue_triage
-    # toggle automated processing. github_notify_chat_id sends notifications
-    # to a separate chat (e.g., a Telegram group) instead of the DM.
+    # toggle automated processing. At startup, a negative
+    # github_notify_chat_id seeds a canonical Workshop notification channel
+    # for that Telegram group. The seeded channel becomes the operator-policy
+    # default; live delivery uses the principal's canonical notification
+    # preference, which may select another authorized destination.
     # github_repos:
     #   - alice/my-project
     #   - alice/other-repo

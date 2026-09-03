@@ -1635,9 +1635,10 @@ class Config:
     # Issue triage agent: per-user toggle lives in users.yaml
     # `issue_triage` (or the per-chat /github triage command).
 
-    # GitHub notification routing is per-user: `github_notify_chat_id`
-    # in users.yaml, with /github notify as the per-chat override. When
-    # neither is set the runtime falls back to the user's own chat_id.
+    # A negative per-user `github_notify_chat_id` in users.yaml bootstraps a
+    # canonical Workshop notification channel as operator policy. Live GitHub
+    # delivery and `/github notify` use canonical per-principal notification
+    # preferences, with the principal's direct channel as the final fallback.
 
     # File retention: delete uploaded files older than this many days.
     # 0 = no cleanup (default). Cleanup runs once every 24 hours.
