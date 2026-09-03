@@ -3082,6 +3082,9 @@ describe("Workshop React client", () => {
     expect(closeCreation).toHaveAttribute("title", "Close agent creation");
     expect(closeCreation.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(within(creationDialog).queryByRole("button", { name: "Cancel" })).toBeNull();
+    expect(
+      within(creationDialog).getByLabelText(/Display name/).previousElementSibling,
+    ).toHaveClass("agent-field-hint-placeholder");
     await user.click(closeCreation);
     expect(screen.queryByRole("dialog", { name: "Create agent" })).toBeNull();
     expect(window.location.search).toBe("?view=agents");

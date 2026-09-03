@@ -3046,6 +3046,15 @@ button:disabled {
   margin-top: 1rem;
 }
 
+.agent-creation-dialog .agent-editor input,
+.agent-creation-dialog .agent-editor textarea {
+  background: var(--color-canvas-inset);
+}
+
+.agent-creation-dialog .agent-handle-input input {
+  background: transparent;
+}
+
 .agent-revision-list li {
   display: grid;
   grid-template-columns: minmax(8rem, 0.25fr) minmax(0, 1fr) auto;
@@ -3083,6 +3092,10 @@ button:disabled {
   color: var(--color-text-muted);
   font-size: 0.6rem;
   font-weight: 400;
+}
+
+.agent-field-hint-placeholder {
+  visibility: hidden;
 }
 
 .agent-handle-input {
@@ -3129,9 +3142,14 @@ button:disabled {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 0.5rem;
+  border: 1px solid var(--color-border-strong);
   padding: 0.55rem;
   border-radius: 0.35rem;
-  background: color-mix(in srgb, var(--color-text) 4%, transparent);
+  background: color-mix(
+    in srgb,
+    var(--color-canvas-inset) 72%,
+    var(--color-surface-raised)
+  );
   cursor: pointer;
 }
 

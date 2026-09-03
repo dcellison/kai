@@ -235,6 +235,12 @@ function AgentCreationForm({
             </label>
             <label>
               Display name
+              <span
+                className="agent-field-hint agent-field-hint-placeholder"
+                aria-hidden="true"
+              >
+                Optional guidance
+              </span>
               <input
                 maxLength={80}
                 required
