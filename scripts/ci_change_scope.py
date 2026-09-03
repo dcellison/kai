@@ -12,6 +12,7 @@ from pathlib import PurePosixPath
 _CLIENT_PREFIXES = ("workshop-client/", "src/kai/workshop/static/")
 _DOCUMENTATION_PREFIXES = ("docs/", "home/docs/", ".github/ISSUE_TEMPLATE/")
 _DOCUMENTATION_FILES = {
+    ".github/CI.md",
     "AGENTS.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
