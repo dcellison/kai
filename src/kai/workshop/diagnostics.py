@@ -1985,6 +1985,86 @@ def workshop_human_handle_status(db_path: Path) -> str:
     )
 
 
+def workshop_human_avatar_status(db_path: Path, avatar_root: Path) -> str:
+    """Report canonical avatar projection and normalized-file integrity."""
+    prefix = "Workshop human avatars:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical human-avatar schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if "principal_avatars" not in tables:
+                return f"{prefix} pending; canonical human-avatar schema unavailable"
+            rows = connection.execute(
+                "SELECT principal_id, state_version, active, media_type, byte_size, width, height, sha256 "
+                "FROM principal_avatars"
+            ).fetchall()
+        finally:
+            connection.close()
+        expected: dict[Path, tuple[int, str]] = {}
+        active = cleared = malformed = 0
+        resolved_root = avatar_root.resolve()
+        for row in rows:
+            principal_id = str(row[0])
+            version = int(row[1])
+            is_active = int(row[2]) == 1
+            metadata = row[3:]
+            if version <= 0:
+                malformed += 1
+            if is_active:
+                active += 1
+                media_type, byte_size, width, height, digest = metadata
+                if (
+                    media_type != "image/png"
+                    or not isinstance(byte_size, int)
+                    or byte_size <= 0
+                    or not isinstance(width, int)
+                    or width <= 0
+                    or not isinstance(height, int)
+                    or height <= 0
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    malformed += 1
+                    continue
+                expected[resolved_root / principal_id / f"{version}.png"] = (byte_size, digest)
+            else:
+                cleared += 1
+                if any(value is not None for value in metadata):
+                    malformed += 1
+        missing = corrupt = 0
+        for path, (byte_size, digest) in expected.items():
+            try:
+                if not path.exists():
+                    missing += 1
+                    continue
+                if path.is_symlink() or not path.is_file() or path.stat().st_size != byte_size:
+                    corrupt += 1
+                    continue
+                if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                    corrupt += 1
+            except OSError:
+                corrupt += 1
+        files: set[Path] = set()
+        if resolved_root.is_dir() and not resolved_root.is_symlink():
+            files = set(resolved_root.glob("*/*"))
+        orphaned = len(files - set(expected))
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if missing == 0 and corrupt == 0 and orphaned == 0 and malformed == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; states={len(rows)}, active={active}, cleared={cleared}, "
+        f"missing files={missing}, orphaned files={orphaned}, corrupt files={corrupt}, "
+        f"malformed={malformed}; authority=canonical"
+    )
+
+
 def workshop_human_notification_status(db_path: Path) -> str:
     """Report canonical human-notification projection and replay integrity."""
     prefix = "Workshop human notifications:"

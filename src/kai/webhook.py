@@ -92,6 +92,7 @@ from kai.workshop.github_automation import (
     WorkshopGitHubAutomationService,
 )
 from kai.workshop.github_settings import WorkshopGitHubSettingsService
+from kai.workshop.human_avatars import WorkshopHumanAvatarService
 from kai.workshop.integration_notifications import (
     DEFAULT_INTEGRATION_ROUTE,
     IntegrationNotification,
@@ -1899,6 +1900,7 @@ async def _register_workshop_client_api(
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
+    human_avatars: WorkshopHumanAvatarService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -1942,6 +1944,7 @@ async def _register_workshop_client_api(
             client_preferences=client_preferences,
             appearance_preferences=appearance_preferences,
             agent_enablement=agent_enablement,
+            human_avatars=human_avatars,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -2029,6 +2032,7 @@ async def start(
             client_preferences=getattr(core_services, "client_preferences", None),
             appearance_preferences=getattr(core_services, "appearance_preferences", None),
             agent_enablement=getattr(core_services, "agent_enablement", None),
+            human_avatars=getattr(core_services, "human_avatars", None),
         )
 
     _runner = web.AppRunner(

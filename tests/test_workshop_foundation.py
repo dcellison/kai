@@ -91,6 +91,7 @@ class TestEventEnvelope:
             "principal.created",
             "principal.handle_assigned",
             "principal.display_name_changed",
+            "principal.avatar_changed",
             "external_identity.bound",
             "channel.created",
             "channel.archived",
@@ -248,6 +249,7 @@ class TestWorkshopSchema:
             "channel_unread_migration_baselines",
             "channel_read_positions",
             "principal_direct_message_archives",
+            "principal_avatars",
             "thread_unread_authority_cutover",
             "thread_read_positions",
             "event_log",
@@ -255,7 +257,7 @@ class TestWorkshopSchema:
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 64
+        assert await workshop_store.schema_version() == 65
         async with workshop_store.connection.execute("PRAGMA table_info(principals)") as cursor:
             principal_columns = {str(row[1]) for row in await cursor.fetchall()}
         assert {"display_name_state_version", "display_name_event_position"} <= principal_columns
@@ -306,7 +308,7 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 64
+        assert await second.schema_version() == 65
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
@@ -338,7 +340,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             async with upgraded.connection.execute("SELECT id, lane, status FROM delivery_authority_epochs") as cursor:
                 assert tuple(await cursor.fetchone()) == (
                     epoch_id,
@@ -366,7 +368,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -448,6 +450,7 @@ class TestWorkshopSchema:
                     62,
                     63,
                     64,
+                    65,
                 ]
         finally:
             await upgraded.close()
@@ -470,7 +473,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
@@ -511,7 +514,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
@@ -564,7 +567,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
@@ -608,7 +611,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
@@ -652,7 +655,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -696,7 +699,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             assert {"delivery_outbox", "delivery_attempts", "delivery_fragments"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -800,7 +803,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             async with upgraded.connection.execute(
                 "SELECT message_id, channel_binding_id, transport, mode, status FROM deliveries WHERE id = ?",
                 (delivery_id,),
@@ -927,7 +930,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 64
+            assert await upgraded.schema_version() == 65
             async with upgraded.connection.execute(
                 "SELECT purpose, status, attempt_count FROM delivery_outbox WHERE id = ?",
                 (delivery_id,),

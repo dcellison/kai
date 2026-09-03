@@ -391,7 +391,7 @@ class TestRunExecutionRecovery:
 
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
 
-            assert checkpoint.version == 25
+            assert checkpoint.version == 26
             assert (await authority.attempt(started.claim.attempt_id)).status == RunAttemptStatus.STARTED
             assert (await WorkshopRunLifecycle(store).state(accepted.run.run_id)).status == RunStatus.STARTED
         finally:

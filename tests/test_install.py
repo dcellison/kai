@@ -8919,7 +8919,8 @@ class TestReviewedDependencyConstraints:
             "requests==2.33.0",
             "setuptools==83.0.0",
             "torch==2.13.0",
-            "tornado==6.5.7",
+            "tornado==6.5.8",
+            "transformers==5.10.1",
             "urllib3==2.7.0",
         } <= constraints
 

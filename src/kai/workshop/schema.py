@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 64
+WORKSHOP_SCHEMA_VERSION = 65
 
 
 @dataclass(frozen=True, slots=True)
@@ -2818,6 +2818,33 @@ _CANONICAL_HUMAN_PROFILE_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_HUMAN_AVATAR_SCHEMA = SchemaMigration(
+    version=65,
+    name="canonical_human_profile_avatars",
+    statements=(
+        """
+        CREATE TABLE principal_avatars (
+            principal_id TEXT PRIMARY KEY REFERENCES principals(id) ON DELETE CASCADE,
+            state_version INTEGER NOT NULL CHECK (state_version > 0),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            media_type TEXT,
+            byte_size INTEGER CHECK (byte_size IS NULL OR byte_size > 0),
+            width INTEGER CHECK (width IS NULL OR width > 0),
+            height INTEGER CHECK (height IS NULL OR height > 0),
+            sha256 TEXT,
+            event_position INTEGER NOT NULL UNIQUE REFERENCES event_log(position) ON DELETE RESTRICT,
+            CHECK (
+                (active = 1 AND media_type = 'image/png' AND byte_size IS NOT NULL
+                    AND width IS NOT NULL AND height IS NOT NULL AND length(sha256) = 64)
+                OR
+                (active = 0 AND media_type IS NULL AND byte_size IS NULL
+                    AND width IS NULL AND height IS NULL AND sha256 IS NULL)
+            )
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2883,6 +2910,7 @@ _MIGRATIONS = (
     _CANONICAL_FOLLOWED_THREAD_UNREAD_SCHEMA,
     _PRINCIPAL_DIRECT_MESSAGE_ARCHIVE_SCHEMA,
     _CANONICAL_HUMAN_PROFILE_SCHEMA,
+    _CANONICAL_HUMAN_AVATAR_SCHEMA,
 )
 
 
