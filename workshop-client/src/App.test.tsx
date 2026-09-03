@@ -3074,7 +3074,17 @@ describe("Workshop React client", () => {
       await screen.findByRole("heading", { name: "Create agent", level: 2 }),
     ).toBeVisible();
     expect(window.location.search).toBe("?view=agents&new=1");
-    await user.click(screen.getAllByRole("button", { name: "Cancel" })[0]);
+    const creationDialog = screen.getByRole("dialog", { name: "Create agent" });
+    const closeCreation = within(creationDialog).getByRole("button", {
+      name: "Close agent creation",
+    });
+    expect(closeCreation).toHaveClass("panel-icon-button");
+    expect(closeCreation).toHaveAttribute("title", "Close agent creation");
+    expect(closeCreation.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+    expect(within(creationDialog).queryByRole("button", { name: "Cancel" })).toBeNull();
+    await user.click(closeCreation);
+    expect(screen.queryByRole("dialog", { name: "Create agent" })).toBeNull();
+    expect(window.location.search).toBe("?view=agents");
     const manageKai = screen.getByRole("button", { name: "Manage Kai" });
     await user.click(manageKai);
 
@@ -3125,9 +3135,24 @@ describe("Workshop React client", () => {
     expect(createAgent).toBeVisible();
 
     await user.click(createAgent);
-    expect(
-      await screen.findByRole("heading", { name: "Create agent", level: 2 }),
-    ).toBeVisible();
+    const creationDialog = await screen.findByRole("dialog", { name: "Create agent" });
+    await user.type(within(creationDialog).getByLabelText(/Stable handle/), "draft_agent");
+    await user.click(within(creationDialog).getByRole("button", {
+      name: "Close agent creation",
+    }));
+    const confirmation = screen.getByRole("dialog", { name: "Continue?" });
+    expect(confirmation).toHaveTextContent("Discard your unsaved agent changes?");
+    await user.click(within(confirmation).getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("dialog", { name: "Create agent" })).toBeVisible();
+    await user.click(within(creationDialog).getByRole("button", {
+      name: "Close agent creation",
+    }));
+    await user.click(within(screen.getByRole("dialog", { name: "Continue?" })).getByRole(
+      "button",
+      { name: "Continue" },
+    ));
+    expect(screen.queryByRole("dialog", { name: "Create agent" })).toBeNull();
+    expect(window.location.search).toBe("?view=agents");
   });
 
   it("keeps active agents in the sidebar and owner drafts in the inactive browser", async () => {
