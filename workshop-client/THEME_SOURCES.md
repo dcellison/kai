@@ -1,4 +1,4 @@
-# Workshop theme catalog
+# Workshop theme sources
 
 Kai Workshop maps curated source palettes onto its semantic color-token
 contract. The source palettes provide each theme's identity; a small number of
