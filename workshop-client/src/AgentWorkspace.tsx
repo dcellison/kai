@@ -92,6 +92,25 @@ function activeRevision(agent: WorkshopAgentDefinition) {
   ) ?? null;
 }
 
+function ConversationIcon(): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path
+        d="M20 15a3 3 0 0 1-3 3H9l-5 3V7a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3z"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
 function formatTimestamp(value: string): string {
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime())
@@ -685,6 +704,48 @@ export function AgentWorkspace({
     active: definitions.filter((item) => item.lifecycleState === "active").length,
     enabled: enablements.filter((item) => item.lifecycleState === "enabled").length,
   }), [definitions, enablements]);
+  const executionProfileControl =
+    selected &&
+    enablement?.canManage &&
+    enablement.eligibleRuntimes.length > 1 ? (
+      <details className="settings-card agent-execution-profile-card">
+        <summary>Advanced execution profile</summary>
+        <p>
+          Choose which authorized execution context sponsors @{selected.handle}.
+          Backend and model choices remain in Runtime settings.
+        </p>
+        <label>
+          Execution profile
+          <select
+            value={runtimeProfileId}
+            disabled={busy}
+            onChange={(event) => setRuntimeProfileId(event.target.value)}
+          >
+            {enablement.eligibleRuntimes.map((runtime) => (
+              <option
+                value={runtime.runtimeProfileId}
+                key={runtime.runtimeProfileId}
+              >
+                {runtime.displayName}
+              </option>
+            ))}
+          </select>
+        </label>
+        {enablement.lifecycleState === "enabled" &&
+          runtimeProfileId !== enablement.runtimeProfileId && (
+            <div className="settings-actions">
+              <button
+                className="quiet-button"
+                type="button"
+                disabled={busy || !runtimeProfileId}
+                onClick={() => void enable()}
+              >
+                {busy ? "Updating…" : "Change execution profile"}
+              </button>
+            </div>
+          )}
+      </details>
+    ) : null;
 
   return (
     <main className="agent-workspace" aria-label="Agents workspace">
@@ -743,6 +804,24 @@ export function AgentWorkspace({
                     <span className={`agent-status ${selected.lifecycleState}`}>
                       {selected.lifecycleState}
                     </span>
+                    {selected.lifecycleState === "active" &&
+                      enablement?.lifecycleState === "enabled" &&
+                      enablement.directChannelId && (
+                        <button
+                          className="panel-icon-button agent-conversation-button"
+                          type="button"
+                          aria-label={`${
+                            enablement.conversationStarted ? "Open" : "Start"
+                          } conversation with ${selected.displayName}`}
+                          title={`${
+                            enablement.conversationStarted ? "Open" : "Start"
+                          } conversation with ${selected.displayName}`}
+                          disabled={busy}
+                          onClick={() => void startConversation()}
+                        >
+                          <ConversationIcon />
+                        </button>
+                      )}
                   </div>
                   <p className="agent-handle">@{selected.handle}</p>
                   <p>{selected.description || "No description has been provided."}</p>
@@ -761,96 +840,86 @@ export function AgentWorkspace({
                 </p>
               </section>
 
-              {selected.lifecycleState === "active" && enablement && (
+              {selected.lifecycleState === "active" &&
+                enablement &&
+                !enablement.canManage && (
                 <section className="agent-enablement-card">
                   <div>
-                    <p className="overline">
-                      {enablement.canManage ? "Owner runtime" : "Conversation access"}
-                    </p>
+                    <p className="overline">Conversation access</p>
                     <h3>
                       {enablement.lifecycleState === "enabled"
-                        ? enablement.canManage ? "Runtime active" : "Available to you"
-                        : enablement.canManage
-                          ? "Available to enable"
-                          : "Conversation available"}
+                        ? "Available to you"
+                        : "Conversation available"}
                     </h3>
                   </div>
-                  {enablement.canManage && enablement.eligibleRuntimes.length > 0 ? (
-                    <label>
-                      Authorized runtime
-                      <select
-                        value={runtimeProfileId}
-                        disabled={busy}
-                        onChange={(event) => setRuntimeProfileId(event.target.value)}
-                      >
-                        {enablement.eligibleRuntimes.map((runtime) => (
-                          <option
-                            value={runtime.runtimeProfileId}
-                            key={runtime.runtimeProfileId}
-                          >
-                            {runtime.displayName}
-                            {runtime.backendOptions.length > 0
-                              ? ` · ${runtime.backendOptions.join(", ")}`
-                              : ""}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  ) : enablement.canManage ? (
-                    <p className="agent-state-copy">
-                      No authorized runtime can satisfy this agent yet.
-                    </p>
-                  ) : null}
-                  <div className="form-actions">
-                    {enablement.lifecycleState === "enabled" &&
-                      enablement.directChannelId && (
-                        <button
-                          className="primary-button"
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void startConversation()}
-                        >
-                          Start conversation
-                        </button>
-                      )}
-                    {!enablement.canManage &&
-                      enablement.lifecycleState !== "enabled" &&
-                      enablement.eligibleRuntimes.length > 0 && (
+                  {enablement.lifecycleState !== "enabled" &&
+                    enablement.eligibleRuntimes.length > 0 && (
+                      <div className="form-actions">
                         <button
                           className="primary-button"
                           type="button"
                           disabled={busy}
                           onClick={() => void enable()}
                         >
-                          Start conversation
+                          Enable conversation
                         </button>
-                      )}
-                    {enablement.canManage && enablement.eligibleRuntimes.length > 0 &&
-                      (enablement.lifecycleState !== "enabled" ||
-                        runtimeProfileId !== enablement.runtimeProfileId) && (
-                        <button
-                          className={
-                            enablement.lifecycleState === "enabled"
-                              ? "quiet-button"
-                              : "primary-button"
-                          }
-                          type="button"
-                          disabled={busy || !runtimeProfileId}
-                          onClick={() => void enable()}
-                        >
-                          {busy
-                            ? "Updating…"
-                            : enablement.lifecycleState === "enabled"
-                              ? "Change runtime"
-                              : "Enable agent"}
-                        </button>
-                      )}
-                  </div>
+                      </div>
+                    )}
                 </section>
               )}
 
+              {selected.lifecycleState === "active" &&
+                enablement?.canManage &&
+                enablement.lifecycleState !== "enabled" && (
+                  <section
+                    className="agent-runtime-controls agent-runtime-setup"
+                    aria-label={`${selected.displayName} runtime settings`}
+                    id="agent-runtime-settings"
+                  >
+                    <section className="settings-section">
+                      <div>
+                        <h2>Runtime settings</h2>
+                        <p>
+                          Enable this agent on one of your authorized execution
+                          profiles before choosing its backend, model, and workspace.
+                        </p>
+                      </div>
+                      <div className="settings-card-stack">
+                        <article className="settings-card agent-runtime-setup-card">
+                          <p className="settings-card-label">Enable agent</p>
+                          {enablement.eligibleRuntimes.length === 0 ? (
+                            <p>
+                              No authorized execution profile can satisfy this agent yet.
+                            </p>
+                          ) : (
+                            <>
+                              <p>
+                                {enablement.eligibleRuntimes.length === 1
+                                  ? "Your authorized execution profile will be used automatically."
+                                  : "An eligible execution profile is selected. Use Advanced execution profile to choose another."}
+                              </p>
+                              <div className="settings-actions">
+                                <button
+                                  className="primary-button"
+                                  type="button"
+                                  disabled={busy || !runtimeProfileId}
+                                  onClick={() => void enable()}
+                                >
+                                  {busy ? "Enabling…" : "Enable agent"}
+                                </button>
+                              </div>
+                            </>
+                          )}
+                        </article>
+                        {executionProfileControl}
+                      </div>
+                    </section>
+                  </section>
+                )}
+
               {runtimeSession && selected && canManage && (
                 <AgentRuntimeControls
+                  executionProfileControl={executionProfileControl}
                   isAdministrator={isAdministrator}
                   onAuthenticationFailure={onAuthenticationFailure}
                   onChannelAccessFailure={onChannelAccessFailure}
