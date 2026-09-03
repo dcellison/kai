@@ -3024,6 +3024,11 @@ describe("Workshop React client", () => {
   });
 
   it("explains that an archived agent conversation is permanently read-only", async () => {
+    const user = userEvent.setup();
+    const archivedDefinition: WorkshopAgentDefinition = {
+      ...agentDefinition,
+      lifecycleState: "archived",
+    };
     const archivedNavigation: WorkshopNavigation = {
       ...navigation,
       workshops: navigation.workshops.map((workshop) => ({
@@ -3043,6 +3048,8 @@ describe("Workshop React client", () => {
       })),
     };
     vi.mocked(loadNavigation).mockResolvedValue(archivedNavigation);
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([archivedDefinition]);
+    vi.mocked(loadAgentEnablements).mockResolvedValue([]);
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "existing-session" }),
@@ -3059,6 +3066,78 @@ describe("Workshop React client", () => {
       screen.queryByText(
         "Sending messages from Workshop is not available for this conversation yet.",
       ),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "Kai" })).toBeNull();
+
+    await user.click(
+      screen.getByRole("button", { name: "Your drafts and archived agents" }),
+    );
+    const archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
+    expect(within(archive).getByText("Kai")).toBeVisible();
+    const openArchivedConversation = within(archive).getByRole("button", {
+      name: "Open archived conversation with Kai",
+    });
+    expect(openArchivedConversation).toBeVisible();
+    expect(
+      within(archive).getByRole("button", { name: "View archived agent Kai" }),
+    ).toBeVisible();
+    await user.click(openArchivedConversation);
+    expect(screen.queryByRole("dialog", { name: "Drafts and archive" })).toBeNull();
+    expect(
+      await screen.findByText(
+        "This agent has been archived. This conversation is read-only.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("gives a nonowner access to an archived conversation only through the agent archive", async () => {
+    const archivedNavigation: WorkshopNavigation = {
+      ...navigation,
+      principal: {
+        displayName: "Scott",
+        handle: "scott",
+        principalId: "prn_99999999999999999999999999999999",
+      },
+      workshops: navigation.workshops.map((workshop) => ({
+        ...workshop,
+        channels: workshop.channels.map((channel) =>
+          channel.channelId === channelId
+            ? {
+                ...channel,
+                agents: channel.agents.map((agent) => ({
+                  ...agent,
+                  lifecycleState: "archived",
+                  sponsorDisplayName: "Daniel",
+                })),
+                canSubmitCommands: false,
+              }
+            : channel,
+        ),
+      })),
+    };
+    vi.mocked(loadNavigation).mockResolvedValue(archivedNavigation);
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([]);
+    vi.mocked(loadAgentEnablements).mockResolvedValue([]);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    expect(screen.queryByRole("button", { name: "Kai" })).toBeNull();
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Your drafts and archived agents" }),
+    );
+    const archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
+    expect(
+      within(archive).getByRole("button", {
+        name: "Open archived conversation with Kai",
+      }),
+    ).toBeVisible();
+    expect(
+      within(archive).queryByRole("button", { name: "View archived agent Kai" }),
     ).toBeNull();
   });
 
