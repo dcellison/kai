@@ -862,6 +862,7 @@ class TestNotificationChatIdMutations:
                 "/v1/client/unread",
                 "/v1/client/unread/events",
                 "/v1/client/followed-threads",
+                "/v1/settings/profile",
                 "/v1/client/notifications/read",
                 "/v1/client/notifications/{notification_id}/read",
                 "/v1/client/notifications/{notification_id}/unread",

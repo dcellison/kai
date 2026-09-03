@@ -13,6 +13,7 @@ import {
   ChannelAccessError,
   deactivateOperatorModel,
   loadAppearancePreferences,
+  loadHumanProfile,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadGitHubSettings,
@@ -36,6 +37,7 @@ import {
   updateChannelNotificationPolicy,
   updateClientPreference,
   updateAppearancePreference,
+  updateHumanDisplayName,
   updateWorkspaceConfig,
 } from "./api";
 import type {
@@ -52,6 +54,7 @@ import type {
   WorkshopClientPreferences,
   WorkshopClientPreferenceChange,
   WorkshopAppearancePreferences,
+  WorkshopHumanProfile,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
@@ -190,6 +193,7 @@ type SettingsWorkspaceContentProps = {
   onChannelAccessFailure: (message: string) => void;
   onClose: () => void;
   onDirtyChange: (dirty: boolean) => void;
+  onNavigationChanged?: () => Promise<void>;
   isAdministrator: boolean;
   principalName: string;
   roleLabel: string;
@@ -206,6 +210,7 @@ function SettingsWorkspaceContent({
   onChannelAccessFailure,
   onClose,
   onDirtyChange,
+  onNavigationChanged,
   isAdministrator,
   principalName,
   roleLabel,
@@ -224,6 +229,12 @@ function SettingsWorkspaceContent({
   const [preferenceBusy, setPreferenceBusy] = useState(false);
   const [preferenceError, setPreferenceError] = useState<string | null>(null);
   const [preferenceNotice, setPreferenceNotice] = useState<string | null>(null);
+  const [profile, setProfile] = useState<WorkshopHumanProfile | null>(null);
+  const [profileDraft, setProfileDraft] = useState("");
+  const [profileLoading, setProfileLoading] = useState(true);
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
 
   const [runtime, setRuntime] = useState<WorkshopSettingsWorkspace | null>(null);
   const [workspaceConfig, setWorkspaceConfig] = useState<WorkshopWorkspaceConfig | null>(null);
@@ -300,6 +311,7 @@ function SettingsWorkspaceContent({
     : "settings-title";
 
   const preferenceDirty = preference !== null && preferenceDraft !== preference.content;
+  const profileDirty = profile !== null && profileDraft.trim() !== profile.displayName;
   const preferenceBytes = useMemo(
     () => new TextEncoder().encode(preferenceDraft).length,
     [preferenceDraft],
@@ -386,6 +398,22 @@ function SettingsWorkspaceContent({
       setPreferenceLoading(false);
     }
   }, [adoptPreference, handleAccessFailure, session]);
+
+  const refreshProfile = useCallback(async (): Promise<void> => {
+    setProfileLoading(true);
+    setProfileError(null);
+    try {
+      const snapshot = await loadHumanProfile(session);
+      setProfile(snapshot);
+      setProfileDraft(snapshot.displayName);
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setProfileError(errorText(caught, "Could not load your profile."));
+      }
+    } finally {
+      setProfileLoading(false);
+    }
+  }, [handleAccessFailure, session]);
 
   const adoptRuntime = useCallback((snapshot: WorkshopSettingsWorkspace): void => {
     setRuntime(snapshot);
@@ -625,6 +653,7 @@ function SettingsWorkspaceContent({
       void refreshRuntime();
     } else {
       void refreshPreferences();
+      void refreshProfile();
       void refreshGitHub();
       void refreshNotifications();
       void refreshChannelNotifications();
@@ -639,16 +668,17 @@ function SettingsWorkspaceContent({
     refreshChannelNotifications,
     refreshNotifications,
     refreshPreferences,
+    refreshProfile,
     refreshRuntime,
   ]);
 
   useEffect(() => {
-    onDirtyChange(preferenceDirty);
+    onDirtyChange(preferenceDirty || profileDirty);
     return () => onDirtyChange(false);
-  }, [onDirtyChange, preferenceDirty]);
+  }, [onDirtyChange, preferenceDirty, profileDirty]);
 
   useEffect(() => {
-    if (!preferenceDirty) {
+    if (!preferenceDirty && !profileDirty) {
       return;
     }
     const warn = (event: BeforeUnloadEvent): void => {
@@ -657,7 +687,40 @@ function SettingsWorkspaceContent({
     };
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
-  }, [preferenceDirty]);
+  }, [preferenceDirty, profileDirty]);
+
+  const saveProfile = async (): Promise<void> => {
+    if (!profile || !profileDirty) {
+      return;
+    }
+    setProfileBusy(true);
+    setProfileError(null);
+    setProfileNotice(null);
+    try {
+      const operationId = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `profile-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const saved = await updateHumanDisplayName(
+        session,
+        profileDraft,
+        profile.stateVersion,
+        operationId,
+      );
+      setProfile(saved);
+      setProfileDraft(saved.displayName);
+      setProfileNotice(saved.mutation?.changed ? "Display name saved." : "No change was needed.");
+      await onNavigationChanged?.();
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshProfile();
+        setProfileError("Your profile changed elsewhere. The latest display name has been reloaded.");
+      } else if (!handleAccessFailure(caught)) {
+        setProfileError(errorText(caught, "Could not save your display name."));
+      }
+    } finally {
+      setProfileBusy(false);
+    }
+  };
 
   const savePreferences = async (
     revision = preference?.revision ?? "",
@@ -1111,10 +1174,47 @@ function SettingsWorkspaceContent({
             <p className="section-number">01</p>
             <h2>Personal preferences</h2>
             <p>
-              Principal-wide guidance supplied to your agents. This is private to
-              your Workshop identity and is not semantic memory.
+              Your Workshop profile and principal-wide guidance supplied to your agents.
             </p>
           </div>
+          {profileLoading ? (
+            <p role="status">Loading profile…</p>
+          ) : profile ? (
+            <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void saveProfile(); }}>
+              <p className="settings-card-label">Profile</p>
+              <label htmlFor="profile-display-name">Display name</label>
+              <input
+                id="profile-display-name"
+                type="text"
+                maxLength={200}
+                value={profileDraft}
+                disabled={profileBusy}
+                onChange={(event) => {
+                  setProfileDraft(event.target.value);
+                  setProfileNotice(null);
+                }}
+              />
+              <p className="settings-help">
+                Your name is shown throughout Workshop. Your unique handle remains @{profile.handle}.
+              </p>
+              <div className="settings-actions">
+                <button
+                  className="primary-button"
+                  type="submit"
+                  disabled={profileBusy || !profileDirty || profileDraft.trim().length === 0}
+                >
+                  {profileBusy ? "Saving…" : "Save display name"}
+                </button>
+              </div>
+              {profileNotice && <p className="settings-notice" role="status">{profileNotice}</p>}
+              {profileError && <p className="settings-error" role="alert">{profileError}</p>}
+            </form>
+          ) : (
+            <div className="settings-failure">
+              <p role="alert">{profileError ?? "Profile is unavailable."}</p>
+              <button className="quiet-button" type="button" onClick={() => void refreshProfile()}>Retry</button>
+            </div>
+          )}
           {preferenceLoading ? (
             <p role="status">Loading preferences…</p>
           ) : preference ? (

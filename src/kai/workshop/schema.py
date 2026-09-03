@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 63
+WORKSHOP_SCHEMA_VERSION = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -2807,6 +2807,17 @@ _PRINCIPAL_DIRECT_MESSAGE_ARCHIVE_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_HUMAN_PROFILE_SCHEMA = SchemaMigration(
+    version=64,
+    name="canonical_human_profile_display_names",
+    statements=(
+        "ALTER TABLE principals ADD COLUMN display_name_state_version "
+        "INTEGER NOT NULL DEFAULT 0 CHECK (display_name_state_version >= 0)",
+        "ALTER TABLE principals ADD COLUMN display_name_event_position "
+        "INTEGER REFERENCES event_log(position) ON DELETE RESTRICT",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2871,6 +2882,7 @@ _MIGRATIONS = (
     _CANONICAL_CHANNEL_READ_POSITION_BOUNDARY_REPAIR_SCHEMA,
     _CANONICAL_FOLLOWED_THREAD_UNREAD_SCHEMA,
     _PRINCIPAL_DIRECT_MESSAGE_ARCHIVE_SCHEMA,
+    _CANONICAL_HUMAN_PROFILE_SCHEMA,
 )
 
 

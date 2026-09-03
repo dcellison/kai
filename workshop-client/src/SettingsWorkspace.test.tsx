@@ -7,6 +7,7 @@ import {
   deactivateOperatorModel,
   loadAppearancePreferences,
   loadGitHubSettings,
+  loadHumanProfile,
   loadNotificationPreferences,
   loadChannelNotificationPolicy,
   loadClientPreferences,
@@ -23,6 +24,7 @@ import {
   switchWorkspace,
   upsertOperatorModel,
   updateGitHubSettings,
+  updateHumanDisplayName,
   updateNotificationPreference,
   updateChannelNotificationPolicy,
   updateClientPreference,
@@ -40,6 +42,7 @@ import type {
   WorkshopChannelNotificationPolicy,
   WorkshopClientPreferences,
   WorkshopAppearancePreferences,
+  WorkshopHumanProfile,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
 } from "./types";
@@ -50,6 +53,7 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     loadPreferenceDocument: vi.fn(),
     loadGitHubSettings: vi.fn(),
+    loadHumanProfile: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadChannelNotificationPolicy: vi.fn(),
     loadClientPreferences: vi.fn(),
@@ -66,6 +70,7 @@ vi.mock("./api", async (importOriginal) => {
     upsertOperatorModel: vi.fn(),
     deactivateOperatorModel: vi.fn(),
     updateGitHubSettings: vi.fn(),
+    updateHumanDisplayName: vi.fn(),
     updateNotificationPreference: vi.fn(),
     updateChannelNotificationPolicy: vi.fn(),
     updateClientPreference: vi.fn(),
@@ -85,6 +90,14 @@ const appearancePreferences: WorkshopAppearancePreferences = {
   revision: "apr_current",
   themeId: "atom-one-dark",
   themes: WORKSHOP_THEME_CATALOG.map((theme) => ({ ...theme })),
+};
+
+const humanProfile: WorkshopHumanProfile = {
+  principalId: "prn_00000000000000000000000000000001",
+  displayName: "Daniel",
+  handle: "daniel",
+  stateVersion: 0,
+  mutation: null,
 };
 
 const preference: WorkshopPreferenceDocument = {
@@ -352,6 +365,7 @@ function renderSettings(
   runActive = false,
   onChannelAccessFailure = vi.fn(),
   isAdministrator = true,
+  onNavigationChanged = vi.fn().mockResolvedValue(undefined),
 ): void {
   render(
     <SettingsWorkspace
@@ -359,6 +373,7 @@ function renderSettings(
       onChannelAccessFailure={onChannelAccessFailure}
       onClose={vi.fn()}
       onDirtyChange={onDirtyChange}
+      onNavigationChanged={onNavigationChanged}
       isAdministrator={isAdministrator}
       principalName="Daniel"
       roleLabel="Workshop administrator"
@@ -414,6 +429,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
+    vi.mocked(loadHumanProfile).mockResolvedValue(humanProfile);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
     vi.mocked(loadChannelNotificationPolicy).mockResolvedValue(channelNotificationPolicy);
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
@@ -437,6 +453,12 @@ describe("Settings workspace", () => {
     vi.mocked(deactivateOperatorModel).mockResolvedValue(modelCatalogue);
     vi.mocked(updateRuntimeSettings).mockResolvedValue(runtime);
     vi.mocked(updateGitHubSettings).mockResolvedValue(githubSettings);
+    vi.mocked(updateHumanDisplayName).mockResolvedValue({
+      ...humanProfile,
+      displayName: "Daniel Example",
+      stateVersion: 1,
+      mutation: { changed: true, replayed: false },
+    });
     vi.mocked(updateNotificationPreference).mockResolvedValue(notificationPreferences);
     vi.mocked(updateChannelNotificationPolicy).mockResolvedValue(channelNotificationPolicy);
     vi.mocked(updateClientPreference).mockResolvedValue(clientPreferences);
@@ -500,6 +522,28 @@ describe("Settings workspace", () => {
       "location",
     );
     expect(editor).toHaveValue(`${preference.content}Unsaved navigation draft`);
+  });
+
+  it("updates the principal display name while showing the immutable handle", async () => {
+    const user = userEvent.setup();
+    const onNavigationChanged = vi.fn().mockResolvedValue(undefined);
+    renderSettings(vi.fn(), false, vi.fn(), true, onNavigationChanged);
+
+    const input = await screen.findByLabelText("Display name");
+    expect(input).toHaveValue("Daniel");
+    expect(screen.getByText(/unique handle remains @daniel/)).toBeVisible();
+    await user.clear(input);
+    await user.type(input, "Daniel Example");
+    await user.click(screen.getByRole("button", { name: "Save display name" }));
+
+    await waitFor(() => expect(updateHumanDisplayName).toHaveBeenCalledWith(
+      session,
+      "Daniel Example",
+      0,
+      expect.any(String),
+    ));
+    expect(onNavigationChanged).toHaveBeenCalledOnce();
+    expect(await screen.findByText("Display name saved.")).toBeVisible();
   });
 
   it("keeps agent model refresh available in a compact catalogue for members", async () => {

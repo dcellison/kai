@@ -164,6 +164,15 @@ from kai.workshop.human_notifications import (
     WorkshopHumanNotificationService,
     WorkshopHumanNotificationValidationError,
 )
+from kai.workshop.human_profiles import (
+    HumanProfileSnapshot,
+    WorkshopHumanProfileAccessDenied,
+    WorkshopHumanProfileConflict,
+    WorkshopHumanProfileError,
+    WorkshopHumanProfileService,
+    WorkshopHumanProfileStorageError,
+    WorkshopHumanProfileValidationError,
+)
 from kai.workshop.inbound import ClientInboundMessage, InboundBindingNotFoundError
 from kai.workshop.memory_queries import (
     DEFAULT_PAGE_SIZE,
@@ -330,6 +339,7 @@ _NOTIFICATION_PREFERENCES_PATH = "/v1/settings/notifications"
 _CHANNEL_NOTIFICATION_POLICY_PATH = "/v1/settings/channel-notifications"
 _CLIENT_PREFERENCES_PATH = "/v1/settings/clients"
 _APPEARANCE_PREFERENCES_PATH = "/v1/settings/appearance"
+_HUMAN_PROFILE_PATH = "/v1/settings/profile"
 _HUMAN_NOTIFICATIONS_PATH = "/v1/client/notifications"
 _HUMAN_NOTIFICATION_COUNTS_PATH = "/v1/client/notifications/counts"
 _HUMAN_NOTIFICATION_EVENTS_PATH = "/v1/client/notifications/events"
@@ -389,6 +399,8 @@ _CLIENT_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "binding_choice_id", 
 _MAX_CLIENT_PREFERENCE_BODY_BYTES = 2_048
 _APPEARANCE_PREFERENCE_REQUEST_FIELDS = frozenset({"revision", "theme_id"})
 _MAX_APPEARANCE_PREFERENCE_BODY_BYTES = 1_024
+_HUMAN_PROFILE_REQUEST_FIELDS = frozenset({"display_name", "expected_state_version", "client_operation_id"})
+_MAX_HUMAN_PROFILE_BODY_BYTES = 2_048
 _MAX_HUMAN_NOTIFICATION_BODY_BYTES = 32_768
 _HUMAN_NOTIFICATION_STATE_FIELDS = frozenset({"expected_state_version", "client_operation_id"})
 _HUMAN_NOTIFICATION_BULK_FIELDS = frozenset({"notifications", "client_operation_id"})
@@ -772,6 +784,24 @@ def _serialize_appearance_preferences(
                 "changed": snapshot.mutation.changed,
             }
             if snapshot.mutation is not None
+            else None
+        ),
+    }
+
+
+def _serialize_human_profile(snapshot: HumanProfileSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "principal_id": str(snapshot.principal_id),
+        "display_name": snapshot.display_name,
+        "handle": snapshot.handle,
+        "state_version": snapshot.state_version,
+        "mutation": (
+            {
+                "changed": snapshot.mutation_changed,
+                "replayed": snapshot.replayed,
+            }
+            if snapshot.mutation_changed is not None
             else None
         ),
     }
@@ -2552,6 +2582,76 @@ async def _handle_appearance_preference_update(
     except WorkshopAppearancePreferenceError as exc:
         return _appearance_preference_error_response(exc)
     return _json_response(_serialize_appearance_preferences(snapshot), status=200)
+
+
+def _human_profile_error_response(exc: WorkshopHumanProfileError) -> web.Response:
+    if isinstance(exc, WorkshopHumanProfileConflict):
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    if isinstance(exc, WorkshopHumanProfileValidationError):
+        return _error_response(status=400, code="invalid_setting", message=str(exc))
+    if isinstance(exc, WorkshopHumanProfileAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopHumanProfileStorageError):
+        return _error_response(status=503, code="profile_unavailable", message="Profile is temporarily unavailable")
+    return _error_response(status=503, code="profile_unavailable", message="Profile is temporarily unavailable")
+
+
+async def _handle_human_profile(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanProfileService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid profile request")
+    try:
+        snapshot = await service.inspect(principal_id)
+    except WorkshopHumanProfileError as exc:
+        return _human_profile_error_response(exc)
+    return _json_response(_serialize_human_profile(snapshot), status=200)
+
+
+async def _handle_human_profile_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopHumanProfileService,
+) -> web.Response:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid profile request")
+    try:
+        if request.content_type != "application/json":
+            raise WorkshopHumanProfileValidationError("Content-Type must be application/json")
+        if request.content_length is not None and request.content_length > _MAX_HUMAN_PROFILE_BODY_BYTES:
+            raise WorkshopHumanProfileValidationError("Profile request is too large")
+        raw = await request.content.read(_MAX_HUMAN_PROFILE_BODY_BYTES + 1)
+        if len(raw) > _MAX_HUMAN_PROFILE_BODY_BYTES:
+            raise WorkshopHumanProfileValidationError("Profile request is too large")
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise WorkshopHumanProfileValidationError("Invalid JSON request") from exc
+        if not isinstance(payload, dict) or set(payload) != _HUMAN_PROFILE_REQUEST_FIELDS:
+            raise WorkshopHumanProfileValidationError("Invalid profile request")
+        snapshot = await service.update_display_name(
+            principal_id,
+            payload.get("display_name"),
+            expected_state_version=payload.get("expected_state_version"),
+            client_operation_id=payload.get("client_operation_id"),
+        )
+    except WorkshopHumanProfileError as exc:
+        return _human_profile_error_response(exc)
+    return _json_response(_serialize_human_profile(snapshot), status=200)
 
 
 async def _handle_runtime_settings(
@@ -4979,11 +5079,13 @@ async def _read_agent_lifecycle_event_records(
         WorkshopEventType.PRINCIPAL_DIRECT_MESSAGE_ARCHIVED,
         WorkshopEventType.PRINCIPAL_DIRECT_MESSAGE_RESTORED,
     )
+    profile_event_types = (WorkshopEventType.PRINCIPAL_DISPLAY_NAME_CHANGED,)
     queried_types = (
         definition_event_types
         + enablement_event_types
         + membership_event_types
         + direct_message_archive_event_types
+        + profile_event_types
         + (WorkshopEventType.MESSAGE_CREATED,)
     )
     visible_definition_types = (
@@ -5026,6 +5128,8 @@ async def _read_agent_lifecycle_event_records(
                     visible = await visibility_cursor.fetchone() is not None
             if not visible:
                 continue
+            event_name = "workshop.navigation.changed"
+        elif event_type in profile_event_types:
             event_name = "workshop.navigation.changed"
         elif event_type in direct_message_archive_event_types:
             if row[6] != principal_id:
@@ -6899,6 +7003,7 @@ def register_workshop_read_routes(
     channel_lifecycle = WorkshopChannelLifecycleService(store)
     direct_message_archives = WorkshopDirectMessageArchiveService(store)
     human_direct_messages = WorkshopHumanDirectMessageService(store)
+    human_profiles = WorkshopHumanProfileService(store)
     agent_lifecycle = WorkshopAgentLifecycleService(store)
     human_notifications = WorkshopHumanNotificationService(store)
     channel_unread = WorkshopChannelUnreadService(store)
@@ -7363,6 +7468,25 @@ def register_workshop_read_routes(
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
     app.router.add_put(_MESSAGE_REACTIONS_PATH, handle_message_reaction)
+
+    async def handle_human_profile(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_profile(
+                request,
+                authenticator=authenticator,
+                service=human_profiles,
+            )
+
+    async def handle_human_profile_update(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_human_profile_update(
+                request,
+                authenticator=authenticator,
+                service=human_profiles,
+            )
+
+    app.router.add_get(_HUMAN_PROFILE_PATH, handle_human_profile)
+    app.router.add_patch(_HUMAN_PROFILE_PATH, handle_human_profile_update)
     if preference_documents is not None:
 
         async def handle_preference_document(request: web.Request) -> web.Response:

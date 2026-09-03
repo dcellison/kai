@@ -25,6 +25,7 @@ class WorkshopEventType(StrEnum):
     WORKSHOP_MEMBER_ADDED = "workshop.member_added"
     PRINCIPAL_CREATED = "principal.created"
     PRINCIPAL_HANDLE_ASSIGNED = "principal.handle_assigned"
+    PRINCIPAL_DISPLAY_NAME_CHANGED = "principal.display_name_changed"
     EXTERNAL_IDENTITY_BOUND = "external_identity.bound"
     CHANNEL_CREATED = "channel.created"
     CHANNEL_ARCHIVED = "channel.archived"
