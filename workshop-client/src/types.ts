@@ -76,6 +76,8 @@ export interface WorkshopChannelSummary {
   archivedAt?: string | null;
   canSubmitCommands: boolean;
   channelId: string;
+  directMessageArchiveEventPosition?: number | null;
+  directMessageArchivedAt?: string | null;
   kind: WorkshopChannelKind;
   lifecycleEventPosition?: number | null;
   name: string | null;

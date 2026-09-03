@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 62
+WORKSHOP_SCHEMA_VERSION = 63
 
 
 @dataclass(frozen=True, slots=True)
@@ -2788,6 +2788,25 @@ _CANONICAL_FOLLOWED_THREAD_UNREAD_SCHEMA = SchemaMigration(
     ),
 )
 
+_PRINCIPAL_DIRECT_MESSAGE_ARCHIVE_SCHEMA = SchemaMigration(
+    version=63,
+    name="principal_direct_message_archives",
+    statements=(
+        """
+        CREATE TABLE principal_direct_message_archives (
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            archived_at TEXT NOT NULL,
+            archived_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (principal_id, channel_id)
+        )
+        """,
+        "CREATE INDEX principal_direct_message_archives_channel_idx "
+        "ON principal_direct_message_archives (channel_id, principal_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2851,6 +2870,7 @@ _MIGRATIONS = (
     _CANONICAL_CHANNEL_READ_POSITION_SCHEMA,
     _CANONICAL_CHANNEL_READ_POSITION_BOUNDARY_REPAIR_SCHEMA,
     _CANONICAL_FOLLOWED_THREAD_UNREAD_SCHEMA,
+    _PRINCIPAL_DIRECT_MESSAGE_ARCHIVE_SCHEMA,
 )
 
 

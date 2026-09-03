@@ -12,6 +12,7 @@ import {
   activateAgentRevision,
   addAgentRevision,
   archiveAgentDefinition,
+  archiveDirectMessage,
   advanceThreadReadPosition,
   createChannel,
   createAgentDefinition,
@@ -61,6 +62,7 @@ import {
   refreshModelCatalogue,
   searchMemories,
   restorePreferenceRevision,
+  restoreDirectMessage,
   savePreferenceDocument,
   setMessageReaction,
   setThreadFollowed,
@@ -1458,6 +1460,8 @@ describe("Workshop client API", () => {
                 name: "Conversation",
                 kind: "direct",
                 role: "owner",
+                direct_message_archived_at: "2026-09-03T15:00:00Z",
+                direct_message_archive_event_position: 601,
                 can_submit_commands: true,
                 agents: [
                   {
@@ -1523,6 +1527,8 @@ describe("Workshop client API", () => {
               ],
               canSubmitCommands: true,
               channelId,
+              directMessageArchiveEventPosition: 601,
+              directMessageArchivedAt: "2026-09-03T15:00:00Z",
               kind: "direct",
               name: "Conversation",
               participants: [
@@ -1577,6 +1583,33 @@ describe("Workshop client API", () => {
       agent_ids: ["agt_00000000000000000000000000000001"],
       name: "Release planning",
       origin_channel_id: channelId,
+    });
+  });
+
+  it("archives and restores principal-scoped direct-message visibility", async () => {
+    const response = (archived: boolean) => Response.json({
+      version: 1,
+      direct_message: {
+        channel_id: channelId,
+        archived,
+        changed: true,
+        occurred_at: "2026-09-03T15:00:00Z",
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(true))
+      .mockResolvedValueOnce(response(false));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await archiveDirectMessage("session-secret", channelId, "archive-direct-1");
+    await restoreDirectMessage("session-secret", channelId, "restore-direct-1");
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      `/v1/direct-messages/${channelId}/archive`,
+      `/v1/direct-messages/${channelId}/restore`,
+    ]);
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      client_operation_id: "archive-direct-1",
     });
   });
 

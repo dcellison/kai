@@ -112,6 +112,14 @@ from kai.workshop.client_preferences import (
 )
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
+from kai.workshop.direct_message_archives import (
+    WorkshopDirectMessageArchiveAccessDenied,
+    WorkshopDirectMessageArchiveConflict,
+    WorkshopDirectMessageArchiveError,
+    WorkshopDirectMessageArchiveMutation,
+    WorkshopDirectMessageArchiveService,
+    WorkshopDirectMessageArchiveStorageError,
+)
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentDefinitionRevisionId,
@@ -280,6 +288,8 @@ _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
 _CHANNEL_ARCHIVAL_PATH = "/v1/channels/{channel_id}/archive"
 _CHANNEL_RESTORATION_PATH = "/v1/channels/{channel_id}/restore"
+_DIRECT_MESSAGE_ARCHIVAL_PATH = "/v1/direct-messages/{channel_id}/archive"
+_DIRECT_MESSAGE_RESTORATION_PATH = "/v1/direct-messages/{channel_id}/restore"
 _CHANNEL_MEMBERS_PATH = "/v1/channels/{channel_id}/members"
 _CHANNEL_MEMBER_ADDITION_PATH = "/v1/channels/{channel_id}/members/{principal_id}/add"
 _CHANNEL_MEMBER_REMOVAL_PATH = "/v1/channels/{channel_id}/members/{principal_id}/remove"
@@ -809,6 +819,20 @@ def _serialize_channel_lifecycle_mutation(
     return {
         "version": 1,
         "channel": {
+            "channel_id": str(mutation.channel_id),
+            "archived": mutation.archived,
+            "changed": mutation.changed,
+            "occurred_at": mutation.occurred_at.isoformat(),
+        },
+    }
+
+
+def _serialize_direct_message_archive_mutation(
+    mutation: WorkshopDirectMessageArchiveMutation,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "direct_message": {
             "channel_id": str(mutation.channel_id),
             "archived": mutation.archived,
             "changed": mutation.changed,
@@ -3589,7 +3613,13 @@ async def _handle_client_navigation(
         "ca.sponsor_principal_id, sponsor.display_name, "
         "ca.sponsored_runtime_profile_id, "
         "CASE WHEN sponsored.id IS NULL THEN 0 ELSE 1 END, "
-        "pae.conversation_started_at, ad.lifecycle_state "
+        "pae.conversation_started_at, ad.lifecycle_state, "
+        "dma.archived_at, dma.archived_event_position, "
+        "CASE WHEN dma.archived_event_position IS NOT NULL AND NOT EXISTS("
+        "SELECT 1 FROM messages newer_message WHERE newer_message.channel_id = c.id "
+        "AND newer_message.author_principal_id != cm.principal_id "
+        "AND newer_message.created_event_position > dma.archived_event_position"
+        ") THEN 1 ELSE 0 END "
         "FROM channel_memberships cm "
         "JOIN channels c ON c.id = cm.channel_id "
         "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
@@ -3606,6 +3636,8 @@ async def _handle_client_navigation(
         "AND sponsored.agent_id = ca.agent_id "
         "AND sponsored.runtime_profile_id = ca.sponsored_runtime_profile_id "
         "AND sponsored.lifecycle_state = 'enabled' "
+        "LEFT JOIN principal_direct_message_archives dma "
+        "ON dma.principal_id = cm.principal_id AND dma.channel_id = c.id "
         "WHERE cm.principal_id = ? "
         "ORDER BY c.workshop_id, "
         "CASE c.kind WHEN 'direct' THEN 0 WHEN 'group' THEN 1 "
@@ -3657,6 +3689,9 @@ async def _handle_client_navigation(
                 "_conversation_started": row[17] is not None,
             },
         )
+        if str(row[2]) == "direct":
+            channel["direct_message_archived_at"] = str(row[19]) if bool(row[21]) else None
+            channel["direct_message_archive_event_position"] = int(row[20]) if bool(row[21]) else None
         if row[7] is not None:
             agents = channel["agents"]
             assignments = channel["_runtime_assignments"]
@@ -3718,8 +3753,10 @@ async def _handle_client_navigation(
                     ChannelId(str(channel["channel_id"])),
                 )
             )
-            channel["can_submit_commands"] = human_direct or (
+            direct_message_archived = channel.get("direct_message_archived_at") is not None
+            channel["can_submit_commands"] = (human_direct and not direct_message_archived) or (
                 channel["archived_at"] is None
+                and not direct_message_archived
                 and channel["kind"] in {"direct", "group"}
                 and len(agents) >= 1
                 and len(assignments) == len(agents)
@@ -3998,6 +4035,60 @@ async def _handle_channel_lifecycle_operation(
             message="Channel lifecycle conflicted with current state",
         )
     return _json_response(_serialize_channel_lifecycle_mutation(mutation), status=200)
+
+
+async def _handle_direct_message_archive_operation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopDirectMessageArchiveService,
+    operation: str,
+) -> web.Response:
+    """Archive or restore one authenticated principal's direct-message visibility."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(status=401, code="authentication_required", message="Authentication required")
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid direct-message archive request")
+    if request.content_length is not None and request.content_length > _MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES:
+        return _error_response(
+            status=400, code="invalid_request", message="Direct-message archive request is too large"
+        )
+    raw = await request.content.read(_MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES + 1)
+    try:
+        payload = json.loads(raw)
+        channel_id = ChannelId(request.match_info["channel_id"])
+    except (UnicodeDecodeError, TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid direct-message archive request")
+    if len(raw) > _MAX_CHANNEL_AGENT_OPERATION_BODY_BYTES or (
+        not isinstance(payload, dict) or set(payload) != _CHANNEL_AGENT_OPERATION_FIELDS
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid direct-message archive request")
+    try:
+        mutation = (
+            await service.archive(principal_id, channel_id, client_operation_id=payload["client_operation_id"])
+            if operation == "archive"
+            else await service.restore(principal_id, channel_id, client_operation_id=payload["client_operation_id"])
+        )
+    except WorkshopDirectMessageArchiveAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopDirectMessageArchiveConflict as exc:
+        return _error_response(status=409, code="direct_message_archive_conflict", message=str(exc))
+    except WorkshopDirectMessageArchiveStorageError:
+        return _error_response(
+            status=503,
+            code="direct_message_archive_unavailable",
+            message="Direct-message archive is temporarily unavailable",
+        )
+    except WorkshopDirectMessageArchiveError:
+        return _error_response(
+            status=409,
+            code="direct_message_archive_conflict",
+            message="Direct-message archive conflicted with current state",
+        )
+    return _json_response(_serialize_direct_message_archive_mutation(mutation), status=200)
 
 
 async def _handle_channel_members(
@@ -4884,13 +4975,24 @@ async def _read_agent_lifecycle_event_records(
         WorkshopEventType.CHANNEL_MEMBER_ADDED,
         WorkshopEventType.CHANNEL_MEMBER_REMOVED,
     )
-    queried_types = definition_event_types + enablement_event_types + membership_event_types
+    direct_message_archive_event_types = (
+        WorkshopEventType.PRINCIPAL_DIRECT_MESSAGE_ARCHIVED,
+        WorkshopEventType.PRINCIPAL_DIRECT_MESSAGE_RESTORED,
+    )
+    queried_types = (
+        definition_event_types
+        + enablement_event_types
+        + membership_event_types
+        + direct_message_archive_event_types
+        + (WorkshopEventType.MESSAGE_CREATED,)
+    )
     visible_definition_types = (
         frozenset(definition_event_types) if role == "admin" else frozenset(definition_event_types[2:])
     )
     placeholders = ",".join("?" for _ in queried_types)
     async with store.connection.execute(
-        "SELECT position, event_type, aggregate_id, payload_json, metadata_json, occurred_at "
+        "SELECT position, event_type, aggregate_id, payload_json, metadata_json, occurred_at, "
+        "actor_principal_id "
         "FROM event_log WHERE workshop_id = ? AND position > ? "
         f"AND event_type IN ({placeholders}) "
         "AND (event_type != ? OR event_version = 2) ORDER BY position LIMIT ?",
@@ -4925,6 +5027,27 @@ async def _read_agent_lifecycle_event_records(
             if not visible:
                 continue
             event_name = "workshop.navigation.changed"
+        elif event_type in direct_message_archive_event_types:
+            if row[6] != principal_id:
+                continue
+            event_name = "workshop.navigation.changed"
+        elif event_type == WorkshopEventType.MESSAGE_CREATED:
+            channel_id = payload.get("channel_id")
+            author_principal_id = payload.get("author_principal_id")
+            if not isinstance(channel_id, str) or author_principal_id == str(principal_id):
+                continue
+            async with store.connection.execute(
+                "SELECT 1 FROM principal_direct_message_archives dma "
+                "JOIN channels c ON c.id = dma.channel_id AND c.kind = 'direct' "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id "
+                "AND cm.principal_id = dma.principal_id "
+                "WHERE dma.principal_id = ? AND dma.channel_id = ? "
+                "AND dma.archived_event_position < ?",
+                (principal_id, channel_id, position),
+            ) as archive_cursor:
+                if await archive_cursor.fetchone() is None:
+                    continue
+            event_name = "workshop.navigation.changed"
         elif event_type in definition_event_types:
             if event_type not in visible_definition_types:
                 continue
@@ -4934,7 +5057,7 @@ async def _read_agent_lifecycle_event_records(
                 continue
             event_name = "agent.enablement.changed"
         definition_id: str | None = None
-        if event_type not in membership_event_types:
+        if event_name != "workshop.navigation.changed":
             definition_id = metadata.get("definition_id")
             if not isinstance(definition_id, str):
                 if event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED:
@@ -6774,6 +6897,7 @@ def register_workshop_read_routes(
         raise ValueError("Event-stream intervals must be positive")
     stream_limiter = event_stream_limiter or WorkshopEventStreamLimiter()
     channel_lifecycle = WorkshopChannelLifecycleService(store)
+    direct_message_archives = WorkshopDirectMessageArchiveService(store)
     human_direct_messages = WorkshopHumanDirectMessageService(store)
     agent_lifecycle = WorkshopAgentLifecycleService(store)
     human_notifications = WorkshopHumanNotificationService(store)
@@ -6850,6 +6974,24 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=channel_lifecycle,
+                operation="restore",
+            )
+
+    async def handle_direct_message_archival(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_direct_message_archive_operation(
+                request,
+                authenticator=authenticator,
+                service=direct_message_archives,
+                operation="archive",
+            )
+
+    async def handle_direct_message_restoration(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_direct_message_archive_operation(
+                request,
+                authenticator=authenticator,
+                service=direct_message_archives,
                 operation="restore",
             )
 
@@ -7164,6 +7306,8 @@ def register_workshop_read_routes(
     app.router.add_post(_HUMAN_CONVERSATION_PATH, handle_human_conversation_start)
     app.router.add_post(_CHANNEL_ARCHIVAL_PATH, handle_channel_archival)
     app.router.add_post(_CHANNEL_RESTORATION_PATH, handle_channel_restoration)
+    app.router.add_post(_DIRECT_MESSAGE_ARCHIVAL_PATH, handle_direct_message_archival)
+    app.router.add_post(_DIRECT_MESSAGE_RESTORATION_PATH, handle_direct_message_restoration)
     app.router.add_get(_CHANNEL_MEMBERS_PATH, handle_channel_members)
     app.router.add_post(_CHANNEL_MEMBER_ADDITION_PATH, handle_channel_member_addition)
     app.router.add_post(_CHANNEL_MEMBER_REMOVAL_PATH, handle_channel_member_removal)

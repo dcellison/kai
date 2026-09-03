@@ -1284,6 +1284,8 @@ class TestWorkshopNavigationHTTPContract:
                 "role": "owner",
                 "archived_at": None,
                 "lifecycle_event_position": None,
+                "direct_message_archived_at": None,
+                "direct_message_archive_event_position": None,
                 "agents": [
                     {
                         "agent_id": direct["agents"][0]["agent_id"],
@@ -1840,6 +1842,64 @@ class TestWorkshopAgentEnablementHTTPContract:
 
 
 class TestWorkshopChannelLifecycleHTTPContract:
+    async def test_principal_archives_and_restores_only_their_direct_message(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_direct, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice": alice_id, "bob": bob_id}))
+        path = f"/v1/direct-messages/{alice_direct}"
+        try:
+            archived = await client.post(
+                f"{path}/archive",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-archive-direct-1"},
+            )
+            replay = await client.post(
+                f"{path}/archive",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-archive-direct-1"},
+            )
+            forbidden = await client.post(
+                f"{path}/archive",
+                headers={"Authorization": "Bearer bob"},
+                json={"client_operation_id": "bob-archive-alice-direct"},
+            )
+            navigation = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+
+            assert archived.status == 200
+            assert (await archived.json())["direct_message"] == {
+                "channel_id": alice_direct,
+                "archived": True,
+                "changed": True,
+                "occurred_at": (await archived.json())["direct_message"]["occurred_at"],
+            }
+            assert (await replay.json())["direct_message"]["changed"] is False
+            assert forbidden.status == 403
+            direct = (await navigation.json())["workshops"][0]["channels"][0]
+            assert direct["direct_message_archived_at"] is not None
+            assert direct["direct_message_archive_event_position"] > 0
+            assert direct["can_submit_commands"] is False
+
+            restored = await client.post(
+                f"{path}/restore",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "alice-restore-direct-1"},
+            )
+            assert restored.status == 200
+            assert (await restored.json())["direct_message"]["archived"] is False
+            refreshed = await client.get(
+                "/v1/client/navigation",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert (await refreshed.json())["workshops"][0]["channels"][0]["can_submit_commands"] is True
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_membership_change_emits_private_live_navigation_signal(
         self,
         tmp_path: Path,

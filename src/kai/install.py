@@ -9563,6 +9563,7 @@ def _cmd_status() -> None:
     print(workshop_channel_notification_policy_status(Path(data_dir) / "kai.db"))
     print(workshop_unread_authority_status(Path(data_dir) / "kai.db"))
     print(_channel_lifecycle_status(Path(data_dir) / "kai.db"))
+    print(_direct_message_archive_status(Path(data_dir) / "kai.db"))
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
     print(_runtime_key_cutover_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
@@ -10271,6 +10272,56 @@ def _channel_lifecycle_status(db_path: Path) -> str:
         f"{prefix} {status}; group channels={total}, active={active}, "
         f"archived={archived}, human members={humans} (owners={owners}, participants={participants}), "
         f"human DMs={human_dms} (invalid={human_dm_gaps}), integrity gaps={gaps}; authority=canonical"
+    )
+
+
+def _direct_message_archive_status(db_path: Path) -> str:
+    """Report canonical per-principal direct-message archive integrity."""
+    prefix = "Workshop direct-message archive:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'principal_direct_message_archives'"
+            ).fetchone()
+            if table is None:
+                return f"{prefix} pending; canonical archive projection unavailable"
+            totals = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN NOT EXISTS(SELECT 1 FROM messages m "
+                "WHERE m.channel_id = dma.channel_id "
+                "AND m.author_principal_id != dma.principal_id "
+                "AND m.created_event_position > dma.archived_event_position) "
+                "THEN 1 ELSE 0 END) "
+                "FROM principal_direct_message_archives dma"
+            ).fetchone()
+            gaps = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM principal_direct_message_archives dma "
+                    "LEFT JOIN channels c ON c.id = dma.channel_id "
+                    "LEFT JOIN principals p ON p.id = dma.principal_id "
+                    "LEFT JOIN channel_memberships cm ON cm.channel_id = dma.channel_id "
+                    "AND cm.principal_id = dma.principal_id "
+                    "LEFT JOIN event_log e ON e.position = dma.archived_event_position "
+                    "WHERE c.id IS NULL OR c.kind != 'direct' OR c.archived_at IS NOT NULL "
+                    "OR p.id IS NULL OR p.kind != 'human' OR cm.principal_id IS NULL "
+                    "OR e.event_type != 'principal_direct_message.archived' "
+                    "OR e.aggregate_id != dma.channel_id "
+                    "OR e.actor_principal_id != dma.principal_id"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"{prefix} NOT VERIFIED ({exc})"
+    preferences, effective = tuple(int(value or 0) for value in (totals or (0, 0)))
+    resurfaced = preferences - effective
+    status = "active" if gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {status}; preferences={preferences}, archived={effective}, "
+        f"resurfaced={resurfaced}, integrity gaps={gaps}; authority=canonical"
     )
 
 
