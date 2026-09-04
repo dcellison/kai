@@ -1,10 +1,11 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   HumanAvatar,
   HumanAvatarCacheProvider,
   HumanAvatarImageCache,
+  useHumanAvatarOverride,
 } from "./HumanAvatar";
 
 const ACTIVE_AVATAR = {
@@ -19,6 +20,28 @@ function pngResponse(): Response {
     headers: new Headers({ "Content-Type": "image/png" }),
     ok: true,
   } as Response;
+}
+
+function AvatarRoute({ route }: { route: string }): React.JSX.Element {
+  const setOverride = useHumanAvatarOverride();
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOverride("prn_test", ACTIVE_AVATAR)}
+      >
+        Save avatar
+      </button>
+      <HumanAvatar
+        avatar={{ active: false, stateVersion: 0, url: null }}
+        className="test-avatar"
+        displayName="Daniel"
+        label="Daniel's avatar"
+        principalId="prn_test"
+      />
+      <span>{route}</span>
+    </div>
+  );
 }
 
 describe("human avatar image cache", () => {
@@ -110,5 +133,34 @@ describe("human avatar image cache", () => {
     expect(avatar).toHaveTextContent("D");
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledOnce());
     expect(avatar).toHaveTextContent("D");
+  });
+
+  it("preserves a saved descriptor when the keyed conversation child changes", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(pngResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const { rerender } = render(
+      <HumanAvatarCacheProvider token="avatar-token">
+        <AvatarRoute key="general" route="General" />
+      </HumanAvatarCacheProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Save avatar" }));
+    await waitFor(() => {
+      expect(screen.getByRole("img", { name: "Daniel's avatar" }).querySelector("img"))
+        .not.toBeNull();
+    });
+
+    rerender(
+      <HumanAvatarCacheProvider token="avatar-token">
+        <AvatarRoute key="direct" route="Direct message" />
+      </HumanAvatarCacheProvider>,
+    );
+
+    expect(screen.getByText("Direct message")).toBeVisible();
+    await waitFor(() => {
+      expect(screen.getByRole("img", { name: "Daniel's avatar" }).querySelector("img"))
+        .not.toBeNull();
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
