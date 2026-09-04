@@ -7827,11 +7827,12 @@ def register_workshop_read_routes(
                 )
 
         async def handle_principal_avatar(request: web.Request) -> web.StreamResponse:
-            return await _handle_principal_avatar(
-                request,
-                authenticator=authenticator,
-                service=human_avatars,
-            )
+            async with request_lock:
+                return await _handle_principal_avatar(
+                    request,
+                    authenticator=authenticator,
+                    service=human_avatars,
+                )
 
         app.router.add_get(_HUMAN_AVATAR_PATH, handle_human_avatar)
         app.router.add_post(_HUMAN_AVATAR_PATH, handle_human_avatar_upload)
