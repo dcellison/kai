@@ -81,6 +81,7 @@ import type {
   WorkshopFollowedThread,
   WorkshopFollowedThreadSnapshot,
   WorkshopPrincipalEventBatch,
+  WorkshopReplyParticipant,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -297,6 +298,8 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     latest_reply_at: latestReplyAt,
     message_id: messageId,
     reply_count: replyCount,
+    reply_participant_count: replyParticipantCount,
+    reply_participants: suppliedReplyParticipants,
     reply_to_message_id: replyToMessageId,
     thread_root_id: threadRootId,
     mentions: suppliedMentions,
@@ -318,6 +321,11 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     !MESSAGE_PATTERN.test(messageId) ||
     !Number.isSafeInteger(replyCount) ||
     (replyCount as number) < 0 ||
+    !Number.isSafeInteger(replyParticipantCount) ||
+    (replyParticipantCount as number) < 0 ||
+    !Array.isArray(suppliedReplyParticipants) ||
+    suppliedReplyParticipants.length > 3 ||
+    (replyParticipantCount as number) < suppliedReplyParticipants.length ||
     (replyToMessageId !== null &&
       (typeof replyToMessageId !== "string" || !MESSAGE_PATTERN.test(replyToMessageId))) ||
     (threadRootId !== null &&
@@ -399,6 +407,35 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
   if (reactions === null) {
     return null;
   }
+  const replyParticipants: WorkshopReplyParticipant[] = [];
+  for (const rawParticipant of suppliedReplyParticipants) {
+    if (!isRecord(rawParticipant)) {
+      return null;
+    }
+    const {
+      avatar,
+      display_name: displayName,
+      kind,
+      principal_id: principalId,
+    } = rawParticipant;
+    if (
+      typeof principalId !== "string" ||
+      !PRINCIPAL_PATTERN.test(principalId) ||
+      (kind !== "human" && kind !== "agent") ||
+      typeof displayName !== "string" ||
+      !displayName.trim()
+    ) {
+      return null;
+    }
+    replyParticipants.push({
+      avatar: kind === "human"
+        ? parseHumanAvatarDescriptor(avatar, principalId)
+        : null,
+      displayName,
+      kind,
+      principalId,
+    });
+  }
   return {
     artifacts,
     authorAvatar: authorKind === "human"
@@ -415,6 +452,8 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     messageId,
     reactions,
     replyCount: replyCount as number,
+    replyParticipantCount: replyParticipantCount as number,
+    replyParticipants,
     replyToMessageId,
     latestReplyAt,
     threadRootId,

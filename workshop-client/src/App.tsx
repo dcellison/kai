@@ -75,6 +75,7 @@ import type {
   WorkshopHumanPeer,
   WorkshopHumanNotification,
   WorkshopFollowedThread,
+  WorkshopReplyParticipant,
   WorkshopReaction,
 } from "./types";
 import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN, MESSAGE_PATTERN } from "./types";
@@ -117,6 +118,48 @@ const MAX_SIDEBAR_WIDTH_PX = 420 * UI_SCALE;
 const COLLAPSED_SIDEBAR_WIDTH_PX = 56 * UI_SCALE;
 const MEMORY_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/;
 const INACTIVE_HUMAN_AVATAR = { active: false, stateVersion: 0, url: null } as const;
+
+function mergeLiveReplyParticipants(
+  message: TimelineMessage,
+  liveReplies: TimelineMessage[],
+): Pick<TimelineMessage, "replyParticipantCount" | "replyParticipants"> {
+  const participants = new Map<string, WorkshopReplyParticipant>();
+  const livePrincipalIds = new Set<string>();
+  for (const reply of [...liveReplies].reverse()) {
+    livePrincipalIds.add(reply.authorPrincipalId);
+    if (!participants.has(reply.authorPrincipalId)) {
+      participants.set(reply.authorPrincipalId, {
+        avatar: reply.authorKind === "human"
+          ? reply.authorAvatar ?? INACTIVE_HUMAN_AVATAR
+          : null,
+        displayName: reply.authorDisplayName,
+        kind: reply.authorKind === "human" ? "human" : "agent",
+        principalId: reply.authorPrincipalId,
+      });
+    }
+  }
+  for (const participant of message.replyParticipants) {
+    if (!participants.has(participant.principalId)) {
+      participants.set(participant.principalId, participant);
+    }
+  }
+  const serverPrincipalIds = new Set(
+    message.replyParticipants.map((participant) => participant.principalId),
+  );
+  const visibleServerSummaryIsComplete =
+    message.replyParticipantCount === message.replyParticipants.length;
+  const newlyKnownParticipants = visibleServerSummaryIsComplete
+    ? [...livePrincipalIds].filter((principalId) => !serverPrincipalIds.has(principalId)).length
+    : 0;
+  const replyParticipants = [...participants.values()].slice(0, 3);
+  return {
+    replyParticipantCount: Math.max(
+      message.replyParticipantCount + newlyKnownParticipants,
+      replyParticipants.length,
+    ),
+    replyParticipants,
+  };
+}
 
 type WorkshopDestination =
   | { kind: "conversation"; messageId?: string; threadRootId?: string | null }
@@ -1052,10 +1095,40 @@ function MessageItem({
                 title="Open thread"
                 onClick={() => onOpenThread(message.messageId)}
               >
-                <span>
+                {message.replyParticipants.length > 0 && (
+                  <span className="thread-participants" aria-hidden="true">
+                    {message.replyParticipants.map((participant) => (
+                      participant.kind === "human" ? (
+                        <HumanAvatar
+                          avatar={participant.avatar ?? INACTIVE_HUMAN_AVATAR}
+                          className="thread-participant-avatar human"
+                          displayName={participant.displayName}
+                          key={participant.principalId}
+                          principalId={participant.principalId}
+                        />
+                      ) : (
+                        <span
+                          className="thread-participant-avatar agent"
+                          key={participant.principalId}
+                          title={participant.displayName}
+                        >
+                          {participant.displayName.trim().slice(0, 1).toUpperCase() || "?"}
+                        </span>
+                      )
+                    ))}
+                    {message.replyParticipantCount > message.replyParticipants.length && (
+                      <span className="thread-participant-overflow">
+                        +{message.replyParticipantCount - message.replyParticipants.length}
+                      </span>
+                    )}
+                  </span>
+                )}
+                <span className="thread-summary-count">
                   {message.replyCount} {message.replyCount === 1 ? "reply" : "replies"}
                 </span>
+                <span className="thread-summary-label">View thread</span>
                 {hasUnreadReplies && <strong>New replies</strong>}
+                <ThreadChevronIcon />
               </button>
             )}
           </div>
@@ -2026,6 +2099,26 @@ function ReplyIcon(): React.JSX.Element {
   );
 }
 
+function ThreadChevronIcon(): React.JSX.Element {
+  return (
+    <svg
+      className="thread-summary-chevron"
+      aria-hidden="true"
+      fill="none"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path
+        d="m9 18 6-6-6-6"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
 function AddReactionIcon(): React.JSX.Element {
   return (
     <svg
@@ -2815,6 +2908,7 @@ function WorkshopView({
         return {
           ...message,
           replyCount: message.replyCount + liveReplies.length,
+          ...mergeLiveReplyParticipants(message, liveReplies),
           latestReplyAt: liveReplies[liveReplies.length - 1].createdAt,
         };
       });

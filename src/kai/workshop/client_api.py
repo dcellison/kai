@@ -3683,6 +3683,26 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
         "event_position": message.event_position,
         "created_at": _format_timestamp(message.created_at),
         "reply_count": message.reply_count,
+        "reply_participant_count": message.reply_participant_count,
+        "reply_participants": [
+            {
+                "principal_id": str(participant.principal_id),
+                "kind": participant.kind,
+                "display_name": participant.display_name,
+                **(
+                    {
+                        "avatar": _serialize_human_avatar_descriptor(
+                            participant.principal_id,
+                            participant.avatar_state_version,
+                            participant.avatar_active,
+                        )
+                    }
+                    if participant.kind == "human"
+                    else {}
+                ),
+            }
+            for participant in message.reply_participants
+        ],
         "latest_reply_at": (
             _format_timestamp(message.latest_reply_at) if message.latest_reply_at is not None else None
         ),

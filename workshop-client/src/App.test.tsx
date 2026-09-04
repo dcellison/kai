@@ -283,6 +283,8 @@ const historyMessage: TimelineMessage = {
   messageId: "msg_00000000000000000000000000000025",
   reactions: [],
   replyCount: 0,
+  replyParticipantCount: 0,
+  replyParticipants: [],
   replyToMessageId: null,
   latestReplyAt: null,
   threadRootId: null,
@@ -2871,6 +2873,21 @@ describe("Workshop React client", () => {
       ...historyMessage,
       channelId: secondChannelId,
       replyCount: 1,
+      replyParticipantCount: 2,
+      replyParticipants: [
+        {
+          avatar: { active: false, stateVersion: 0, url: null },
+          displayName: "Scott",
+          kind: "human" as const,
+          principalId: "prn_00000000000000000000000000000003",
+        },
+        {
+          avatar: null,
+          displayName: "Kai",
+          kind: "agent" as const,
+          principalId: "prn_00000000000000000000000000000002",
+        },
+      ],
       latestReplyAt: "2026-08-13T09:01:00Z",
     };
     const reply = {
@@ -2921,8 +2938,10 @@ describe("Workshop React client", () => {
       name: "Open thread with 1 reply, including unread replies",
     });
     expect(threadButton).toHaveTextContent("1 reply");
+    expect(threadButton).toHaveTextContent("View thread");
     expect(threadButton).toHaveTextContent("New replies");
-    expect(threadButton.querySelector("svg")).toBeNull();
+    expect(threadButton.querySelectorAll(".thread-participant-avatar")).toHaveLength(2);
+    expect(threadButton.querySelector(".thread-summary-chevron")).not.toBeNull();
     await user.click(threadButton);
     const context = screen.getByLabelText("Channel context");
     expect(await within(context).findByText("Existing thread reply")).toBeVisible();

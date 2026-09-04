@@ -245,6 +245,16 @@ class TestThreadTimelineQuery:
             assert [message.body for message in channel_page.messages] == ["Root message"]
             assert channel_page.messages[0].reply_count == 2
             assert channel_page.messages[0].latest_reply_at == _NOW + timedelta(seconds=2)
+            assert channel_page.messages[0].reply_participant_count == 2
+            assert [participant.kind for participant in channel_page.messages[0].reply_participants] == [
+                "agent",
+                "human",
+            ]
+            assert [participant.display_name for participant in channel_page.messages[0].reply_participants] == [
+                "Kai",
+                "User One",
+            ]
+            assert channel_page.messages[0].reply_participants[1].avatar_active is False
             assert first.root.message_id == root_id
             assert [message.body for message in first.messages] == ["Human reply"]
             assert first.next_cursor is not None
@@ -271,6 +281,11 @@ class TestThreadTimelineQuery:
             )
             assert [message.body for message in rebuilt.messages] == ["Human reply", "Agent reply"]
             assert rebuilt.root.reply_count == 2
+            assert rebuilt.root.reply_participant_count == 2
+            assert [participant.kind for participant in rebuilt.root.reply_participants] == [
+                "agent",
+                "human",
+            ]
         finally:
             await store.close()
 
