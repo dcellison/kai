@@ -52,6 +52,7 @@ import {
   loadChannelMessage,
   loadHumanNotificationCounts,
   loadHumanNotifications,
+  loadHumanAvatar,
   loadHumanProfile,
   loadWorkshopHumans,
   loadFollowedThreads,
@@ -80,6 +81,8 @@ import {
   updateRoutingPolicy,
   updateGitHubSettings,
   updateHumanDisplayName,
+  uploadHumanAvatar,
+  clearHumanAvatar,
   updateNotificationPreference,
   updateChannelNotificationPolicy,
   updateClientPreference,
@@ -1298,6 +1301,11 @@ describe("Workshop client API", () => {
       display_name: "Daniel",
       handle: "daniel",
       state_version: 2,
+      avatar: {
+        active: true,
+        state_version: 4,
+        url: "/v1/principals/prn_00000000000000000000000000000001/avatar/4",
+      },
       mutation: null,
     };
     const fetchMock = vi.fn()
@@ -1314,6 +1322,10 @@ describe("Workshop client API", () => {
       displayName: "Daniel",
       handle: "daniel",
       stateVersion: 2,
+      avatar: {
+        active: true,
+        stateVersion: 4,
+      },
     });
     await expect(
       updateHumanDisplayName(session, "Daniel Example", 2, "profile-op-1"),
@@ -1327,6 +1339,98 @@ describe("Workshop client API", () => {
       display_name: "Daniel Example",
       expected_state_version: 2,
       client_operation_id: "profile-op-1",
+    });
+  });
+
+  it("loads, uploads, and clears a versioned human avatar", async () => {
+    const principalId = "prn_00000000000000000000000000000001";
+    const active = {
+      version: 1,
+      principal_id: principalId,
+      state_version: 3,
+      active: true,
+      media_type: "image/png",
+      byte_size: 123,
+      width: 64,
+      height: 64,
+      sha256: "a".repeat(64),
+      url: `/v1/principals/${principalId}/avatar/3`,
+      mutation: null,
+    };
+    const cleared = {
+      ...active,
+      state_version: 4,
+      active: false,
+      media_type: null,
+      byte_size: null,
+      width: null,
+      height: null,
+      sha256: null,
+      url: null,
+      mutation: { changed: true, replayed: false },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(active))
+      .mockResolvedValueOnce(Response.json({
+        ...active,
+        mutation: { changed: true, replayed: false },
+      }))
+      .mockResolvedValueOnce(Response.json(cleared));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadHumanAvatar(session)).resolves.toMatchObject({
+      active: true,
+      principalId,
+      stateVersion: 3,
+      url: active.url,
+    });
+    await expect(uploadHumanAvatar(
+      session,
+      new File(["png"], "avatar.png", { type: "image/png" }),
+      2,
+      "avatar-upload-1",
+    )).resolves.toMatchObject({ active: true, stateVersion: 3 });
+    await expect(clearHumanAvatar(session, 3, "avatar-clear-1")).resolves.toMatchObject({
+      active: false,
+      stateVersion: 4,
+      url: null,
+    });
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      "/v1/settings/profile/avatar",
+      "/v1/settings/profile/avatar",
+      "/v1/settings/profile/avatar",
+    ]);
+    const upload = fetchMock.mock.calls[1]?.[1] as RequestInit;
+    expect(upload.method).toBe("POST");
+    expect(upload.body).toBeInstanceOf(FormData);
+    expect((upload.body as FormData).get("expected_state_version")).toBe("2");
+    expect((upload.body as FormData).get("client_operation_id")).toBe("avatar-upload-1");
+    expect((upload.body as FormData).get("file")).toBeInstanceOf(File);
+    expect(JSON.parse((fetchMock.mock.calls[2]?.[1] as RequestInit).body as string)).toEqual({
+      expected_state_version: 3,
+      client_operation_id: "avatar-clear-1",
+    });
+  });
+
+  it("degrades malformed avatar descriptors to initials without rejecting their parent payload", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+      version: 1,
+      principal_id: "prn_00000000000000000000000000000001",
+      display_name: "Daniel",
+      handle: "daniel",
+      state_version: 2,
+      avatar: {
+        active: true,
+        state_version: 7,
+        url: "https://unexpected.example/avatar.png",
+      },
+      mutation: null,
+    })));
+
+    await expect(loadHumanProfile(session)).resolves.toMatchObject({
+      avatar: { active: false, stateVersion: 0, url: null },
+      displayName: "Daniel",
     });
   });
 
@@ -1540,6 +1644,11 @@ describe("Workshop client API", () => {
 
     await expect(loadNavigation("session-secret")).resolves.toEqual({
       principal: {
+        avatar: {
+          active: false,
+          stateVersion: 0,
+          url: null,
+        },
         displayName: "Daniel",
         handle: "daniel",
         principalId: "prn_00000000000000000000000000000001",
@@ -1688,6 +1797,11 @@ describe("Workshop client API", () => {
 
     await expect(loadWorkshopHumans("session-secret", workshopId)).resolves.toEqual([
       {
+        avatar: {
+          active: false,
+          stateVersion: 0,
+          url: null,
+        },
         conversationChannelId: humanChannelId,
         displayName: "Scott",
         handle: "scott",
@@ -1700,6 +1814,11 @@ describe("Workshop client API", () => {
       channelId: humanChannelId,
       created: false,
       peer: {
+        avatar: {
+          active: false,
+          stateVersion: 0,
+          url: null,
+        },
         conversationChannelId: humanChannelId,
         displayName: "Scott",
         handle: "scott",

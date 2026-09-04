@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from kai.workshop.domain import (
@@ -13,6 +13,7 @@ from kai.workshop.domain import (
     WorkshopEventType,
     WorkshopId,
 )
+from kai.workshop.human_avatars import human_avatar_descriptors
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 
@@ -41,6 +42,8 @@ class WorkshopHumanPeer:
     display_name: str
     handle: str
     channel_id: ChannelId | None
+    avatar_state_version: int = 0
+    avatar_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +138,20 @@ class WorkshopHumanDirectMessageService:
                     channels[0] if channels else None,
                 )
             )
+        descriptors = await human_avatar_descriptors(
+            self._store,
+            (peer.principal_id for peer in peers),
+        )
+        peers = [
+            replace(
+                peer,
+                avatar_state_version=descriptors[peer.principal_id].state_version,
+                avatar_active=descriptors[peer.principal_id].active,
+            )
+            if peer.principal_id in descriptors
+            else peer
+            for peer in peers
+        ]
         return WorkshopHumanPeerSnapshot(workshop_id, tuple(peers))
 
     async def start(
@@ -161,7 +178,7 @@ class WorkshopHumanDirectMessageService:
                 return WorkshopHumanDirectConversation(
                     workshop_id,
                     channels[0],
-                    WorkshopHumanPeer(peer_principal_id, peer[0], peer[1], channels[0]),
+                    await self._with_avatar(WorkshopHumanPeer(peer_principal_id, peer[0], peer[1], channels[0])),
                     False,
                 )
 
@@ -219,7 +236,7 @@ class WorkshopHumanDirectMessageService:
             return WorkshopHumanDirectConversation(
                 workshop_id,
                 channel_id,
-                WorkshopHumanPeer(peer_principal_id, peer[0], peer[1], channel_id),
+                await self._with_avatar(WorkshopHumanPeer(peer_principal_id, peer[0], peer[1], channel_id)),
                 True,
             )
         except WorkshopHumanDirectMessageError:
@@ -247,6 +264,17 @@ class WorkshopHumanDirectMessageService:
         if row is None:
             raise WorkshopHumanDirectMessageAccessDenied("Human is unavailable in this Workshop")
         return str(row[0]), str(row[1])
+
+    async def _with_avatar(self, peer: WorkshopHumanPeer) -> WorkshopHumanPeer:
+        descriptors = await human_avatar_descriptors(self._store, (peer.principal_id,))
+        descriptor = descriptors.get(peer.principal_id)
+        if descriptor is None:
+            return peer
+        return replace(
+            peer,
+            avatar_state_version=descriptor.state_version,
+            avatar_active=descriptor.active,
+        )
 
     async def _matching_channels(
         self,

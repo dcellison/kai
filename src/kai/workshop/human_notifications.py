@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -21,6 +21,7 @@ from kai.workshop.domain import (
     WorkshopEventType,
     WorkshopId,
 )
+from kai.workshop.human_avatars import human_avatar_descriptors
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import AppendResult, StoredEvent, WorkshopEventStore
 
@@ -61,6 +62,8 @@ class HumanNotification:
     read_at: datetime | None
     state_version: int
     last_event_position: int
+    source_author_avatar_state_version: int = 0
+    source_author_avatar_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +144,8 @@ def _notification_from_row(row: object) -> HumanNotification:
         read_at=(_parse_timestamp(values[10]) if values[10] is not None else None),
         state_version=int(values[11]),
         last_event_position=int(values[12]),
+        source_author_avatar_state_version=(int(values[13]) if len(values) > 13 else 0),
+        source_author_avatar_active=(bool(values[14]) if len(values) > 14 else False),
     )
 
 
@@ -546,7 +551,7 @@ class WorkshopHumanNotificationService:
             rows = list(await query_cursor.fetchall())
         has_more = len(rows) > limit
         page_rows = rows[:limit]
-        notifications = tuple(_notification_from_row(row) for row in page_rows)
+        notifications = await self._with_author_avatars(tuple(_notification_from_row(row) for row in page_rows))
         next_cursor = None
         if has_more and notifications:
             last = notifications[-1]
@@ -719,13 +724,14 @@ class WorkshopHumanNotificationService:
             ),
         ) as cursor:
             rows = list(await cursor.fetchall())
+        notifications = await self._with_author_avatars(tuple(_notification_from_row(tuple(row)[2:]) for row in rows))
         events = tuple(
             HumanNotificationEvent(
-                notification=_notification_from_row(tuple(row)[2:]),
+                notification=notification,
                 transition=WorkshopEventType(str(row[1])),
                 event_position=int(row[0]),
             )
-            for row in rows
+            for row, notification in zip(rows, notifications, strict=True)
         )
         return HumanNotificationEventBatch(
             events,
@@ -749,7 +755,33 @@ class WorkshopHumanNotificationService:
             row = await cursor.fetchone()
         if row is None:
             raise WorkshopHumanNotificationAccessDenied("Notification access denied")
-        return _notification_from_row(row)
+        notifications = await self._with_author_avatars((_notification_from_row(row),))
+        return notifications[0]
+
+    async def _with_author_avatars(
+        self,
+        notifications: tuple[HumanNotification, ...],
+    ) -> tuple[HumanNotification, ...]:
+        descriptors = await human_avatar_descriptors(
+            self._store,
+            (notification.source_author_principal_id for notification in notifications),
+        )
+        return tuple(
+            replace(
+                notification,
+                source_author_avatar_state_version=(
+                    descriptors[notification.source_author_principal_id].state_version
+                    if notification.source_author_principal_id in descriptors
+                    else 0
+                ),
+                source_author_avatar_active=(
+                    descriptors[notification.source_author_principal_id].active
+                    if notification.source_author_principal_id in descriptors
+                    else False
+                ),
+            )
+            for notification in notifications
+        )
 
     async def _workshop_id(self, notification_id: HumanNotificationId) -> WorkshopId:
         async with self._store.connection.execute(

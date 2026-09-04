@@ -2,6 +2,9 @@ import { useState } from "react";
 
 import type { WorkshopHumanNotification } from "./types";
 import type { HumanNotificationState } from "./useHumanNotifications";
+import { HumanAvatar } from "./HumanAvatar";
+
+const INACTIVE_HUMAN_AVATAR = { active: false, stateVersion: 0, url: null } as const;
 
 function formatMentionTime(value: string): string {
   const parsed = new Date(value);
@@ -91,9 +94,12 @@ export function MentionsInbox({
                   }
                 }}
               >
-                <span className="mention-avatar" aria-hidden="true">
-                  {notification.sourceAuthorDisplayName.slice(0, 1).toUpperCase()}
-                </span>
+                <HumanAvatar
+                  avatar={notification.sourceAuthorAvatar ?? INACTIVE_HUMAN_AVATAR}
+                  className="mention-avatar"
+                  displayName={notification.sourceAuthorDisplayName}
+                  principalId={notification.sourceAuthorPrincipalId}
+                />
                 <span className="mention-copy">
                   <span>
                     <strong>{notification.sourceAuthorDisplayName}</strong>

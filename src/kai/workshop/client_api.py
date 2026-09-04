@@ -157,6 +157,7 @@ from kai.workshop.human_avatars import (
     WorkshopHumanAvatarTooLarge,
     WorkshopHumanAvatarUnsupportedType,
     WorkshopHumanAvatarValidationError,
+    human_avatar_descriptors,
 )
 from kai.workshop.human_direct_messages import (
     WorkshopHumanDirectConversation,
@@ -806,13 +807,21 @@ def _serialize_appearance_preferences(
     }
 
 
-def _serialize_human_profile(snapshot: HumanProfileSnapshot) -> dict[str, object]:
+def _serialize_human_profile(
+    snapshot: HumanProfileSnapshot,
+    avatar: HumanAvatarSnapshot | None = None,
+) -> dict[str, object]:
     return {
         "version": 1,
         "principal_id": str(snapshot.principal_id),
         "display_name": snapshot.display_name,
         "handle": snapshot.handle,
         "state_version": snapshot.state_version,
+        "avatar": _serialize_human_avatar_descriptor(
+            snapshot.principal_id,
+            avatar.state_version if avatar is not None else 0,
+            avatar.active if avatar is not None else False,
+        ),
         "mutation": (
             {
                 "changed": snapshot.mutation_changed,
@@ -821,6 +830,18 @@ def _serialize_human_profile(snapshot: HumanProfileSnapshot) -> dict[str, object
             if snapshot.mutation_changed is not None
             else None
         ),
+    }
+
+
+def _serialize_human_avatar_descriptor(
+    principal_id: PrincipalId,
+    state_version: int,
+    active: bool,
+) -> dict[str, object]:
+    return {
+        "state_version": state_version,
+        "active": active,
+        "url": (f"/v1/principals/{principal_id}/avatar/{state_version}" if active else None),
     }
 
 
@@ -917,6 +938,11 @@ def _serialize_human_membership_snapshot(
             "display_name": member.display_name,
             "handle": member.handle,
             "role": member.role,
+            "avatar": _serialize_human_avatar_descriptor(
+                member.principal_id,
+                member.avatar_state_version,
+                member.avatar_active,
+            ),
         }
 
     return {
@@ -944,6 +970,11 @@ def _serialize_human_membership_mutation(
             "display_name": mutation.member.display_name,
             "handle": mutation.member.handle,
             "role": mutation.member.role,
+            "avatar": _serialize_human_avatar_descriptor(
+                mutation.member.principal_id,
+                mutation.member.avatar_state_version,
+                mutation.member.avatar_active,
+            ),
         },
     }
 
@@ -958,6 +989,11 @@ def _serialize_human_peers(snapshot: WorkshopHumanPeerSnapshot) -> dict[str, obj
                 "display_name": peer.display_name,
                 "handle": peer.handle,
                 "conversation_channel_id": str(peer.channel_id) if peer.channel_id is not None else None,
+                "avatar": _serialize_human_avatar_descriptor(
+                    peer.principal_id,
+                    peer.avatar_state_version,
+                    peer.avatar_active,
+                ),
             }
             for peer in snapshot.peers
         ],
@@ -976,6 +1012,11 @@ def _serialize_human_conversation(conversation: WorkshopHumanDirectConversation)
                 "principal_id": str(conversation.peer.principal_id),
                 "display_name": conversation.peer.display_name,
                 "handle": conversation.peer.handle,
+                "avatar": _serialize_human_avatar_descriptor(
+                    conversation.peer.principal_id,
+                    conversation.peer.avatar_state_version,
+                    conversation.peer.avatar_active,
+                ),
             },
         },
     }
@@ -2638,6 +2679,7 @@ async def _handle_human_profile(
     *,
     authenticator: WorkshopClientAuthenticator,
     service: WorkshopHumanProfileService,
+    avatar_service: WorkshopHumanAvatarService | None = None,
 ) -> web.Response:
     principal_id = await authenticator.authenticate(request)
     if not isinstance(principal_id, PrincipalId):
@@ -2648,9 +2690,10 @@ async def _handle_human_profile(
         return _error_response(status=400, code="invalid_request", message="Invalid profile request")
     try:
         snapshot = await service.inspect(principal_id)
+        avatar = await avatar_service.inspect(principal_id) if avatar_service is not None else None
     except WorkshopHumanProfileError as exc:
         return _human_profile_error_response(exc)
-    return _json_response(_serialize_human_profile(snapshot), status=200)
+    return _json_response(_serialize_human_profile(snapshot, avatar), status=200)
 
 
 async def _handle_human_profile_update(
@@ -2658,6 +2701,7 @@ async def _handle_human_profile_update(
     *,
     authenticator: WorkshopClientAuthenticator,
     service: WorkshopHumanProfileService,
+    avatar_service: WorkshopHumanAvatarService | None = None,
 ) -> web.Response:
     principal_id = await authenticator.authenticate(request)
     if not isinstance(principal_id, PrincipalId):
@@ -2686,9 +2730,10 @@ async def _handle_human_profile_update(
             expected_state_version=payload.get("expected_state_version"),
             client_operation_id=payload.get("client_operation_id"),
         )
+        avatar = await avatar_service.inspect(principal_id) if avatar_service is not None else None
     except WorkshopHumanProfileError as exc:
         return _human_profile_error_response(exc)
-    return _json_response(_serialize_human_profile(snapshot), status=200)
+    return _json_response(_serialize_human_profile(snapshot, avatar), status=200)
 
 
 def _human_avatar_error_response(exc: WorkshopHumanAvatarError) -> web.Response:
@@ -3621,6 +3666,17 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
         "author_principal_id": str(message.author_principal_id),
         "author_kind": message.author_kind,
         "author_display_name": message.author_display_name,
+        **(
+            {
+                "author_avatar": _serialize_human_avatar_descriptor(
+                    message.author_principal_id,
+                    message.author_avatar_state_version,
+                    message.author_avatar_active,
+                )
+            }
+            if message.author_kind == "human"
+            else {}
+        ),
         "reply_to_message_id": (str(message.reply_to_message_id) if message.reply_to_message_id is not None else None),
         "thread_root_id": (str(message.thread_root_id) if message.thread_root_id is not None else None),
         "body": message.body,
@@ -3656,6 +3712,11 @@ def _serialize_human_notification(notification: HumanNotification) -> dict[str, 
         ),
         "source_author_principal_id": str(notification.source_author_principal_id),
         "source_author_display_name": notification.source_author_display_name,
+        "source_author_avatar": _serialize_human_avatar_descriptor(
+            notification.source_author_principal_id,
+            notification.source_author_avatar_state_version,
+            notification.source_author_avatar_active,
+        ),
         "channel_name": notification.channel_name,
         "created_at": _format_timestamp(notification.created_at),
         "created_event_position": notification.created_event_position,
@@ -3989,6 +4050,13 @@ async def _handle_client_navigation(
         (principal_id,),
     ) as cursor:
         participant_rows = list(await cursor.fetchall())
+    avatar_descriptors = await human_avatar_descriptors(
+        store,
+        (
+            principal_id,
+            *(PrincipalId(str(row[2])) for row in participant_rows if str(row[3]) == "human"),
+        ),
+    )
 
     channels_by_workshop: dict[str, dict[str, dict[str, object]]] = {}
     for row in channel_rows:
@@ -4051,6 +4119,21 @@ async def _handle_client_navigation(
                 "kind": str(row[3]),
                 "display_name": str(row[4]),
                 "handle": str(row[5]) if row[5] is not None else None,
+                **(
+                    {
+                        "avatar": _serialize_human_avatar_descriptor(
+                            PrincipalId(str(row[2])),
+                            avatar_descriptors[PrincipalId(str(row[2]))].state_version
+                            if PrincipalId(str(row[2])) in avatar_descriptors
+                            else 0,
+                            avatar_descriptors[PrincipalId(str(row[2]))].active
+                            if PrincipalId(str(row[2])) in avatar_descriptors
+                            else False,
+                        )
+                    }
+                    if str(row[3]) == "human"
+                    else {}
+                ),
             }
         )
 
@@ -4118,6 +4201,11 @@ async def _handle_client_navigation(
                 "principal_id": str(principal_id),
                 "display_name": str(principal_row[0]),
                 "handle": str(principal_row[1]) if principal_row[1] is not None else None,
+                "avatar": _serialize_human_avatar_descriptor(
+                    principal_id,
+                    avatar_descriptors[principal_id].state_version if principal_id in avatar_descriptors else 0,
+                    avatar_descriptors[principal_id].active if principal_id in avatar_descriptors else False,
+                ),
             },
             "workshops": workshops,
         },
@@ -7698,6 +7786,7 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=human_profiles,
+                avatar_service=human_avatars,
             )
 
     async def handle_human_profile_update(request: web.Request) -> web.Response:
@@ -7706,6 +7795,7 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=human_profiles,
+                avatar_service=human_avatars,
             )
 
     app.router.add_get(_HUMAN_PROFILE_PATH, handle_human_profile)

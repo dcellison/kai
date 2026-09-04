@@ -12,8 +12,10 @@ import {
   AuthenticationError,
   ChannelAccessError,
   deactivateOperatorModel,
+  clearHumanAvatar,
   loadAppearancePreferences,
   loadHumanProfile,
+  loadHumanAvatar,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadGitHubSettings,
@@ -38,6 +40,7 @@ import {
   updateClientPreference,
   updateAppearancePreference,
   updateHumanDisplayName,
+  uploadHumanAvatar,
   updateWorkspaceConfig,
 } from "./api";
 import type {
@@ -55,6 +58,8 @@ import type {
   WorkshopClientPreferenceChange,
   WorkshopAppearancePreferences,
   WorkshopHumanProfile,
+  WorkshopHumanAvatar,
+  WorkshopHumanAvatarDescriptor,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
@@ -64,6 +69,42 @@ import type {
 } from "./types";
 import { applyWorkshopTheme } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
+import { HumanAvatar } from "./HumanAvatar";
+
+const MAX_AVATAR_UPLOAD_BYTES = 256 * 1024;
+const AVATAR_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+function avatarFromProfile(profile: WorkshopHumanProfile): WorkshopHumanAvatar {
+  const descriptor = profile.avatar ?? { active: false, stateVersion: 0, url: null };
+  return {
+    ...descriptor,
+    byteSize: null,
+    height: null,
+    mediaType: null,
+    mutation: null,
+    principalId: profile.principalId,
+    sha256: null,
+    width: null,
+  };
+}
+
+function AvatarUploadIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path d="M4 6h4l1.4-2h5.2L16 6h4v14H4z" />
+      <circle cx="12" cy="13" r="3.5" />
+      <path d="M18 3v5m-2.5-2.5h5" />
+    </svg>
+  );
+}
+
+function AvatarClearIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path d="M5 7h14M9 7V4h6v3m2 0-1 13H8L7 7m3 4v5m4-5v5" />
+    </svg>
+  );
+}
 
 const VOICE_MODE_LABELS = {
   off: "Text only",
@@ -194,6 +235,10 @@ type SettingsWorkspaceContentProps = {
   onClose: () => void;
   onDirtyChange: (dirty: boolean) => void;
   onNavigationChanged?: () => Promise<void>;
+  onHumanAvatarChanged?: (
+    principalId: string,
+    avatar: WorkshopHumanAvatarDescriptor,
+  ) => void;
   isAdministrator: boolean;
   principalName: string;
   roleLabel: string;
@@ -211,6 +256,7 @@ function SettingsWorkspaceContent({
   onClose,
   onDirtyChange,
   onNavigationChanged,
+  onHumanAvatarChanged,
   isAdministrator,
   principalName,
   roleLabel,
@@ -235,6 +281,11 @@ function SettingsWorkspaceContent({
   const [profileBusy, setProfileBusy] = useState(false);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [profileNotice, setProfileNotice] = useState<string | null>(null);
+  const [avatar, setAvatar] = useState<WorkshopHumanAvatar | null>(null);
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const [avatarError, setAvatarError] = useState<string | null>(null);
+  const [avatarNotice, setAvatarNotice] = useState<string | null>(null);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
 
   const [runtime, setRuntime] = useState<WorkshopSettingsWorkspace | null>(null);
   const [workspaceConfig, setWorkspaceConfig] = useState<WorkshopWorkspaceConfig | null>(null);
@@ -402,10 +453,19 @@ function SettingsWorkspaceContent({
   const refreshProfile = useCallback(async (): Promise<void> => {
     setProfileLoading(true);
     setProfileError(null);
+    setAvatarError(null);
     try {
       const snapshot = await loadHumanProfile(session);
       setProfile(snapshot);
       setProfileDraft(snapshot.displayName);
+      try {
+        setAvatar(await loadHumanAvatar(session));
+      } catch (caught) {
+        setAvatar(avatarFromProfile(snapshot));
+        if (!handleAccessFailure(caught)) {
+          setAvatarError("Your avatar is temporarily unavailable. Showing your initial instead.");
+        }
+      }
     } catch (caught) {
       if (!handleAccessFailure(caught)) {
         setProfileError(errorText(caught, "Could not load your profile."));
@@ -719,6 +779,84 @@ function SettingsWorkspaceContent({
       }
     } finally {
       setProfileBusy(false);
+    }
+  };
+
+  const changeAvatar = async (file: File): Promise<void> => {
+    if (!avatar || avatarBusy) {
+      return;
+    }
+    setAvatarError(null);
+    setAvatarNotice(null);
+    if (!AVATAR_MEDIA_TYPES.has(file.type)) {
+      setAvatarError("Choose a PNG, JPEG, GIF, or WebP image.");
+      return;
+    }
+    if (file.size > MAX_AVATAR_UPLOAD_BYTES) {
+      setAvatarError("Avatar images must be no larger than 256 KiB.");
+      return;
+    }
+    setAvatarBusy(true);
+    try {
+      const operationId = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `avatar-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const saved = await uploadHumanAvatar(
+        session,
+        file,
+        avatar.stateVersion,
+        operationId,
+      );
+      setAvatar(saved);
+      setProfile((current) => current ? { ...current, avatar: saved } : current);
+      onHumanAvatarChanged?.(saved.principalId, saved);
+      setAvatarNotice("Avatar saved.");
+      await onNavigationChanged?.();
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshProfile();
+        setAvatarError("Your avatar changed elsewhere. The latest image has been reloaded.");
+      } else if (!handleAccessFailure(caught)) {
+        setAvatarError(errorText(caught, "Could not save your avatar."));
+      }
+    } finally {
+      setAvatarBusy(false);
+      if (avatarInputRef.current) {
+        avatarInputRef.current.value = "";
+      }
+    }
+  };
+
+  const removeAvatar = async (): Promise<void> => {
+    if (!avatar || !avatar.active || avatarBusy) {
+      return;
+    }
+    setAvatarBusy(true);
+    setAvatarError(null);
+    setAvatarNotice(null);
+    try {
+      const operationId = globalThis.crypto?.randomUUID
+        ? globalThis.crypto.randomUUID()
+        : `avatar-clear-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const saved = await clearHumanAvatar(
+        session,
+        avatar.stateVersion,
+        operationId,
+      );
+      setAvatar(saved);
+      setProfile((current) => current ? { ...current, avatar: saved } : current);
+      onHumanAvatarChanged?.(saved.principalId, saved);
+      setAvatarNotice("Avatar cleared.");
+      await onNavigationChanged?.();
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshProfile();
+        setAvatarError("Your avatar changed elsewhere. The latest image has been reloaded.");
+      } else if (!handleAccessFailure(caught)) {
+        setAvatarError(errorText(caught, "Could not clear your avatar."));
+      }
+    } finally {
+      setAvatarBusy(false);
     }
   };
 
@@ -1183,6 +1321,56 @@ function SettingsWorkspaceContent({
           ) : profile ? (
             <form className="settings-card" onSubmit={(event) => { event.preventDefault(); void saveProfile(); }}>
               <p className="settings-card-label">Profile</p>
+              {avatar && (
+                <div className="profile-avatar-editor">
+                  <HumanAvatar
+                    avatar={avatar}
+                    className="profile-avatar-preview"
+                    displayName={profileDraft || profile.displayName}
+                    label="Your profile avatar"
+                    principalId={profile.principalId}
+                  />
+                  <div className="profile-avatar-actions">
+                    <input
+                      ref={avatarInputRef}
+                      className="visually-hidden"
+                      type="file"
+                      accept="image/png,image/jpeg,image/gif,image/webp"
+                      disabled={avatarBusy}
+                      aria-label="Choose avatar image"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) {
+                          void changeAvatar(file);
+                        }
+                      }}
+                    />
+                    <button
+                      className="panel-icon-button"
+                      type="button"
+                      aria-label={avatar.active ? "Change avatar" : "Add avatar"}
+                      title={avatar.active ? "Change avatar" : "Add avatar"}
+                      disabled={avatarBusy}
+                      onClick={() => avatarInputRef.current?.click()}
+                    >
+                      <AvatarUploadIcon />
+                    </button>
+                    {avatar.active && (
+                      <button
+                        className="panel-icon-button"
+                        type="button"
+                        aria-label="Clear avatar"
+                        title="Clear avatar"
+                        disabled={avatarBusy}
+                        onClick={() => void removeAvatar()}
+                      >
+                        <AvatarClearIcon />
+                      </button>
+                    )}
+                    <span>{avatarBusy ? "Saving…" : "PNG, JPEG, GIF, or WebP · 256 KiB max"}</span>
+                  </div>
+                </div>
+              )}
               <label htmlFor="profile-display-name">Display name</label>
               <input
                 id="profile-display-name"
@@ -1208,7 +1396,9 @@ function SettingsWorkspaceContent({
                 </button>
               </div>
               {profileNotice && <p className="settings-notice" role="status">{profileNotice}</p>}
+              {avatarNotice && <p className="settings-notice" role="status">{avatarNotice}</p>}
               {profileError && <p className="settings-error" role="alert">{profileError}</p>}
+              {avatarError && <p className="settings-error" role="alert">{avatarError}</p>}
             </form>
           ) : (
             <div className="settings-failure">
