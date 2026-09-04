@@ -5416,8 +5416,7 @@ function ActiveWorkshopClient({
   }
 
   return (
-    <HumanAvatarCacheProvider token={session.token}>
-      <WorkshopView
+    <WorkshopView
       agentDestination={destination.kind === "agents" ? destination : null}
       agentToken={session.token}
       channel={selected.channel}
@@ -5498,8 +5497,7 @@ function ActiveWorkshopClient({
       onSwitchWorkspace={switchSelectedWorkspace}
       onSettingsAccessFailure={onChannelAccessFailure}
       onSettingsDirtyChange={onSettingsDirtyChange}
-      />
-    </HumanAvatarCacheProvider>
+    />
   );
 }
 
@@ -6057,44 +6055,46 @@ function WorkshopApp(): React.JSX.Element {
   }
 
   return (
-    <ActiveWorkshopClient
-      key={session.channelId}
-      destination={destination}
-      navigation={navigation}
-      session={session}
-      readActivationChannelId={readActivationChannelId}
-      onAuthenticationFailure={handleAuthenticationFailure}
-      onArchiveChannel={(channelId, clientOperationId) =>
-        changeWorkshopChannelLifecycle(channelId, clientOperationId, "archive")
-      }
-      onArchiveDirectMessage={(channelId, clientOperationId) =>
-        changeWorkshopDirectMessageArchive(channelId, clientOperationId, "archive")
-      }
-      onChannelAccessFailure={handleChannelAccessFailure}
-      onCreateChannel={createWorkshopChannel}
-      onStartHumanConversation={startWorkshopHumanConversation}
-      onForget={() => forgetSession()}
-      onAgentNavigationChanged={refreshAgentNavigation}
-      onCreateAgent={() => void openAgents(null, true)}
-      onOpenAgentChannel={openAgentChannel}
-      onOpenAgentDefinition={openAgentDefinition}
-      onOpenMemory={() => void openMemory()}
-      onOpenMentions={() => void openMentions()}
-      onOpenFollowing={() => void openFollowing()}
-      onOpenFollowedThread={openFollowedThread}
-      onOpenHumanNotification={openHumanNotification}
-      onOpenSettings={openSettings}
-      onRestoreChannel={(channelId, clientOperationId) =>
-        changeWorkshopChannelLifecycle(channelId, clientOperationId, "restore")
-      }
-      onRestoreDirectMessage={(channelId, clientOperationId) =>
-        changeWorkshopDirectMessageArchive(channelId, clientOperationId, "restore")
-      }
-      onSelectChannel={(channelId) => void selectChannel(channelId)}
-      onSelectAgent={selectAgent}
-      onSelectMemory={selectMemory}
-      onSettingsDirtyChange={setSettingsDirty}
-    />
+    <HumanAvatarCacheProvider token={session.token}>
+      <ActiveWorkshopClient
+        key={session.channelId}
+        destination={destination}
+        navigation={navigation}
+        session={session}
+        readActivationChannelId={readActivationChannelId}
+        onAuthenticationFailure={handleAuthenticationFailure}
+        onArchiveChannel={(channelId, clientOperationId) =>
+          changeWorkshopChannelLifecycle(channelId, clientOperationId, "archive")
+        }
+        onArchiveDirectMessage={(channelId, clientOperationId) =>
+          changeWorkshopDirectMessageArchive(channelId, clientOperationId, "archive")
+        }
+        onChannelAccessFailure={handleChannelAccessFailure}
+        onCreateChannel={createWorkshopChannel}
+        onStartHumanConversation={startWorkshopHumanConversation}
+        onForget={() => forgetSession()}
+        onAgentNavigationChanged={refreshAgentNavigation}
+        onCreateAgent={() => void openAgents(null, true)}
+        onOpenAgentChannel={openAgentChannel}
+        onOpenAgentDefinition={openAgentDefinition}
+        onOpenMemory={() => void openMemory()}
+        onOpenMentions={() => void openMentions()}
+        onOpenFollowing={() => void openFollowing()}
+        onOpenFollowedThread={openFollowedThread}
+        onOpenHumanNotification={openHumanNotification}
+        onOpenSettings={openSettings}
+        onRestoreChannel={(channelId, clientOperationId) =>
+          changeWorkshopChannelLifecycle(channelId, clientOperationId, "restore")
+        }
+        onRestoreDirectMessage={(channelId, clientOperationId) =>
+          changeWorkshopDirectMessageArchive(channelId, clientOperationId, "restore")
+        }
+        onSelectChannel={(channelId) => void selectChannel(channelId)}
+        onSelectAgent={selectAgent}
+        onSelectMemory={selectMemory}
+        onSettingsDirtyChange={setSettingsDirty}
+      />
+    </HumanAvatarCacheProvider>
   );
 }
 
