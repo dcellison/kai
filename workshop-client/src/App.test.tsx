@@ -2938,7 +2938,9 @@ describe("Workshop React client", () => {
       name: "Open thread with 1 reply, including unread replies",
     });
     expect(threadButton).toHaveTextContent("1 reply");
-    expect(threadButton).toHaveTextContent("View thread");
+    expect(within(threadButton).getByText("View thread")).toHaveClass(
+      "thread-summary-label",
+    );
     expect(threadButton).toHaveTextContent("New replies");
     expect(threadButton.querySelectorAll(".thread-participant-avatar")).toHaveLength(2);
     expect(threadButton.querySelector(".thread-summary-chevron")).not.toBeNull();

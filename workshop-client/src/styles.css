@@ -1395,7 +1395,9 @@ button:disabled {
   overflow: hidden;
   color: var(--color-text-muted);
   font-weight: 520;
+  opacity: 0;
   text-overflow: ellipsis;
+  transition: opacity 120ms ease;
   white-space: nowrap;
 }
 
@@ -1411,6 +1413,8 @@ button:disabled {
   transition: opacity 120ms ease;
 }
 
+.thread-summary:hover .thread-summary-label,
+.thread-summary:focus-visible .thread-summary-label,
 .thread-summary:hover .thread-summary-chevron,
 .thread-summary:focus-visible .thread-summary-chevron {
   opacity: 1;
