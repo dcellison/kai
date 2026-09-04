@@ -1322,7 +1322,6 @@ button:disabled {
   width: fit-content;
   min-width: 2rem;
   min-height: 2rem;
-  margin-left: auto;
   border: 0;
   border-radius: 0.35rem;
   padding: 0.3rem 0.45rem;
