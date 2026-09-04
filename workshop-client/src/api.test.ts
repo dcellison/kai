@@ -171,6 +171,8 @@ function message(position: number, body = `Message ${position}`): Record<string,
     message_id: `msg_${position.toString().padStart(32, "0")}`,
     mentions: [],
     reply_count: 0,
+    reply_participant_count: 0,
+    reply_participants: [],
     reply_to_message_id: null,
     thread_root_id: null,
   };
@@ -638,7 +640,17 @@ describe("Workshop client API", () => {
           version: 1,
           channel_id: channelId,
           thread_root_id: rootId,
-          root: { ...message(10, "Root"), reply_count: 1 },
+          root: {
+            ...message(10, "Root"),
+            reply_count: 1,
+            reply_participant_count: 1,
+            reply_participants: [{
+              avatar: { active: false, state_version: 0, url: null },
+              display_name: "Daniel",
+              kind: "human",
+              principal_id: "prn_00000000000000000000000000000001",
+            }],
+          },
           messages: [reply],
           next_cursor: null,
           through_position: 11,
@@ -656,6 +668,13 @@ describe("Workshop client API", () => {
 
     const page = await loadThreadTimeline(session, rootId);
     expect(page.root.replyCount).toBe(1);
+    expect(page.root.replyParticipantCount).toBe(1);
+    expect(page.root.replyParticipants).toEqual([{
+      avatar: { active: false, stateVersion: 0, url: null },
+      displayName: "Daniel",
+      kind: "human",
+      principalId: "prn_00000000000000000000000000000001",
+    }]);
     expect(page.messages[0].threadRootId).toBe(rootId);
     await submitCommand(session, "thread-reply", "Continue", null, rootId);
     expect(fetchMock.mock.calls[1]?.[0]).toBe(

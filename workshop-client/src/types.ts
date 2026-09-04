@@ -821,9 +821,18 @@ export interface TimelineMessage {
   messageId: string;
   reactions: WorkshopMessageReaction[];
   replyCount: number;
+  replyParticipantCount: number;
+  replyParticipants: WorkshopReplyParticipant[];
   replyToMessageId: string | null;
   latestReplyAt: string | null;
   threadRootId: string | null;
+}
+
+export interface WorkshopReplyParticipant {
+  avatar: WorkshopHumanAvatarDescriptor | null;
+  displayName: string;
+  kind: "human" | "agent";
+  principalId: string;
 }
 
 export type WorkshopReaction =

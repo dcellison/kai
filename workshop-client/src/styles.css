@@ -1317,29 +1317,103 @@ button:disabled {
 .thread-summary {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 0.35rem;
-  width: fit-content;
-  min-width: 2rem;
-  min-height: 2rem;
-  border: 0;
-  border-radius: 0.35rem;
-  padding: 0.3rem 0.45rem 0.3rem 0;
+  justify-content: flex-start;
+  gap: 0.55rem;
+  flex: 1 1 18rem;
+  min-width: 0;
+  min-height: 2.35rem;
+  border: 1px solid transparent;
+  border-radius: 0.48rem;
+  padding: 0.26rem 0.55rem;
   background: transparent;
-  color: var(--color-accent);
-  font: 700 0.68rem var(--sans);
+  color: var(--color-text-muted);
+  font: 650 0.72rem var(--sans);
   cursor: pointer;
 }
 
 .thread-summary:hover,
 .thread-summary:focus-visible {
-  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  border-color: var(--color-border-strong);
+  background: color-mix(in srgb, var(--color-panel) 72%, transparent);
   outline: none;
 }
 
 .thread-summary svg {
   width: 1rem;
   height: 1rem;
+}
+
+.thread-participants {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.thread-participant-avatar,
+.thread-participant-overflow {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 1.65rem;
+  height: 1.65rem;
+  overflow: hidden;
+  border-radius: 0.36rem;
+  background: color-mix(in srgb, var(--color-accent) 13%, var(--color-panel));
+  color: var(--color-accent);
+  font: 750 0.64rem var(--sans);
+}
+
+.thread-participant-avatar.agent {
+  background: color-mix(in srgb, var(--color-success) 13%, var(--color-panel));
+  color: var(--color-success);
+}
+
+.thread-participant-avatar img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.thread-participant-overflow {
+  width: auto;
+  min-width: 1.65rem;
+  padding: 0 0.28rem;
+  background: color-mix(in srgb, var(--color-text-muted) 10%, var(--color-panel));
+  color: var(--color-text-muted);
+}
+
+.thread-summary-count {
+  flex: none;
+  color: var(--color-accent);
+  font-weight: 750;
+}
+
+.thread-summary-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-weight: 520;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-summary strong {
+  flex: none;
+  color: var(--color-accent);
+}
+
+.thread-summary-chevron {
+  flex: none;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.thread-summary:hover .thread-summary-chevron,
+.thread-summary:focus-visible .thread-summary-chevron {
+  opacity: 1;
 }
 
 @media (hover: none) {
@@ -1351,16 +1425,6 @@ button:disabled {
     pointer-events: auto;
     transform: none;
   }
-}
-
-.thread-summary span {
-  color: var(--color-text-muted);
-  font-weight: 500;
-}
-
-.thread-summary strong {
-  color: var(--color-accent);
-  font-weight: 700;
 }
 
 .message-artifact {

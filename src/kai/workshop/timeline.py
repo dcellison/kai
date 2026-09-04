@@ -26,6 +26,7 @@ from kai.workshop.store import WorkshopEventStore
 _CURSOR_PREFIX = "v1."
 _MAX_CURSOR_LENGTH = 512
 _MAX_PAGE_SIZE = 100
+_MAX_REPLY_PARTICIPANTS = 3
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _VISIBLE_MESSAGE_PREDICATE = (
     "NOT (p.kind = 'human' AND COALESCE(json_extract(e.metadata_json, '$.source'), '') = 'scheduled_job')"
@@ -51,6 +52,17 @@ class ChannelTimelineAuthorizer(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class TimelineReplyParticipant:
+    """One recent distinct participant in a message thread."""
+
+    principal_id: PrincipalId
+    kind: str
+    display_name: str
+    avatar_state_version: int = 0
+    avatar_active: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class TimelineMessage:
     """One canonical message suitable for a transport-neutral timeline."""
 
@@ -69,6 +81,8 @@ class TimelineMessage:
     reactions: tuple[MessageReactionSummary, ...] = ()
     reply_count: int = 0
     latest_reply_at: datetime | None = None
+    reply_participants: tuple[TimelineReplyParticipant, ...] = ()
+    reply_participant_count: int = 0
     author_avatar_state_version: int = 0
     author_avatar_active: bool = False
 
@@ -343,10 +357,57 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
     return tuple(messages)
 
 
+async def _reply_participant_summaries(
+    store: WorkshopEventStore,
+    messages: tuple[TimelineMessage, ...],
+    through_position: int,
+) -> dict[MessageId, tuple[tuple[TimelineReplyParticipant, ...], int]]:
+    root_ids = tuple(
+        message.message_id for message in messages if message.thread_root_id is None and message.reply_count > 0
+    )
+    if not root_ids:
+        return {}
+    placeholders = ",".join("?" for _ in root_ids)
+    async with store.connection.execute(
+        "WITH latest_by_author AS ("
+        "SELECT tr.thread_root_id, tr.author_principal_id, p.kind, p.display_name, "
+        "MAX(tr.created_event_position) AS latest_position "
+        "FROM messages tr JOIN principals p ON p.id = tr.author_principal_id "
+        "JOIN event_log e ON e.position = tr.created_event_position "
+        f"WHERE tr.thread_root_id IN ({placeholders}) AND tr.created_event_position <= ? "
+        f"AND {_VISIBLE_MESSAGE_PREDICATE} "
+        "GROUP BY tr.thread_root_id, tr.author_principal_id, p.kind, p.display_name"
+        "), ranked AS ("
+        "SELECT thread_root_id, author_principal_id, kind, display_name, latest_position, "
+        "ROW_NUMBER() OVER (PARTITION BY thread_root_id "
+        "ORDER BY latest_position DESC, author_principal_id ASC) AS participant_rank, "
+        "COUNT(*) OVER (PARTITION BY thread_root_id) AS participant_count "
+        "FROM latest_by_author"
+        ") SELECT thread_root_id, author_principal_id, kind, display_name, participant_count "
+        "FROM ranked WHERE participant_rank <= ? ORDER BY thread_root_id, participant_rank",
+        (*root_ids, through_position, _MAX_REPLY_PARTICIPANTS),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    participants: dict[MessageId, list[TimelineReplyParticipant]] = {}
+    counts: dict[MessageId, int] = {}
+    for row in rows:
+        root_id = MessageId(str(row[0]))
+        participants.setdefault(root_id, []).append(
+            TimelineReplyParticipant(
+                principal_id=PrincipalId(str(row[1])),
+                kind=str(row[2]),
+                display_name=str(row[3]),
+            )
+        )
+        counts[root_id] = int(row[4])
+    return {root_id: (tuple(summary), counts[root_id]) for root_id, summary in participants.items()}
+
+
 async def attach_message_details(
     store: WorkshopEventStore,
     messages: tuple[TimelineMessage, ...],
     principal_id: PrincipalId,
+    through_position: int,
 ) -> tuple[TimelineMessage, ...]:
     artifact_map = await artifacts_for_messages(
         store,
@@ -357,15 +418,39 @@ async def attach_message_details(
         message_ids=tuple(message.message_id for message in messages),
         viewer_principal_id=principal_id,
     )
+    reply_participant_map = await _reply_participant_summaries(
+        store,
+        messages,
+        through_position,
+    )
+    reply_participants = tuple(participant for summary, _ in reply_participant_map.values() for participant in summary)
     avatar_map = await human_avatar_descriptors(
         store,
-        (message.author_principal_id for message in messages if message.author_kind == "human"),
+        (
+            *(message.author_principal_id for message in messages if message.author_kind == "human"),
+            *(participant.principal_id for participant in reply_participants if participant.kind == "human"),
+        ),
     )
     return tuple(
         replace(
             message,
             artifacts=artifact_map.get(message.message_id, ()),
             reactions=reaction_map.get(message.message_id, ()),
+            reply_participants=tuple(
+                replace(
+                    participant,
+                    avatar_state_version=(
+                        avatar_map[participant.principal_id].state_version
+                        if participant.principal_id in avatar_map
+                        else 0
+                    ),
+                    avatar_active=(
+                        avatar_map[participant.principal_id].active if participant.principal_id in avatar_map else False
+                    ),
+                )
+                for participant in reply_participant_map.get(message.message_id, ((), 0))[0]
+            ),
+            reply_participant_count=reply_participant_map.get(message.message_id, ((), 0))[1],
             author_avatar_state_version=(
                 avatar_map[message.author_principal_id].state_version
                 if message.author_principal_id in avatar_map
@@ -412,7 +497,12 @@ async def _read_forward_page(
 
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    messages = await attach_message_details(store, _messages_from_rows(page_rows), principal_id)
+    messages = await attach_message_details(
+        store,
+        _messages_from_rows(page_rows),
+        principal_id,
+        state.through_position,
+    )
     next_cursor = None
     if has_more:
         next_cursor = _encode_cursor(
@@ -456,7 +546,12 @@ async def _read_tail_page(
 
     has_more = len(rows) > limit
     page_rows = list(reversed(rows[:limit]))
-    messages = await attach_message_details(store, _messages_from_rows(page_rows), principal_id)
+    messages = await attach_message_details(
+        store,
+        _messages_from_rows(page_rows),
+        principal_id,
+        state.through_position,
+    )
     previous_cursor = None
     if has_more:
         previous_cursor = _encode_tail_cursor(
@@ -624,7 +719,7 @@ async def read_channel_message(
         (message_id, channel_id),
     ) as cursor:
         rows = list(await cursor.fetchall())
-    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id)
+    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id, through_position)
     if len(messages) != 1 or messages[0].event_position > through_position:
         raise TimelineAccessDeniedError("Message access denied")
     return messages[0]
@@ -653,7 +748,7 @@ async def _read_thread_root(
         (through_position, through_position, thread_root_id, channel_id, through_position),
     ) as cursor:
         rows = list(await cursor.fetchall())
-    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id)
+    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id, through_position)
     if len(messages) != 1:
         raise TimelineAccessDeniedError("Thread access denied")
     return messages[0]
@@ -709,7 +804,12 @@ async def read_thread_timeline(
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
     has_more = len(rows) > limit
-    messages = await attach_message_details(store, _messages_from_rows(rows[:limit]), principal_id)
+    messages = await attach_message_details(
+        store,
+        _messages_from_rows(rows[:limit]),
+        principal_id,
+        state.through_position,
+    )
     next_cursor = None
     if has_more:
         next_cursor = _encode_thread_cursor(
@@ -772,6 +872,11 @@ async def read_channel_timeline_updates(
     ) as query_cursor:
         rows = list(await query_cursor.fetchall())
 
-    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id)
+    messages = await attach_message_details(
+        store,
+        _messages_from_rows(rows),
+        principal_id,
+        await _latest_message_position(store, channel_id),
+    )
     next_position = int(rows[-1][8]) if rows else after_position
     return TimelineUpdateBatch(messages, next_position)

@@ -4205,6 +4205,8 @@ class TestWorkshopTimelineHTTPContract:
                         "event_position": payload["messages"][0]["event_position"],
                         "created_at": "2026-08-11T14:00:01Z",
                         "reply_count": 0,
+                        "reply_participant_count": 0,
+                        "reply_participants": [],
                         "latest_reply_at": None,
                         "mentions": [],
                         "reactions": [],
@@ -4448,6 +4450,19 @@ class TestWorkshopThreadTimelineHTTPContract:
             assert channel_response.status == first_response.status == second_response.status == 200
             assert [message["body"] for message in channel_payload["messages"]] == ["Root"]
             assert channel_payload["messages"][0]["reply_count"] == 2
+            assert channel_payload["messages"][0]["reply_participant_count"] == 1
+            assert channel_payload["messages"][0]["reply_participants"] == [
+                {
+                    "principal_id": alice_id,
+                    "kind": "human",
+                    "display_name": "Alice",
+                    "avatar": {
+                        "state_version": 0,
+                        "active": False,
+                        "url": None,
+                    },
+                }
+            ]
             assert first["thread_root_id"] == root_id
             assert first["root"]["body"] == "Root"
             assert [message["body"] for message in first["messages"]] == ["First reply"]
@@ -4797,6 +4812,8 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "event_position": int(str(first["id"])),
                     "created_at": "2026-08-11T14:00:01Z",
                     "reply_count": 0,
+                    "reply_participant_count": 0,
+                    "reply_participants": [],
                     "latest_reply_at": None,
                     "mentions": [],
                     "reactions": [],
