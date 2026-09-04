@@ -3024,7 +3024,7 @@ describe("Workshop React client", () => {
     expect(replyButton.querySelector("svg")).not.toBeNull();
   });
 
-  it("offers monochrome hover actions and toggles a canonical reaction", async () => {
+  it("offers monochrome hover actions and lays coloured reactions above replies", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -3041,7 +3041,7 @@ describe("Workshop React client", () => {
       previousCursor: null,
     });
     vi.mocked(setMessageReaction).mockResolvedValueOnce([
-      { count: 1, reactedByViewer: true, reaction: "eyes" },
+      { count: 1, reactedByViewer: true, reaction: "fire" },
     ]).mockResolvedValueOnce([]);
 
     render(<App />);
@@ -3058,32 +3058,38 @@ describe("Workshop React client", () => {
     expect(replyAction.querySelector("svg")).not.toBeNull();
 
     await user.click(reactionAction);
+    expect(screen.getAllByRole("menuitemcheckbox")).toHaveLength(12);
     await user.click(screen.getByRole("menuitemcheckbox", {
-      name: "Add Eyes reaction",
+      name: "Add Fire reaction",
     }));
     expect(setMessageReaction).toHaveBeenLastCalledWith(
       { channelId: secondChannelId, token: "existing-session" },
       historyMessage.messageId,
-      "eyes",
+      "fire",
       true,
     );
 
     const reactionChip = await screen.findByRole("button", {
-      name: "Eyes: 1. Remove your reaction",
+      name: "Fire: 1. Remove your reaction",
     });
     const engagement = screen.getByRole("group", { name: "Message engagement" });
     expect(engagement).toHaveClass("message-engagement");
-    expect(within(engagement).getByRole("button", {
+    const threadButton = within(engagement).getByRole("button", {
       name: "Open thread with 2 replies",
-    })).toBeVisible();
-    expect(within(engagement).getByRole("button", {
-      name: "Eyes: 1. Remove your reaction",
+    });
+    expect(threadButton).toBeVisible();
+    const reactions = within(engagement).getByRole("group", {
+      name: "Message reactions",
+    });
+    expect(within(reactions).getByRole("button", {
+      name: "Fire: 1. Remove your reaction",
     })).toBe(reactionChip);
+    expect(reactions.nextElementSibling).toBe(threadButton);
     await user.click(reactionChip);
     expect(setMessageReaction).toHaveBeenLastCalledWith(
       { channelId: secondChannelId, token: "existing-session" },
       historyMessage.messageId,
-      "eyes",
+      "fire",
       false,
     );
   });

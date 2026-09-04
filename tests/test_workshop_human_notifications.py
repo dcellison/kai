@@ -319,7 +319,7 @@ class TestHumanNotificationAuthority:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             async with upgraded.connection.execute(
                 "SELECT kind FROM human_notifications WHERE recipient_principal_id = ?",
                 (scott_id,),

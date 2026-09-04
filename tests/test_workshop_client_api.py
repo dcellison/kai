@@ -4527,18 +4527,18 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             added = await client.put(
                 path,
                 headers={"Authorization": "Bearer alice-token"},
-                json={"reaction": "eyes", "active": True},
+                json={"reaction": "fire", "active": True},
             )
             added_payload = await added.json()
             replayed = await client.put(
                 path,
                 headers={"Authorization": "Bearer alice-token"},
-                json={"reaction": "eyes", "active": True},
+                json={"reaction": "fire", "active": True},
             )
             denied = await client.put(
                 path,
                 headers={"Authorization": "Bearer bob-token"},
-                json={"reaction": "eyes", "active": True},
+                json={"reaction": "fire", "active": True},
             )
             invalid = await client.put(
                 path,
@@ -4567,7 +4567,7 @@ class TestWorkshopTimelineEventStreamHTTPContract:
 
             assert added.status == 200
             assert added_payload["changed"] is True
-            assert added_payload["reactions"] == [{"reaction": "eyes", "count": 1, "reacted_by_viewer": True}]
+            assert added_payload["reactions"] == [{"reaction": "fire", "count": 1, "reacted_by_viewer": True}]
             assert replayed.status == 200
             assert (await replayed.json())["changed"] is False
             assert (await replayed.json())["event_position"] is None
@@ -4598,7 +4598,7 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             removed = await client.put(
                 path,
                 headers={"Authorization": "Bearer alice-token"},
-                json={"reaction": "eyes", "active": False},
+                json={"reaction": "fire", "active": False},
             )
             assert removed.status == 200
             assert (await removed.json())["reactions"] == []

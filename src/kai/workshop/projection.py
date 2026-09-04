@@ -2868,7 +2868,20 @@ class CanonicalConversationProjection:
             await _require_active_channel(connection, channel_id)
             principal_id = PrincipalId(_required_text(payload, "principal_id"))
             reaction = _required_text(payload, "reaction")
-            if reaction not in {"thumbs_up", "heart", "laugh", "celebrate", "eyes", "check"}:
+            if reaction not in {
+                "thumbs_up",
+                "thumbs_down",
+                "heart",
+                "laugh",
+                "celebrate",
+                "eyes",
+                "check",
+                "thinking",
+                "surprised",
+                "sad",
+                "fire",
+                "question",
+            }:
                 raise ValueError("Unsupported Workshop message reaction")
             if envelope.actor_principal_id != principal_id:
                 raise ValueError("Workshop message reaction actor must match its principal")

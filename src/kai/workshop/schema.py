@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 65
+WORKSHOP_SCHEMA_VERSION = 66
 
 
 @dataclass(frozen=True, slots=True)
@@ -2845,6 +2845,37 @@ _CANONICAL_HUMAN_AVATAR_SCHEMA = SchemaMigration(
     ),
 )
 
+_EXPANDED_MESSAGE_REACTIONS_SCHEMA = SchemaMigration(
+    version=66,
+    name="expanded_message_reactions",
+    statements=(
+        "ALTER TABLE message_reactions RENAME TO message_reactions_v66",
+        """
+        CREATE TABLE message_reactions (
+            message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            reaction TEXT NOT NULL CHECK (
+                reaction IN (
+                    'thumbs_up', 'thumbs_down', 'heart', 'laugh', 'celebrate',
+                    'eyes', 'check', 'thinking', 'surprised', 'sad', 'fire', 'question'
+                )
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (message_id, principal_id, reaction)
+        )
+        """,
+        "INSERT INTO message_reactions "
+        "(message_id, principal_id, reaction, created_at, created_event_position) "
+        "SELECT message_id, principal_id, reaction, created_at, created_event_position "
+        "FROM message_reactions_v66",
+        "DROP TABLE message_reactions_v66",
+        "CREATE INDEX message_reactions_message_idx ON message_reactions "
+        "(message_id, reaction, created_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2911,6 +2942,7 @@ _MIGRATIONS = (
     _PRINCIPAL_DIRECT_MESSAGE_ARCHIVE_SCHEMA,
     _CANONICAL_HUMAN_PROFILE_SCHEMA,
     _CANONICAL_HUMAN_AVATAR_SCHEMA,
+    _EXPANDED_MESSAGE_REACTIONS_SCHEMA,
 )
 
 

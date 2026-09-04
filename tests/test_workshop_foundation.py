@@ -257,7 +257,7 @@ class TestWorkshopSchema:
         }
 
         assert expected <= await workshop_store.schema_tables()
-        assert await workshop_store.schema_version() == 65
+        assert await workshop_store.schema_version() == 66
         async with workshop_store.connection.execute("PRAGMA table_info(principals)") as cursor:
             principal_columns = {str(row[1]) for row in await cursor.fetchall()}
         assert {"display_name_state_version", "display_name_event_position"} <= principal_columns
@@ -308,13 +308,106 @@ class TestWorkshopSchema:
         await first.close()
 
         second = await WorkshopEventStore.open(path)
-        assert await second.schema_version() == 65
+        assert await second.schema_version() == 66
         async with second.connection.execute(
             "SELECT COUNT(*) FROM workshop_schema_migrations WHERE version = 1"
         ) as cursor:
             row = await cursor.fetchone()
         assert row[0] == 1
         await second.close()
+
+    async def test_expanded_reaction_migration_preserves_existing_reactions(self, tmp_path: Path, monkeypatch):
+        from kai.workshop import schema
+
+        path = tmp_path / "workshop.db"
+        workshop_id = WorkshopId.new()
+        principal_id = PrincipalId.new()
+        channel_id = ChannelId.new()
+        message_id = MessageId.new()
+        timestamp = "2026-09-04T12:00:00Z"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 65)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:65])
+            version_sixty_five = await WorkshopEventStore.open(path)
+            await version_sixty_five.connection.execute(
+                "INSERT INTO workshops (id, name, created_at) VALUES (?, 'Existing', ?)",
+                (workshop_id, timestamp),
+            )
+            await version_sixty_five.connection.execute(
+                "INSERT INTO principals (id, kind, display_name, created_at) VALUES (?, 'human', 'Daniel', ?)",
+                (principal_id, timestamp),
+            )
+            await version_sixty_five.connection.execute(
+                "INSERT INTO channels (id, workshop_id, kind, created_at) VALUES (?, ?, 'group', ?)",
+                (channel_id, workshop_id, timestamp),
+            )
+            await version_sixty_five.connection.commit()
+            message_event = await version_sixty_five.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.MESSAGE_CREATED,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="message",
+                    aggregate_id=message_id,
+                    actor_principal_id=principal_id,
+                    occurred_at=datetime(2026, 9, 4, 12, 0, tzinfo=UTC),
+                    payload={
+                        "channel_id": channel_id,
+                        "author_principal_id": principal_id,
+                        "body": "Existing reaction",
+                    },
+                )
+            )
+            await version_sixty_five.connection.execute(
+                "INSERT INTO messages "
+                "(id, channel_id, author_principal_id, body, created_event_position, created_at) "
+                "VALUES (?, ?, ?, 'Existing reaction', ?, ?)",
+                (message_id, channel_id, principal_id, message_event.event.position, timestamp),
+            )
+            await version_sixty_five.connection.commit()
+            reaction_event = await version_sixty_five.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.MESSAGE_REACTION_ADDED,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="message",
+                    aggregate_id=message_id,
+                    actor_principal_id=principal_id,
+                    occurred_at=datetime(2026, 9, 4, 12, 0, 1, tzinfo=UTC),
+                    payload={
+                        "channel_id": channel_id,
+                        "principal_id": principal_id,
+                        "reaction": "eyes",
+                    },
+                )
+            )
+            await version_sixty_five.connection.execute(
+                "INSERT INTO message_reactions "
+                "(message_id, principal_id, reaction, created_at, created_event_position) "
+                "VALUES (?, ?, 'eyes', ?, ?)",
+                (message_id, principal_id, timestamp, reaction_event.event.position),
+            )
+            await version_sixty_five.connection.commit()
+            await version_sixty_five.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        try:
+            assert await upgraded.schema_version() == 66
+            async with upgraded.connection.execute(
+                "SELECT reaction, created_event_position FROM message_reactions "
+                "WHERE message_id = ? AND principal_id = ?",
+                (message_id, principal_id),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("eyes", reaction_event.event.position)
+            async with upgraded.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'message_reactions'"
+            ) as cursor:
+                table_sql = str((await cursor.fetchone())[0])
+            assert "'thumbs_down'" in table_sql
+            assert "'fire'" in table_sql
+            assert "'question'" in table_sql
+        finally:
+            await upgraded.close()
 
     async def test_version_twenty_nine_authority_lane_migrates_without_losing_epoch(
         self,
@@ -340,7 +433,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             async with upgraded.connection.execute("SELECT id, lane, status FROM delivery_authority_epochs") as cursor:
                 assert tuple(await cursor.fetchone()) == (
                     epoch_id,
@@ -368,7 +461,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             assert {
                 "deliveries",
                 "channel_memberships",
@@ -451,6 +544,7 @@ class TestWorkshopSchema:
                     63,
                     64,
                     65,
+                    66,
                 ]
         finally:
             await upgraded.close()
@@ -473,7 +567,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             assert {
                 "channel_memberships",
                 "workshop_client_devices",
@@ -514,7 +608,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             assert {
                 "workshop_client_devices",
                 "workshop_client_enrollment_grants",
@@ -567,7 +661,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             assert "workshop_client_enrollment_grants" in await upgraded.schema_tables()
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
@@ -611,7 +705,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             assert "artifacts" in await upgraded.schema_tables()
             assert "delivery_outbox" in await upgraded.schema_tables()
             async with upgraded.connection.execute(
@@ -655,7 +749,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             assert {"delivery_outbox", "delivery_attempts"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -699,7 +793,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             assert {"delivery_outbox", "delivery_attempts", "delivery_fragments"} <= await upgraded.schema_tables()
             async with upgraded.connection.execute(
                 "SELECT display_name FROM principals WHERE id = ?",
@@ -803,7 +897,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             async with upgraded.connection.execute(
                 "SELECT message_id, channel_binding_id, transport, mode, status FROM deliveries WHERE id = ?",
                 (delivery_id,),
@@ -930,7 +1024,7 @@ class TestWorkshopSchema:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 65
+            assert await upgraded.schema_version() == 66
             async with upgraded.connection.execute(
                 "SELECT purpose, status, attempt_count FROM delivery_outbox WHERE id = ?",
                 (delivery_id,),

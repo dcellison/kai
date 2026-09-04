@@ -142,11 +142,17 @@ interface StreamHandlers {
 
 const REACTIONS = new Set<WorkshopReaction>([
   "thumbs_up",
+  "thumbs_down",
   "heart",
   "laugh",
   "celebrate",
   "eyes",
   "check",
+  "thinking",
+  "surprised",
+  "sad",
+  "fire",
+  "question",
 ]);
 
 function parseReactions(value: unknown): WorkshopMessageReaction[] | null {
