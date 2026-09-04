@@ -174,6 +174,20 @@ class _Authenticator:
         return self.principals_by_token.get(token)
 
 
+class _LockCheckingAuthenticator(_Authenticator):
+    def __init__(
+        self,
+        principals_by_token: dict[str, PrincipalId],
+        request_lock: asyncio.Lock,
+    ) -> None:
+        super().__init__(principals_by_token)
+        self._request_lock = request_lock
+
+    async def authenticate(self, request: web.Request) -> PrincipalId | None:
+        assert self._request_lock.locked(), "Workshop client authentication bypassed the shared request lock"
+        return await super().authenticate(request)
+
+
 @dataclass
 class _CommandSubmitter:
     messages: list[ClientInboundMessage] = field(default_factory=list)
@@ -855,6 +869,7 @@ async def _open_client(
     store: WorkshopEventStore,
     authenticator: _Authenticator,
     *,
+    request_lock: asyncio.Lock | None = None,
     event_poll_interval: float = 0.01,
     event_heartbeat_interval: float = 0.05,
     event_authentication_recheck_interval: float = 0.01,
@@ -877,7 +892,7 @@ async def _open_client(
         app,
         store=store,
         authenticator=authenticator,
-        request_lock=asyncio.Lock(),
+        request_lock=request_lock or asyncio.Lock(),
         event_poll_interval=event_poll_interval,
         event_heartbeat_interval=event_heartbeat_interval,
         event_authentication_recheck_interval=event_authentication_recheck_interval,
@@ -1265,6 +1280,41 @@ async def test_human_avatar_api_normalizes_versions_authorizes_and_clears(
         status = workshop_human_avatar_status(tmp_path / "kai.db", service.storage_root)
         assert "active; states=1, active=1, cleared=0" in status
         assert "missing files=0, orphaned files=0, corrupt files=0, malformed=0" in status
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_avatar_content_and_agent_reads_share_the_client_request_lock(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    service = WorkshopHumanAvatarService(store, data_dir=tmp_path)
+    avatar = await service.upload(
+        alice_id,
+        _avatar_bytes("PNG"),
+        "image/png",
+        expected_state_version=0,
+        client_operation_id="request-lock-avatar",
+    )
+    assert avatar.active is True
+    request_lock = asyncio.Lock()
+    client = await _open_client(
+        store,
+        _LockCheckingAuthenticator({"alice-token": alice_id}, request_lock),
+        request_lock=request_lock,
+        human_avatars=service,
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        avatar_response, agents_response = await asyncio.gather(
+            client.get(f"/v1/principals/{alice_id}/avatar/{avatar.state_version}", headers=headers),
+            client.get("/v1/client/agents", headers=headers),
+        )
+
+        assert avatar_response.status == 200
+        assert agents_response.status == 200
     finally:
         await client.close()
         await store.close()
