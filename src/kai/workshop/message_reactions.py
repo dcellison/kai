@@ -17,7 +17,22 @@ from kai.workshop.domain import (
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 
-SUPPORTED_MESSAGE_REACTIONS = frozenset({"thumbs_up", "heart", "laugh", "celebrate", "eyes", "check"})
+SUPPORTED_MESSAGE_REACTIONS = frozenset(
+    {
+        "thumbs_up",
+        "thumbs_down",
+        "heart",
+        "laugh",
+        "celebrate",
+        "eyes",
+        "check",
+        "thinking",
+        "surprised",
+        "sad",
+        "fire",
+        "question",
+    }
+)
 
 
 class MessageReactionAccessDeniedError(PermissionError):

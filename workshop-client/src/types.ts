@@ -837,11 +837,17 @@ export interface WorkshopReplyParticipant {
 
 export type WorkshopReaction =
   | "thumbs_up"
+  | "thumbs_down"
   | "heart"
   | "laugh"
   | "celebrate"
   | "eyes"
-  | "check";
+  | "check"
+  | "thinking"
+  | "surprised"
+  | "sad"
+  | "fire"
+  | "question";
 
 export interface WorkshopMessageReaction {
   count: number;

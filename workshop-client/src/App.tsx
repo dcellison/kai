@@ -861,11 +861,17 @@ const MESSAGE_REACTIONS: {
   symbol: string;
 }[] = [
   { label: "Thumbs up", reaction: "thumbs_up", symbol: "👍" },
-  { label: "Heart", reaction: "heart", symbol: "♥" },
+  { label: "Thumbs down", reaction: "thumbs_down", symbol: "👎" },
+  { label: "Heart", reaction: "heart", symbol: "❤️" },
   { label: "Laugh", reaction: "laugh", symbol: "😄" },
   { label: "Celebrate", reaction: "celebrate", symbol: "🎉" },
   { label: "Eyes", reaction: "eyes", symbol: "👀" },
-  { label: "Done", reaction: "check", symbol: "✓" },
+  { label: "Done", reaction: "check", symbol: "✅" },
+  { label: "Thinking", reaction: "thinking", symbol: "🤔" },
+  { label: "Surprised", reaction: "surprised", symbol: "😮" },
+  { label: "Sad", reaction: "sad", symbol: "😢" },
+  { label: "Fire", reaction: "fire", symbol: "🔥" },
+  { label: "Question", reaction: "question", symbol: "❓" },
 ];
 
 function MessageItem({
@@ -1062,7 +1068,7 @@ function MessageItem({
         {(reactions.length > 0 || (onOpenThread && message.replyCount > 0)) && (
           <div className="message-engagement" role="group" aria-label="Message engagement">
             {reactions.length > 0 && (
-              <div className="message-reactions" aria-label="Message reactions">
+              <div className="message-reactions" role="group" aria-label="Message reactions">
                 {reactions.map((reaction) => {
                   const option = MESSAGE_REACTIONS.find(
                     (candidate) => candidate.reaction === reaction.reaction,

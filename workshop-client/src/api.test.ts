@@ -1928,21 +1928,21 @@ describe("Workshop client API", () => {
       Response.json({
         version: 1,
         message_id: messageId,
-        reaction: "eyes",
+        reaction: "thinking",
         active: true,
         changed: true,
         event_position: 42,
         reactions: [
-          { reaction: "eyes", count: 2, reacted_by_viewer: true },
+          { reaction: "thinking", count: 2, reacted_by_viewer: true },
         ],
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
-      setMessageReaction(session, messageId, "eyes", true),
+      setMessageReaction(session, messageId, "thinking", true),
     ).resolves.toEqual([
-      { reaction: "eyes", count: 2, reactedByViewer: true },
+      { reaction: "thinking", count: 2, reactedByViewer: true },
     ]);
 
     const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -1950,7 +1950,7 @@ describe("Workshop client API", () => {
       `/v1/channels/${channelId}/messages/${messageId}/reactions`,
     );
     expect(JSON.parse(options.body as string)).toEqual({
-      reaction: "eyes",
+      reaction: "thinking",
       active: true,
     });
   });
