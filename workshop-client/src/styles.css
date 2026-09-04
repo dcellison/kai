@@ -1324,7 +1324,7 @@ button:disabled {
   min-height: 2rem;
   border: 0;
   border-radius: 0.35rem;
-  padding: 0.3rem 0.45rem;
+  padding: 0.3rem 0.45rem 0.3rem 0;
   background: transparent;
   color: var(--color-accent);
   font: 700 0.68rem var(--sans);
