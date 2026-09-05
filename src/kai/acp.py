@@ -955,12 +955,16 @@ class AcpBackend(AgentBackend):
                 return TraceEntry(
                     kind="tool_result",
                     tool_use_id=tool_call_id,
-                    summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                    summary=scrub_trace_text(
+                        summary, self.active_trace_secrets(self._trace_secrets), TRACE_SUMMARY_MAX_CHARS
+                    ),
                     # A recognized result with no content blocks keeps an
                     # empty detail, matching the codex emitter's no-output
                     # results; the raw-payload fallback is for shapes that
                     # would otherwise lose information.
-                    detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                    detail=scrub_trace_text(
+                        detail, self.active_trace_secrets(self._trace_secrets), TRACE_DETAIL_MAX_CHARS
+                    ),
                     is_error=status == "failed",
                 )
             if update_type == "tool_call":
@@ -975,10 +979,12 @@ class AcpBackend(AgentBackend):
                 return TraceEntry(
                     kind="tool_call",
                     tool_use_id=tool_call_id,
-                    summary=scrub_trace_text(summary, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                    summary=scrub_trace_text(
+                        summary, self.active_trace_secrets(self._trace_secrets), TRACE_SUMMARY_MAX_CHARS
+                    ),
                     detail=scrub_trace_text(
                         detail or json.dumps(update, ensure_ascii=False),
-                        self._trace_secrets,
+                        self.active_trace_secrets(self._trace_secrets),
                         TRACE_DETAIL_MAX_CHARS,
                     ),
                     tool_name=tool_name,
@@ -989,10 +995,10 @@ class AcpBackend(AgentBackend):
             return TraceEntry(
                 kind="tool_call",
                 tool_use_id=tool_call_id if isinstance(tool_call_id, str) else "",
-                summary=scrub_trace_text(name, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
+                summary=scrub_trace_text(name, self.active_trace_secrets(self._trace_secrets), TRACE_SUMMARY_MAX_CHARS),
                 detail=scrub_trace_text(
                     json.dumps(update, ensure_ascii=False),
-                    self._trace_secrets,
+                    self.active_trace_secrets(self._trace_secrets),
                     TRACE_DETAIL_MAX_CHARS,
                 ),
                 tool_name=name,
@@ -1475,6 +1481,7 @@ class AcpBackend(AgentBackend):
             runtime_identity=runtime_identity if had_user_text else None,
             session_context=session_ctx,
             agent_definition_context=self.consume_canonical_agent_context(),
+            collaboration_context=self.consume_collaboration_context(),
             workspace_reminder=reminder,
             workspace=self.workspace,
             backend_name=self.backend_name,

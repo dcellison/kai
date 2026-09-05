@@ -64,7 +64,6 @@ from kai.config import (
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.workshop.agent_delegation import (
-    AgentDelegationAuthority,
     AgentDelegationConflict,
     AgentDelegationDenied,
 )
@@ -87,6 +86,7 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
+from kai.workshop.collaboration_authority import CollaborationBaseIdentity
 from kai.workshop.github_automation import (
     GitHubSubscriptionRoute,
     WorkshopGitHubAutomationService,
@@ -1201,7 +1201,7 @@ async def _handle_send_message(request: web.Request, principal: InternalAPIPrinc
     return _proactive_response(result)
 
 
-@_require_internal_api(InternalAPIScope.AGENTS_DELEGATE)
+@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
 async def _handle_agent_delegation(
     request: web.Request,
     principal: InternalAPIPrincipal,
@@ -1232,20 +1232,39 @@ async def _handle_agent_delegation(
     if missing:
         return web.json_response({"error": f"Missing required field: {missing[0]}"}, status=400)
     try:
+        proof = request.headers.get("X-Kai-Collaboration-Proof", "")
         result = await request.app[CORE_HOST_KEY].services.agent_delegation.delegate(
-            AgentDelegationAuthority(
-                sponsor_principal_id=principal.principal_id,
+            CollaborationBaseIdentity(
+                principal_id=principal.principal_id,
                 channel_id=principal.channel_id,
-                caller_agent_id=principal.agent_id,
+                agent_id=principal.agent_id,
                 runtime_profile_id=principal.runtime_profile_id,
             ),
+            proof=proof,
             target_handle=payload["target_handle"],
             task=payload["task"],
             context=payload.get("context"),
             idempotency_key=payload["idempotency_key"],
         )
     except AgentDelegationDenied as exc:
-        status = 400 if exc.code.startswith("invalid_") or exc.code.endswith("_too_large") else 409
+        status = (
+            403
+            if exc.code
+            in {
+                "invalid_proof",
+                "base_identity_mismatch",
+                "operation_not_granted",
+                "grant_revoked",
+                "grant_expired",
+                "attempt_not_active",
+                "agent_unavailable",
+                "authority_detached",
+                "quota_exhausted",
+            }
+            else 400
+            if exc.code.startswith("invalid_") or exc.code.endswith("_too_large")
+            else 409
+        )
         return web.json_response(
             {"error": str(exc), "code": exc.code},
             status=status,

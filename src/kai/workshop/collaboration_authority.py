@@ -39,6 +39,8 @@ from kai.workshop.run_execution_authority import RunExecutionClaim
 from kai.workshop.store import WorkshopEventStore
 
 _REVOCATION_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PROOF_REDACTION = "[redacted collaboration proof]"
 
 
@@ -75,6 +77,16 @@ class CollaborationDenied(CollaborationAuthorityError):
 
 class CollaborationGrantConflict(CollaborationAuthorityError):
     """Durable state conflicts with the proposed attempt grant."""
+
+
+@dataclass(frozen=True, slots=True)
+class CollaborationBaseIdentity:
+    """Stable process identity that must agree with a transient proof."""
+
+    principal_id: PrincipalId
+    channel_id: ChannelId
+    agent_id: AgentId
+    runtime_profile_id: RuntimeProfileId
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +170,18 @@ class CollaborationInvocation:
 
     def redact(self, text: str) -> str:
         return text.replace(self.token, _PROOF_REDACTION)
+
+    def render_context(self) -> str:
+        """Render the proof only into its exact turn, never durable context."""
+        return (
+            "[Attempt-scoped collaboration authority: This turn alone may use "
+            "the collaboration operations granted by your immutable agent revision. "
+            "Every collaboration request must include header "
+            f"'X-Kai-Collaboration-Proof: {self.token}'. "
+            "The persistent $KAI_WEBHOOK_SECRET identifies your backend process but "
+            "does not authorize collaboration. Never print, quote, persist, or pass "
+            "this proof to another agent. It expires when this exact attempt ends.]"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +377,7 @@ class WorkshopCollaborationAuthority:
         token: str,
         operation: CollaborationOperation,
         *,
+        base_identity: CollaborationBaseIdentity | None = None,
         occurred_at: datetime,
     ) -> CollaborationAuthorization:
         """Resolve an untrusted token through the exact live grant and attempt."""
@@ -366,11 +391,146 @@ class WorkshopCollaborationAuthority:
         fingerprint = hashlib.sha256(token.encode()).hexdigest()
         if not hmac.compare_digest(fingerprint, grant.proof_fingerprint):
             raise CollaborationProofError("Invalid collaboration proof")
+        if base_identity is not None and (
+            base_identity.principal_id != grant.requested_by_principal_id
+            or base_identity.channel_id != grant.channel_id
+            or base_identity.agent_id != grant.agent_id
+            or base_identity.runtime_profile_id != grant.runtime_profile_id
+        ):
+            raise CollaborationDenied(
+                "base_identity_mismatch",
+                "The persistent backend identity does not match this collaboration attempt",
+            )
         if operation not in grant.effective_operations:
             raise CollaborationDenied(
                 "operation_not_granted",
                 f"The active attempt is not authorized for {operation.value}",
             )
+        return CollaborationAuthorization(grant, operation)
+
+    async def authorize(
+        self,
+        token: str,
+        operation: CollaborationOperation,
+        *,
+        base_identity: CollaborationBaseIdentity,
+        idempotency_key: str,
+        request_hash: str,
+        occurred_at: datetime,
+    ) -> CollaborationAuthorization:
+        """Authorize and durably audit one idempotent operation invocation."""
+        if not isinstance(operation, CollaborationOperation):
+            raise ValueError("operation must be a CollaborationOperation")
+        if not isinstance(base_identity, CollaborationBaseIdentity):
+            raise ValueError("base_identity must be a CollaborationBaseIdentity")
+        if not _IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key):
+            raise ValueError("idempotency_key must be a bounded identifier")
+        if not _SHA256_PATTERN.fullmatch(request_hash):
+            raise ValueError("request_hash must be a SHA-256 fingerprint")
+        invocation = self._match_token(token)
+        if invocation is None:
+            raise CollaborationProofError("Invalid collaboration proof")
+        now = _timestamp(occurred_at, field_name="occurred_at")
+        grant = await self._snapshot(invocation.grant_id)
+        fingerprint = hashlib.sha256(token.encode()).hexdigest()
+        if not hmac.compare_digest(fingerprint, grant.proof_fingerprint):
+            raise CollaborationProofError("Invalid collaboration proof")
+
+        denial: CollaborationDenied | None = None
+        try:
+            grant = await self._live_grant(invocation.grant_id, occurred_at=now)
+        except CollaborationDenied as exc:
+            denial = exc
+        if denial is None and (
+            base_identity.principal_id != grant.requested_by_principal_id
+            or base_identity.channel_id != grant.channel_id
+            or base_identity.agent_id != grant.agent_id
+            or base_identity.runtime_profile_id != grant.runtime_profile_id
+        ):
+            denial = CollaborationDenied(
+                "base_identity_mismatch",
+                "The persistent backend identity does not match this collaboration attempt",
+            )
+        if denial is None and operation not in grant.effective_operations:
+            denial = CollaborationDenied(
+                "operation_not_granted",
+                f"The active attempt is not authorized for {operation.value}",
+            )
+
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            projection = CanonicalConversationProjection()
+            await self._store.project_pending_in_transaction(projection)
+            async with connection.execute(
+                "SELECT request_hash, decision, denial_code FROM collaboration_operation_decisions "
+                "WHERE grant_id = ? AND operation = ? AND idempotency_key = ?",
+                (grant.grant_id, operation.value, idempotency_key),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing is not None:
+                if not hmac.compare_digest(str(existing[0]), request_hash):
+                    raise CollaborationDenied(
+                        "idempotency_conflict",
+                        "Collaboration idempotency key was reused with different content",
+                    )
+                await connection.commit()
+                if str(existing[1]) == "denied":
+                    code = str(existing[2])
+                    raise CollaborationDenied(code, f"Collaboration invocation was denied: {code}")
+                return CollaborationAuthorization(grant, operation)
+
+            quota_ordinal: int | None = None
+            if denial is None:
+                async with connection.execute(
+                    "SELECT COUNT(*) FROM collaboration_operation_decisions "
+                    "WHERE grant_id = ? AND operation = ? AND decision = 'authorized'",
+                    (grant.grant_id, operation.value),
+                ) as cursor:
+                    count_row = await cursor.fetchone()
+                assert count_row is not None
+                quota_ordinal = int(count_row[0]) + 1
+                if quota_ordinal > grant.quotas[operation]:
+                    quota_ordinal = None
+                    denial = CollaborationDenied(
+                        "quota_exhausted",
+                        f"The active attempt exhausted its {operation.value} quota",
+                    )
+
+            decision = "denied" if denial is not None else "authorized"
+            event = EventEnvelope.create(
+                event_id=EventId.derived(
+                    grant.grant_id,
+                    f"operation:{operation.value}:{idempotency_key}",
+                ),
+                event_type=WorkshopEventType.COLLABORATION_OPERATION_DECIDED,
+                event_version=1,
+                workshop_id=grant.workshop_id,
+                aggregate_type="collaboration_grant",
+                aggregate_id=grant.grant_id,
+                actor_principal_id=grant.agent_principal_id,
+                occurred_at=now,
+                idempotency_key=(
+                    f"workshop-collaboration-operation:v1:{grant.grant_id}:{operation.value}:{idempotency_key}"
+                ),
+                payload={
+                    "operation": operation.value,
+                    "idempotency_key": idempotency_key,
+                    "request_hash": request_hash,
+                    "decision": decision,
+                    "denial_code": denial.code if denial is not None else None,
+                    "quota_ordinal": quota_ordinal,
+                },
+                metadata={"source": "workshop_collaboration_authority"},
+            )
+            await self._store.append_in_transaction(event)
+            await self._store.project_pending_in_transaction(projection)
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+        if denial is not None:
+            raise denial
         return CollaborationAuthorization(grant, operation)
 
     async def revoke(

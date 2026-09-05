@@ -451,6 +451,7 @@ class PiBackend(AgentBackend):
             runtime_identity=runtime_identity if had_user_text else None,
             session_context=session_context,
             agent_definition_context=self.consume_canonical_agent_context(),
+            collaboration_context=self.consume_collaboration_context(),
             workspace_reminder=reminder,
             workspace=self.workspace,
             backend_name=self.backend_name,
@@ -612,8 +613,10 @@ class PiBackend(AgentBackend):
             return TraceEntry(
                 kind="tool_call",
                 tool_use_id=tool_call_id,
-                summary=scrub_trace_text(tool_name, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
-                detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                summary=scrub_trace_text(
+                    tool_name, self.active_trace_secrets(self._trace_secrets), TRACE_SUMMARY_MAX_CHARS
+                ),
+                detail=scrub_trace_text(detail, self.active_trace_secrets(self._trace_secrets), TRACE_DETAIL_MAX_CHARS),
                 tool_name=tool_name,
             )
         except Exception:
@@ -642,8 +645,10 @@ class PiBackend(AgentBackend):
             return TraceEntry(
                 kind="tool_result",
                 tool_use_id=tool_call_id,
-                summary=scrub_trace_text(tool_name, self._trace_secrets, TRACE_SUMMARY_MAX_CHARS),
-                detail=scrub_trace_text(detail, self._trace_secrets, TRACE_DETAIL_MAX_CHARS),
+                summary=scrub_trace_text(
+                    tool_name, self.active_trace_secrets(self._trace_secrets), TRACE_SUMMARY_MAX_CHARS
+                ),
+                detail=scrub_trace_text(detail, self.active_trace_secrets(self._trace_secrets), TRACE_DETAIL_MAX_CHARS),
                 is_error=bool(message.get("isError", False)),
             )
         except Exception:

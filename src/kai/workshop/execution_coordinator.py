@@ -19,7 +19,10 @@ from kai.workshop.agent_definitions import (
 )
 from kai.workshop.artifacts import ArtifactMessageNotFoundError, build_agent_prompt_for_message
 from kai.workshop.collaboration_authority import (
+    CollaborationAuthorization,
+    CollaborationBaseIdentity,
     CollaborationInvocation,
+    CollaborationOperation,
     WorkshopCollaborationAuthority,
 )
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
@@ -182,6 +185,27 @@ class WorkshopCanonicalExecutionCoordinator:
     def collaboration_authority(self) -> WorkshopCollaborationAuthority:
         """Return the host-owned authority used by future backend tool bridges."""
         return self._collaboration_authority
+
+    async def authorize_collaboration(
+        self,
+        proof: str,
+        operation: CollaborationOperation,
+        *,
+        base_identity: CollaborationBaseIdentity,
+        idempotency_key: str,
+        request_hash: str,
+        occurred_at: datetime,
+    ) -> CollaborationAuthorization:
+        """Serialize collaboration authorization with run-state transactions."""
+        async with self._database_lock:
+            return await self._collaboration_authority.authorize(
+                proof,
+                operation,
+                base_identity=base_identity,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                occurred_at=occurred_at,
+            )
 
     async def execute(
         self,
@@ -347,6 +371,9 @@ class WorkshopCanonicalExecutionCoordinator:
                         occurred_at=self._now(),
                     )
 
+            if active.collaboration_invocation is not None:
+                prepared.stage_collaboration_invocation(active.collaboration_invocation)
+
             response = await self._consume_with_renewal(active, prepared, stream_observer=stream_observer)
             if active.cancellation_requested:
                 return await self._settle_requested_cancellation(active)
@@ -469,6 +496,8 @@ class WorkshopCanonicalExecutionCoordinator:
             )
         finally:
             if active.collaboration_invocation is not None:
+                if active.prepared is not None:
+                    active.prepared.discard_collaboration_invocation(active.collaboration_invocation)
                 try:
                     async with self._database_lock:
                         await self._collaboration_authority.revoke(
@@ -561,6 +590,8 @@ class WorkshopCanonicalExecutionCoordinator:
         response: AgentResponse | None = None
         traces_truncated = False
         async for event in prepared.stream(prompt):
+            if active.collaboration_invocation is not None:
+                event = _redact_collaboration_event(event, active.collaboration_invocation)
             if event.done:
                 response = event.response
                 break
@@ -684,3 +715,37 @@ def _history_with_transcript_pointer(history: str, transcript_path: object) -> s
         "Search it with grep or jq only when older context is needed."
     )
     return f"{history}\n\n{note}" if history else note
+
+
+def _redact_collaboration_event(
+    event: StreamEvent,
+    invocation: CollaborationInvocation,
+) -> StreamEvent:
+    """Fail closed if a backend echoes its short-lived proof."""
+    response = event.response
+    if response is not None:
+        response = AgentResponse(
+            success=response.success,
+            text=invocation.redact(response.text),
+            session_id=response.session_id,
+            duration_ms=response.duration_ms,
+            error=invocation.redact(response.error) if response.error is not None else None,
+            failure_kind=response.failure_kind,
+        )
+    trace = event.trace
+    if trace is not None:
+        trace = type(trace)(
+            kind=trace.kind,
+            tool_use_id=trace.tool_use_id,
+            summary=invocation.redact(trace.summary),
+            detail=invocation.redact(trace.detail),
+            tool_name=trace.tool_name,
+            is_diff=trace.is_diff,
+            is_error=trace.is_error,
+        )
+    return StreamEvent(
+        text_so_far=invocation.redact(event.text_so_far),
+        done=event.done,
+        response=response,
+        trace=trace,
+    )

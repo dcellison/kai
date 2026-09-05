@@ -14,6 +14,7 @@ process management; the context functions here handle the Kai-specific
 prompt assembly that is identical across all backends.
 """
 
+import hmac
 import logging
 import os
 import shutil
@@ -556,6 +557,39 @@ class AgentBackend(ABC):
         if hasattr(self, "_canonical_agent_context"):
             del self._canonical_agent_context
 
+    def stage_collaboration_invocation(self, context: str, proof: str) -> None:
+        """Stage exact-attempt collaboration authority for one protected turn.
+
+        The proof is deliberately separate from the persistent subprocess
+        environment.  It is injected only into the turn that owns it and is
+        retained solely as a trace-redaction value until dispatch finishes.
+        """
+        if not isinstance(context, str) or not context:
+            raise ValueError("collaboration context must be non-empty text")
+        if not isinstance(proof, str) or len(proof) < 32:
+            raise ValueError("collaboration proof must contain at least 32 characters")
+        self._canonical_collaboration_context = context
+        self._collaboration_trace_secret = proof
+
+    def consume_collaboration_context(self) -> str:
+        """Consume the staged authority instructions without dropping redaction."""
+        context = getattr(self, "_canonical_collaboration_context", "")
+        if hasattr(self, "_canonical_collaboration_context"):
+            del self._canonical_collaboration_context
+        return context
+
+    def discard_collaboration_invocation(self, proof: str) -> None:
+        """Clear one turn's unconsumed context and transient redaction value."""
+        if hasattr(self, "_canonical_collaboration_context"):
+            del self._canonical_collaboration_context
+        if hmac.compare_digest(getattr(self, "_collaboration_trace_secret", ""), proof):
+            del self._collaboration_trace_secret
+
+    def active_trace_secrets(self, secrets: tuple[str, ...]) -> tuple[str, ...]:
+        """Include the current attempt proof in backend trace scrubbing."""
+        proof = getattr(self, "_collaboration_trace_secret", "")
+        return secrets + ((proof,) if proof else ())
+
     @abstractmethod
     async def send(
         self,
@@ -985,20 +1019,25 @@ def build_session_context(
         )
         parts.append("\n".join(svc_lines))
 
-    # Internal API authority is carried only by the short-lived credential.
-    # Explicit identity selectors are rejected at the HTTP boundary.
+    # The persistent credential establishes only the backend's server-owned
+    # base identity. Explicit identity selectors are rejected at the HTTP
+    # boundary, and collaboration additionally requires a proof injected into
+    # the exact active turn.
     if api.webhook_secret:
         parts.append(
-            "[Internal API identity: $KAI_WEBHOOK_SECRET already binds your "
+            "[Internal API identity: $KAI_WEBHOOK_SECRET binds your persistent "
             "canonical human, channel, agent, and runtime context. Never include "
-            "chat_id or another identity selector in an internal API request.]"
+            "chat_id or another identity selector in an internal API request. "
+            "This credential alone never authorizes collaboration.]"
         )
         parts.append(
             "[Agent delegation API: In a shared channel, you may explicitly request "
             "work from another attached agent only when your immutable definition "
             "declares the agent_delegation capability. POST JSON to "
-            f"http://localhost:{api.webhook_port}/api/agent-delegations with header "
-            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET'. Required fields are "
+            f"http://localhost:{api.webhook_port}/api/agent-delegations with headers "
+            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and the exact-attempt "
+            "'X-Kai-Collaboration-Proof' injected separately for the current turn. "
+            "If no proof is present, delegation is unavailable. Required fields are "
             "target_handle, task, and idempotency_key. Optional context accepts only "
             "summary and canonical same-channel message_ids. The request waits for a "
             "bounded terminal response. Never include credentials, secrets, private "
@@ -1603,6 +1642,7 @@ async def assemble_turn_context(
     runtime_identity: AgentRuntimeIdentity | None = None,
     session_context: str = "",
     agent_definition_context: str = "",
+    collaboration_context: str = "",
     workspace_reminder: str = "",
     workspace: Path | None = None,
     backend_name: str | None = None,
@@ -1622,6 +1662,7 @@ async def assemble_turn_context(
         workspace_reminder    (topmost)
         semantic memory block
         session_context
+        collaboration_context
         agent_definition_context
         USER_MESSAGE_MARKER
         user prompt           (bottom; the real message)
@@ -1679,6 +1720,12 @@ async def assemble_turn_context(
     # context and never carries authority of its own.
     if agent_definition_context:
         prompt = prepend_to_prompt(prompt, agent_definition_context)
+
+    # Exact-attempt collaboration authority is refreshed on every turn, even
+    # when the provider subprocess/session remains live.  It sits above the
+    # immutable definition and below general session context.
+    if collaboration_context:
+        prompt = prepend_to_prompt(prompt, collaboration_context)
 
     # First-session context (AGENTS.md + PREFERENCES.md + recent
     # history + API context) is built by the caller because the
