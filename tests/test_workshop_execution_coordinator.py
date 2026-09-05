@@ -210,6 +210,18 @@ class TestCanonicalExecutionCoordinator:
             assert prepared.validated is True
             assert prepared.prompts == ["Canonical prompt 1"]
             assert await _terminal_bodies(store) == ["Canonical prompt 1", "Canonical answer"]
+            async with store.connection.execute(
+                "SELECT requested_operations_json, effective_operations_json, "
+                "revocation_code, length(proof_fingerprint) "
+                "FROM collaboration_grants WHERE run_id = ?",
+                (run.run_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == (
+                    '["agent_delegation"]',
+                    '["agent_delegation"]',
+                    "attempt_terminal",
+                    64,
+                )
             session = await load_runtime_session(store, run.channel_id, run.agent_id)
             assert session is not None
             assert session.last_run_id == run.run_id
@@ -285,7 +297,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 66
+            assert await upgraded.schema_version() == 67
             assert await load_runtime_session(upgraded, run.channel_id, run.agent_id) is None
             after = workshop_runtime_session_status(path)
             assert after.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
@@ -313,7 +325,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 66
+            assert await upgraded.schema_version() == 67
             session = await load_runtime_session(upgraded, run.channel_id, run.agent_id)
             assert session is not None
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID

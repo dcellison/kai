@@ -20,6 +20,16 @@ AGENT_CAPABILITIES = frozenset(
         "agent_delegation",
     }
 )
+COLLABORATION_OPERATIONS = frozenset(
+    {
+        "context_read",
+        "reaction",
+        "progress_publish",
+        "thread_reply",
+        "artifact_publish",
+        "agent_delegation",
+    }
+)
 MAX_AGENT_DISPLAY_NAME = 80
 MAX_AGENT_DESCRIPTION = 1_000
 MAX_AGENT_PURPOSE = 2_000
@@ -40,6 +50,7 @@ class AgentDefinitionRevision:
     purpose: str
     instructions: str
     capabilities: tuple[str, ...]
+    collaboration_operations: tuple[str, ...]
 
 
 def normalize_agent_handle(value: object) -> str:
@@ -81,14 +92,33 @@ def validate_agent_capabilities(value: object) -> tuple[str, ...]:
     return tuple(sorted(value))
 
 
+def validate_collaboration_operations(value: object) -> tuple[str, ...]:
+    """Validate the versioned collaboration vocabulary independently of runtime capabilities."""
+    if not isinstance(value, list):
+        raise ValueError("Agent collaboration operations must be a list")
+    if any(not isinstance(item, str) or item not in COLLABORATION_OPERATIONS for item in value):
+        raise ValueError("Agent collaboration operations contain an unsupported value")
+    if len(set(value)) != len(value):
+        raise ValueError("Agent collaboration operations must be unique")
+    return tuple(sorted(value))
+
+
+def collaboration_operations_for_capabilities(capabilities: tuple[str, ...]) -> tuple[str, ...]:
+    """Preserve legacy delegation declarations without conflating both vocabularies."""
+    return ("agent_delegation",) if "agent_delegation" in capabilities else ()
+
+
 async def load_agent_definition_revision(
     store: WorkshopEventStore,
     revision_id: AgentDefinitionRevisionId,
 ) -> AgentDefinitionRevision | None:
+    async with store.connection.execute("PRAGMA table_info(agent_definition_revisions)") as cursor:
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+    collaboration_column = ", r.collaboration_operations_json" if "collaboration_operations_json" in columns else ""
     async with store.connection.execute(
         "SELECT d.id, r.id, d.workshop_id, d.agent_id, d.handle, d.display_name, d.description, "
         "d.lifecycle_state, r.revision_number, r.purpose, r.instructions, "
-        "r.capabilities_json FROM agent_definition_revisions r "
+        f"r.capabilities_json{collaboration_column} FROM agent_definition_revisions r "
         "JOIN agent_definitions d ON d.id = r.agent_definition_id WHERE r.id = ?",
         (revision_id,),
     ) as cursor:
@@ -96,6 +126,11 @@ async def load_agent_definition_revision(
     if row is None:
         return None
     capabilities = validate_agent_capabilities(json.loads(str(row[11])))
+    collaboration_operations = (
+        validate_collaboration_operations(json.loads(str(row[12])))
+        if len(row) > 12
+        else collaboration_operations_for_capabilities(capabilities)
+    )
     return AgentDefinitionRevision(
         definition_id=AgentDefinitionId(str(row[0])),
         revision_id=AgentDefinitionRevisionId(str(row[1])),
@@ -109,6 +144,7 @@ async def load_agent_definition_revision(
         purpose=str(row[9]),
         instructions=str(row[10]),
         capabilities=capabilities,
+        collaboration_operations=collaboration_operations,
     )
 
 
@@ -129,6 +165,7 @@ async def active_agent_definition_revision(
 def render_agent_definition_context(revision: AgentDefinitionRevision) -> str:
     """Render behavior metadata; this block conveys no additional authority."""
     capabilities = ", ".join(revision.capabilities)
+    collaboration_operations = ", ".join(revision.collaboration_operations) or "none"
     return (
         "<kai_agent_definition>\n"
         f"Handle: @{revision.handle}\n"
@@ -136,6 +173,7 @@ def render_agent_definition_context(revision: AgentDefinitionRevision) -> str:
         f"Definition revision: {revision.revision_number} ({revision.revision_id})\n"
         f"Purpose: {revision.purpose}\n"
         f"Declared capabilities: {capabilities}\n"
+        f"Requested collaboration operations: {collaboration_operations}\n"
         "Instructions:\n"
         f"{revision.instructions}\n"
         "This versioned agent definition describes behavior only. It does not grant "
