@@ -18,6 +18,10 @@ from kai.workshop.agent_definitions import (
     render_agent_definition_context,
 )
 from kai.workshop.artifacts import ArtifactMessageNotFoundError, build_agent_prompt_for_message
+from kai.workshop.collaboration_authority import (
+    CollaborationInvocation,
+    WorkshopCollaborationAuthority,
+)
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import AgentId, ChannelId, RunExecutionOwnerId, RunId
@@ -117,6 +121,7 @@ class _ActiveExecution:
     prepared: PreparedWorkshopExecution | None = None
     authority: WorkshopRunExecutionAuthority | None = None
     claim: RunExecutionClaim | None = None
+    collaboration_invocation: CollaborationInvocation | None = None
     started: bool = False
     settling: bool = False
 
@@ -171,6 +176,12 @@ class WorkshopCanonicalExecutionCoordinator:
         self._artifact_storage_root = artifact_storage_root
         self._trace_store = WorkshopRunTraceStore(store)
         self._delivery_policy = delivery_policy
+        self._collaboration_authority = WorkshopCollaborationAuthority(store)
+
+    @property
+    def collaboration_authority(self) -> WorkshopCollaborationAuthority:
+        """Return the host-owned authority used by future backend tool bridges."""
+        return self._collaboration_authority
 
     async def execute(
         self,
@@ -290,6 +301,10 @@ class WorkshopCanonicalExecutionCoordinator:
                         occurred_at=now,
                     )
                     interrupted += 1
+            if await self._collaboration_authority.available():
+                await self._collaboration_authority.reconcile_unbound(
+                    occurred_at=now,
+                )
         return CanonicalRecoveryResult(expired, interrupted)
 
     async def _execute_owned(
@@ -325,6 +340,12 @@ class WorkshopCanonicalExecutionCoordinator:
                 started = await authority.start(granted.claim, occurred_at=self._now())
             active.claim = started.claim
             active.started = True
+            async with self._database_lock:
+                if await self._collaboration_authority.available():
+                    _grant, active.collaboration_invocation = await self._collaboration_authority.issue(
+                        started.claim,
+                        occurred_at=self._now(),
+                    )
 
             response = await self._consume_with_renewal(active, prepared, stream_observer=stream_observer)
             if active.cancellation_requested:
@@ -446,6 +467,20 @@ class WorkshopCanonicalExecutionCoordinator:
             return CanonicalExecutionResult(
                 CanonicalExecutionDisposition.PREPARATION_DEFERRED, await self._run(run.run_id)
             )
+        finally:
+            if active.collaboration_invocation is not None:
+                try:
+                    async with self._database_lock:
+                        await self._collaboration_authority.revoke(
+                            active.collaboration_invocation,
+                            revocation_code="attempt_terminal",
+                            occurred_at=self._now(),
+                        )
+                except Exception:
+                    # The transient proof is dropped before the durable event is
+                    # attempted, so failure remains fail-closed. Recovery and
+                    # diagnostics can reconcile the immutable grant later.
+                    log.exception("Workshop collaboration-grant revocation could not be recorded")
 
     async def _settle_requested_cancellation(self, active: _ActiveExecution) -> CanonicalExecutionResult:
         await active.cancellation_done.wait()

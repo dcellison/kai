@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from kai.workshop.artifacts import StagedArtifact
+from kai.workshop.collaboration_authority import WorkshopCollaborationAuthority
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandAcceptance,
@@ -123,6 +124,11 @@ class WorkshopPrivateTextExecutionService:
     @property
     def ready(self) -> bool:
         return not self._closed and self._task is not None and not self._task.done()
+
+    @property
+    def collaboration_authority(self) -> WorkshopCollaborationAuthority:
+        """Expose the coordinator-owned authority to trusted host adapters only."""
+        return self._coordinator.collaboration_authority
 
     async def accept(
         self,

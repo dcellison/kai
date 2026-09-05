@@ -17,10 +17,12 @@ from kai.workshop.agent_definitions import (
     MAX_AGENT_DISPLAY_NAME,
     MAX_AGENT_INSTRUCTIONS,
     MAX_AGENT_PURPOSE,
+    collaboration_operations_for_capabilities,
     normalize_agent_handle,
     validate_agent_capabilities,
     validate_agent_presentation,
     validate_agent_text,
+    validate_collaboration_operations,
 )
 from kai.workshop.domain import (
     AgentDefinitionId,
@@ -30,6 +32,7 @@ from kai.workshop.domain import (
     AgentId,
     ChannelId,
     ChannelReadPositionId,
+    CollaborationGrantId,
     HumanNotificationId,
     MessageId,
     PrincipalId,
@@ -804,6 +807,206 @@ async def _apply_run_attempt_event(connection: aiosqlite.Connection, event: Stor
     )
 
 
+async def _apply_collaboration_grant_event(
+    connection: aiosqlite.Connection,
+    event: StoredEvent,
+) -> None:
+    envelope = event.envelope
+    if (
+        not isinstance(envelope.aggregate_id, CollaborationGrantId)
+        or envelope.aggregate_type != "collaboration_grant"
+        or envelope.event_version != 1
+    ):
+        raise ValueError("Workshop collaboration-grant events require a typed v1 grant aggregate")
+    payload = envelope.payload
+    occurred_at = envelope.occurred_at
+
+    if envelope.event_type == WorkshopEventType.COLLABORATION_GRANT_ISSUED:
+        _require_exact_payload(
+            payload,
+            {
+                "attempt_id",
+                "run_id",
+                "execution_owner_id",
+                "fence_token",
+                "requested_by_principal_id",
+                "agent_principal_id",
+                "agent_id",
+                "agent_definition_revision_id",
+                "sponsor_principal_id",
+                "runtime_profile_id",
+                "channel_id",
+                "thread_root_id",
+                "requested_operations",
+                "owner_allowed_operations",
+                "host_allowed_operations",
+                "effective_operations",
+                "owner_policy_version",
+                "host_policy_version",
+                "quotas",
+                "proof_fingerprint",
+                "initial_lease_expires_at",
+            },
+        )
+        attempt_id = RunAttemptId(_required_text(payload, "attempt_id"))
+        run_id = RunId(_required_text(payload, "run_id"))
+        execution_owner_id = RunExecutionOwnerId(_required_text(payload, "execution_owner_id"))
+        requested_by = PrincipalId(_required_text(payload, "requested_by_principal_id"))
+        agent_principal = PrincipalId(_required_text(payload, "agent_principal_id"))
+        agent_id = AgentId(_required_text(payload, "agent_id"))
+        revision_id = AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
+        sponsor = PrincipalId(_required_text(payload, "sponsor_principal_id"))
+        runtime_profile_id = _required_text(payload, "runtime_profile_id")
+        channel_id = ChannelId(_required_text(payload, "channel_id"))
+        thread_value = payload.get("thread_root_id")
+        thread_root_id = MessageId(str(thread_value)) if thread_value is not None else None
+        fence_token = payload.get("fence_token")
+        owner_policy_version = payload.get("owner_policy_version")
+        host_policy_version = payload.get("host_policy_version")
+        if (
+            isinstance(fence_token, bool)
+            or not isinstance(fence_token, int)
+            or fence_token < 1
+            or isinstance(owner_policy_version, bool)
+            or not isinstance(owner_policy_version, int)
+            or owner_policy_version < 0
+            or isinstance(host_policy_version, bool)
+            or not isinstance(host_policy_version, int)
+            or host_policy_version < 1
+        ):
+            raise ValueError("Workshop collaboration policy and fence versions are invalid")
+        requested = validate_collaboration_operations(payload.get("requested_operations"))
+        owner_allowed = validate_collaboration_operations(payload.get("owner_allowed_operations"))
+        host_allowed = validate_collaboration_operations(payload.get("host_allowed_operations"))
+        effective = validate_collaboration_operations(payload.get("effective_operations"))
+        if set(effective) != set(requested).intersection(owner_allowed, host_allowed):
+            raise ValueError("Workshop collaboration effective operations do not match the policy intersection")
+        quotas = payload.get("quotas")
+        if (
+            not isinstance(quotas, dict)
+            or set(quotas) != set(effective)
+            or any(
+                operation not in effective or isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+                for operation, limit in quotas.items()
+            )
+        ):
+            raise ValueError("Workshop collaboration quotas are invalid")
+        proof_fingerprint = _required_text(payload, "proof_fingerprint")
+        if not _SHA256_PATTERN.fullmatch(proof_fingerprint):
+            raise ValueError("Workshop collaboration proof fingerprint must be SHA-256")
+        initial_expiry = _parse_projection_timestamp(payload.get("initial_lease_expires_at"))
+        async with connection.execute(
+            "SELECT ra.run_id, ra.owner_id, ra.fence_token, ra.status, ra.lease_expires_at, "
+            "r.workshop_id, r.requested_by_principal_id, r.agent_id, "
+            "r.agent_definition_revision_id, r.sponsor_principal_id, r.runtime_profile_id, "
+            "r.channel_id, m.thread_root_id, a.principal_id "
+            "FROM run_attempts ra JOIN runs r ON r.id = ra.run_id "
+            "JOIN messages m ON m.id = r.inbound_message_id "
+            "JOIN agents a ON a.id = r.agent_id WHERE ra.id = ?",
+            (attempt_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if (
+            row is None
+            or RunId(str(row[0])) != run_id
+            or RunExecutionOwnerId(str(row[1])) != execution_owner_id
+            or int(row[2]) != fence_token
+            or str(row[3]) != "started"
+            or _parse_projection_timestamp(row[4]) != initial_expiry
+            or WorkshopId(str(row[5])) != envelope.workshop_id
+            or requested_by != PrincipalId(str(row[6]))
+            or agent_id != AgentId(str(row[7]))
+            or revision_id != AgentDefinitionRevisionId(str(row[8]))
+            or sponsor != PrincipalId(str(row[9]))
+            or runtime_profile_id != str(row[10])
+            or channel_id != ChannelId(str(row[11]))
+            or thread_root_id != (MessageId(str(row[12])) if row[12] is not None else None)
+            or agent_principal != PrincipalId(str(row[13]))
+            or envelope.actor_principal_id != agent_principal
+            or envelope.aggregate_id != CollaborationGrantId.derived(attempt_id, "collaboration-grant")
+            or occurred_at >= initial_expiry
+        ):
+            raise ValueError("Workshop collaboration grant does not match its active attempt")
+        async with connection.execute(
+            "SELECT collaboration_operations_json FROM agent_definition_revisions WHERE id = ?",
+            (revision_id,),
+        ) as cursor:
+            revision_row = await cursor.fetchone()
+        if revision_row is None or requested != validate_collaboration_operations(json.loads(str(revision_row[0]))):
+            raise ValueError("Workshop collaboration request does not match the immutable revision")
+        await connection.execute(
+            "INSERT INTO collaboration_grants "
+            "(id, attempt_id, run_id, execution_owner_id, fence_token, workshop_id, "
+            "requested_by_principal_id, agent_principal_id, agent_id, "
+            "agent_definition_revision_id, sponsor_principal_id, runtime_profile_id, "
+            "channel_id, thread_root_id, requested_operations_json, "
+            "owner_allowed_operations_json, host_allowed_operations_json, "
+            "effective_operations_json, owner_policy_version, host_policy_version, "
+            "quotas_json, proof_fingerprint, issued_at, initial_lease_expires_at, "
+            "issued_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                envelope.aggregate_id,
+                attempt_id,
+                run_id,
+                execution_owner_id,
+                fence_token,
+                envelope.workshop_id,
+                requested_by,
+                agent_principal,
+                agent_id,
+                revision_id,
+                sponsor,
+                runtime_profile_id,
+                channel_id,
+                thread_root_id,
+                json.dumps(requested, separators=(",", ":")),
+                json.dumps(owner_allowed, separators=(",", ":")),
+                json.dumps(host_allowed, separators=(",", ":")),
+                json.dumps(effective, separators=(",", ":")),
+                owner_policy_version,
+                host_policy_version,
+                json.dumps(quotas, separators=(",", ":"), sort_keys=True),
+                proof_fingerprint,
+                occurred_at.isoformat(),
+                initial_expiry.isoformat(),
+                event.position,
+            ),
+        )
+        return
+
+    if envelope.event_type == WorkshopEventType.COLLABORATION_GRANT_REVOKED:
+        _require_exact_payload(payload, {"revocation_code", "expected_state_version"})
+        revocation_code = _required_text(payload, "revocation_code")
+        expected_state_version = payload.get("expected_state_version")
+        if (
+            not _RUN_TERMINAL_CODE_PATTERN.fullmatch(revocation_code)
+            or isinstance(expected_state_version, bool)
+            or not isinstance(expected_state_version, int)
+            or expected_state_version < 0
+        ):
+            raise ValueError("Workshop collaboration revocation state is invalid")
+        async with connection.execute(
+            "SELECT agent_principal_id, state_version, revoked_at FROM collaboration_grants WHERE id = ?",
+            (envelope.aggregate_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if (
+            row is None
+            or envelope.actor_principal_id != PrincipalId(str(row[0]))
+            or int(row[1]) != expected_state_version
+            or row[2] is not None
+        ):
+            raise ValueError("Workshop collaboration grant revocation is stale")
+        await connection.execute(
+            "UPDATE collaboration_grants SET revoked_at = ?, revocation_code = ?, "
+            "revoked_event_position = ?, state_version = state_version + 1 WHERE id = ?",
+            (occurred_at.isoformat(), revocation_code, event.position, envelope.aggregate_id),
+        )
+        return
+
+    raise ValueError(f"Unsupported Workshop collaboration-grant event: {envelope.event_type}")
+
+
 async def _apply_agent_delegation_event(
     connection: aiosqlite.Connection,
     event: StoredEvent,
@@ -1107,7 +1310,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 26
+    version = 27
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1126,6 +1329,7 @@ class CanonicalConversationProjection:
             "deliveries",
             "artifacts",
             "agent_delegations",
+            "collaboration_grants",
             "run_attempts",
             "runs",
             "message_reactions",
@@ -1160,6 +1364,13 @@ class CanonicalConversationProjection:
         envelope = event.envelope
         payload = envelope.payload
         occurred_at = envelope.occurred_at.isoformat()
+
+        if envelope.event_type in {
+            WorkshopEventType.COLLABORATION_GRANT_ISSUED,
+            WorkshopEventType.COLLABORATION_GRANT_REVOKED,
+        }:
+            await _apply_collaboration_grant_event(connection, event)
+            return
 
         if envelope.event_type in {
             WorkshopEventType.RUN_ACCEPTED,
@@ -1750,6 +1961,7 @@ class CanonicalConversationProjection:
                 payload.get("instructions"), field="instructions", maximum=MAX_AGENT_INSTRUCTIONS
             )
             capabilities = validate_agent_capabilities(payload.get("capabilities"))
+            collaboration_operations = collaboration_operations_for_capabilities(capabilities)
             async with connection.execute(
                 "SELECT workshop_id FROM agent_definitions WHERE id = ?", (definition_id,)
             ) as cursor:
@@ -1766,22 +1978,45 @@ class CanonicalConversationProjection:
             expected_number = int(revision_count_row[0]) + 1
             if revision_number != expected_number:
                 raise ValueError("Workshop agent revisions must be sequential")
-            await connection.execute(
-                "INSERT INTO agent_definition_revisions "
-                "(id, agent_definition_id, revision_number, purpose, instructions, "
-                "capabilities_json, created_at, created_event_position) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    envelope.aggregate_id,
-                    definition_id,
-                    revision_number,
-                    purpose,
-                    instructions,
-                    json.dumps(capabilities, separators=(",", ":")),
-                    occurred_at,
-                    event.position,
-                ),
-            )
+            if await _table_has_column(
+                connection,
+                "agent_definition_revisions",
+                "collaboration_operations_json",
+            ):
+                await connection.execute(
+                    "INSERT INTO agent_definition_revisions "
+                    "(id, agent_definition_id, revision_number, purpose, instructions, "
+                    "capabilities_json, collaboration_operations_json, created_at, created_event_position) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        envelope.aggregate_id,
+                        definition_id,
+                        revision_number,
+                        purpose,
+                        instructions,
+                        json.dumps(capabilities, separators=(",", ":")),
+                        json.dumps(collaboration_operations, separators=(",", ":")),
+                        occurred_at,
+                        event.position,
+                    ),
+                )
+            else:
+                await connection.execute(
+                    "INSERT INTO agent_definition_revisions "
+                    "(id, agent_definition_id, revision_number, purpose, instructions, "
+                    "capabilities_json, created_at, created_event_position) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        envelope.aggregate_id,
+                        definition_id,
+                        revision_number,
+                        purpose,
+                        instructions,
+                        json.dumps(capabilities, separators=(",", ":")),
+                        occurred_at,
+                        event.position,
+                    ),
+                )
         elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_REVISION_ACTIVATED:
             if (
                 not isinstance(envelope.aggregate_id, AgentDefinitionId)

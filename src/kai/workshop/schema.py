@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 66
+WORKSHOP_SCHEMA_VERSION = 67
 
 
 @dataclass(frozen=True, slots=True)
@@ -2876,6 +2876,80 @@ _EXPANDED_MESSAGE_REACTIONS_SCHEMA = SchemaMigration(
     ),
 )
 
+_ATTEMPT_SCOPED_COLLABORATION_AUTHORITY_SCHEMA = SchemaMigration(
+    version=67,
+    name="attempt_scoped_collaboration_authority",
+    statements=(
+        "ALTER TABLE agent_definition_revisions ADD COLUMN collaboration_operations_json "
+        "TEXT NOT NULL DEFAULT '[]' CHECK ("
+        "json_valid(collaboration_operations_json) "
+        "AND json_type(collaboration_operations_json) = 'array')",
+        "UPDATE agent_definition_revisions SET collaboration_operations_json = "
+        "'[\"agent_delegation\"]' WHERE EXISTS (SELECT 1 FROM json_each(capabilities_json) "
+        "WHERE value = 'agent_delegation')",
+        """
+        CREATE TABLE collaboration_grants (
+            id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL UNIQUE REFERENCES run_attempts(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            execution_owner_id TEXT NOT NULL,
+            fence_token INTEGER NOT NULL CHECK (fence_token > 0),
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            requested_by_principal_id TEXT NOT NULL
+                REFERENCES principals(id) ON DELETE RESTRICT,
+            agent_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+            agent_definition_revision_id TEXT NOT NULL
+                REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            sponsor_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            runtime_profile_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE RESTRICT,
+            thread_root_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            requested_operations_json TEXT NOT NULL CHECK (
+                json_valid(requested_operations_json)
+                AND json_type(requested_operations_json) = 'array'
+            ),
+            owner_allowed_operations_json TEXT NOT NULL CHECK (
+                json_valid(owner_allowed_operations_json)
+                AND json_type(owner_allowed_operations_json) = 'array'
+            ),
+            host_allowed_operations_json TEXT NOT NULL CHECK (
+                json_valid(host_allowed_operations_json)
+                AND json_type(host_allowed_operations_json) = 'array'
+            ),
+            effective_operations_json TEXT NOT NULL CHECK (
+                json_valid(effective_operations_json)
+                AND json_type(effective_operations_json) = 'array'
+            ),
+            owner_policy_version INTEGER NOT NULL CHECK (owner_policy_version >= 0),
+            host_policy_version INTEGER NOT NULL CHECK (host_policy_version > 0),
+            quotas_json TEXT NOT NULL CHECK (
+                json_valid(quotas_json) AND json_type(quotas_json) = 'object'
+            ),
+            proof_fingerprint TEXT NOT NULL UNIQUE CHECK (length(proof_fingerprint) = 64),
+            issued_at TEXT NOT NULL,
+            initial_lease_expires_at TEXT NOT NULL,
+            issued_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            revoked_at TEXT,
+            revocation_code TEXT,
+            revoked_event_position INTEGER UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+            CHECK (
+                (revoked_at IS NULL AND revocation_code IS NULL AND revoked_event_position IS NULL)
+                OR
+                (revoked_at IS NOT NULL AND revocation_code IS NOT NULL
+                    AND revoked_event_position IS NOT NULL)
+            )
+        )
+        """,
+        "CREATE INDEX collaboration_grants_run_idx ON collaboration_grants (run_id, issued_event_position)",
+        "CREATE INDEX collaboration_grants_active_idx ON collaboration_grants "
+        "(attempt_id, revoked_at) WHERE revoked_at IS NULL",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -2943,6 +3017,7 @@ _MIGRATIONS = (
     _CANONICAL_HUMAN_PROFILE_SCHEMA,
     _CANONICAL_HUMAN_AVATAR_SCHEMA,
     _EXPANDED_MESSAGE_REACTIONS_SCHEMA,
+    _ATTEMPT_SCOPED_COLLABORATION_AUTHORITY_SCHEMA,
 )
 
 
