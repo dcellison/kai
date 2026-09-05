@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
+from kai.workshop.collaboration_authority import CollaborationInvocation
 from kai.workshop.domain import ChannelId, RunId, RuntimeProfileId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.routing_policy import RunRoutingDecision, WorkshopRoutingPolicyService
@@ -59,6 +60,12 @@ class PreparedWorkshopExecution:
 
     def stage_agent_definition_context(self, context: str) -> None:
         self._runtime.stage_canonical_agent_context(context)
+
+    def stage_collaboration_invocation(self, invocation: CollaborationInvocation) -> None:
+        self._runtime.stage_collaboration_invocation(invocation.render_context(), invocation.token)
+
+    def discard_collaboration_invocation(self, invocation: CollaborationInvocation) -> None:
+        self._runtime.discard_collaboration_invocation(invocation.token)
 
     def validate_current(self) -> None:
         """Verify the exact runtime immediately before the started boundary."""

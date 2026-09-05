@@ -51,12 +51,20 @@ class _Runtime:
         self.cancelled = False
         self.canonical_histories: list[str] = []
         self.agent_definition_contexts: list[str] = []
+        self.collaboration_proof: str | None = None
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
 
     def stage_canonical_agent_context(self, context: str) -> None:
         self.agent_definition_contexts.append(context)
+
+    def stage_collaboration_invocation(self, _context: str, proof: str) -> None:
+        self.collaboration_proof = proof
+
+    def discard_collaboration_invocation(self, proof: str) -> None:
+        assert proof == self.collaboration_proof
+        self.collaboration_proof = None
 
     def validate_current(self) -> None:
         self.validated = True

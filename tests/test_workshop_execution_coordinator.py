@@ -65,12 +65,21 @@ class _Prepared:
         self.reject_validation = False
         self.canonical_histories: list[str] = []
         self.agent_definition_contexts: list[str] = []
+        self.collaboration_invocations = []
+        self.discarded_collaboration_invocations = []
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
 
     def stage_agent_definition_context(self, context: str) -> None:
         self.agent_definition_contexts.append(context)
+
+    def stage_collaboration_invocation(self, invocation) -> None:
+        self.collaboration_invocations.append(invocation)
+
+    def discard_collaboration_invocation(self, invocation) -> None:
+        assert self.collaboration_invocations[-1] == invocation
+        self.discarded_collaboration_invocations.append(invocation)
 
     def validate_current(self) -> None:
         self.validated = True
@@ -209,6 +218,8 @@ class TestCanonicalExecutionCoordinator:
             assert result.run.status == RunStatus.COMPLETED
             assert prepared.validated is True
             assert prepared.prompts == ["Canonical prompt 1"]
+            assert len(prepared.collaboration_invocations) == 1
+            assert prepared.discarded_collaboration_invocations == prepared.collaboration_invocations
             assert await _terminal_bodies(store) == ["Canonical prompt 1", "Canonical answer"]
             async with store.connection.execute(
                 "SELECT requested_operations_json, effective_operations_json, "
@@ -297,7 +308,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 67
+            assert await upgraded.schema_version() == 68
             assert await load_runtime_session(upgraded, run.channel_id, run.agent_id) is None
             after = workshop_runtime_session_status(path)
             assert after.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
@@ -325,7 +336,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 67
+            assert await upgraded.schema_version() == 68
             session = await load_runtime_session(upgraded, run.channel_id, run.agent_id)
             assert session is not None
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
@@ -487,6 +498,56 @@ class TestCanonicalExecutionCoordinator:
             ) as cursor:
                 rows = list(await cursor.fetchall())
             assert [tuple(row) for row in rows] == [(1, "tool_call", "Bash: ls")]
+        finally:
+            await store.close()
+
+    async def test_attempt_proof_is_redacted_from_preview_trace_and_terminal_message(self, tmp_path: Path):
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(run)
+        observed: list[StreamEvent] = []
+
+        async def stream_with_proof(prompt: str) -> AsyncIterator[StreamEvent]:
+            proof = prepared.collaboration_invocations[-1].token
+            yield StreamEvent(text_so_far=f"preview {proof}")
+            yield StreamEvent(
+                text_so_far="",
+                trace=TraceEntry(
+                    kind="tool_call",
+                    tool_use_id="proof-tool",
+                    summary=f"curl {proof}",
+                    detail=f"header={proof}",
+                    tool_name="curl",
+                ),
+            )
+            yield StreamEvent(
+                text_so_far=f"answer {proof}",
+                done=True,
+                response=AgentResponse(success=True, text=f"answer {proof}"),
+            )
+
+        async def observe(event: StreamEvent) -> None:
+            observed.append(event)
+
+        prepared.stream = stream_with_proof  # type: ignore[method-assign]
+        try:
+            result = await _coordinator(store, _Preparation(prepared)).execute(
+                run.run_id,
+                stream_observer=observe,
+            )
+            proof = prepared.collaboration_invocations[-1].token
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            assert proof not in "".join(event.text_so_far for event in observed)
+            async with store.connection.execute(
+                "SELECT summary, detail FROM run_traces WHERE run_id = ?",
+                (run.run_id,),
+            ) as cursor:
+                trace_row = tuple(await cursor.fetchone())
+            assert proof not in "".join(trace_row)
+            assert trace_row == (
+                "curl [redacted collaboration proof]",
+                "header=[redacted collaboration proof]",
+            )
+            assert (await _terminal_bodies(store))[-1] == "answer [redacted collaboration proof]"
         finally:
             await store.close()
 

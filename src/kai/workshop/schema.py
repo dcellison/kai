@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 67
+WORKSHOP_SCHEMA_VERSION = 68
 
 
 @dataclass(frozen=True, slots=True)
@@ -2950,6 +2950,40 @@ _ATTEMPT_SCOPED_COLLABORATION_AUTHORITY_SCHEMA = SchemaMigration(
     ),
 )
 
+_COLLABORATION_OPERATION_DECISION_SCHEMA = SchemaMigration(
+    version=68,
+    name="collaboration_operation_decisions",
+    statements=(
+        """
+        CREATE TABLE collaboration_operation_decisions (
+            grant_id TEXT NOT NULL REFERENCES collaboration_grants(id) ON DELETE CASCADE,
+            operation TEXT NOT NULL CHECK (
+                operation IN (
+                    'context_read', 'reaction', 'progress_publish',
+                    'thread_reply', 'artifact_publish', 'agent_delegation'
+                )
+            ),
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+            decision TEXT NOT NULL CHECK (decision IN ('authorized', 'denied')),
+            denial_code TEXT,
+            quota_ordinal INTEGER,
+            decided_at TEXT NOT NULL,
+            decided_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (grant_id, operation, idempotency_key),
+            CHECK (
+                (decision = 'authorized' AND denial_code IS NULL AND quota_ordinal > 0)
+                OR
+                (decision = 'denied' AND denial_code IS NOT NULL AND quota_ordinal IS NULL)
+            )
+        )
+        """,
+        "CREATE INDEX collaboration_operation_decisions_quota_idx ON "
+        "collaboration_operation_decisions (grant_id, operation, decision, quota_ordinal)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3018,6 +3052,7 @@ _MIGRATIONS = (
     _CANONICAL_HUMAN_AVATAR_SCHEMA,
     _EXPANDED_MESSAGE_REACTIONS_SCHEMA,
     _ATTEMPT_SCOPED_COLLABORATION_AUTHORITY_SCHEMA,
+    _COLLABORATION_OPERATION_DECISION_SCHEMA,
 )
 
 

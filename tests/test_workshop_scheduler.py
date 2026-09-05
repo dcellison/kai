@@ -111,12 +111,20 @@ class _CanonicalRuntime:
             model="gpt-5.6-sol",
         )
         self.workspace = workspace
+        self.collaboration_proof: str | None = None
 
     def stage_canonical_history(self, _history: str) -> None:
         pass
 
     def stage_canonical_agent_context(self, _context: str) -> None:
         pass
+
+    def stage_collaboration_invocation(self, _context: str, proof: str) -> None:
+        self.collaboration_proof = proof
+
+    def discard_collaboration_invocation(self, proof: str) -> None:
+        assert proof == self.collaboration_proof
+        self.collaboration_proof = None
 
     def validate_current(self) -> None:
         pass

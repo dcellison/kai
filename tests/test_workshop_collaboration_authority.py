@@ -11,6 +11,7 @@ import pytest
 from kai.internal_api_auth import InternalAPIAuth
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.collaboration_authority import (
+    CollaborationBaseIdentity,
     CollaborationDenied,
     CollaborationHostPolicy,
     CollaborationOperation,
@@ -32,6 +33,16 @@ from kai.workshop.store import WorkshopEventStore
 
 _NOW = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)
 _RUNTIME_PROFILE_ID = RuntimeProfileId.new()
+
+
+def _base_identity(started) -> CollaborationBaseIdentity:
+    assert started.run.runtime_profile_id is not None
+    return CollaborationBaseIdentity(
+        principal_id=started.run.requested_by_principal_id,
+        channel_id=started.run.channel_id,
+        agent_id=started.run.agent_id,
+        runtime_profile_id=started.run.runtime_profile_id,
+    )
 
 
 async def _running_attempt(path: Path, *, suffix: str = "1"):
@@ -397,7 +408,7 @@ async def test_version_sixty_seven_migrates_only_legacy_delegation_requests(
 
     upgraded = await WorkshopEventStore.open(path)
     try:
-        assert await upgraded.schema_version() == 67
+        assert await upgraded.schema_version() == 68
         async with upgraded.connection.execute(
             "SELECT id, capabilities_json, collaboration_operations_json "
             "FROM agent_definition_revisions ORDER BY revision_number"
@@ -414,3 +425,99 @@ async def test_version_sixty_seven_migrates_only_legacy_delegation_requests(
                 assert operations == (["agent_delegation"] if "agent_delegation" in capabilities else [])
     finally:
         await upgraded.close()
+
+
+async def test_operation_authorization_is_durable_idempotent_and_quota_bounded(tmp_path: Path) -> None:
+    store, _execution, started = await _running_attempt(tmp_path / "kai.db")
+    try:
+        authority = WorkshopCollaborationAuthority(
+            store,
+            host_policy=CollaborationHostPolicy(
+                allowed_operations=frozenset({CollaborationOperation.AGENT_DELEGATION}),
+                quotas={CollaborationOperation.AGENT_DELEGATION: 1},
+            ),
+            token_factory=lambda: "attempt-proof-000000000000000000000000000008",
+        )
+        _grant, invocation = await authority.issue(
+            started.claim,
+            occurred_at=_NOW + timedelta(seconds=3),
+        )
+        request_hash = "a" * 64
+        first = await authority.authorize(
+            invocation.token,
+            CollaborationOperation.AGENT_DELEGATION,
+            base_identity=_base_identity(started),
+            idempotency_key="operation-one",
+            request_hash=request_hash,
+            occurred_at=_NOW + timedelta(seconds=4),
+        )
+        replay = await authority.authorize(
+            invocation.token,
+            CollaborationOperation.AGENT_DELEGATION,
+            base_identity=_base_identity(started),
+            idempotency_key="operation-one",
+            request_hash=request_hash,
+            occurred_at=_NOW + timedelta(seconds=5),
+        )
+        assert replay == first
+
+        with pytest.raises(CollaborationDenied) as denied:
+            await authority.authorize(
+                invocation.token,
+                CollaborationOperation.AGENT_DELEGATION,
+                base_identity=_base_identity(started),
+                idempotency_key="operation-two",
+                request_hash="b" * 64,
+                occurred_at=_NOW + timedelta(seconds=6),
+            )
+        assert denied.value.code == "quota_exhausted"
+        async with store.connection.execute(
+            "SELECT idempotency_key, decision, denial_code, quota_ordinal "
+            "FROM collaboration_operation_decisions ORDER BY decided_event_position"
+        ) as cursor:
+            assert [tuple(row) for row in await cursor.fetchall()] == [
+                ("operation-one", "authorized", None, 1),
+                ("operation-two", "denied", "quota_exhausted", None),
+            ]
+
+        await store.rebuild_projection(CanonicalConversationProjection())
+        async with store.connection.execute("SELECT COUNT(*) FROM collaboration_operation_decisions") as cursor:
+            assert int((await cursor.fetchone())[0]) == 2
+    finally:
+        await store.close()
+
+
+async def test_mismatched_base_identity_is_denied_and_audited(tmp_path: Path) -> None:
+    store, _execution, started = await _running_attempt(tmp_path / "kai.db")
+    try:
+        authority = WorkshopCollaborationAuthority(
+            store,
+            token_factory=lambda: "attempt-proof-000000000000000000000000000009",
+        )
+        _grant, invocation = await authority.issue(
+            started.claim,
+            occurred_at=_NOW + timedelta(seconds=3),
+        )
+        correct = _base_identity(started)
+        mismatched = CollaborationBaseIdentity(
+            principal_id=correct.principal_id,
+            channel_id=correct.channel_id,
+            agent_id=correct.agent_id,
+            runtime_profile_id=RuntimeProfileId.new(),
+        )
+        with pytest.raises(CollaborationDenied) as denied:
+            await authority.authorize(
+                invocation.token,
+                CollaborationOperation.AGENT_DELEGATION,
+                base_identity=mismatched,
+                idempotency_key="wrong-runtime",
+                request_hash="c" * 64,
+                occurred_at=_NOW + timedelta(seconds=4),
+            )
+        assert denied.value.code == "base_identity_mismatch"
+        async with store.connection.execute(
+            "SELECT decision, denial_code FROM collaboration_operation_decisions"
+        ) as cursor:
+            assert tuple(await cursor.fetchone()) == ("denied", "base_identity_mismatch")
+    finally:
+        await store.close()

@@ -142,6 +142,15 @@ class PreparedBackendExecution:
         self._pool._validate_prepared(self)
         self._instance.stage_canonical_agent_context(context)
 
+    def stage_collaboration_invocation(self, context: str, proof: str) -> None:
+        """Stage exact-attempt collaboration authority on this runtime."""
+        self._pool._validate_prepared(self)
+        self._instance.stage_collaboration_invocation(context, proof)
+
+    def discard_collaboration_invocation(self, proof: str) -> None:
+        """Drop exact-attempt context and proof redaction after dispatch."""
+        self._instance.discard_collaboration_invocation(proof)
+
     def validate_current(self) -> None:
         """Fail before dispatch if the protected runtime selection drifted."""
         self._pool._validate_prepared(self)

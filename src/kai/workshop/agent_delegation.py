@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from kai.workshop.agent_definitions import normalize_agent_handle
+from kai.workshop.collaboration_authority import (
+    CollaborationAuthorization,
+    CollaborationBaseIdentity,
+    CollaborationDenied,
+    CollaborationOperation,
+    CollaborationProofError,
+)
 from kai.workshop.domain import (
     AgentDefinitionRevisionId,
     AgentDelegationId,
@@ -33,7 +40,7 @@ from kai.workshop.execution_coordinator import (
     CanonicalExecutionResult,
 )
 from kai.workshop.projection import CanonicalConversationProjection
-from kai.workshop.run_lifecycle import DurableRun, RunStatus
+from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
 from kai.workshop.store import WorkshopEventStore
 
 if TYPE_CHECKING:
@@ -82,16 +89,6 @@ class AgentDelegationPolicy:
                 raise ValueError(f"{name} must be a positive integer")
         if self.max_elapsed <= timedelta(0):
             raise ValueError("max_elapsed must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class AgentDelegationAuthority:
-    """Exact canonical runtime lane bound to the internal API credential."""
-
-    sponsor_principal_id: PrincipalId
-    channel_id: ChannelId
-    caller_agent_id: AgentId
-    runtime_profile_id: RuntimeProfileId
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +161,17 @@ class _TargetAuthority:
 
 
 class _ExecutionService(Protocol):
+    async def authorize_collaboration(
+        self,
+        proof: str,
+        operation: CollaborationOperation,
+        *,
+        base_identity: CollaborationBaseIdentity,
+        idempotency_key: str,
+        request_hash: str,
+        occurred_at: datetime,
+    ) -> CollaborationAuthorization: ...
+
     async def execute(self, run_id: RunId) -> CanonicalExecutionResult: ...
 
     async def run_state(self, run_id: RunId) -> DurableRun: ...
@@ -308,8 +316,9 @@ class WorkshopAgentDelegationService:
 
     async def delegate(
         self,
-        authority: AgentDelegationAuthority,
+        base_identity: CollaborationBaseIdentity,
         *,
+        proof: str,
         target_handle: object,
         task: object,
         context: object = None,
@@ -324,9 +333,23 @@ class WorkshopAgentDelegationService:
         normalized_task = _normalize_task(task)
         normalized_context = _normalize_context(context)
         key = _normalize_idempotency_key(idempotency_key)
+        fingerprint = _request_hash(handle, normalized_task, normalized_context)
+        try:
+            authorization = await self._execution.authorize_collaboration(
+                proof,
+                CollaborationOperation.AGENT_DELEGATION,
+                base_identity=base_identity,
+                idempotency_key=key,
+                request_hash=fingerprint,
+                occurred_at=datetime.now(UTC),
+            )
+        except CollaborationProofError as exc:
+            raise AgentDelegationDenied("invalid_proof", str(exc)) from exc
+        except CollaborationDenied as exc:
+            raise AgentDelegationDenied(exc.code, str(exc)) from exc
         async with self._lock:
             delegation = await self._accept(
-                authority,
+                authorization,
                 target_handle=handle,
                 task=normalized_task,
                 context=normalized_context,
@@ -416,14 +439,14 @@ class WorkshopAgentDelegationService:
 
     async def _accept(
         self,
-        authority: AgentDelegationAuthority,
+        authorization: CollaborationAuthorization,
         *,
         target_handle: str,
         task: str,
         context: AgentDelegationContext,
         idempotency_key: str,
     ) -> AgentDelegationSnapshot:
-        if not isinstance(authority, AgentDelegationAuthority):
+        if not isinstance(authorization, CollaborationAuthorization):
             raise AgentDelegationDenied("invalid_authority", "Delegation authority is unavailable")
         now = datetime.now(UTC)
         connection = self._store.connection
@@ -431,7 +454,7 @@ class WorkshopAgentDelegationService:
             await connection.execute("BEGIN IMMEDIATE")
             projection = CanonicalConversationProjection()
             await self._store.project_pending_in_transaction(projection)
-            parent = await self._active_parent(authority)
+            parent = await self._active_parent(authorization)
             delegation_id = AgentDelegationId.derived(
                 parent.workshop_id,
                 f"agent-delegation:{parent.run.run_id}:{idempotency_key}",
@@ -527,8 +550,8 @@ class WorkshopAgentDelegationService:
                     "requesting_principal_id": parent.run.requested_by_principal_id,
                     "caller_agent_id": parent.run.agent_id,
                     "target_agent_id": target.agent_id,
-                    "caller_sponsor_principal_id": authority.sponsor_principal_id,
-                    "caller_runtime_profile_id": authority.runtime_profile_id,
+                    "caller_sponsor_principal_id": authorization.grant.sponsor_principal_id,
+                    "caller_runtime_profile_id": authorization.grant.runtime_profile_id,
                     "target_sponsor_principal_id": target.sponsor_principal_id,
                     "target_runtime_profile_id": target.runtime_profile_id,
                     "caller_definition_revision_id": parent.caller_revision_id,
@@ -552,10 +575,11 @@ class WorkshopAgentDelegationService:
             await connection.rollback()
             raise
 
-    async def _active_parent(self, authority: AgentDelegationAuthority) -> _ParentAuthority:
+    async def _active_parent(self, authorization: CollaborationAuthorization) -> _ParentAuthority:
+        grant = authorization.grant
         async with self._store.connection.execute(
             "SELECT kind FROM channels WHERE id = ? AND archived_at IS NULL",
-            (authority.channel_id,),
+            (grant.channel_id,),
         ) as cursor:
             channel_row = await cursor.fetchone()
         if channel_row is None or str(channel_row[0]) != "group":
@@ -563,68 +587,21 @@ class WorkshopAgentDelegationService:
                 "shared_channel_required",
                 "Agent delegation is available only in a shared group channel",
             )
-        async with self._store.connection.execute(
-            "SELECT r.id, r.workshop_id, r.channel_id, r.requested_by_principal_id, "
-            "r.agent_id, r.inbound_message_id, r.status, r.accepted_at, r.started_at, "
-            "r.terminal_at, r.terminal_code, r.cancellation_requested_at, r.cancellation_code, "
-            "r.result_message_id, r.last_event_position, r.agent_definition_revision_id, "
-            "r.runtime_profile_id, r.sponsor_principal_id, r.parent_run_id, r.delegation_id, "
-            "a.principal_id, m.thread_root_id "
-            "FROM runs r JOIN run_attempts attempt ON attempt.run_id = r.id "
-            "AND attempt.status = 'started' "
-            "JOIN agents a ON a.id = r.agent_id "
-            "JOIN messages m ON m.id = r.inbound_message_id "
-            "WHERE r.channel_id = ? AND r.agent_id = ? AND r.runtime_profile_id = ? "
-            "AND r.sponsor_principal_id = ? AND r.status = 'started' "
-            "AND r.cancellation_requested_at IS NULL ORDER BY r.started_at DESC",
-            (
-                authority.channel_id,
-                authority.caller_agent_id,
-                authority.runtime_profile_id,
-                authority.sponsor_principal_id,
-            ),
-        ) as cursor:
-            rows = list(await cursor.fetchall())
-        if len(rows) != 1:
+        run = await WorkshopRunLifecycle(self._store).state(grant.run_id)
+        if (
+            run.status != RunStatus.STARTED
+            or run.cancellation_requested_at is not None
+            or run.channel_id != grant.channel_id
+            or run.agent_id != grant.agent_id
+            or run.runtime_profile_id != grant.runtime_profile_id
+            or run.sponsor_principal_id != grant.sponsor_principal_id
+            or run.agent_definition_revision_id != grant.agent_definition_revision_id
+        ):
             raise AgentDelegationDenied(
                 "no_active_attempt",
-                "Delegation requires exactly one active caller attempt in this canonical lane",
+                "Delegation requires its exact active caller attempt",
             )
-        row = rows[0]
-        run = DurableRun(
-            run_id=RunId(str(row[0])),
-            workshop_id=WorkshopId(str(row[1])),
-            channel_id=ChannelId(str(row[2])),
-            requested_by_principal_id=PrincipalId(str(row[3])),
-            agent_id=AgentId(str(row[4])),
-            inbound_message_id=MessageId(str(row[5])),
-            status=RunStatus(str(row[6])),
-            accepted_at=_timestamp(row[7]),
-            started_at=_optional_timestamp(row[8]),
-            terminal_at=_optional_timestamp(row[9]),
-            terminal_code=str(row[10]) if row[10] is not None else None,
-            cancellation_requested_at=_optional_timestamp(row[11]),
-            cancellation_code=str(row[12]) if row[12] is not None else None,
-            result_message_id=MessageId(str(row[13])) if row[13] is not None else None,
-            last_event_position=int(row[14]),
-            agent_definition_revision_id=AgentDefinitionRevisionId(str(row[15])),
-            runtime_profile_id=RuntimeProfileId(str(row[16])),
-            sponsor_principal_id=PrincipalId(str(row[17])),
-            parent_run_id=RunId(str(row[18])) if row[18] is not None else None,
-            delegation_id=AgentDelegationId(str(row[19])) if row[19] is not None else None,
-        )
         assert run.agent_definition_revision_id is not None
-        async with self._store.connection.execute(
-            "SELECT capabilities_json FROM agent_definition_revisions WHERE id = ?",
-            (run.agent_definition_revision_id,),
-        ) as cursor:
-            capability_row = await cursor.fetchone()
-        capabilities = () if capability_row is None else tuple(json.loads(str(capability_row[0])))
-        if "agent_delegation" not in capabilities:
-            raise AgentDelegationDenied(
-                "delegation_not_granted",
-                "The caller's immutable agent revision does not grant delegation",
-            )
         root_run_id = run.run_id
         parent_delegation_id = run.delegation_id
         depth = 1
@@ -644,9 +621,9 @@ class WorkshopAgentDelegationService:
         return _ParentAuthority(
             run=run,
             workshop_id=run.workshop_id,
-            caller_principal_id=PrincipalId(str(row[20])),
+            caller_principal_id=grant.agent_principal_id,
             caller_revision_id=run.agent_definition_revision_id,
-            thread_root_id=MessageId(str(row[21])) if row[21] is not None else None,
+            thread_root_id=grant.thread_root_id,
             root_run_id=root_run_id,
             parent_delegation_id=parent_delegation_id,
             depth=depth,

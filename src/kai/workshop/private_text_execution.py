@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from kai.workshop.artifacts import StagedArtifact
-from kai.workshop.collaboration_authority import WorkshopCollaborationAuthority
+from kai.workshop.collaboration_authority import (
+    CollaborationAuthorization,
+    CollaborationBaseIdentity,
+    CollaborationOperation,
+    WorkshopCollaborationAuthority,
+)
 from kai.workshop.conversation_commands import (
     ClientConversationCommandAcceptance,
     ConversationCommandAcceptance,
@@ -129,6 +135,28 @@ class WorkshopPrivateTextExecutionService:
     def collaboration_authority(self) -> WorkshopCollaborationAuthority:
         """Expose the coordinator-owned authority to trusted host adapters only."""
         return self._coordinator.collaboration_authority
+
+    async def authorize_collaboration(
+        self,
+        proof: str,
+        operation: CollaborationOperation,
+        *,
+        base_identity: CollaborationBaseIdentity,
+        idempotency_key: str,
+        request_hash: str,
+        occurred_at: datetime,
+    ) -> CollaborationAuthorization:
+        """Authorize one operation through the coordinator's transaction lock."""
+        if self._closed:
+            raise RuntimeError("Workshop private-text execution service is closed")
+        return await self._coordinator.authorize_collaboration(
+            proof,
+            operation,
+            base_identity=base_identity,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            occurred_at=occurred_at,
+        )
 
     async def accept(
         self,

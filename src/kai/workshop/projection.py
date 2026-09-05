@@ -52,6 +52,7 @@ _MEDIA_TYPE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#
 _RUN_TERMINAL_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _EXECUTION_IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _MODEL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_COLLABORATION_IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def _required_text(payload: dict[str, Any], key: str) -> str:
@@ -1004,6 +1005,95 @@ async def _apply_collaboration_grant_event(
         )
         return
 
+    if envelope.event_type == WorkshopEventType.COLLABORATION_OPERATION_DECIDED:
+        _require_exact_payload(
+            payload,
+            {
+                "operation",
+                "idempotency_key",
+                "request_hash",
+                "decision",
+                "denial_code",
+                "quota_ordinal",
+            },
+        )
+        operation = _required_text(payload, "operation")
+        validate_collaboration_operations([operation])
+        idempotency_key = _required_text(payload, "idempotency_key")
+        request_hash = _required_text(payload, "request_hash")
+        decision = _required_text(payload, "decision")
+        denial_value = payload.get("denial_code")
+        denial_code = str(denial_value) if denial_value is not None else None
+        quota_ordinal = payload.get("quota_ordinal")
+        if (
+            not _COLLABORATION_IDEMPOTENCY_PATTERN.fullmatch(idempotency_key)
+            or not _SHA256_PATTERN.fullmatch(request_hash)
+            or decision not in {"authorized", "denied"}
+            or (denial_code is not None and not _RUN_TERMINAL_CODE_PATTERN.fullmatch(denial_code))
+        ):
+            raise ValueError("Workshop collaboration operation decision is malformed")
+        async with connection.execute(
+            "SELECT agent_principal_id, effective_operations_json, quotas_json, revoked_at, attempt_id "
+            "FROM collaboration_grants WHERE id = ?",
+            (envelope.aggregate_id,),
+        ) as cursor:
+            grant_row = await cursor.fetchone()
+        if grant_row is None or envelope.actor_principal_id != PrincipalId(str(grant_row[0])):
+            raise ValueError("Workshop collaboration operation decision has no matching grant")
+        effective = validate_collaboration_operations(json.loads(str(grant_row[1])))
+        quotas = json.loads(str(grant_row[2]))
+        async with connection.execute(
+            "SELECT COUNT(*) FROM collaboration_operation_decisions "
+            "WHERE grant_id = ? AND operation = ? AND decision = 'authorized'",
+            (envelope.aggregate_id, operation),
+        ) as cursor:
+            count_row = await cursor.fetchone()
+        assert count_row is not None
+        prior_authorized = int(count_row[0])
+        if decision == "authorized":
+            async with connection.execute(
+                "SELECT ra.status, r.status, r.cancellation_requested_at, ra.lease_expires_at "
+                "FROM run_attempts ra JOIN runs r ON r.id = ra.run_id WHERE ra.id = ?",
+                (str(grant_row[4]),),
+            ) as cursor:
+                attempt_row = await cursor.fetchone()
+            limit = quotas.get(operation) if isinstance(quotas, dict) else None
+            if (
+                denial_code is not None
+                or isinstance(quota_ordinal, bool)
+                or not isinstance(quota_ordinal, int)
+                or quota_ordinal != prior_authorized + 1
+                or operation not in effective
+                or not isinstance(limit, int)
+                or quota_ordinal > limit
+                or grant_row[3] is not None
+                or attempt_row is None
+                or str(attempt_row[0]) != "started"
+                or str(attempt_row[1]) != "started"
+                or attempt_row[2] is not None
+                or occurred_at >= _parse_projection_timestamp(attempt_row[3])
+            ):
+                raise ValueError("Workshop collaboration authorization decision is invalid")
+        elif denial_code is None or quota_ordinal is not None:
+            raise ValueError("Workshop collaboration denial decision is invalid")
+        await connection.execute(
+            "INSERT INTO collaboration_operation_decisions "
+            "(grant_id, operation, idempotency_key, request_hash, decision, denial_code, "
+            "quota_ordinal, decided_at, decided_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                envelope.aggregate_id,
+                operation,
+                idempotency_key,
+                request_hash,
+                decision,
+                denial_code,
+                quota_ordinal,
+                occurred_at.isoformat(),
+                event.position,
+            ),
+        )
+        return
+
     raise ValueError(f"Unsupported Workshop collaboration-grant event: {envelope.event_type}")
 
 
@@ -1310,7 +1400,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 27
+    version = 28
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1329,6 +1419,7 @@ class CanonicalConversationProjection:
             "deliveries",
             "artifacts",
             "agent_delegations",
+            "collaboration_operation_decisions",
             "collaboration_grants",
             "run_attempts",
             "runs",
@@ -1368,6 +1459,7 @@ class CanonicalConversationProjection:
         if envelope.event_type in {
             WorkshopEventType.COLLABORATION_GRANT_ISSUED,
             WorkshopEventType.COLLABORATION_GRANT_REVOKED,
+            WorkshopEventType.COLLABORATION_OPERATION_DECIDED,
         }:
             await _apply_collaboration_grant_event(connection, event)
             return

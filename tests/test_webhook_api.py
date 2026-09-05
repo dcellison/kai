@@ -263,7 +263,10 @@ class TestAgentDelegation:
             ),
             response="Bounded result.",
         )
-        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.headers = {
+            "X-Webhook-Secret": "test-secret",
+            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
+        }
         mock_request.json = AsyncMock(
             return_value={
                 "target_handle": "nova",
@@ -280,10 +283,11 @@ class TestAgentDelegation:
         assert body["status"] == "completed"
         assert body["response"] == "Bounded result."
         authority = service.delegate.await_args.args[0]
-        assert authority.sponsor_principal_id == _internal_api_context(123).principal_id
+        assert authority.principal_id == _internal_api_context(123).principal_id
         assert authority.channel_id == _internal_api_context(123).channel_id
-        assert authority.caller_agent_id == _internal_api_context(123).agent_id
+        assert authority.agent_id == _internal_api_context(123).agent_id
         assert authority.runtime_profile_id == _internal_api_context(123).runtime_profile_id
+        assert service.delegate.await_args.kwargs["proof"] == mock_request.headers["X-Kai-Collaboration-Proof"]
 
     async def test_rejects_caller_selected_run_identity_before_delegating(self, mock_request):
         service = mock_request.app[CORE_HOST_KEY].services.agent_delegation

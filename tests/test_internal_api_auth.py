@@ -56,7 +56,7 @@ def test_persistent_agent_profile_is_explicit_and_excludes_delete_all() -> None:
             InternalAPIScope.FILES_SEND,
             InternalAPIScope.MEMORY_READ,
             InternalAPIScope.MEMORY_ADD,
-            InternalAPIScope.AGENTS_DELEGATE,
+            InternalAPIScope.COLLABORATION_INVOKE,
         }
     )
     assert principal.allowed_services == frozenset()
