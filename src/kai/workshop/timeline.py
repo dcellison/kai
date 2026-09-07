@@ -408,15 +408,18 @@ async def attach_message_details(
     messages: tuple[TimelineMessage, ...],
     principal_id: PrincipalId,
     through_position: int,
+    metadata_through_position: int | None = None,
 ) -> tuple[TimelineMessage, ...]:
     artifact_map = await artifacts_for_messages(
         store,
         tuple(message.message_id for message in messages),
+        through_position=metadata_through_position,
     )
     reaction_map = await load_message_reactions(
         store,
         message_ids=tuple(message.message_id for message in messages),
         viewer_principal_id=principal_id,
+        through_position=metadata_through_position,
     )
     reply_participant_map = await _reply_participant_summaries(
         store,
@@ -470,6 +473,7 @@ async def _read_forward_page(
     state: _CursorState,
     limit: int,
     principal_id: PrincipalId,
+    metadata_through_position: int | None = None,
 ) -> TimelinePage:
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
@@ -502,6 +506,7 @@ async def _read_forward_page(
         _messages_from_rows(page_rows),
         principal_id,
         state.through_position,
+        metadata_through_position,
     )
     next_cursor = None
     if has_more:
@@ -521,6 +526,7 @@ async def _read_tail_page(
     state: _TailCursorState,
     limit: int,
     principal_id: PrincipalId,
+    metadata_through_position: int | None = None,
 ) -> TimelinePage:
     # The strict upper bound alone keeps the page inside the snapshot:
     # decoded cursors guarantee before_position <= through_position, and
@@ -551,6 +557,7 @@ async def _read_tail_page(
         _messages_from_rows(page_rows),
         principal_id,
         state.through_position,
+        metadata_through_position,
     )
     previous_cursor = None
     if has_more:
@@ -573,6 +580,7 @@ async def read_channel_timeline(
     cursor: str | None = None,
     limit: int = 50,
     tail: bool = False,
+    snapshot_through_position: int | None = None,
 ) -> TimelinePage:
     """Read an authorized, stable snapshot page from one canonical channel.
 
@@ -583,6 +591,13 @@ async def read_channel_timeline(
     one is supplied.
     """
     _validate_request(principal_id, channel_id, limit)
+    if snapshot_through_position is not None and (
+        not isinstance(snapshot_through_position, int)
+        or isinstance(snapshot_through_position, bool)
+        or snapshot_through_position < 0
+        or snapshot_through_position > _MAX_SQLITE_INTEGER
+    ):
+        raise ValueError("snapshot_through_position must be a non-negative event position")
     if tail and cursor is not None:
         raise ValueError("tail requests must not carry a cursor")
     await _authorize(authorizer, principal_id, channel_id)
@@ -594,13 +609,35 @@ async def read_channel_timeline(
         state = _decode_cursor(cursor)
         if state.channel_id != channel_id:
             raise TimelineCursorError("Timeline cursor belongs to another channel")
+        if snapshot_through_position is not None and state.through_position != snapshot_through_position:
+            raise TimelineCursorError("Timeline cursor belongs to another snapshot")
         if isinstance(state, _ThreadCursorState):
             raise TimelineCursorError("Thread cursor cannot page a channel timeline")
         if isinstance(state, _TailCursorState):
-            return await _read_tail_page(store, channel_id, state, limit, principal_id)
-        return await _read_forward_page(store, channel_id, state, limit, principal_id)
+            return await _read_tail_page(
+                store,
+                channel_id,
+                state,
+                limit,
+                principal_id,
+                snapshot_through_position,
+            )
+        return await _read_forward_page(
+            store,
+            channel_id,
+            state,
+            limit,
+            principal_id,
+            snapshot_through_position,
+        )
 
-    through_position = await _latest_message_position(store, channel_id)
+    through_position = (
+        await _latest_message_position(store, channel_id)
+        if snapshot_through_position is None
+        else snapshot_through_position
+    )
+    if through_position > await _latest_event_position(store):
+        raise TimelineCursorError("Timeline snapshot is ahead of the event log")
     if tail:
         # The initial tail page has no boundary message yet; one past the
         # snapshot bound makes the strict inequality include the bound.
@@ -610,6 +647,7 @@ async def read_channel_timeline(
             _TailCursorState(channel_id, through_position + 1, through_position),
             limit,
             principal_id,
+            snapshot_through_position,
         )
     return await _read_forward_page(
         store,
@@ -617,6 +655,7 @@ async def read_channel_timeline(
         _CursorState(channel_id, 0, through_position),
         limit,
         principal_id,
+        snapshot_through_position,
     )
 
 
@@ -731,6 +770,7 @@ async def _read_thread_root(
     thread_root_id: MessageId,
     through_position: int,
     principal_id: PrincipalId,
+    metadata_through_position: int | None = None,
 ) -> TimelineMessage:
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
@@ -748,7 +788,13 @@ async def _read_thread_root(
         (through_position, through_position, thread_root_id, channel_id, through_position),
     ) as cursor:
         rows = list(await cursor.fetchall())
-    messages = await attach_message_details(store, _messages_from_rows(rows), principal_id, through_position)
+    messages = await attach_message_details(
+        store,
+        _messages_from_rows(rows),
+        principal_id,
+        through_position,
+        metadata_through_position,
+    )
     if len(messages) != 1:
         raise TimelineAccessDeniedError("Thread access denied")
     return messages[0]
@@ -763,9 +809,17 @@ async def read_thread_timeline(
     authorizer: ChannelTimelineAuthorizer,
     cursor: str | None = None,
     limit: int = 50,
+    snapshot_through_position: int | None = None,
 ) -> ThreadTimelinePage:
     """Read one authorized, stable, forward-paged group-channel thread."""
     _validate_request(principal_id, channel_id, limit)
+    if snapshot_through_position is not None and (
+        not isinstance(snapshot_through_position, int)
+        or isinstance(snapshot_through_position, bool)
+        or snapshot_through_position < 0
+        or snapshot_through_position > _MAX_SQLITE_INTEGER
+    ):
+        raise ValueError("snapshot_through_position must be a non-negative event position")
     if not isinstance(thread_root_id, MessageId):
         raise ValueError("thread_root_id must be a MessageId")
     await _authorize(authorizer, principal_id, channel_id)
@@ -773,7 +827,13 @@ async def read_thread_timeline(
         raise TimelineAccessDeniedError("Thread access denied")
 
     if cursor is None:
-        through_position = await _latest_message_position(store, channel_id)
+        through_position = (
+            await _latest_message_position(store, channel_id)
+            if snapshot_through_position is None
+            else snapshot_through_position
+        )
+        if through_position > await _latest_event_position(store):
+            raise TimelineCursorError("Timeline snapshot is ahead of the event log")
         state = _ThreadCursorState(channel_id, thread_root_id, 0, through_position)
     else:
         decoded = _decode_cursor(cursor)
@@ -781,6 +841,8 @@ async def read_thread_timeline(
             raise TimelineCursorError("Channel cursor cannot page a thread timeline")
         if decoded.channel_id != channel_id or decoded.thread_root_id != thread_root_id:
             raise TimelineCursorError("Thread cursor belongs to another thread")
+        if snapshot_through_position is not None and decoded.through_position != snapshot_through_position:
+            raise TimelineCursorError("Thread cursor belongs to another snapshot")
         state = decoded
 
     root = await _read_thread_root(
@@ -789,6 +851,7 @@ async def read_thread_timeline(
         thread_root_id,
         state.through_position,
         principal_id,
+        snapshot_through_position,
     )
     async with store.connection.execute(
         "SELECT m.id, m.channel_id, m.author_principal_id, p.kind, p.display_name, "
@@ -809,6 +872,7 @@ async def read_thread_timeline(
         _messages_from_rows(rows[:limit]),
         principal_id,
         state.through_position,
+        snapshot_through_position,
     )
     next_cursor = None
     if has_more:

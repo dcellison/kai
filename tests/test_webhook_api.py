@@ -27,6 +27,7 @@ from kai.webhook import (
     WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY,
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
     _handle_agent_delegation,
+    _handle_collaboration_context,
     _handle_delete_job,
     _handle_generic,
     _handle_get_job,
@@ -225,6 +226,7 @@ def mock_request(tmp_path):
             services=SimpleNamespace(
                 scheduler=_CanonicalSchedulerDouble(),
                 agent_delegation=SimpleNamespace(delegate=AsyncMock()),
+                collaboration_context=SimpleNamespace(read=AsyncMock()),
                 runtime_pool=SimpleNamespace(
                     get_effective_workspace=AsyncMock(return_value=tmp_path),
                 ),
@@ -306,6 +308,53 @@ class TestAgentDelegation:
         assert response.status == 400
         assert "parent_run_id" in json.loads(response.body.decode())["error"]
         service.delegate.assert_not_awaited()
+
+
+class TestCollaborationContext:
+    async def test_credential_binds_context_and_forwards_only_bounded_inputs(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.collaboration_context
+        service.read.return_value = SimpleNamespace(
+            payload={"version": 1, "content_trust": "untrusted", "messages": []}
+        )
+        mock_request.headers = {
+            "X-Webhook-Secret": "test-secret",
+            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
+        }
+        mock_request.json = AsyncMock(
+            return_value={"limit": 7, "cursor": "opaque-cursor", "idempotency_key": "context-one"}
+        )
+
+        response = await _handle_collaboration_context(mock_request)
+
+        assert response.status == 200
+        body = json.loads(response.body.decode())
+        assert body["content_trust"] == "untrusted"
+        authority = service.read.await_args.args[0]
+        assert authority.principal_id == _internal_api_context(123).principal_id
+        assert authority.channel_id == _internal_api_context(123).channel_id
+        assert authority.agent_id == _internal_api_context(123).agent_id
+        assert authority.runtime_profile_id == _internal_api_context(123).runtime_profile_id
+        assert service.read.await_args.kwargs == {
+            "proof": mock_request.headers["X-Kai-Collaboration-Proof"],
+            "cursor": "opaque-cursor",
+            "limit": 7,
+            "idempotency_key": "context-one",
+        }
+
+    async def test_rejects_every_context_selector_before_reading(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.collaboration_context
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        for selector, value in (
+            ("channel_id", str(ChannelId.new())),
+            ("thread_root_id", str(MessageId.new())),
+            ("principal_id", str(PrincipalId.new())),
+            ("run_id", str(RunId.new())),
+        ):
+            mock_request.json = AsyncMock(return_value={"idempotency_key": "context-selector", selector: value})
+            response = await _handle_collaboration_context(mock_request)
+            assert response.status == 400
+            assert selector in json.loads(response.body.decode())["error"]
+        service.read.assert_not_awaited()
 
 
 # ── POST /api/schedule ────────────────────────────────────────────────
@@ -3677,6 +3726,7 @@ _NON_OBJECT_HANDLERS = [
     ),
     pytest.param(_handle_schedule, lambda r: None, id="schedule"),
     pytest.param(_handle_agent_delegation, lambda r: None, id="agent_delegation"),
+    pytest.param(_handle_collaboration_context, lambda r: None, id="collaboration_context"),
     pytest.param(
         _handle_update_job,
         lambda r: r.match_info.update({"id": "1"}),

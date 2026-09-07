@@ -459,7 +459,10 @@ async def test_operation_authorization_is_durable_idempotent_and_quota_bounded(t
             request_hash=request_hash,
             occurred_at=_NOW + timedelta(seconds=5),
         )
-        assert replay == first
+        assert replay.grant == first.grant
+        assert replay.operation == first.operation
+        assert first.replayed is False
+        assert replay.replayed is True
 
         with pytest.raises(CollaborationDenied) as denied:
             await authority.authorize(
@@ -483,6 +486,49 @@ async def test_operation_authorization_is_durable_idempotent_and_quota_bounded(t
         await store.rebuild_projection(CanonicalConversationProjection())
         async with store.connection.execute("SELECT COUNT(*) FROM collaboration_operation_decisions") as cursor:
             assert int((await cursor.fetchone())[0]) == 2
+    finally:
+        await store.close()
+
+
+async def test_authorized_idempotency_replay_does_not_resurrect_fenced_attempt(tmp_path: Path) -> None:
+    store, _execution, started = await _running_attempt(tmp_path / "kai.db")
+    try:
+        authority = WorkshopCollaborationAuthority(
+            store,
+            token_factory=lambda: "attempt-proof-000000000000000000000000000009",
+        )
+        _grant, invocation = await authority.issue(
+            started.claim,
+            occurred_at=_NOW + timedelta(seconds=3),
+        )
+        await authority.authorize(
+            invocation.token,
+            CollaborationOperation.AGENT_DELEGATION,
+            base_identity=_base_identity(started),
+            idempotency_key="authorized-before-fence",
+            request_hash="c" * 64,
+            occurred_at=_NOW + timedelta(seconds=4),
+        )
+        await store.connection.execute(
+            "UPDATE run_attempts SET status = 'failed', terminal_at = ?, terminal_code = ? WHERE id = ?",
+            (
+                (_NOW + timedelta(seconds=5)).isoformat(),
+                "test_fence",
+                started.claim.attempt_id,
+            ),
+        )
+        await store.connection.commit()
+
+        with pytest.raises(CollaborationDenied) as denied:
+            await authority.authorize(
+                invocation.token,
+                CollaborationOperation.AGENT_DELEGATION,
+                base_identity=_base_identity(started),
+                idempotency_key="authorized-before-fence",
+                request_hash="c" * 64,
+                occurred_at=_NOW + timedelta(seconds=5),
+            )
+        assert denied.value.code == "attempt_not_active"
     finally:
         await store.close()
 

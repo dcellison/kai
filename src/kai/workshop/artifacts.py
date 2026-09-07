@@ -597,15 +597,20 @@ async def artifact_for_delivery(
 async def artifacts_for_messages(
     store: WorkshopEventStore,
     message_ids: tuple[MessageId, ...],
+    *,
+    through_position: int | None = None,
 ) -> dict[MessageId, tuple[ArtifactSummary, ...]]:
     if not message_ids:
         return {}
     placeholders = ", ".join("?" for _ in message_ids)
+    position_clause = "" if through_position is None else " AND created_event_position <= ?"
+    parameters: tuple[object, ...] = (*message_ids,) if through_position is None else (*message_ids, through_position)
     async with store.connection.execute(
         "SELECT id, message_id, channel_id, kind, media_type, byte_size, "
         "content_sha256, original_filename, created_at FROM artifacts "
-        f"WHERE message_id IN ({placeholders}) ORDER BY created_event_position, id",
-        message_ids,
+        f"WHERE message_id IN ({placeholders}){position_clause} "
+        "ORDER BY created_event_position, id",
+        parameters,
     ) as cursor:
         rows = list(await cursor.fetchall())
     grouped: dict[MessageId, list[ArtifactSummary]] = {}
