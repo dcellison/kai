@@ -66,20 +66,51 @@ async def load_message_reactions(
     *,
     message_ids: tuple[MessageId, ...],
     viewer_principal_id: PrincipalId,
+    through_position: int | None = None,
 ) -> dict[MessageId, tuple[MessageReactionSummary, ...]]:
     """Aggregate reactions for messages, including viewer-specific state."""
     if not message_ids:
         return {}
     placeholders = ", ".join("?" for _ in message_ids)
-    async with store.connection.execute(
-        "SELECT message_id, reaction, COUNT(*), "
-        "MAX(CASE WHEN principal_id = ? THEN 1 ELSE 0 END) "
-        f"FROM message_reactions WHERE message_id IN ({placeholders}) "
-        "GROUP BY message_id, reaction "
-        "ORDER BY message_id, MIN(created_event_position), reaction",
-        (viewer_principal_id, *message_ids),
-    ) as cursor:
-        rows = list(await cursor.fetchall())
+    if through_position is None:
+        async with store.connection.execute(
+            "SELECT message_id, reaction, COUNT(*), "
+            "MAX(CASE WHEN principal_id = ? THEN 1 ELSE 0 END) "
+            f"FROM message_reactions WHERE message_id IN ({placeholders}) "
+            "GROUP BY message_id, reaction "
+            "ORDER BY message_id, MIN(created_event_position), reaction",
+            (viewer_principal_id, *message_ids),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+    else:
+        # The current-state projection intentionally deletes removed reactions.
+        # Snapshot reads therefore reconstruct the latest state at the fixed
+        # event boundary from canonical events instead of leaking later edits.
+        async with store.connection.execute(
+            "WITH ranked AS ("
+            "SELECT aggregate_id AS message_id, "
+            "json_extract(payload_json, '$.principal_id') AS principal_id, "
+            "json_extract(payload_json, '$.reaction') AS reaction, event_type, position, "
+            "ROW_NUMBER() OVER (PARTITION BY aggregate_id, "
+            "json_extract(payload_json, '$.principal_id'), "
+            "json_extract(payload_json, '$.reaction') ORDER BY position DESC) AS state_rank "
+            "FROM event_log WHERE aggregate_type = 'message' "
+            "AND event_type IN (?, ?) AND position <= ? "
+            f"AND aggregate_id IN ({placeholders})"
+            ") SELECT message_id, reaction, COUNT(*), "
+            "MAX(CASE WHEN principal_id = ? THEN 1 ELSE 0 END) "
+            "FROM ranked WHERE state_rank = 1 AND event_type = ? "
+            "GROUP BY message_id, reaction ORDER BY message_id, MIN(position), reaction",
+            (
+                WorkshopEventType.MESSAGE_REACTION_ADDED.value,
+                WorkshopEventType.MESSAGE_REACTION_REMOVED.value,
+                through_position,
+                *message_ids,
+                viewer_principal_id,
+                WorkshopEventType.MESSAGE_REACTION_ADDED.value,
+            ),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
     grouped: dict[MessageId, list[MessageReactionSummary]] = {}
     for row in rows:
         message_id = MessageId(str(row[0]))

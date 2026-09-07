@@ -190,6 +190,7 @@ class CollaborationAuthorization:
 
     grant: CollaborationGrantSnapshot
     operation: CollaborationOperation
+    replayed: bool = False
 
 
 type OwnerPolicyResolver = Callable[[AgentDefinitionRevision], CollaborationOwnerPolicy]
@@ -478,7 +479,11 @@ class WorkshopCollaborationAuthority:
                 if str(existing[1]) == "denied":
                     code = str(existing[2])
                     raise CollaborationDenied(code, f"Collaboration invocation was denied: {code}")
-                return CollaborationAuthorization(grant, operation)
+                # Idempotency preserves the semantic operation result; it must
+                # never resurrect authority after the exact attempt is fenced.
+                if denial is not None:
+                    raise denial
+                return CollaborationAuthorization(grant, operation, replayed=True)
 
             quota_ordinal: int | None = None
             if denial is None:

@@ -20,6 +20,7 @@ Routes are organized into these groups:
     - /api/send-message     - Publish a proactive canonical text message
     - /api/send-file        - Publish a proactive canonical artifact
     - /api/agent-delegations - Run one bounded agent-to-agent delegation
+    - /api/collaboration/context - Read exact-attempt bounded conversation context
     - /api/memory/add       - Store a structured memory (POST)
     - /api/memory/search    - Search memories by query (POST)
     - /api/memory/stats     - Memory statistics for a user (GET)
@@ -86,7 +87,14 @@ from kai.workshop.client_sessions import (
     WorkshopClientSessionManager,
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
-from kai.workshop.collaboration_authority import CollaborationBaseIdentity
+from kai.workshop.collaboration_authority import (
+    CollaborationBaseIdentity,
+    CollaborationDenied,
+    CollaborationProofError,
+)
+from kai.workshop.collaboration_context import (
+    CollaborationContextValidationError,
+)
 from kai.workshop.github_automation import (
     GitHubSubscriptionRoute,
     WorkshopGitHubAutomationService,
@@ -120,6 +128,7 @@ from kai.workshop.storage_namespaces import (
     WorkshopStorageNamespaceError,
 )
 from kai.workshop.store import WorkshopEventStore
+from kai.workshop.timeline import TimelineAccessDeniedError, TimelineCursorError
 
 log = logging.getLogger(__name__)
 
@@ -1291,6 +1300,63 @@ async def _handle_agent_delegation(
     )
 
 
+@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+async def _handle_collaboration_context(
+    request: web.Request,
+    principal: InternalAPIPrincipal,
+) -> web.Response:
+    """Read only the current attempt's bounded canonical conversation context."""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+    unsupported = set(payload) - {"cursor", "limit", "idempotency_key"}
+    if unsupported:
+        return web.json_response(
+            {"error": f"Unsupported field: {sorted(unsupported)[0]}"},
+            status=400,
+        )
+    if "idempotency_key" not in payload:
+        return web.json_response({"error": "Missing required field: idempotency_key"}, status=400)
+    try:
+        result = await request.app[CORE_HOST_KEY].services.collaboration_context.read(
+            CollaborationBaseIdentity(
+                principal_id=principal.principal_id,
+                channel_id=principal.channel_id,
+                agent_id=principal.agent_id,
+                runtime_profile_id=principal.runtime_profile_id,
+            ),
+            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
+            cursor=payload.get("cursor"),
+            limit=payload.get("limit", 20),
+            idempotency_key=payload["idempotency_key"],
+        )
+    except CollaborationProofError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_proof"}, status=403)
+    except CollaborationDenied as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    except TimelineCursorError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_cursor"}, status=400)
+    except CollaborationContextValidationError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_request"}, status=400)
+    except TimelineAccessDeniedError:
+        return web.json_response(
+            {"error": "Collaboration context is unavailable", "code": "context_unavailable"},
+            status=403,
+        )
+    except TimeoutError:
+        return web.json_response(
+            {"error": "Collaboration context read timed out", "code": "context_timeout"},
+            status=504,
+        )
+    except Exception:
+        log.exception("Canonical collaboration context read failed")
+        return web.json_response({"error": "Collaboration context read failed"}, status=500)
+    return web.json_response(result.payload)
+
+
 # ── File exchange ────────────────────────────────────────────────────
 
 
@@ -1899,6 +1965,7 @@ def _register_routes(
     app.router.add_post("/api/send-message", _handle_send_message)
     app.router.add_post("/api/send-file", _handle_send_file)
     app.router.add_post("/api/agent-delegations", _handle_agent_delegation)
+    app.router.add_post("/api/collaboration/context", _handle_collaboration_context)
 
 
 async def _register_workshop_client_api(
