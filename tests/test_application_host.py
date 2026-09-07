@@ -16,6 +16,7 @@ from kai.workshop.bootstrap import (
 )
 from kai.workshop.claude_model_discovery import ClaudeModelDiscoveryAdapter
 from kai.workshop.codex_model_discovery import CodexModelDiscoveryAdapter
+from kai.workshop.collaboration_authority import CollaborationHostPolicy
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
@@ -67,6 +68,7 @@ class _FakeExecution:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.routing_policy = SimpleNamespace()
+        self.collaboration_authority = SimpleNamespace(host_policy=CollaborationHostPolicy())
 
     async def wait(self) -> None:
         self.events.append("execution:wait")

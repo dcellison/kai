@@ -27,7 +27,7 @@ from kai.workshop.collaboration_authority import (
 )
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import AgentId, ChannelId, RunExecutionOwnerId, RunId
+from kai.workshop.domain import AgentDefinitionId, AgentId, ChannelId, RunExecutionOwnerId, RunId
 from kai.workshop.protected_execution import (
     PreparedWorkshopExecution,
     ProtectedExecutionRoutingRejected,
@@ -204,6 +204,19 @@ class WorkshopCanonicalExecutionCoordinator:
                 base_identity=base_identity,
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
+                occurred_at=occurred_at,
+            )
+
+    async def revoke_collaboration_for_definition(
+        self,
+        definition_id: AgentDefinitionId,
+        *,
+        occurred_at: datetime,
+    ) -> int:
+        """Serialize an owner emergency fence with attempt state changes."""
+        async with self._database_lock:
+            return await self._collaboration_authority.revoke_definition(
+                definition_id,
                 occurred_at=occurred_at,
             )
 

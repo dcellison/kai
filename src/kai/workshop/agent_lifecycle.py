@@ -13,10 +13,12 @@ from kai.workshop.agent_definitions import (
     MAX_AGENT_DISPLAY_NAME,
     MAX_AGENT_INSTRUCTIONS,
     MAX_AGENT_PURPOSE,
+    collaboration_operations_for_capabilities,
     normalize_agent_handle,
     validate_agent_capabilities,
     validate_agent_presentation,
     validate_agent_text,
+    validate_collaboration_operations,
 )
 from kai.workshop.domain import (
     AgentDefinitionId,
@@ -62,6 +64,7 @@ class AgentRevisionSnapshot:
     purpose: str
     instructions: str
     capabilities: tuple[str, ...]
+    collaboration_operations: tuple[str, ...]
     created_at: str
     created_by_principal_id: PrincipalId | None
     event_position: int
@@ -163,6 +166,7 @@ class WorkshopAgentLifecycleService:
         purpose: object,
         instructions: object,
         capabilities: object,
+        collaboration_operations: object = None,
     ) -> AgentDefinitionSnapshot:
         workshop_id, _role = await self._authority(principal_id)
         key = _normalize_idempotency_key(idempotency_key)
@@ -183,6 +187,11 @@ class WorkshopAgentLifecycleService:
                 instructions, field="instructions", maximum=MAX_AGENT_INSTRUCTIONS
             )
             normalized_capabilities = validate_agent_capabilities(capabilities)
+            normalized_collaboration_operations = (
+                collaboration_operations_for_capabilities(normalized_capabilities)
+                if collaboration_operations is None
+                else validate_collaboration_operations(collaboration_operations)
+            )
         except ValueError as exc:
             raise WorkshopAgentLifecycleValidationError(str(exc)) from exc
         operation_payload: dict[str, object] = {
@@ -193,6 +202,7 @@ class WorkshopAgentLifecycleService:
             "purpose": normalized_purpose,
             "instructions": normalized_instructions,
             "capabilities": list(normalized_capabilities),
+            "collaboration_operations": list(normalized_collaboration_operations),
         }
         fingerprint = _operation_hash("create", operation_payload)
         operation_key = self._operation_key(workshop_id, principal_id, key)
@@ -266,7 +276,7 @@ class WorkshopAgentLifecycleService:
             ),
             EventEnvelope.create(
                 event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
-                event_version=1,
+                event_version=2,
                 workshop_id=workshop_id,
                 aggregate_type="agent_definition_revision",
                 aggregate_id=revision_id,
@@ -279,6 +289,7 @@ class WorkshopAgentLifecycleService:
                     "purpose": normalized_purpose,
                     "instructions": normalized_instructions,
                     "capabilities": list(normalized_capabilities),
+                    "collaboration_operations": list(normalized_collaboration_operations),
                 },
                 metadata=metadata,
             ),
@@ -303,6 +314,7 @@ class WorkshopAgentLifecycleService:
         purpose: object,
         instructions: object,
         capabilities: object,
+        collaboration_operations: object = None,
     ) -> AgentDefinitionSnapshot:
         workshop_id, _role = await self._authority(principal_id)
         key = _normalize_idempotency_key(idempotency_key)
@@ -313,6 +325,11 @@ class WorkshopAgentLifecycleService:
                 instructions, field="instructions", maximum=MAX_AGENT_INSTRUCTIONS
             )
             normalized_capabilities = validate_agent_capabilities(capabilities)
+            normalized_collaboration_operations = (
+                collaboration_operations_for_capabilities(normalized_capabilities)
+                if collaboration_operations is None
+                else validate_collaboration_operations(collaboration_operations)
+            )
         except ValueError as exc:
             raise WorkshopAgentLifecycleValidationError(str(exc)) from exc
         operation_payload: dict[str, object] = {
@@ -321,6 +338,7 @@ class WorkshopAgentLifecycleService:
             "purpose": normalized_purpose,
             "instructions": normalized_instructions,
             "capabilities": list(normalized_capabilities),
+            "collaboration_operations": list(normalized_collaboration_operations),
         }
         fingerprint = _operation_hash("revise", operation_payload)
         operation_key = self._operation_key(workshop_id, principal_id, key)
@@ -340,7 +358,7 @@ class WorkshopAgentLifecycleService:
             revision_id = AgentDefinitionRevisionId.derived(definition_id, f"revision:{revision_number}")
             event = EventEnvelope.create(
                 event_type=WorkshopEventType.AGENT_DEFINITION_REVISION_ADDED,
-                event_version=1,
+                event_version=2,
                 workshop_id=workshop_id,
                 aggregate_type="agent_definition_revision",
                 aggregate_id=revision_id,
@@ -353,6 +371,7 @@ class WorkshopAgentLifecycleService:
                     "purpose": normalized_purpose,
                     "instructions": normalized_instructions,
                     "capabilities": list(normalized_capabilities),
+                    "collaboration_operations": list(normalized_collaboration_operations),
                 },
                 metadata=self._metadata("revise", fingerprint, definition_id),
             )
@@ -585,28 +604,40 @@ class WorkshopAgentLifecycleService:
             row = await cursor.fetchone()
         if row is None:
             raise WorkshopAgentLifecycleAccessDenied("Access denied")
+        async with self._store.connection.execute("PRAGMA table_info(agent_definition_revisions)") as cursor:
+            revision_columns = {str(column[1]) for column in await cursor.fetchall()}
+        collaboration_column = (
+            ", r.collaboration_operations_json" if "collaboration_operations_json" in revision_columns else ""
+        )
         async with self._store.connection.execute(
             "SELECT r.id, r.revision_number, r.purpose, r.instructions, r.capabilities_json, "
-            "r.created_at, e.actor_principal_id, r.created_event_position "
+            f"r.created_at, e.actor_principal_id, r.created_event_position{collaboration_column} "
             "FROM agent_definition_revisions r JOIN event_log e "
             "ON e.position = r.created_event_position WHERE r.agent_definition_id = ? "
             "ORDER BY r.revision_number",
             (definition_id,),
         ) as cursor:
             revision_rows = list(await cursor.fetchall())
-        revisions = tuple(
-            AgentRevisionSnapshot(
-                revision_id=AgentDefinitionRevisionId(str(revision[0])),
-                revision_number=int(revision[1]),
-                purpose=str(revision[2]),
-                instructions=str(revision[3]),
-                capabilities=validate_agent_capabilities(json.loads(str(revision[4]))),
-                created_at=str(revision[5]),
-                created_by_principal_id=(PrincipalId(str(revision[6])) if revision[6] is not None else None),
-                event_position=int(revision[7]),
+        revisions: list[AgentRevisionSnapshot] = []
+        for revision in revision_rows:
+            capabilities = validate_agent_capabilities(json.loads(str(revision[4])))
+            revisions.append(
+                AgentRevisionSnapshot(
+                    revision_id=AgentDefinitionRevisionId(str(revision[0])),
+                    revision_number=int(revision[1]),
+                    purpose=str(revision[2]),
+                    instructions=str(revision[3]),
+                    capabilities=capabilities,
+                    collaboration_operations=(
+                        validate_collaboration_operations(json.loads(str(revision[8])))
+                        if len(revision) > 8
+                        else collaboration_operations_for_capabilities(capabilities)
+                    ),
+                    created_at=str(revision[5]),
+                    created_by_principal_id=(PrincipalId(str(revision[6])) if revision[6] is not None else None),
+                    event_position=int(revision[7]),
+                )
             )
-            for revision in revision_rows
-        )
         async with self._store.connection.execute(
             "SELECT COALESCE(MAX(position), ?) FROM event_log WHERE workshop_id = ? "
             "AND ((aggregate_type = 'agent_definition' AND aggregate_id = ?) "
@@ -632,7 +663,7 @@ class WorkshopAgentLifecycleService:
             created_by_principal_id=(PrincipalId(str(row[11])) if row[11] is not None else None),
             owner_principal_id=(PrincipalId(str(row[12])) if row[12] is not None else None),
             owner_display_name=(str(row[13]) if row[13] is not None else None),
-            revisions=revisions,
+            revisions=tuple(revisions),
         )
 
     @staticmethod

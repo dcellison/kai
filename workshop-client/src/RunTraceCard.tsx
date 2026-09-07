@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 
-import type { WorkshopRunTraceEntry } from "./types";
+import type { WorkshopCollaborationActivity, WorkshopRunTraceEntry } from "./types";
 
 interface TraceRow {
   call: WorkshopRunTraceEntry | null;
@@ -173,11 +173,13 @@ function DetailBlock({ entry }: { entry: WorkshopRunTraceEntry }): React.JSX.Ele
 // resize pointermove while the card's props (entries array identity and
 // scalars) only change when trace pages land or the inspected run moves.
 export const RunTraceCard = memo(function RunTraceCard({
+  collaborationActivity = [],
   entries,
   failed,
   loaded,
   runId,
 }: {
+  collaborationActivity?: WorkshopCollaborationActivity[];
   entries: WorkshopRunTraceEntry[];
   failed: boolean;
   loaded: boolean;
@@ -211,7 +213,7 @@ export const RunTraceCard = memo(function RunTraceCard({
   if (failed && entries.length === 0) {
     return <p className="trace-empty">Trace unavailable for this run.</p>;
   }
-  if (loaded && entries.length === 0) {
+  if (loaded && entries.length === 0 && collaborationActivity.length === 0) {
     return <p className="trace-empty">No steps recorded for this run.</p>;
   }
 
@@ -282,6 +284,26 @@ export const RunTraceCard = memo(function RunTraceCard({
           );
         })}
       </ol>
+      {collaborationActivity.length > 0 && (
+        <section className="collaboration-activity" aria-label="Collaboration activity">
+          <h4>Collaboration activity</h4>
+          <ol>
+            {collaborationActivity.map((entry) => (
+              <li key={entry.eventPosition}>
+                <strong>
+                  {entry.kind === "revocation"
+                    ? "Access revoked"
+                    : (entry.operation ?? "Collaboration").replaceAll("_", " ")}
+                </strong>
+                <span className={`collaboration-outcome ${entry.outcome}`}>
+                  {entry.outcome}
+                </span>
+                {entry.detail && <small>{entry.detail.replaceAll("_", " ")}</small>}
+              </li>
+            ))}
+          </ol>
+        </section>
+      )}
     </div>
   );
 });

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 70
+WORKSHOP_SCHEMA_VERSION = 71
 
 
 @dataclass(frozen=True, slots=True)
@@ -3097,6 +3097,30 @@ _AGENT_AUTHORED_PUBLICATION_SCHEMA = SchemaMigration(
     ),
 )
 
+_AGENT_COLLABORATION_OWNER_POLICY_SCHEMA = SchemaMigration(
+    version=71,
+    name="agent_collaboration_owner_policy",
+    statements=(
+        """
+        CREATE TABLE agent_collaboration_owner_policies (
+            agent_definition_id TEXT PRIMARY KEY
+                REFERENCES agent_definitions(id) ON DELETE CASCADE,
+            owner_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            allowed_operations_json TEXT NOT NULL CHECK (
+                json_valid(allowed_operations_json)
+                AND json_type(allowed_operations_json) = 'array'
+            ),
+            policy_version INTEGER NOT NULL CHECK (policy_version > 0),
+            updated_at TEXT NOT NULL,
+            updated_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX agent_collaboration_owner_policies_owner_idx ON "
+        "agent_collaboration_owner_policies (owner_principal_id, updated_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3168,6 +3192,7 @@ _MIGRATIONS = (
     _COLLABORATION_OPERATION_DECISION_SCHEMA,
     _AGENT_AUTHORED_REACTION_SCHEMA,
     _AGENT_AUTHORED_PUBLICATION_SCHEMA,
+    _AGENT_COLLABORATION_OWNER_POLICY_SCHEMA,
 )
 
 

@@ -29,6 +29,7 @@ import {
   loadChannelUnread,
   loadAgentDefinitions,
   loadAgentEnablements,
+  loadAgentCollaborationPolicy,
   loadAppearancePreferences,
   loadEarlierTimeline,
   loadMemoryDetail,
@@ -47,6 +48,7 @@ import {
   loadRoutingEligibility,
   loadRoutingPolicy,
   loadRun,
+  loadRunTrace,
   loadTimeline,
   loadThreadTimeline,
   loadThreadUnread,
@@ -88,8 +90,10 @@ import {
   updateChannelNotificationPolicy,
   updateClientPreference,
   updateAppearancePreference,
+  updateAgentCollaborationPolicy,
   updateWorkspaceConfig,
   upsertOperatorModel,
+  revokeAgentCollaborationGrants,
 } from "./api";
 import type { WorkshopSession } from "./types";
 import { WORKSHOP_THEME_CATALOG } from "./theme";
@@ -119,6 +123,7 @@ function agentDefinitionPayload(): Record<string, unknown> {
     revisions: [
       {
         capabilities: ["text_generation", "workspace_execution"],
+        collaboration_operations: ["context_read"],
         created_at: "2026-08-29T10:00:00Z",
         created_by_principal_id: "prn_00000000000000000000000000000001",
         event_position: 91,
@@ -129,6 +134,37 @@ function agentDefinitionPayload(): Record<string, unknown> {
       },
     ],
     state_version: 3,
+  };
+}
+
+function collaborationPolicyPayload(): Record<string, unknown> {
+  return {
+    active_grants: 2,
+    active_revision_id: agentRevisionId,
+    can_manage: true,
+    definition_id: agentDefinitionId,
+    operations: [
+      {
+        effective_for_new_attempt: true,
+        host_allowed: true,
+        operation: "context_read",
+        owner_allowed: true,
+        quota: 200,
+        requested: true,
+        unavailable_reason: null,
+      },
+      {
+        effective_for_new_attempt: false,
+        host_allowed: true,
+        operation: "reaction",
+        owner_allowed: false,
+        quota: 64,
+        requested: true,
+        unavailable_reason: "Owner policy does not allow this operation",
+      },
+    ],
+    owner_principal_id: "prn_00000000000000000000000000000001",
+    policy_version: 3,
   };
 }
 
@@ -2203,6 +2239,54 @@ describe("Workshop client API", () => {
     expect((fetchMock.mock.calls[1]?.[1] as RequestInit).method).toBe("POST");
   });
 
+  it("loads collaboration decisions and revocations with a run trace", async () => {
+    const runId = "run_00000000000000000000000000000001";
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      collaboration_activity: [
+        {
+          detail: "quota use 1",
+          event_position: 81,
+          kind: "operation",
+          occurred_at: "2026-09-07T12:00:00Z",
+          operation: "context_read",
+          outcome: "authorized",
+        },
+        {
+          detail: "owner_emergency_revoke",
+          event_position: 82,
+          kind: "revocation",
+          occurred_at: "2026-09-07T12:00:01Z",
+          operation: null,
+          outcome: "revoked",
+        },
+      ],
+      entries: [],
+      has_more: false,
+      run_id: runId,
+      version: 1,
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadRunTrace(session, runId, 0)).resolves.toEqual({
+      collaborationActivity: [
+        expect.objectContaining({
+          detail: "quota use 1",
+          kind: "operation",
+          operation: "context_read",
+          outcome: "authorized",
+        }),
+        expect.objectContaining({
+          detail: "owner_emergency_revoke",
+          kind: "revocation",
+          operation: null,
+          outcome: "revoked",
+        }),
+      ],
+      entries: [],
+      hasMore: false,
+    });
+  });
+
   it("decodes fragmented event-stream blocks", () => {
     const decoder = new EventStreamDecoder();
     expect(decoder.push("id: 42\nevent: timeline.")).toEqual([]);
@@ -2534,6 +2618,7 @@ describe("Workshop client API", () => {
     await createAgentDefinition("session-secret", {
       avatar: "B",
       capabilities: ["text_generation"],
+      collaborationOperations: [],
       description: "Builds things.",
       displayName: "Builder",
       handle: "builder",
@@ -2543,6 +2628,7 @@ describe("Workshop client API", () => {
     });
     await addAgentRevision("session-secret", agentDefinitionId, {
       capabilities: ["text_generation", "workspace_execution"],
+      collaborationOperations: ["context_read"],
       expectedVersion: 3,
       idempotencyKey: "revision-key",
       instructions: "Use tests.",
@@ -2582,6 +2668,74 @@ describe("Workshop client API", () => {
       expected_version: 2,
       idempotency_key: "conversation-key",
     });
+  });
+
+  it("loads, updates, and emergency-revokes collaboration policy", async () => {
+    const response = () => new Response(JSON.stringify({
+      policy: collaborationPolicyPayload(),
+      version: 1,
+    }), { status: 200 });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = await loadAgentCollaborationPolicy("session-secret", agentDefinitionId);
+    expect(loaded).toEqual(expect.objectContaining({
+      activeGrants: 2,
+      canManage: true,
+      policyVersion: 3,
+    }));
+    expect(loaded.operations).toEqual([
+      expect.objectContaining({ operation: "context_read", effectiveForNewAttempt: true }),
+      expect.objectContaining({ operation: "reaction", effectiveForNewAttempt: false }),
+    ]);
+
+    await updateAgentCollaborationPolicy("session-secret", agentDefinitionId, {
+      allowedOperations: ["context_read", "reaction"],
+      clientOperationId: "policy-key",
+      expectedPolicyVersion: 3,
+    });
+    await revokeAgentCollaborationGrants(
+      "session-secret",
+      agentDefinitionId,
+      "revoke-key",
+    );
+
+    const path = `/v1/client/agents/${agentDefinitionId}/collaboration-policy`;
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      path,
+      path,
+      `${path}/revoke-active`,
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      allowed_operations: ["context_read", "reaction"],
+      client_operation_id: "policy-key",
+      expected_policy_version: 3,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+      client_operation_id: "revoke-key",
+    });
+  });
+
+  it("accepts a non-owner collaboration view with private policy fields redacted", async () => {
+    const policy = collaborationPolicyPayload();
+    policy.can_manage = false;
+    policy.active_grants = null;
+    policy.operations = (policy.operations as Record<string, unknown>[]).map((operation) => ({
+      ...operation,
+      owner_allowed: null,
+    }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      policy,
+      version: 1,
+    }), { status: 200 })));
+
+    const loaded = await loadAgentCollaborationPolicy("session-secret", agentDefinitionId);
+    expect(loaded.canManage).toBe(false);
+    expect(loaded.activeGrants).toBeNull();
+    expect(loaded.operations.every((operation) => operation.ownerAllowed === null)).toBe(true);
   });
 
   it("streams typed agent changes over a distinct live connection", async () => {

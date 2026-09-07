@@ -259,11 +259,20 @@ export type WorkshopAgentCapability =
   | "tool_activity"
   | "workspace_execution";
 
+export type WorkshopCollaborationOperation =
+  | "context_read"
+  | "reaction"
+  | "progress_publish"
+  | "thread_reply"
+  | "artifact_publish"
+  | "agent_delegation";
+
 export type WorkshopAgentLifecycleState = "draft" | "active" | "archived";
 export type WorkshopAgentEnablementState = "available" | "enabled" | "disabled";
 
 export interface WorkshopAgentRevision {
   capabilities: WorkshopAgentCapability[];
+  collaborationOperations: WorkshopCollaborationOperation[];
   createdAt: string;
   createdByPrincipalId: string | null;
   eventPosition: number;
@@ -271,6 +280,26 @@ export interface WorkshopAgentRevision {
   purpose: string;
   revisionId: string;
   revisionNumber: number;
+}
+
+export interface WorkshopCollaborationOperationState {
+  effectiveForNewAttempt: boolean;
+  hostAllowed: boolean;
+  operation: WorkshopCollaborationOperation;
+  ownerAllowed: boolean | null;
+  quota: number | null;
+  requested: boolean;
+  unavailableReason: string | null;
+}
+
+export interface WorkshopCollaborationPolicy {
+  activeGrants: number | null;
+  activeRevisionId: string | null;
+  canManage: boolean;
+  definitionId: string;
+  operations: WorkshopCollaborationOperationState[];
+  ownerPrincipalId: string;
+  policyVersion: number;
 }
 
 export interface WorkshopAgentDefinition {
@@ -973,8 +1002,18 @@ export interface WorkshopRunTraceEntry {
 }
 
 export interface WorkshopRunTracePage {
+  collaborationActivity: WorkshopCollaborationActivity[];
   entries: WorkshopRunTraceEntry[];
   hasMore: boolean;
+}
+
+export interface WorkshopCollaborationActivity {
+  detail: string | null;
+  eventPosition: number;
+  kind: "operation" | "revocation";
+  occurredAt: string;
+  operation: WorkshopCollaborationOperation | null;
+  outcome: string;
 }
 
 export interface WorkshopRunTraceSignal {

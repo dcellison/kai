@@ -378,6 +378,7 @@ const agentDefinition: WorkshopAgentDefinition = {
   revisions: [
     {
       capabilities: ["text_generation", "tool_activity"],
+      collaborationOperations: [],
       createdAt: "2026-08-29T10:00:00Z",
       createdByPrincipalId: "prn_00000000000000000000000000000001",
       eventPosition: 10,
@@ -736,7 +737,7 @@ describe("Workshop React client", () => {
     );
     vi.mocked(markHumanNotificationsRead).mockResolvedValue([]);
     vi.mocked(loadRun).mockResolvedValue(completedRun);
-    vi.mocked(loadRunTrace).mockResolvedValue({ entries: [], hasMore: false });
+    vi.mocked(loadRunTrace).mockResolvedValue({ collaborationActivity: [], entries: [], hasMore: false });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
     vi.mocked(loadPreferenceDocument).mockResolvedValue({
       content: "# Preferences\n\nBe concise.\n",
@@ -1713,8 +1714,8 @@ describe("Workshop React client", () => {
       toolUseId: `toolu_${seq}`,
     });
     vi.mocked(loadRunTrace)
-      .mockResolvedValueOnce({ entries: [traceEntry(1), traceEntry(2)], hasMore: false })
-      .mockResolvedValueOnce({ entries: [traceEntry(3)], hasMore: false });
+      .mockResolvedValueOnce({ collaborationActivity: [], entries: [traceEntry(1), traceEntry(2)], hasMore: false })
+      .mockResolvedValueOnce({ collaborationActivity: [], entries: [traceEntry(3)], hasMore: false });
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
 
@@ -1758,6 +1759,7 @@ describe("Workshop React client", () => {
       JSON.stringify({ channelId, token: "existing-session" }),
     );
     const page = {
+      collaborationActivity: [],
       entries: [
         {
           createdAt: "2026-08-13T09:00:00+00:00",

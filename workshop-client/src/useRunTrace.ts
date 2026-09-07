@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type {
+  WorkshopCollaborationActivity,
   WorkshopRunTraceEntry,
   WorkshopRunTracePage,
   WorkshopRunTraceSignal,
@@ -10,8 +11,14 @@ export function useRunTrace(
   runId: string | null,
   signal: WorkshopRunTraceSignal | null,
   fetchPage: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>,
-): { entries: WorkshopRunTraceEntry[]; failed: boolean; loaded: boolean } {
+): {
+  collaborationActivity: WorkshopCollaborationActivity[];
+  entries: WorkshopRunTraceEntry[];
+  failed: boolean;
+  loaded: boolean;
+} {
   const [entries, setEntries] = useState<WorkshopRunTraceEntry[]>([]);
+  const [collaborationActivity, setCollaborationActivity] = useState<WorkshopCollaborationActivity[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
   // Highest seq already held, the after_seq cursor for every fetch; a
@@ -54,6 +61,7 @@ export function useRunTrace(
           return fresh.length > 0 ? [...current, ...fresh] : current;
         });
       }
+      setCollaborationActivity(page.collaborationActivity);
       hasMore = page.hasMore;
     }
     setLoaded(true);
@@ -64,6 +72,7 @@ export function useRunTrace(
     generationRef.current = generation;
     highestSeqRef.current = 0;
     setEntries([]);
+    setCollaborationActivity([]);
     setLoaded(false);
     setFailed(false);
     if (runId) {
@@ -81,5 +90,5 @@ export function useRunTrace(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, signal, fetchPage]);
 
-  return { entries, failed, loaded };
+  return { collaborationActivity, entries, failed, loaded };
 }

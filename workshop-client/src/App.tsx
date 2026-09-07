@@ -3179,6 +3179,7 @@ function WorkshopView({
   // and is seeded from replayed lifecycle events on mount).
   const inspectedRunId = activeRun?.runId ?? null;
   const {
+    collaborationActivity,
     entries: traceEntries,
     failed: traceFailed,
     loaded: traceLoaded,
@@ -5046,6 +5047,7 @@ function WorkshopView({
             </span>
             <h3>Run inspector</h3>
             <RunTraceCard
+              collaborationActivity={collaborationActivity}
               entries={traceEntries}
               failed={traceFailed}
               loaded={traceLoaded}
