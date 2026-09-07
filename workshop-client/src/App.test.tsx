@@ -35,6 +35,7 @@ import {
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
+  loadMessageReactors,
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadRun,
@@ -107,6 +108,7 @@ vi.mock("./api", async (importOriginal) => {
     loadMemoryRecords: vi.fn(),
     loadMemorySource: vi.fn(),
     loadMemoryStats: vi.fn(),
+    loadMessageReactors: vi.fn(),
     loadPreferenceDocument: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadTimeline: vi.fn(),
@@ -620,6 +622,11 @@ describe("Workshop React client", () => {
     vi.mocked(restoreChannel).mockResolvedValue(undefined);
     vi.mocked(restoreDirectMessage).mockResolvedValue(undefined);
     vi.mocked(setMessageReaction).mockResolvedValue([]);
+    vi.mocked(loadMessageReactors).mockResolvedValue({
+      reactors: [],
+      total: 0,
+      truncated: false,
+    });
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
       mutation: null,
@@ -3043,6 +3050,24 @@ describe("Workshop React client", () => {
     vi.mocked(setMessageReaction).mockResolvedValueOnce([
       { count: 1, reactedByViewer: true, reaction: "fire" },
     ]).mockResolvedValueOnce([]);
+    vi.mocked(loadMessageReactors).mockResolvedValueOnce({
+      total: 2,
+      truncated: false,
+      reactors: [
+        {
+          displayName: "Daniel",
+          handle: "daniel",
+          kind: "human",
+          principalId: "prn_00000000000000000000000000000001",
+        },
+        {
+          displayName: "Kai",
+          handle: "kai",
+          kind: "agent",
+          principalId: "prn_00000000000000000000000000000002",
+        },
+      ],
+    });
 
     render(<App />);
     const actions = await screen.findByRole("group", {
@@ -3085,6 +3110,18 @@ describe("Workshop React client", () => {
       name: "Fire: 1. Remove your reaction",
     })).toBe(reactionChip);
     expect(reactions.nextElementSibling).toBe(threadButton);
+    await user.hover(reactionChip);
+    const reactors = await screen.findByRole("tooltip");
+    expect(reactors).toHaveTextContent("Daniel");
+    expect(reactors).toHaveTextContent("Human · @daniel");
+    expect(reactors).toHaveTextContent("Kai");
+    expect(reactors).toHaveTextContent("Agent · @kai");
+    expect(loadMessageReactors).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      historyMessage.messageId,
+      "fire",
+    );
+    await user.unhover(reactionChip);
     await user.click(reactionChip);
     expect(setMessageReaction).toHaveBeenLastCalledWith(
       { channelId: secondChannelId, token: "existing-session" },

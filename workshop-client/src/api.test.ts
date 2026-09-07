@@ -36,6 +36,7 @@ import {
   loadMemorySource,
   loadMemoryStats,
   loadModelCatalogue,
+  loadMessageReactors,
   loadNavigation,
   loadGitHubSettings,
   loadNotificationPreferences,
@@ -1953,6 +1954,56 @@ describe("Workshop client API", () => {
       reaction: "thinking",
       active: true,
     });
+  });
+
+  it("loads bounded human and agent reactor identities on demand", async () => {
+    const messageId = "msg_00000000000000000000000000000001";
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        total: 2,
+        truncated: false,
+        reactors: [
+          {
+            principal_id: "prn_00000000000000000000000000000001",
+            kind: "human",
+            display_name: "Daniel",
+            handle: "daniel",
+          },
+          {
+            principal_id: "prn_00000000000000000000000000000002",
+            kind: "agent",
+            display_name: "Kai",
+            handle: "kai",
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadMessageReactors(session, messageId, "eyes")).resolves.toEqual({
+      total: 2,
+      truncated: false,
+      reactors: [
+        {
+          principalId: "prn_00000000000000000000000000000001",
+          kind: "human",
+          displayName: "Daniel",
+          handle: "daniel",
+        },
+        {
+          principalId: "prn_00000000000000000000000000000002",
+          kind: "agent",
+          displayName: "Kai",
+          handle: "kai",
+        },
+      ],
+    });
+    const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe(
+      `/v1/channels/${channelId}/messages/${messageId}/reactions/eyes/reactors`,
+    );
+    expect(new Headers(options.headers).get("Authorization")).toBe("Bearer session-secret");
   });
 
   it("scopes an agent dismissal to a thread when supplied", async () => {

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -164,10 +165,17 @@ def _bounded_message(message: TimelineMessage) -> tuple[dict[str, object], bool]
 class WorkshopCollaborationContextService:
     """Serve context from one exact active grant without accepting selectors."""
 
-    def __init__(self, store: WorkshopEventStore, execution: _ExecutionService) -> None:
+    def __init__(
+        self,
+        store: WorkshopEventStore,
+        execution: _ExecutionService,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._store = store
         self._execution = execution
         self._traces = WorkshopRunTraceStore(store)
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def read(
         self,
@@ -182,7 +190,7 @@ class WorkshopCollaborationContextService:
         normalized_limit = _normalize_limit(limit)
         normalized_key = _normalize_idempotency_key(idempotency_key)
         fingerprint = _request_hash(normalized_cursor, normalized_limit)
-        now = datetime.now(UTC)
+        now = self._clock()
         async with asyncio.timeout(_READ_TIMEOUT_SECONDS):
             authorization = await self._execution.authorize_collaboration(
                 proof,
@@ -248,7 +256,7 @@ class WorkshopCollaborationContextService:
                 base_identity=base_identity,
                 idempotency_key=normalized_key,
                 request_hash=fingerprint,
-                occurred_at=datetime.now(UTC),
+                occurred_at=self._clock(),
             )
             payload: dict[str, object] = {
                 "version": 1,
@@ -393,5 +401,5 @@ class WorkshopCollaborationContextService:
                 summary="Read bounded Workshop context",
                 detail=json.dumps(detail, separators=(",", ":"), sort_keys=True),
             ),
-            occurred_at=datetime.now(UTC),
+            occurred_at=self._clock(),
         )

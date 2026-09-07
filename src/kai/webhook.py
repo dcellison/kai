@@ -21,6 +21,7 @@ Routes are organized into these groups:
     - /api/send-file        - Publish a proactive canonical artifact
     - /api/agent-delegations - Run one bounded agent-to-agent delegation
     - /api/collaboration/context - Read exact-attempt bounded conversation context
+    - /api/collaboration/reactions - Add or remove an exact-attempt reaction
     - /api/memory/add       - Store a structured memory (POST)
     - /api/memory/search    - Search memories by query (POST)
     - /api/memory/stats     - Memory statistics for a user (GET)
@@ -94,6 +95,10 @@ from kai.workshop.collaboration_authority import (
 )
 from kai.workshop.collaboration_context import (
     CollaborationContextValidationError,
+)
+from kai.workshop.collaboration_reactions import (
+    CollaborationReactionDenied,
+    CollaborationReactionValidationError,
 )
 from kai.workshop.github_automation import (
     GitHubSubscriptionRoute,
@@ -1357,6 +1362,62 @@ async def _handle_collaboration_context(
     return web.json_response(result.payload)
 
 
+@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+async def _handle_collaboration_reaction(
+    request: web.Request,
+    principal: InternalAPIPrincipal,
+) -> web.Response:
+    """Set one agent reaction under the current attempt's exact authority."""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    required = {"message_id", "reaction", "active", "idempotency_key"}
+    if not isinstance(payload, dict) or set(payload) != required:
+        return web.json_response({"error": "Invalid collaboration reaction request"}, status=400)
+    try:
+        result = await request.app[CORE_HOST_KEY].services.collaboration_reactions.react(
+            CollaborationBaseIdentity(
+                principal_id=principal.principal_id,
+                channel_id=principal.channel_id,
+                agent_id=principal.agent_id,
+                runtime_profile_id=principal.runtime_profile_id,
+            ),
+            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
+            message_id=payload["message_id"],
+            reaction=payload["reaction"],
+            active=payload["active"],
+            idempotency_key=payload["idempotency_key"],
+        )
+    except CollaborationProofError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_proof"}, status=403)
+    except CollaborationDenied as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    except CollaborationReactionDenied as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    except CollaborationReactionValidationError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_request"}, status=400)
+    except TimeoutError:
+        return web.json_response(
+            {"error": "Collaboration reaction timed out", "code": "reaction_timeout"},
+            status=504,
+        )
+    except Exception:
+        log.exception("Canonical collaboration reaction failed")
+        return web.json_response({"error": "Collaboration reaction failed"}, status=500)
+    return web.json_response(
+        {
+            "version": 1,
+            "message_id": str(result.message_id),
+            "reaction": result.reaction,
+            "active": result.active,
+            "changed": result.changed,
+            "event_position": result.event_position,
+            "replayed": result.replayed,
+        }
+    )
+
+
 # ── File exchange ────────────────────────────────────────────────────
 
 
@@ -1966,6 +2027,7 @@ def _register_routes(
     app.router.add_post("/api/send-file", _handle_send_file)
     app.router.add_post("/api/agent-delegations", _handle_agent_delegation)
     app.router.add_post("/api/collaboration/context", _handle_collaboration_context)
+    app.router.add_post("/api/collaboration/reactions", _handle_collaboration_reaction)
 
 
 async def _register_workshop_client_api(

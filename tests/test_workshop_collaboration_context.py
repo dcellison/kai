@@ -130,7 +130,11 @@ async def _running_context(path: Path):
         grant,
         invocation,
         identity,
-        WorkshopCollaborationContextService(store, _Execution(collaboration_authority)),
+        WorkshopCollaborationContextService(
+            store,
+            _Execution(collaboration_authority),
+            clock=lambda: _NOW + timedelta(seconds=34),
+        ),
         collaboration_authority,
     )
 
@@ -320,7 +324,11 @@ async def test_thread_context_returns_only_root_and_bounded_replies(tmp_path: Pa
             agent_ids[0],
             started.run.runtime_profile_id,
         )
-        result = await WorkshopCollaborationContextService(store, _Execution(authority)).read(
+        result = await WorkshopCollaborationContextService(
+            store,
+            _Execution(authority),
+            clock=lambda: _NOW + timedelta(seconds=5),
+        ).read(
             identity,
             proof=invocation.token,
             cursor=None,

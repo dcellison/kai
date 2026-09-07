@@ -28,6 +28,7 @@ from kai.webhook import (
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
     _handle_agent_delegation,
     _handle_collaboration_context,
+    _handle_collaboration_reaction,
     _handle_delete_job,
     _handle_generic,
     _handle_get_job,
@@ -227,6 +228,7 @@ def mock_request(tmp_path):
                 scheduler=_CanonicalSchedulerDouble(),
                 agent_delegation=SimpleNamespace(delegate=AsyncMock()),
                 collaboration_context=SimpleNamespace(read=AsyncMock()),
+                collaboration_reactions=SimpleNamespace(react=AsyncMock()),
                 runtime_pool=SimpleNamespace(
                     get_effective_workspace=AsyncMock(return_value=tmp_path),
                 ),
@@ -355,6 +357,77 @@ class TestCollaborationContext:
             assert response.status == 400
             assert selector in json.loads(response.body.decode())["error"]
         service.read.assert_not_awaited()
+
+
+class TestCollaborationReaction:
+    async def test_credential_binds_context_and_forwards_only_reaction_inputs(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.collaboration_reactions
+        message_id = MessageId.new()
+        service.react.return_value = SimpleNamespace(
+            message_id=message_id,
+            reaction="eyes",
+            active=True,
+            changed=True,
+            event_position=77,
+            replayed=False,
+        )
+        mock_request.headers = {
+            "X-Webhook-Secret": "test-secret",
+            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
+        }
+        mock_request.json = AsyncMock(
+            return_value={
+                "message_id": str(message_id),
+                "reaction": "eyes",
+                "active": True,
+                "idempotency_key": "reaction-one",
+            }
+        )
+
+        response = await _handle_collaboration_reaction(mock_request)
+
+        assert response.status == 200
+        assert json.loads(response.body.decode()) == {
+            "version": 1,
+            "message_id": str(message_id),
+            "reaction": "eyes",
+            "active": True,
+            "changed": True,
+            "event_position": 77,
+            "replayed": False,
+        }
+        identity = service.react.await_args.args[0]
+        assert identity.principal_id == _internal_api_context(123).principal_id
+        assert identity.channel_id == _internal_api_context(123).channel_id
+        assert identity.agent_id == _internal_api_context(123).agent_id
+        assert identity.runtime_profile_id == _internal_api_context(123).runtime_profile_id
+        assert service.react.await_args.kwargs == {
+            "proof": mock_request.headers["X-Kai-Collaboration-Proof"],
+            "message_id": str(message_id),
+            "reaction": "eyes",
+            "active": True,
+            "idempotency_key": "reaction-one",
+        }
+
+    async def test_rejects_identity_and_context_selectors_before_mutating(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.collaboration_reactions
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        base = {
+            "message_id": str(MessageId.new()),
+            "reaction": "check",
+            "active": True,
+            "idempotency_key": "reaction-selector",
+        }
+        for selector, value in (
+            ("channel_id", str(ChannelId.new())),
+            ("thread_root_id", str(MessageId.new())),
+            ("principal_id", str(PrincipalId.new())),
+            ("run_id", str(RunId.new())),
+        ):
+            mock_request.json = AsyncMock(return_value={**base, selector: value})
+            response = await _handle_collaboration_reaction(mock_request)
+            assert response.status == 400
+        service.react.assert_not_awaited()
 
 
 # ── POST /api/schedule ────────────────────────────────────────────────
@@ -3727,6 +3800,7 @@ _NON_OBJECT_HANDLERS = [
     pytest.param(_handle_schedule, lambda r: None, id="schedule"),
     pytest.param(_handle_agent_delegation, lambda r: None, id="agent_delegation"),
     pytest.param(_handle_collaboration_context, lambda r: None, id="collaboration_context"),
+    pytest.param(_handle_collaboration_reaction, lambda r: None, id="collaboration_reaction"),
     pytest.param(
         _handle_update_job,
         lambda r: r.match_info.update({"id": "1"}),

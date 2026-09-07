@@ -1280,6 +1280,48 @@ button:disabled {
   gap: 0.35rem;
 }
 
+.reaction-chip-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.reaction-reactors {
+  position: absolute;
+  z-index: 12;
+  bottom: calc(100% + 0.4rem);
+  left: 0;
+  display: grid;
+  gap: 0.35rem;
+  width: max-content;
+  min-width: 10rem;
+  max-width: 18rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.55rem;
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  box-shadow: 0 0.45rem 1rem color-mix(in srgb, var(--color-shadow-base) 35%, transparent);
+  font: 500 0.68rem var(--sans);
+}
+
+.reaction-reactors strong,
+.reaction-reactors span,
+.reaction-reactors small {
+  display: block;
+}
+
+.reaction-reactors ul {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reaction-reactors small {
+  color: var(--color-text-muted);
+}
+
 .message-reactions button {
   display: inline-flex;
   align-items: center;

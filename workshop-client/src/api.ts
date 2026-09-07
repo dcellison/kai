@@ -57,6 +57,7 @@ import type {
   WorkshopArtifactSummary,
   WorkshopMessageReaction,
   WorkshopReaction,
+  WorkshopReactionReactors,
   WorkshopAgentCapability,
   WorkshopAgentChangeSignal,
   WorkshopAgentDefinition,
@@ -1621,6 +1622,58 @@ export async function setMessageReaction(
     throw new Error("Kai returned an unsupported reaction response.");
   }
   return reactions;
+}
+
+export async function loadMessageReactors(
+  session: WorkshopSession,
+  messageId: string,
+  reaction: WorkshopReaction,
+): Promise<WorkshopReactionReactors> {
+  if (!MESSAGE_PATTERN.test(messageId) || !REACTIONS.has(reaction)) {
+    throw new Error("Invalid message reaction.");
+  }
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(reaction)}/reactors`,
+  );
+  const payload = await responsePayload(response);
+  if (
+    !response.ok ||
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !Number.isSafeInteger(payload.total) ||
+    (payload.total as number) < 0 ||
+    typeof payload.truncated !== "boolean" ||
+    !Array.isArray(payload.reactors)
+  ) {
+    throw new Error(safeErrorMessage(payload, "Could not load reaction participants."));
+  }
+  const reactors = payload.reactors.map((item) => {
+    if (
+      !isRecord(item) ||
+      typeof item.principal_id !== "string" ||
+      !PRINCIPAL_PATTERN.test(item.principal_id) ||
+      !["human", "agent"].includes(String(item.kind)) ||
+      typeof item.display_name !== "string" ||
+      (item.handle !== null && typeof item.handle !== "string")
+    ) {
+      throw new Error("Kai returned unsupported reaction participants.");
+    }
+    return {
+      displayName: item.display_name,
+      handle: item.handle as string | null,
+      kind: item.kind as "human" | "agent",
+      principalId: item.principal_id,
+    };
+  });
+  if (reactors.length > (payload.total as number)) {
+    throw new Error("Kai returned unsupported reaction participants.");
+  }
+  return {
+    reactors,
+    total: payload.total as number,
+    truncated: payload.truncated,
+  };
 }
 
 function parseEditableCapabilities(value: unknown): WorkshopEditableCapability[] {

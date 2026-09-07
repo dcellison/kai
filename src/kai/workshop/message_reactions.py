@@ -33,6 +33,7 @@ SUPPORTED_MESSAGE_REACTIONS = frozenset(
         "question",
     }
 )
+MAX_MESSAGE_REACTORS = 100
 
 
 class MessageReactionAccessDeniedError(PermissionError):
@@ -53,6 +54,23 @@ class MessageReactionMutation:
     changed: bool
     event_position: int | None
     reactions: tuple[MessageReactionSummary, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MessageReactorIdentity:
+    """One bounded, user-visible human or agent reactor identity."""
+
+    principal_id: PrincipalId
+    kind: str
+    display_name: str
+    handle: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MessageReactorSnapshot:
+    reactors: tuple[MessageReactorIdentity, ...]
+    total: int
+    truncated: bool
 
 
 def validate_message_reaction(value: object) -> str:
@@ -210,4 +228,58 @@ async def set_message_reaction(
         changed=current_active != active,
         event_position=event_position,
         reactions=reactions.get(message_id, ()),
+    )
+
+
+async def load_message_reactors(
+    store: WorkshopEventStore,
+    *,
+    viewer_principal_id: PrincipalId,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    reaction: object,
+) -> MessageReactorSnapshot:
+    """Load bounded reactor identities after checking the viewer's channel access."""
+    if not isinstance(viewer_principal_id, PrincipalId):
+        raise MessageReactionValidationError("Invalid reaction viewer")
+    if not isinstance(channel_id, ChannelId) or not isinstance(message_id, MessageId):
+        raise MessageReactionValidationError("Invalid reaction target")
+    normalized_reaction = validate_message_reaction(reaction)
+    async with store.connection.execute(
+        "SELECT c.workshop_id FROM messages m JOIN channels c ON c.id = m.channel_id "
+        "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.principal_id = ? "
+        "WHERE m.id = ? AND m.channel_id = ? AND c.archived_at IS NULL",
+        (viewer_principal_id, message_id, channel_id),
+    ) as cursor:
+        access = await cursor.fetchone()
+    if access is None:
+        raise MessageReactionAccessDeniedError("Reaction access denied")
+    async with store.connection.execute(
+        "SELECT mr.principal_id, p.kind, p.display_name, "
+        "CASE p.kind WHEN 'human' THEN hh.handle ELSE ad.handle END, COUNT(*) OVER() "
+        "FROM message_reactions mr JOIN principals p ON p.id = mr.principal_id "
+        "JOIN channels c ON c.id = ? "
+        "LEFT JOIN human_handles hh ON hh.workshop_id = c.workshop_id AND hh.principal_id = p.id "
+        "LEFT JOIN agents a ON a.principal_id = p.id "
+        "LEFT JOIN agent_definitions ad ON ad.agent_id = a.id "
+        "WHERE mr.message_id = ? AND mr.reaction = ? "
+        "ORDER BY mr.created_event_position, mr.principal_id LIMIT ?",
+        (channel_id, message_id, normalized_reaction, MAX_MESSAGE_REACTORS),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    total = int(rows[0][4]) if rows else 0
+    truncated = total > MAX_MESSAGE_REACTORS
+    visible = rows[:MAX_MESSAGE_REACTORS]
+    return MessageReactorSnapshot(
+        reactors=tuple(
+            MessageReactorIdentity(
+                principal_id=PrincipalId(str(row[0])),
+                kind=str(row[1]),
+                display_name=str(row[2]),
+                handle=str(row[3]) if row[3] is not None else None,
+            )
+            for row in visible
+        ),
+        total=total,
+        truncated=truncated,
     )

@@ -63,64 +63,75 @@ class WorkshopRunTraceStore:
         connection = self._store.connection
         try:
             await connection.execute("BEGIN IMMEDIATE")
-            async with connection.execute(
-                "SELECT status FROM run_attempts WHERE id = ? AND run_id = ? AND owner_id = ? AND fence_token = ?",
-                (claim.attempt_id, claim.run_id, claim.owner_id, claim.fence_token),
-            ) as cursor:
-                row = await cursor.fetchone()
-            if row is None or str(row[0]) not in ("granted", "started"):
-                raise StaleRunExecutionAuthorityError("Execution claim no longer holds active authority")
-            async with connection.execute(
-                "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM run_traces WHERE run_id = ?",
-                (claim.run_id,),
-            ) as cursor:
-                seq_row = await cursor.fetchone()
-            assert seq_row is not None
-            next_seq = int(seq_row[0]) + 1
-            if int(seq_row[1]) >= _TRACE_MAX_ENTRIES:
-                async with connection.execute(
-                    "SELECT 1 FROM run_traces WHERE run_id = ? AND kind = ? LIMIT 1",
-                    (claim.run_id, TRACE_TRUNCATION_KIND),
-                ) as cursor:
-                    already_marked = await cursor.fetchone()
-                if already_marked is None:
-                    await connection.execute(
-                        _INSERT_TRACE,
-                        (
-                            claim.run_id,
-                            next_seq,
-                            TRACE_TRUNCATION_KIND,
-                            None,
-                            None,
-                            _TRACE_TRUNCATION_SUMMARY,
-                            "",
-                            0,
-                            0,
-                            occurred_at.isoformat(),
-                        ),
-                    )
-                await connection.commit()
-                return False
-            await connection.execute(
-                _INSERT_TRACE,
-                (
-                    claim.run_id,
-                    next_seq,
-                    trace.kind,
-                    # Absent optional fields store as NULL, never "";
-                    # one representation keeps readers from having to
-                    # treat the two as synonyms.
-                    trace.tool_name or None,
-                    trace.tool_use_id or None,
-                    trace.summary,
-                    trace.detail,
-                    int(trace.is_diff),
-                    int(trace.is_error),
-                    occurred_at.isoformat(),
-                ),
-            )
+            appended = await self.append_in_transaction(claim, trace, occurred_at=occurred_at)
             await connection.commit()
-            return True
+            return appended
         except Exception:
             await connection.rollback()
             raise
+
+    async def append_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        trace: TraceEntry,
+        *,
+        occurred_at: datetime,
+    ) -> bool:
+        """Append under the caller's active write transaction without committing it."""
+        connection = self._store.connection
+        async with connection.execute(
+            "SELECT status FROM run_attempts WHERE id = ? AND run_id = ? AND owner_id = ? AND fence_token = ?",
+            (claim.attempt_id, claim.run_id, claim.owner_id, claim.fence_token),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or str(row[0]) not in ("granted", "started"):
+            raise StaleRunExecutionAuthorityError("Execution claim no longer holds active authority")
+        async with connection.execute(
+            "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM run_traces WHERE run_id = ?",
+            (claim.run_id,),
+        ) as cursor:
+            seq_row = await cursor.fetchone()
+        assert seq_row is not None
+        next_seq = int(seq_row[0]) + 1
+        if int(seq_row[1]) >= _TRACE_MAX_ENTRIES:
+            async with connection.execute(
+                "SELECT 1 FROM run_traces WHERE run_id = ? AND kind = ? LIMIT 1",
+                (claim.run_id, TRACE_TRUNCATION_KIND),
+            ) as cursor:
+                already_marked = await cursor.fetchone()
+            if already_marked is None:
+                await connection.execute(
+                    _INSERT_TRACE,
+                    (
+                        claim.run_id,
+                        next_seq,
+                        TRACE_TRUNCATION_KIND,
+                        None,
+                        None,
+                        _TRACE_TRUNCATION_SUMMARY,
+                        "",
+                        0,
+                        0,
+                        occurred_at.isoformat(),
+                    ),
+                )
+            return False
+        await connection.execute(
+            _INSERT_TRACE,
+            (
+                claim.run_id,
+                next_seq,
+                trace.kind,
+                # Absent optional fields store as NULL, never "";
+                # one representation keeps readers from having to
+                # treat the two as synonyms.
+                trace.tool_name or None,
+                trace.tool_use_id or None,
+                trace.summary,
+                trace.detail,
+                int(trace.is_diff),
+                int(trace.is_error),
+                occurred_at.isoformat(),
+            ),
+        )
+        return True

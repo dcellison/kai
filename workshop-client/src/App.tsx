@@ -32,6 +32,7 @@ import {
   loadWorkshopHumans,
   loadNavigation,
   loadNotificationPreferences,
+  loadMessageReactors,
   loadArtifactBlob,
   loadRun,
   loadRunTrace,
@@ -77,6 +78,7 @@ import type {
   WorkshopFollowedThread,
   WorkshopReplyParticipant,
   WorkshopReaction,
+  WorkshopReactionReactors,
 } from "./types";
 import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN, MESSAGE_PATTERN } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
@@ -883,6 +885,7 @@ function MessageItem({
   onLoadArtifact,
   onMessageVisible,
   onOpenThread,
+  onLoadReactors,
   onSetReaction,
 }: {
   hasUnreadReplies?: boolean;
@@ -893,6 +896,10 @@ function MessageItem({
   onLoadArtifact: (artifactId: string) => Promise<Blob>;
   onMessageVisible?: (messageId: string) => void;
   onOpenThread?: (messageId: string) => void;
+  onLoadReactors?: (
+    messageId: string,
+    reaction: WorkshopReaction,
+  ) => Promise<WorkshopReactionReactors>;
   onSetReaction?: (
     messageId: string,
     reaction: WorkshopReaction,
@@ -902,10 +909,25 @@ function MessageItem({
   const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
   const [reactionPending, setReactionPending] = useState<WorkshopReaction | null>(null);
   const [reactionError, setReactionError] = useState<string | null>(null);
+  const [inspectedReaction, setInspectedReaction] = useState<WorkshopReaction | null>(null);
+  const [reactorResults, setReactorResults] = useState<
+    Partial<Record<WorkshopReaction, WorkshopReactionReactors>>
+  >({});
+  const [reactorLoading, setReactorLoading] = useState<WorkshopReaction | null>(null);
+  const [reactorError, setReactorError] = useState<WorkshopReaction | null>(null);
   const rowRef = useRef<HTMLLIElement | null>(null);
   const isAgent = message.authorKind === "agent";
   const displayName = message.authorDisplayName || "Unknown author";
   const reactions = message.reactions ?? [];
+  const reactionSignature = reactions
+    .map((reaction) => `${reaction.reaction}:${reaction.count}:${reaction.reactedByViewer}`)
+    .join("|");
+  useEffect(() => {
+    setInspectedReaction(null);
+    setReactorResults({});
+    setReactorLoading(null);
+    setReactorError(null);
+  }, [message.messageId, reactionSignature]);
   useEffect(() => {
     const row = rowRef.current;
     if (!row || !onMessageVisible || !("IntersectionObserver" in window)) {
@@ -942,6 +964,20 @@ function MessageItem({
     } finally {
       setReactionPending(null);
     }
+  };
+  const inspectReaction = (reaction: WorkshopReaction): void => {
+    setInspectedReaction(reaction);
+    if (!onLoadReactors || reactorResults[reaction] || reactorLoading === reaction) {
+      return;
+    }
+    setReactorLoading(reaction);
+    setReactorError(null);
+    void onLoadReactors(message.messageId, reaction)
+      .then((result) => {
+        setReactorResults((current) => ({ ...current, [reaction]: result }));
+      })
+      .catch(() => setReactorError(reaction))
+      .finally(() => setReactorLoading((current) => current === reaction ? null : current));
   };
   if (notification) {
     return (
@@ -1076,19 +1112,49 @@ function MessageItem({
                   if (!option) {
                     return null;
                   }
+                  const inspected = inspectedReaction === reaction.reaction;
+                  const reactors = reactorResults[reaction.reaction];
                   return (
-                    <button
-                      className={reaction.reactedByViewer ? "active" : ""}
-                      type="button"
-                      aria-label={`${option.label}: ${reaction.count}. ${reaction.reactedByViewer ? "Remove your reaction" : "Add your reaction"}`}
-                      aria-pressed={reaction.reactedByViewer}
-                      disabled={!onSetReaction || reactionPending !== null}
+                    <span
+                      className="reaction-chip-anchor"
                       key={reaction.reaction}
-                      onClick={() => void setReaction(reaction.reaction, !reaction.reactedByViewer)}
+                      onMouseEnter={() => inspectReaction(reaction.reaction)}
+                      onMouseLeave={() => setInspectedReaction(null)}
                     >
-                      <span aria-hidden="true">{option.symbol}</span>
-                      <span>{reaction.count}</span>
-                    </button>
+                      <button
+                        className={reaction.reactedByViewer ? "active" : ""}
+                        type="button"
+                        aria-label={`${option.label}: ${reaction.count}. ${reaction.reactedByViewer ? "Remove your reaction" : "Add your reaction"}`}
+                        aria-pressed={reaction.reactedByViewer}
+                        disabled={!onSetReaction || reactionPending !== null}
+                        onClick={() => void setReaction(reaction.reaction, !reaction.reactedByViewer)}
+                        onFocus={() => inspectReaction(reaction.reaction)}
+                        onBlur={() => setInspectedReaction(null)}
+                      >
+                        <span aria-hidden="true">{option.symbol}</span>
+                        <span>{reaction.count}</span>
+                      </button>
+                      {inspected && onLoadReactors && (
+                        <div className="reaction-reactors" role="tooltip">
+                          <strong>{option.symbol} {option.label}</strong>
+                          {reactorLoading === reaction.reaction && <span>Loading…</span>}
+                          {reactorError === reaction.reaction && <span>Participants unavailable</span>}
+                          {reactors && (
+                            <>
+                              <ul>
+                                {reactors.reactors.map((reactor) => (
+                                  <li key={reactor.principalId}>
+                                    <span>{reactor.displayName}</span>
+                                    <small>{reactor.kind === "agent" ? "Agent" : "Human"}{reactor.handle ? ` · @${reactor.handle}` : ""}</small>
+                                  </li>
+                                ))}
+                              </ul>
+                              {reactors.truncated && <span>Showing {reactors.reactors.length} of {reactors.total}</span>}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </span>
                   );
                 })}
               </div>
@@ -2231,6 +2297,7 @@ function ThreadPane({
   onLoadArtifact,
   onLoadThread,
   onLoadThreadUnread,
+  onLoadReactors,
   onAdvanceThreadRead,
   onSetThreadFollowed,
   onMessageVisible,
@@ -2268,6 +2335,10 @@ function ThreadPane({
     reaction: WorkshopReaction,
     active: boolean,
   ) => Promise<void>;
+  onLoadReactors: (
+    messageId: string,
+    reaction: WorkshopReaction,
+  ) => Promise<WorkshopReactionReactors>;
   onSubmitCommand: (clientMessageId: string, body: string, artifact: File | null, threadRootId: string | null) => Promise<CommandSubmissionResult>;
   reactionUpdates: Record<string, TimelineMessage["reactions"]>;
   principalEvents: WorkshopPrincipalEvents;
@@ -2529,6 +2600,7 @@ function ThreadPane({
             })()}
             onDownloadArtifact={onDownloadArtifact}
             onLoadArtifact={onLoadArtifact}
+            onLoadReactors={onLoadReactors}
             onMessageVisible={onMessageVisible}
             onSetReaction={readOnly ? undefined : onSetReaction}
           />
@@ -2547,6 +2619,7 @@ function ThreadPane({
                 }}
                 onDownloadArtifact={onDownloadArtifact}
                 onLoadArtifact={onLoadArtifact}
+                onLoadReactors={onLoadReactors}
                 onMessageVisible={markReplyVisible}
                 onSetReaction={readOnly ? undefined : onSetReaction}
               />
@@ -2660,6 +2733,7 @@ function WorkshopView({
   onLoadSettingsWorkspace,
   onLoadThread,
   onLoadThreadUnread,
+  onLoadReactors,
   onAdvanceThreadRead,
   onSetThreadFollowed,
   onChangeChannelMember,
@@ -2748,6 +2822,10 @@ function WorkshopView({
     rootMessageId: string,
     signal?: AbortSignal,
   ) => Promise<WorkshopThreadUnreadState>;
+  onLoadReactors: (
+    messageId: string,
+    reaction: WorkshopReaction,
+  ) => Promise<WorkshopReactionReactors>;
   onAdvanceThreadRead: (
     rootMessageId: string,
     messageId: string,
@@ -4430,6 +4508,7 @@ function WorkshopView({
                     notification={channel.kind === "notification"}
                     onDownloadArtifact={onDownloadArtifact}
                     onLoadArtifact={onLoadArtifact}
+                    onLoadReactors={onLoadReactors}
                     onMessageVisible={markVisibleMessageRead}
                     onSetReaction={!conversationReadOnly ? onSetReaction : undefined}
                     onOpenThread={
@@ -4703,6 +4782,7 @@ function WorkshopView({
             onLoadArtifact={onLoadArtifact}
             onLoadThread={onLoadThread}
             onLoadThreadUnread={onLoadThreadUnread}
+            onLoadReactors={onLoadReactors}
             onMessageVisible={markVisibleMentionRead}
             onAdvanceThreadRead={onAdvanceThreadRead}
             onSetThreadFollowed={onSetThreadFollowed}
@@ -5511,6 +5591,11 @@ function ActiveWorkshopClient({
       }),
     [session, updateReactions, withAccessHandling],
   );
+  const loadSelectedMessageReactors = useCallback(
+    (messageId: string, reaction: WorkshopReaction) =>
+      withAccessHandling(() => loadMessageReactors(session, messageId, reaction)),
+    [session, withAccessHandling],
+  );
   if (!selected) {
     return <main className="loading-workshop">Workshop access changed.</main>;
   }
@@ -5592,6 +5677,7 @@ function ActiveWorkshopClient({
       onSelectAgent={onSelectAgent}
       onSelectChannel={onSelectChannel}
       onSetReaction={setSelectedMessageReaction}
+      onLoadReactors={loadSelectedMessageReactors}
       onSubmitCommand={submitSelectedCommand}
       onStartHumanConversation={startSelectedHumanConversation}
       onSwitchWorkspace={switchSelectedWorkspace}
