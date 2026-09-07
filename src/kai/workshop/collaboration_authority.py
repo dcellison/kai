@@ -19,6 +19,7 @@ from kai.workshop.agent_definitions import (
     validate_collaboration_operations,
 )
 from kai.workshop.domain import (
+    AgentDefinitionId,
     AgentDefinitionRevisionId,
     AgentId,
     ChannelId,
@@ -255,6 +256,34 @@ class WorkshopCollaborationAuthority:
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    @property
+    def host_policy(self) -> CollaborationHostPolicy:
+        """Expose immutable host maxima for owner-policy inspection."""
+        return self._host_policy
+
+    async def owner_policy_for_revision(
+        self,
+        revision: AgentDefinitionRevision,
+    ) -> CollaborationOwnerPolicy:
+        """Resolve canonical owner allowance, preserving the migration default."""
+        if self._owner_policy_resolver is not _default_owner_policy:
+            policy = self._owner_policy_resolver(revision)
+            if not isinstance(policy, CollaborationOwnerPolicy):
+                raise TypeError("owner_policy_resolver must return CollaborationOwnerPolicy")
+            return policy
+        async with self._store.connection.execute(
+            "SELECT allowed_operations_json, policy_version FROM "
+            "agent_collaboration_owner_policies WHERE agent_definition_id = ?",
+            (revision.definition_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return _default_owner_policy(revision)
+        return CollaborationOwnerPolicy(
+            version=int(row[1]),
+            allowed_operations=_decode_operations(row[0]),
+        )
+
     async def issue(
         self,
         claim: RunExecutionClaim,
@@ -303,9 +332,7 @@ class WorkshopCollaborationAuthority:
             if revision is None or revision.agent_id != AgentId(str(row[7])):
                 raise CollaborationGrantConflict("Collaboration revision is unavailable")
             requested = frozenset(CollaborationOperation(item) for item in revision.collaboration_operations)
-            owner_policy = self._owner_policy_resolver(revision)
-            if not isinstance(owner_policy, CollaborationOwnerPolicy):
-                raise TypeError("owner_policy_resolver must return CollaborationOwnerPolicy")
+            owner_policy = await self.owner_policy_for_revision(revision)
             host_allowed = self._host_policy.allowed_operations
             effective = requested & owner_policy.allowed_operations & host_allowed
             grant_id = CollaborationGrantId.derived(claim.attempt_id, "collaboration-grant")
@@ -577,6 +604,34 @@ class WorkshopCollaborationAuthority:
             )
             reconciled += int(changed)
         return reconciled
+
+    async def revoke_definition(
+        self,
+        definition_id: AgentDefinitionId,
+        *,
+        occurred_at: datetime,
+    ) -> int:
+        """Fence every live grant for one definition, dropping proofs first."""
+        now = _timestamp(occurred_at, field_name="occurred_at")
+        async with self._store.connection.execute(
+            "SELECT g.id FROM collaboration_grants g JOIN agent_definition_revisions r "
+            "ON r.id = g.agent_definition_revision_id WHERE r.agent_definition_id = ? "
+            "AND g.revoked_at IS NULL ORDER BY g.issued_event_position",
+            (definition_id,),
+        ) as cursor:
+            grant_ids = [CollaborationGrantId(str(row[0])) for row in await cursor.fetchall()]
+        for invocation in tuple(self._invocations_by_attempt.values()):
+            if invocation.grant_id in grant_ids:
+                self._drop_invocation(invocation)
+        revoked = 0
+        for grant_id in grant_ids:
+            _snapshot, changed = await self._revoke_grant(
+                grant_id,
+                revocation_code="owner_emergency_revoke",
+                occurred_at=now,
+            )
+            revoked += int(changed)
+        return revoked
 
     async def _revoke_grant(
         self,

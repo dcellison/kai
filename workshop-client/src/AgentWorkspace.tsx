@@ -8,14 +8,19 @@ import {
   archiveAgentDefinition,
   createAgentDefinition,
   enableAgentDefinition,
+  loadAgentCollaborationPolicy,
   loadAgentDefinitions,
   loadAgentEnablements,
   startAgentConversation,
+  updateAgentCollaborationPolicy,
+  revokeAgentCollaborationGrants,
 } from "./api";
 import type {
   WorkshopAgentCapability,
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
+  WorkshopCollaborationOperation,
+  WorkshopCollaborationPolicy,
 } from "./types";
 import { useConfirmation } from "./ConfirmationDialog";
 import { AgentRuntimeControls } from "./SettingsWorkspace";
@@ -54,9 +59,23 @@ const CAPABILITIES: {
   },
 ];
 
+const COLLABORATION_TOOLS: {
+  description: string;
+  label: string;
+  value: WorkshopCollaborationOperation;
+}[] = [
+  { description: "Read bounded canonical conversation context.", label: "Context reading", value: "context_read" },
+  { description: "Add or remove reactions on messages.", label: "Reactions", value: "reaction" },
+  { description: "Publish visible progress updates while working.", label: "Progress updates", value: "progress_publish" },
+  { description: "Reply inside an existing thread.", label: "Thread replies", value: "thread_reply" },
+  { description: "Publish a bounded artifact with provenance.", label: "Artifacts", value: "artifact_publish" },
+  { description: "Delegate bounded work to another active agent.", label: "Agent delegation", value: "agent_delegation" },
+];
+
 interface DefinitionFormState {
   avatar: string;
   capabilities: WorkshopAgentCapability[];
+  collaborationOperations: WorkshopCollaborationOperation[];
   description: string;
   displayName: string;
   handle: string;
@@ -67,6 +86,7 @@ interface DefinitionFormState {
 const EMPTY_DEFINITION: DefinitionFormState = {
   avatar: "",
   capabilities: ["text_generation"],
+  collaborationOperations: [],
   description: "",
   displayName: "",
   handle: "",
@@ -160,6 +180,40 @@ function CapabilityChoices({
   );
 }
 
+function CollaborationToolChoices({
+  disabled,
+  selected,
+  onChange,
+}: {
+  disabled: boolean;
+  selected: WorkshopCollaborationOperation[];
+  onChange: (operations: WorkshopCollaborationOperation[]) => void;
+}): React.JSX.Element {
+  return (
+    <fieldset className="agent-capability-choices" disabled={disabled}>
+      <legend>Requested collaboration tools</legend>
+      <p>
+        This immutable revision requests operations. Owner and host policy still
+        decide what a run actually receives.
+      </p>
+      {COLLABORATION_TOOLS.map((operation) => (
+        <label key={operation.value}>
+          <input
+            type="checkbox"
+            checked={selected.includes(operation.value)}
+            onChange={(event) => onChange(
+              event.target.checked
+                ? [...selected, operation.value]
+                : selected.filter((item) => item !== operation.value),
+            )}
+          />
+          <span><strong>{operation.label}</strong><small>{operation.description}</small></span>
+        </label>
+      ))}
+    </fieldset>
+  );
+}
+
 function AgentCreationForm({
   busy,
   onCancel,
@@ -182,7 +236,8 @@ function AgentCreationForm({
     form.capabilities.length !== EMPTY_DEFINITION.capabilities.length ||
     form.capabilities.some(
       (capability, index) => capability !== EMPTY_DEFINITION.capabilities[index],
-    );
+    ) ||
+    form.collaborationOperations.length !== EMPTY_DEFINITION.collaborationOperations.length;
 
   const close = async (): Promise<void> => {
     if (busy) return;
@@ -335,6 +390,13 @@ function AgentCreationForm({
               setForm((current) => ({ ...current, capabilities }))
             }
           />
+          <CollaborationToolChoices
+            disabled={busy}
+            selected={form.collaborationOperations}
+            onChange={(collaborationOperations) =>
+              setForm((current) => ({ ...current, collaborationOperations }))
+            }
+          />
           {error && <p className="form-error" role="alert">{error}</p>}
           <div className="form-actions">
             <button className="primary-button" type="submit" disabled={busy}>
@@ -358,6 +420,7 @@ function RevisionEditor({
   onCancel: () => void;
   onSave: (input: {
     capabilities: WorkshopAgentCapability[];
+    collaborationOperations: WorkshopCollaborationOperation[];
     instructions: string;
     purpose: string;
   }) => Promise<void>;
@@ -368,6 +431,9 @@ function RevisionEditor({
   const [capabilities, setCapabilities] = useState<WorkshopAgentCapability[]>(
     latest?.capabilities ?? ["text_generation"],
   );
+  const [collaborationOperations, setCollaborationOperations] = useState<WorkshopCollaborationOperation[]>(
+    latest?.collaborationOperations ?? [],
+  );
   const [error, setError] = useState<string | null>(null);
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -377,7 +443,7 @@ function RevisionEditor({
     }
     setError(null);
     try {
-      await onSave({ capabilities, instructions, purpose });
+      await onSave({ capabilities, collaborationOperations, instructions, purpose });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not save this revision.");
     }
@@ -413,6 +479,11 @@ function RevisionEditor({
         selected={capabilities}
         onChange={setCapabilities}
       />
+      <CollaborationToolChoices
+        disabled={busy}
+        selected={collaborationOperations}
+        onChange={setCollaborationOperations}
+      />
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="form-actions">
         <button className="primary-button" type="submit" disabled={busy}>
@@ -423,6 +494,103 @@ function RevisionEditor({
         </button>
       </div>
     </form>
+  );
+}
+
+function CollaborationPolicyControls({
+  busy,
+  policy,
+  onRevoke,
+  onSave,
+}: {
+  busy: boolean;
+  policy: WorkshopCollaborationPolicy;
+  onRevoke: () => Promise<void>;
+  onSave: (allowed: WorkshopCollaborationOperation[]) => Promise<void>;
+}): React.JSX.Element {
+  const [allowed, setAllowed] = useState<WorkshopCollaborationOperation[]>(
+    policy.operations.filter((item) => item.ownerAllowed).map((item) => item.operation),
+  );
+  useEffect(() => {
+    setAllowed(policy.operations.filter((item) => item.ownerAllowed).map((item) => item.operation));
+  }, [policy]);
+  const changed = policy.canManage && policy.operations.some(
+    (item) => item.ownerAllowed !== allowed.includes(item.operation),
+  );
+  return (
+    <section className="agent-collaboration-policy">
+      <div className="agent-section-heading">
+        <div>
+          <p className="overline">{policy.canManage ? "Owner policy" : "Collaboration access"}</p>
+          <h3>Collaboration tools</h3>
+          {policy.canManage ? (
+            <p>
+              Policy changes apply to newly accepted attempts. Active attempts retain
+              their immutable snapshot unless you revoke them below.
+            </p>
+          ) : (
+            <p>
+              This read-only view shows revision requests and resulting availability.
+              Owner policy and active-run details remain private.
+            </p>
+          )}
+        </div>
+      </div>
+      <div className="collaboration-policy-grid" role="list">
+        {policy.operations.map((item) => {
+          const choice = COLLABORATION_TOOLS.find((candidate) => candidate.value === item.operation);
+          return (
+            <article key={item.operation} role="listitem">
+              <label>
+                {policy.canManage && (
+                  <input
+                    type="checkbox"
+                    checked={allowed.includes(item.operation)}
+                    disabled={busy || !item.hostAllowed}
+                    onChange={(event) => setAllowed((current) =>
+                      event.target.checked
+                        ? [...current, item.operation]
+                        : current.filter((operation) => operation !== item.operation),
+                    )}
+                  />
+                )}
+                <strong>{choice?.label ?? item.operation.replaceAll("_", " ")}</strong>
+              </label>
+              <dl>
+                <div><dt>Revision</dt><dd>{item.requested ? "requested" : "not requested"}</dd></div>
+                {policy.canManage && (
+                  <div><dt>Owner</dt><dd>{item.ownerAllowed ? "allowed" : "blocked"}</dd></div>
+                )}
+                <div><dt>Host</dt><dd>{item.hostAllowed ? "available" : "unavailable"}</dd></div>
+                <div><dt>Next attempt</dt><dd>{item.effectiveForNewAttempt ? "effective" : "not effective"}</dd></div>
+              </dl>
+              {item.unavailableReason && <small>{item.unavailableReason}</small>}
+              {item.quota !== null && <small>Per-attempt quota: {item.quota}</small>}
+            </article>
+          );
+        })}
+      </div>
+      {policy.canManage && (
+        <div className="collaboration-policy-actions">
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busy || !changed}
+            onClick={() => void onSave(allowed)}
+          >
+            Save policy
+          </button>
+          <button
+            className="danger-button"
+            type="button"
+            disabled={busy || (policy.activeGrants ?? 0) === 0}
+            onClick={() => void onRevoke()}
+          >
+            Revoke active access ({policy.activeGrants ?? 0})
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -469,6 +637,7 @@ export function AgentWorkspace({
   const confirm = useConfirmation();
   const [definitions, setDefinitions] = useState<WorkshopAgentDefinition[]>([]);
   const [enablements, setEnablements] = useState<WorkshopAgentEnablement[]>([]);
+  const [collaborationPolicy, setCollaborationPolicy] = useState<WorkshopCollaborationPolicy | null>(null);
   const [selectedDefinitionId, setSelectedDefinitionId] = useState<string | null>(
     initialDefinitionId,
   );
@@ -564,6 +733,17 @@ export function AgentWorkspace({
   }, [selectedDefinitionId]);
 
   useEffect(() => {
+    let cancelled = false;
+    setCollaborationPolicy(null);
+    if (!selectedDefinitionId) return () => { cancelled = true; };
+    void loadAgentCollaborationPolicy(token, selectedDefinitionId).then(
+      (policy) => { if (!cancelled) setCollaborationPolicy(policy); },
+      (caught: unknown) => { if (!cancelled) handleError(caught, "Could not load collaboration policy."); },
+    );
+    return () => { cancelled = true; };
+  }, [handleError, selectedDefinitionId, token]);
+
+  useEffect(() => {
     setRuntimeProfileId(
       enablement?.runtimeProfileId ??
       enablement?.eligibleRuntimes[0]?.runtimeProfileId ??
@@ -612,6 +792,7 @@ export function AgentWorkspace({
 
   const addRevision = (input: {
     capabilities: WorkshopAgentCapability[];
+    collaborationOperations: WorkshopCollaborationOperation[];
     instructions: string;
     purpose: string;
   }): Promise<void> => {
@@ -629,6 +810,34 @@ export function AgentWorkspace({
     }, "Could not save this revision.");
   };
 
+  const saveCollaborationPolicy = (
+    allowedOperations: WorkshopCollaborationOperation[],
+  ): Promise<void> => {
+    if (!selected || !collaborationPolicy) return Promise.resolve();
+    return runMutation(async () => {
+      const updated = await updateAgentCollaborationPolicy(token, selected.definitionId, {
+        allowedOperations,
+        clientOperationId: operationKey("collaboration-policy"),
+        expectedPolicyVersion: collaborationPolicy.policyVersion,
+      });
+      setCollaborationPolicy(updated);
+    }, "Could not update collaboration policy.");
+  };
+
+  const revokeCollaboration = async (): Promise<void> => {
+    if (!selected || !collaborationPolicy || !await confirm(
+      `Immediately revoke active collaboration access for @${selected.handle}? Current attempts will be fenced.`,
+    )) return;
+    await runMutation(async () => {
+      const updated = await revokeAgentCollaborationGrants(
+        token,
+        selected.definitionId,
+        operationKey("collaboration-revoke"),
+      );
+      setCollaborationPolicy(updated);
+    }, "Could not revoke active collaboration access.");
+  };
+
   const activate = (revisionId: string): Promise<void> => {
     if (!selected) {
       return Promise.resolve();
@@ -640,6 +849,9 @@ export function AgentWorkspace({
         revisionId,
       });
       await refresh();
+      setCollaborationPolicy(
+        await loadAgentCollaborationPolicy(token, selected.definitionId),
+      );
       await onNavigationChanged();
     }, "Could not activate this agent revision.");
   };
@@ -951,11 +1163,27 @@ export function AgentWorkspace({
                       <span key={capability}>{capability.replaceAll("_", " ")}</span>
                     ))}
                   </div>
+                  {selectedRevision.collaborationOperations.length > 0 && (
+                    <div className="agent-capability-tags agent-collaboration-tags">
+                      {selectedRevision.collaborationOperations.map((operation) => (
+                        <span key={operation}>{operation.replaceAll("_", " ")}</span>
+                      ))}
+                    </div>
+                  )}
                 </section>
               ) : (
                 <p className="agent-state-copy">
                   This draft is not active and cannot be enabled or run.
                 </p>
+              )}
+
+              {collaborationPolicy && (
+                <CollaborationPolicyControls
+                  busy={busy}
+                  policy={collaborationPolicy}
+                  onRevoke={revokeCollaboration}
+                  onSave={saveCollaborationPolicy}
+                />
               )}
 
               {canManage && selected.lifecycleState !== "archived" && (

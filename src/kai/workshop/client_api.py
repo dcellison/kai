@@ -111,6 +111,15 @@ from kai.workshop.client_preferences import (
     WorkshopClientPreferenceValidationError,
 )
 from kai.workshop.client_sessions import EnrollmentGrantUnavailableError, WorkshopClientEnrollmentManager
+from kai.workshop.collaboration_policy import (
+    CollaborationPolicySnapshot,
+    WorkshopCollaborationPolicyAccessDenied,
+    WorkshopCollaborationPolicyConflict,
+    WorkshopCollaborationPolicyError,
+    WorkshopCollaborationPolicyService,
+    WorkshopCollaborationPolicyStorageError,
+    WorkshopCollaborationPolicyValidationError,
+)
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.direct_message_archives import (
     WorkshopDirectMessageArchiveAccessDenied,
@@ -329,6 +338,8 @@ _AGENT_ENABLEMENTS_PATH = "/v1/client/agent-enablement"
 _AGENT_ENABLEMENT_PATH = "/v1/client/agents/{definition_id}/enablement"
 _AGENT_ENABLE_PATH = "/v1/client/agents/{definition_id}/enable"
 _AGENT_CONVERSATION_START_PATH = "/v1/client/agents/{definition_id}/conversation"
+_AGENT_COLLABORATION_POLICY_PATH = "/v1/client/agents/{definition_id}/collaboration-policy"
+_AGENT_COLLABORATION_REVOKE_PATH = "/v1/client/agents/{definition_id}/collaboration-policy/revoke-active"
 _ENROLLMENT_REDEMPTION_PATH = "/v1/client/enrollment/redeem"
 _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
@@ -444,11 +455,16 @@ _AGENT_CREATION_FIELDS = frozenset(
         "purpose",
         "instructions",
         "capabilities",
+        "collaboration_operations",
     }
 )
-_AGENT_REVISION_FIELDS = frozenset({"idempotency_key", "expected_version", "purpose", "instructions", "capabilities"})
+_AGENT_REVISION_FIELDS = frozenset(
+    {"idempotency_key", "expected_version", "purpose", "instructions", "capabilities", "collaboration_operations"}
+)
 _AGENT_ACTIVATION_FIELDS = frozenset({"idempotency_key", "expected_version", "revision_id"})
 _AGENT_ARCHIVAL_FIELDS = frozenset({"idempotency_key", "expected_version"})
+_AGENT_COLLABORATION_POLICY_FIELDS = frozenset({"allowed_operations", "expected_policy_version", "client_operation_id"})
+_AGENT_COLLABORATION_REVOKE_FIELDS = frozenset({"client_operation_id"})
 _MAX_AGENT_LIFECYCLE_BODY_BYTES = 32_768
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -1048,6 +1064,7 @@ def _serialize_agent_definition(snapshot: AgentDefinitionSnapshot) -> dict[str, 
                 "purpose": revision.purpose,
                 "instructions": revision.instructions,
                 "capabilities": list(revision.capabilities),
+                "collaboration_operations": list(revision.collaboration_operations),
                 "created_at": revision.created_at,
                 "created_by_principal_id": (
                     str(revision.created_by_principal_id) if revision.created_by_principal_id is not None else None
@@ -1055,6 +1072,29 @@ def _serialize_agent_definition(snapshot: AgentDefinitionSnapshot) -> dict[str, 
                 "event_position": revision.event_position,
             }
             for revision in snapshot.revisions
+        ],
+    }
+
+
+def _serialize_collaboration_policy(snapshot: CollaborationPolicySnapshot) -> dict[str, object]:
+    return {
+        "definition_id": str(snapshot.definition_id),
+        "owner_principal_id": str(snapshot.owner_principal_id),
+        "can_manage": snapshot.can_manage,
+        "policy_version": snapshot.policy_version,
+        "active_revision_id": snapshot.active_revision_id,
+        "active_grants": snapshot.active_grants,
+        "operations": [
+            {
+                "operation": item.operation,
+                "requested": item.requested,
+                "owner_allowed": item.owner_allowed,
+                "host_allowed": item.host_allowed,
+                "effective_for_new_attempt": item.effective_for_new_attempt,
+                "unavailable_reason": item.unavailable_reason,
+                "quota": item.quota,
+            }
+            for item in snapshot.operations
         ],
     }
 
@@ -4694,6 +4734,8 @@ async def _handle_channel_agent_operation(
 async def _read_agent_lifecycle_payload(
     request: web.Request,
     expected_fields: frozenset[str],
+    *,
+    optional_fields: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, object] | None, web.Response | None]:
     if request.query or request.content_type != "application/json":
         return None, _error_response(
@@ -4718,7 +4760,8 @@ async def _read_agent_lifecycle_payload(
         payload = json.loads(raw)
     except (UnicodeDecodeError, ValueError):
         payload = None
-    if not isinstance(payload, dict) or set(payload) != expected_fields:
+    required_fields = expected_fields - optional_fields
+    if not isinstance(payload, dict) or not required_fields <= set(payload) or not set(payload) <= expected_fields:
         return None, _error_response(
             status=400,
             code="invalid_request",
@@ -4815,6 +4858,97 @@ async def _handle_agent_definition_detail(
     return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=200)
 
 
+def _collaboration_policy_error_response(exc: WorkshopCollaborationPolicyError) -> web.Response:
+    if isinstance(exc, WorkshopCollaborationPolicyAccessDenied):
+        return _error_response(status=404, code="agent_not_found", message="Agent not found")
+    if isinstance(exc, WorkshopCollaborationPolicyValidationError):
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    if isinstance(exc, WorkshopCollaborationPolicyConflict):
+        return _error_response(status=409, code="collaboration_policy_conflict", message=str(exc))
+    if isinstance(exc, WorkshopCollaborationPolicyStorageError):
+        return _error_response(
+            status=503,
+            code="collaboration_policy_unavailable",
+            message="Collaboration policy is temporarily unavailable",
+        )
+    return _error_response(status=409, code="collaboration_policy_conflict", message=str(exc))
+
+
+async def _handle_agent_collaboration_policy(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopCollaborationPolicyService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    try:
+        definition_id = _agent_definition_id(request)
+        if request.method == "GET":
+            if request.query or request.can_read_body:
+                return _error_response(status=400, code="invalid_request", message="Invalid policy request")
+            snapshot = await service.inspect(principal_id, definition_id)
+            return _json_response(
+                {"version": 1, "policy": _serialize_collaboration_policy(snapshot)},
+                status=200,
+            )
+        payload, error = await _read_agent_lifecycle_payload(request, _AGENT_COLLABORATION_POLICY_FIELDS)
+        if error is not None:
+            return error
+        assert payload is not None
+        mutation = await service.set_allowed(
+            principal_id,
+            definition_id,
+            allowed_operations=payload["allowed_operations"],
+            expected_policy_version=payload["expected_policy_version"],
+            client_operation_id=payload["client_operation_id"],
+        )
+    except WorkshopCollaborationPolicyError as exc:
+        return _collaboration_policy_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "policy": _serialize_collaboration_policy(mutation.snapshot),
+            "changed": mutation.changed,
+            "replayed": mutation.replayed,
+        },
+        status=200,
+    )
+
+
+async def _handle_agent_collaboration_revoke(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopCollaborationPolicyService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    payload, error = await _read_agent_lifecycle_payload(request, _AGENT_COLLABORATION_REVOKE_FIELDS)
+    if error is not None:
+        return error
+    assert payload is not None
+    client_operation_id = payload.get("client_operation_id")
+    if not isinstance(client_operation_id, str) or not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(client_operation_id):
+        return _error_response(status=400, code="invalid_request", message="Invalid operation identity")
+    try:
+        snapshot, revoked = await service.revoke_active(principal_id, _agent_definition_id(request))
+    except WorkshopCollaborationPolicyError as exc:
+        return _collaboration_policy_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "policy": _serialize_collaboration_policy(snapshot),
+            "revoked_grants": revoked,
+        },
+        status=200,
+    )
+
+
 async def _handle_agent_definition_create(
     request: web.Request,
     *,
@@ -4825,10 +4959,15 @@ async def _handle_agent_definition_create(
     if error is not None:
         return error
     assert principal_id is not None
-    payload, error = await _read_agent_lifecycle_payload(request, _AGENT_CREATION_FIELDS)
+    payload, error = await _read_agent_lifecycle_payload(
+        request,
+        _AGENT_CREATION_FIELDS,
+        optional_fields=frozenset({"collaboration_operations"}),
+    )
     if error is not None:
         return error
     assert payload is not None
+    payload.setdefault("collaboration_operations", None)
     try:
         snapshot = await service.create_draft(principal_id, **payload)
     except WorkshopAgentLifecycleError as exc:
@@ -4846,10 +4985,15 @@ async def _handle_agent_revision_create(
     if error is not None:
         return error
     assert principal_id is not None
-    payload, error = await _read_agent_lifecycle_payload(request, _AGENT_REVISION_FIELDS)
+    payload, error = await _read_agent_lifecycle_payload(
+        request,
+        _AGENT_REVISION_FIELDS,
+        optional_fields=frozenset({"collaboration_operations"}),
+    )
     if error is not None:
         return error
     assert payload is not None
+    payload.setdefault("collaboration_operations", None)
     try:
         snapshot = await service.add_revision(principal_id, _agent_definition_id(request), **payload)
     except WorkshopAgentLifecycleError as exc:
@@ -7205,6 +7349,7 @@ async def _handle_run_trace(
     authenticator: WorkshopClientAuthenticator,
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
+    collaboration_policy: WorkshopCollaborationPolicyService | None = None,
 ) -> web.Response:
     """Serve one page of a run's durable trace rows, as stored.
 
@@ -7231,7 +7376,7 @@ async def _handle_run_trace(
     )
     if isinstance(authorized, web.Response):
         return authorized
-    _, channel_id, run = authorized
+    principal_id, channel_id, run = authorized
     async with (
         request_lock,
         store.connection.execute(
@@ -7256,6 +7401,22 @@ async def _handle_run_trace(
         }
         for row in rows[:_TRACE_PAGE_SIZE]
     ]
+    collaboration_activity = []
+    if collaboration_policy is not None:
+        try:
+            collaboration_activity = [
+                {
+                    "event_position": item.event_position,
+                    "kind": item.kind,
+                    "operation": item.operation,
+                    "outcome": item.outcome,
+                    "detail": item.detail,
+                    "occurred_at": item.occurred_at,
+                }
+                for item in await collaboration_policy.activity(principal_id, run.run_id)
+            ]
+        except WorkshopCollaborationPolicyAccessDenied:
+            collaboration_activity = []
     return _json_response(
         {
             "version": 1,
@@ -7263,6 +7424,7 @@ async def _handle_run_trace(
             "run_id": str(run.run_id),
             "entries": entries,
             "has_more": has_more,
+            "collaboration_activity": collaboration_activity,
         },
         status=200,
     )
@@ -7377,6 +7539,7 @@ def register_workshop_read_routes(
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
+    collaboration_policy: WorkshopCollaborationPolicyService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -7815,6 +7978,27 @@ def register_workshop_read_routes(
     app.router.add_post(_AGENT_REVISIONS_PATH, handle_agent_revision_create)
     app.router.add_post(_AGENT_ACTIVATION_PATH, handle_agent_activation)
     app.router.add_post(_AGENT_ARCHIVAL_PATH, handle_agent_archival)
+    if collaboration_policy is not None:
+
+        async def handle_agent_collaboration_policy(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_agent_collaboration_policy(
+                    request,
+                    authenticator=authenticator,
+                    service=collaboration_policy,
+                )
+
+        async def handle_agent_collaboration_revoke(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_agent_collaboration_revoke(
+                    request,
+                    authenticator=authenticator,
+                    service=collaboration_policy,
+                )
+
+        app.router.add_get(_AGENT_COLLABORATION_POLICY_PATH, handle_agent_collaboration_policy)
+        app.router.add_put(_AGENT_COLLABORATION_POLICY_PATH, handle_agent_collaboration_policy)
+        app.router.add_post(_AGENT_COLLABORATION_REVOKE_PATH, handle_agent_collaboration_revoke)
     if agent_enablement is not None:
 
         async def handle_agent_enablement_list(request: web.Request) -> web.Response:
@@ -8357,6 +8541,7 @@ def register_workshop_command_routes(
     request_lock: asyncio.Lock,
     artifact_service: WorkshopArtifactService | None = None,
     routing_policy: WorkshopRoutingPolicyService | None = None,
+    collaboration_policy: WorkshopCollaborationPolicyService | None = None,
 ) -> None:
     """Register the authenticated command boundary on a supplied application."""
 
@@ -8386,6 +8571,7 @@ def register_workshop_command_routes(
             authenticator=authenticator,
             submitter=submitter,
             request_lock=request_lock,
+            collaboration_policy=collaboration_policy,
         )
 
     async def handle_run_cancellation(request: web.Request) -> web.Response:

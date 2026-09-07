@@ -21,7 +21,7 @@ from kai.workshop.conversation_commands import (
 )
 from kai.workshop.conversation_context import assemble_canonical_prior_pairs
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import MessageId, RunId, RuntimeProfileId
+from kai.workshop.domain import AgentDefinitionId, MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionResult,
@@ -155,6 +155,20 @@ class WorkshopPrivateTextExecutionService:
             base_identity=base_identity,
             idempotency_key=idempotency_key,
             request_hash=request_hash,
+            occurred_at=occurred_at,
+        )
+
+    async def revoke_collaboration_for_definition(
+        self,
+        definition_id: AgentDefinitionId,
+        *,
+        occurred_at: datetime,
+    ) -> int:
+        """Immediately fence every live collaboration grant for an agent."""
+        if self._closed:
+            raise RuntimeError("Workshop private-text execution service is closed")
+        return await self._coordinator.revoke_collaboration_for_definition(
+            definition_id,
             occurred_at=occurred_at,
         )
 

@@ -62,6 +62,8 @@ import type {
   WorkshopAgentChangeSignal,
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
+  WorkshopCollaborationOperation,
+  WorkshopCollaborationPolicy,
   WorkshopAgentSummary,
   WorkshopHumanChannelMember,
   WorkshopHumanConversation,
@@ -83,6 +85,7 @@ import type {
   WorkshopFollowedThreadSnapshot,
   WorkshopPrincipalEventBatch,
   WorkshopReplyParticipant,
+  WorkshopCollaborationActivity,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -765,6 +768,33 @@ function parseAgentCapabilities(value: unknown): WorkshopAgentCapability[] | nul
   return capabilities;
 }
 
+const COLLABORATION_OPERATIONS = new Set<WorkshopCollaborationOperation>([
+  "context_read",
+  "reaction",
+  "progress_publish",
+  "thread_reply",
+  "artifact_publish",
+  "agent_delegation",
+]);
+
+function parseCollaborationOperations(
+  value: unknown,
+): WorkshopCollaborationOperation[] | null {
+  if (!Array.isArray(value)) return null;
+  const operations: WorkshopCollaborationOperation[] = [];
+  for (const item of value) {
+    if (
+      typeof item !== "string" ||
+      !COLLABORATION_OPERATIONS.has(item as WorkshopCollaborationOperation) ||
+      operations.includes(item as WorkshopCollaborationOperation)
+    ) {
+      return null;
+    }
+    operations.push(item as WorkshopCollaborationOperation);
+  }
+  return operations;
+}
+
 function parseAgentDefinition(value: unknown): WorkshopAgentDefinition | null {
   if (
     !isRecord(value) ||
@@ -817,11 +847,15 @@ function parseAgentDefinition(value: unknown): WorkshopAgentDefinition | null {
       return null;
     }
     const capabilities = parseAgentCapabilities(rawRevision.capabilities);
-    if (!capabilities) {
+    const collaborationOperations = parseCollaborationOperations(
+      rawRevision.collaboration_operations,
+    );
+    if (!capabilities || !collaborationOperations) {
       return null;
     }
     return {
       capabilities,
+      collaborationOperations,
       createdAt: rawRevision.created_at,
       createdByPrincipalId: rawRevision.created_by_principal_id,
       eventPosition: rawRevision.event_position as number,
@@ -1015,9 +1049,131 @@ export async function loadAgentEnablements(
   return agents as WorkshopAgentEnablement[];
 }
 
+function parseCollaborationPolicy(value: unknown): WorkshopCollaborationPolicy | null {
+  if (
+    !isRecord(value) ||
+    typeof value.definition_id !== "string" ||
+    !AGENT_DEFINITION_PATTERN.test(value.definition_id) ||
+    typeof value.owner_principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(value.owner_principal_id) ||
+    typeof value.can_manage !== "boolean" ||
+    !Number.isSafeInteger(value.policy_version) ||
+    (value.policy_version as number) < 0 ||
+    (value.active_revision_id !== null &&
+      (typeof value.active_revision_id !== "string" ||
+        !AGENT_REVISION_PATTERN.test(value.active_revision_id))) ||
+    (value.active_grants !== null &&
+      (!Number.isSafeInteger(value.active_grants) || (value.active_grants as number) < 0)) ||
+    !Array.isArray(value.operations)
+  ) {
+    return null;
+  }
+  const operations = value.operations.map((item) => {
+    if (
+      !isRecord(item) ||
+      typeof item.operation !== "string" ||
+      !COLLABORATION_OPERATIONS.has(item.operation as WorkshopCollaborationOperation) ||
+      typeof item.requested !== "boolean" ||
+      (item.owner_allowed !== null && typeof item.owner_allowed !== "boolean") ||
+      typeof item.host_allowed !== "boolean" ||
+      typeof item.effective_for_new_attempt !== "boolean" ||
+      (item.unavailable_reason !== null && typeof item.unavailable_reason !== "string") ||
+      (item.quota !== null && (!Number.isSafeInteger(item.quota) || (item.quota as number) < 1))
+    ) {
+      return null;
+    }
+    return {
+      effectiveForNewAttempt: item.effective_for_new_attempt,
+      hostAllowed: item.host_allowed,
+      operation: item.operation as WorkshopCollaborationOperation,
+      ownerAllowed: item.owner_allowed,
+      quota: item.quota as number | null,
+      requested: item.requested,
+      unavailableReason: item.unavailable_reason,
+    };
+  });
+  if (operations.some((item) => item === null)) return null;
+  return {
+    activeGrants: value.active_grants as number | null,
+    activeRevisionId: value.active_revision_id,
+    canManage: value.can_manage,
+    definitionId: value.definition_id,
+    operations: operations as WorkshopCollaborationPolicy["operations"],
+    ownerPrincipalId: value.owner_principal_id,
+    policyVersion: value.policy_version as number,
+  };
+}
+
+async function collaborationPolicyResponse(
+  response: Response,
+  fallback: string,
+): Promise<WorkshopCollaborationPolicy> {
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, fallback));
+  const policy = isRecord(payload) && payload.version === 1
+    ? parseCollaborationPolicy(payload.policy)
+    : null;
+  if (!policy) throw new Error("Kai returned unsupported collaboration policy.");
+  return policy;
+}
+
+export async function loadAgentCollaborationPolicy(
+  token: string,
+  definitionId: string,
+): Promise<WorkshopCollaborationPolicy> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/collaboration-policy`,
+  );
+  return collaborationPolicyResponse(response, "Could not load collaboration policy.");
+}
+
+export async function updateAgentCollaborationPolicy(
+  token: string,
+  definitionId: string,
+  input: {
+    allowedOperations: WorkshopCollaborationOperation[];
+    clientOperationId: string;
+    expectedPolicyVersion: number;
+  },
+): Promise<WorkshopCollaborationPolicy> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/collaboration-policy`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        allowed_operations: input.allowedOperations,
+        client_operation_id: input.clientOperationId,
+        expected_policy_version: input.expectedPolicyVersion,
+      }),
+    },
+  );
+  return collaborationPolicyResponse(response, "Could not update collaboration policy.");
+}
+
+export async function revokeAgentCollaborationGrants(
+  token: string,
+  definitionId: string,
+  clientOperationId: string,
+): Promise<WorkshopCollaborationPolicy> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/client/agents/${encodeURIComponent(definitionId)}/collaboration-policy/revoke-active`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_operation_id: clientOperationId }),
+    },
+  );
+  return collaborationPolicyResponse(response, "Could not revoke active collaboration access.");
+}
+
 export interface AgentDefinitionDraftInput {
   avatar: string;
   capabilities: WorkshopAgentCapability[];
+  collaborationOperations: WorkshopCollaborationOperation[];
   description: string;
   displayName: string;
   handle: string;
@@ -1035,6 +1191,7 @@ export async function createAgentDefinition(
     "/v1/client/agents",
     {
       capabilities: input.capabilities,
+      collaboration_operations: input.collaborationOperations,
       description: input.description,
       display_name: input.displayName,
       handle: input.handle,
@@ -1052,6 +1209,7 @@ export async function addAgentRevision(
   definitionId: string,
   input: {
     capabilities: WorkshopAgentCapability[];
+    collaborationOperations: WorkshopCollaborationOperation[];
     expectedVersion: number;
     idempotencyKey: string;
     instructions: string;
@@ -1063,6 +1221,7 @@ export async function addAgentRevision(
     `/v1/client/agents/${encodeURIComponent(definitionId)}/revisions`,
     {
       capabilities: input.capabilities,
+      collaboration_operations: input.collaborationOperations,
       expected_version: input.expectedVersion,
       idempotency_key: input.idempotencyKey,
       instructions: input.instructions,
@@ -4058,6 +4217,7 @@ export async function loadRunTrace(
     payload.version !== 1 ||
     payload.run_id !== runId ||
     !Array.isArray(payload.entries) ||
+    !Array.isArray(payload.collaboration_activity) ||
     typeof payload.has_more !== "boolean"
   ) {
     throw new Error("Kai returned an unsupported trace response.");
@@ -4070,7 +4230,32 @@ export async function loadRunTrace(
     }
     entries.push(entry);
   }
-  return { entries, hasMore: payload.has_more };
+  const collaborationActivity: WorkshopCollaborationActivity[] = [];
+  for (const value of payload.collaboration_activity) {
+    if (
+      !isRecord(value) ||
+      !Number.isSafeInteger(value.event_position) ||
+      (value.event_position as number) < 1 ||
+      !["operation", "revocation"].includes(String(value.kind)) ||
+      (value.operation !== null &&
+        (typeof value.operation !== "string" ||
+          !COLLABORATION_OPERATIONS.has(value.operation as WorkshopCollaborationOperation))) ||
+      typeof value.outcome !== "string" ||
+      (value.detail !== null && typeof value.detail !== "string") ||
+      typeof value.occurred_at !== "string"
+    ) {
+      throw new Error("Kai returned an unsupported trace response.");
+    }
+    collaborationActivity.push({
+      detail: value.detail,
+      eventPosition: value.event_position as number,
+      kind: value.kind as "operation" | "revocation",
+      occurredAt: value.occurred_at,
+      operation: value.operation as WorkshopCollaborationOperation | null,
+      outcome: value.outcome,
+    });
+  }
+  return { collaborationActivity, entries, hasMore: payload.has_more };
 }
 
 export async function cancelRun(

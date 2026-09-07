@@ -3249,6 +3249,75 @@ button:disabled {
   font-size: 0.6rem;
 }
 
+.agent-collaboration-tags span {
+  border: 1px solid color-mix(in srgb, var(--color-special) 40%, var(--color-border));
+  color: var(--color-special);
+}
+
+.agent-collaboration-policy {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.5rem;
+  background: var(--color-panel);
+}
+
+.collaboration-policy-grid {
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+}
+
+.collaboration-policy-grid article {
+  padding: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  background: var(--color-canvas-inset);
+}
+
+.collaboration-policy-grid label,
+.collaboration-policy-grid dl div,
+.collaboration-policy-actions {
+  display: flex;
+  align-items: center;
+}
+
+.collaboration-policy-grid label {
+  gap: 0.45rem;
+}
+
+.collaboration-policy-grid dl {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0.65rem 0;
+}
+
+.collaboration-policy-grid dl div {
+  justify-content: space-between;
+}
+
+.collaboration-policy-grid dt,
+.collaboration-policy-grid dd {
+  margin: 0;
+  font-size: 0.65rem;
+}
+
+.collaboration-policy-grid dt,
+.collaboration-policy-grid small {
+  color: var(--color-text-muted);
+}
+
+.collaboration-policy-grid small {
+  display: block;
+  margin-top: 0.25rem;
+}
+
+.collaboration-policy-actions {
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.85rem;
+}
+
 .agent-section-heading,
 .agent-creation-header {
   align-items: flex-start;
@@ -5470,6 +5539,41 @@ button:disabled {
 .trace-card {
   max-height: 22rem;
   overflow-y: auto;
+}
+
+.collaboration-activity {
+  margin-top: 0.75rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.collaboration-activity h4 {
+  margin: 0 0 0.4rem;
+}
+
+.collaboration-activity ol {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.collaboration-activity li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.12rem 0.5rem;
+  font-size: 0.65rem;
+}
+
+.collaboration-activity small {
+  grid-column: 1 / -1;
+  color: var(--color-text-muted);
+}
+
+.collaboration-outcome.denied,
+.collaboration-outcome.revoked {
+  color: var(--color-danger);
 }
 
 .trace-empty {

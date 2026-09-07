@@ -1727,6 +1727,68 @@ class CanonicalConversationProjection:
             await _apply_collaboration_grant_event(connection, event)
             return
 
+        if envelope.event_type == WorkshopEventType.AGENT_DEFINITION_COLLABORATION_POLICY_SET:
+            if (
+                not isinstance(envelope.aggregate_id, AgentDefinitionId)
+                or envelope.aggregate_type != "agent_definition"
+                or envelope.event_version != 1
+            ):
+                raise ValueError("Workshop collaboration policy requires an agent definition aggregate")
+            _require_exact_payload(
+                payload,
+                {"allowed_operations", "expected_policy_version", "policy_version"},
+            )
+            allowed = validate_collaboration_operations(payload.get("allowed_operations"))
+            expected = payload.get("expected_policy_version")
+            policy_version = payload.get("policy_version")
+            if (
+                not isinstance(expected, int)
+                or isinstance(expected, bool)
+                or expected < 0
+                or not isinstance(policy_version, int)
+                or isinstance(policy_version, bool)
+                or policy_version != expected + 1
+            ):
+                raise ValueError("Workshop collaboration policy version is invalid")
+            async with connection.execute(
+                "SELECT owner_principal_id FROM agent_definitions WHERE id = ? AND workshop_id = ?",
+                (envelope.aggregate_id, envelope.workshop_id),
+            ) as cursor:
+                definition = await cursor.fetchone()
+            if (
+                definition is None
+                or envelope.actor_principal_id is None
+                or str(definition[0]) != str(envelope.actor_principal_id)
+            ):
+                raise ValueError("Workshop collaboration policy must be set by the agent owner")
+            async with connection.execute(
+                "SELECT policy_version FROM agent_collaboration_owner_policies WHERE agent_definition_id = ?",
+                (envelope.aggregate_id,),
+            ) as cursor:
+                current = await cursor.fetchone()
+            current_version = int(current[0]) if current is not None else 0
+            if current_version != expected:
+                raise ValueError("Workshop collaboration policy changed concurrently")
+            await connection.execute(
+                "INSERT INTO agent_collaboration_owner_policies "
+                "(agent_definition_id, owner_principal_id, allowed_operations_json, "
+                "policy_version, updated_at, updated_event_position) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(agent_definition_id) DO UPDATE SET "
+                "owner_principal_id = excluded.owner_principal_id, "
+                "allowed_operations_json = excluded.allowed_operations_json, "
+                "policy_version = excluded.policy_version, updated_at = excluded.updated_at, "
+                "updated_event_position = excluded.updated_event_position",
+                (
+                    envelope.aggregate_id,
+                    envelope.actor_principal_id,
+                    json.dumps(allowed, separators=(",", ":")),
+                    policy_version,
+                    occurred_at,
+                    event.position,
+                ),
+            )
+            return
+
         if envelope.event_type in {
             WorkshopEventType.RUN_ACCEPTED,
             WorkshopEventType.RUN_CANCELLATION_REQUESTED,

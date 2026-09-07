@@ -40,6 +40,7 @@ class WorkshopEventType(StrEnum):
     AGENT_DEFINITION_CREATED = "agent_definition.created"
     AGENT_DEFINITION_REVISION_ADDED = "agent_definition.revision_added"
     AGENT_DEFINITION_REVISION_ACTIVATED = "agent_definition.revision_activated"
+    AGENT_DEFINITION_COLLABORATION_POLICY_SET = "agent_definition.collaboration_policy_set"
     AGENT_DEFINITION_ARCHIVED = "agent_definition.archived"
     AGENT_DEFINITION_AUTHORITY_ASSIGNED = "agent_definition.authority_assigned"
     PRINCIPAL_AGENT_ENABLED = "principal_agent.enabled"

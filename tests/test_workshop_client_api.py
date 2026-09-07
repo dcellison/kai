@@ -50,6 +50,12 @@ from kai.workshop.client_sessions import (
     WorkshopBearerSessionAuthenticator,
     WorkshopClientSessionManager,
 )
+from kai.workshop.collaboration_policy import (
+    CollaborationOperationState,
+    CollaborationPolicyMutation,
+    CollaborationPolicySnapshot,
+    WorkshopCollaborationPolicyAccessDenied,
+)
 from kai.workshop.conversation_commands import ConversationCommandDisposition
 from kai.workshop.diagnostics import workshop_human_avatar_status
 from kai.workshop.domain import (
@@ -886,6 +892,7 @@ async def _open_client(
     appearance_preferences=None,
     agent_enablement=None,
     human_avatars=None,
+    collaboration_policy=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -909,6 +916,7 @@ async def _open_client(
         appearance_preferences=appearance_preferences,
         agent_enablement=agent_enablement,
         human_avatars=human_avatars,
+        collaboration_policy=collaboration_policy,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -1992,6 +2000,89 @@ class TestWorkshopNavigationHTTPContract:
             await store.close()
 
 
+@dataclass
+class _CollaborationPolicy:
+    owner_id: PrincipalId
+    definition_id: AgentDefinitionId
+    policy_version: int = 0
+    allowed: tuple[str, ...] = ("agent_delegation",)
+    revoked: int = 0
+
+    def _snapshot(self, principal_id: PrincipalId) -> CollaborationPolicySnapshot:
+        can_manage = principal_id == self.owner_id
+        operations = tuple(
+            CollaborationOperationState(
+                operation=operation,
+                requested=operation in {"context_read", "agent_delegation"},
+                owner_allowed=(operation in self.allowed if can_manage else None),
+                host_allowed=True,
+                effective_for_new_attempt=(
+                    operation in {"context_read", "agent_delegation"} and operation in self.allowed
+                ),
+                unavailable_reason=(
+                    None
+                    if operation in {"context_read", "agent_delegation"} and operation in self.allowed
+                    else "Owner policy does not allow this operation"
+                ),
+                quota=12,
+            )
+            for operation in (
+                "context_read",
+                "reaction",
+                "progress_publish",
+                "thread_reply",
+                "artifact_publish",
+                "agent_delegation",
+            )
+        )
+        return CollaborationPolicySnapshot(
+            definition_id=self.definition_id,
+            owner_principal_id=self.owner_id,
+            can_manage=can_manage,
+            policy_version=self.policy_version,
+            active_revision_id="rev_00000000000000000000000000000000",
+            active_grants=(1 - self.revoked if can_manage else None),
+            operations=operations,
+        )
+
+    async def inspect(
+        self,
+        principal_id: PrincipalId,
+        definition_id: AgentDefinitionId,
+    ) -> CollaborationPolicySnapshot:
+        assert definition_id == self.definition_id
+        return self._snapshot(principal_id)
+
+    async def set_allowed(
+        self,
+        principal_id: PrincipalId,
+        definition_id: AgentDefinitionId,
+        *,
+        allowed_operations,
+        expected_policy_version,
+        client_operation_id,
+    ) -> CollaborationPolicyMutation:
+        assert definition_id == self.definition_id
+        assert client_operation_id == "policy-http-1"
+        if principal_id != self.owner_id:
+            raise WorkshopCollaborationPolicyAccessDenied("owner only")
+        assert expected_policy_version == self.policy_version
+        self.allowed = tuple(allowed_operations)
+        self.policy_version += 1
+        return CollaborationPolicyMutation(self._snapshot(principal_id), changed=True, replayed=False)
+
+    async def revoke_active(
+        self,
+        principal_id: PrincipalId,
+        definition_id: AgentDefinitionId,
+    ) -> tuple[CollaborationPolicySnapshot, int]:
+        assert definition_id == self.definition_id
+        if principal_id != self.owner_id:
+            raise WorkshopCollaborationPolicyAccessDenied("owner only")
+        self.revoked = 1
+        return self._snapshot(principal_id), 1
+
+
 class TestWorkshopAgentLifecycleHTTPContract:
     @staticmethod
     def _draft_payload(*, key: str = "create-researcher") -> dict[str, object]:
@@ -2005,6 +2096,72 @@ class TestWorkshopAgentLifecycleHTTPContract:
             "instructions": "Find reliable evidence and distinguish fact from inference.",
             "capabilities": ["text_generation", "tool_activity"],
         }
+
+    async def test_collaboration_policy_is_owner_managed_and_member_read_only(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        definition_id = AgentDefinitionId.new()
+        policy = _CollaborationPolicy(alice_id, definition_id)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+            collaboration_policy=policy,
+        )
+        path = f"/v1/client/agents/{definition_id}/collaboration-policy"
+        try:
+            owner = await client.get(path, headers={"Authorization": "Bearer alice"})
+            assert owner.status == 200
+            owner_policy = (await owner.json())["policy"]
+            assert owner_policy["can_manage"] is True
+            assert owner_policy["policy_version"] == 0
+            assert len(owner_policy["operations"]) == 6
+
+            member = await client.get(path, headers={"Authorization": "Bearer bob"})
+            assert member.status == 200
+            member_policy = (await member.json())["policy"]
+            assert member_policy["can_manage"] is False
+            assert member_policy["active_grants"] is None
+            assert all(operation["owner_allowed"] is None for operation in member_policy["operations"])
+            denied = await client.put(
+                path,
+                headers={"Authorization": "Bearer bob"},
+                json={
+                    "allowed_operations": [],
+                    "client_operation_id": "policy-http-1",
+                    "expected_policy_version": 0,
+                },
+            )
+            assert denied.status == 404
+
+            updated = await client.put(
+                path,
+                headers={"Authorization": "Bearer alice"},
+                json={
+                    "allowed_operations": ["context_read"],
+                    "client_operation_id": "policy-http-1",
+                    "expected_policy_version": 0,
+                },
+            )
+            assert updated.status == 200
+            updated_body = await updated.json()
+            assert updated_body["changed"] is True
+            assert updated_body["replayed"] is False
+            assert updated_body["policy"]["policy_version"] == 1
+
+            revoked = await client.post(
+                f"{path}/revoke-active",
+                headers={"Authorization": "Bearer alice"},
+                json={"client_operation_id": "revoke-http-1"},
+            )
+            assert revoked.status == 200
+            revoked_body = await revoked.json()
+            assert revoked_body["revoked_grants"] == 1
+            assert revoked_body["policy"]["active_grants"] == 0
+        finally:
+            await client.close()
+            await store.close()
 
     async def test_admin_completes_revisioned_lifecycle_and_archive_preserves_history(
         self,

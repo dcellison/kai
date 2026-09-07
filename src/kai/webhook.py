@@ -98,6 +98,7 @@ from kai.workshop.collaboration_authority import (
 from kai.workshop.collaboration_context import (
     CollaborationContextValidationError,
 )
+from kai.workshop.collaboration_policy import WorkshopCollaborationPolicyService
 from kai.workshop.collaboration_publications import (
     CollaborationPublicationDenied,
     CollaborationPublicationValidationError,
@@ -2187,6 +2188,7 @@ async def _register_workshop_client_api(
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
+    collaboration_policy: WorkshopCollaborationPolicyService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -2231,6 +2233,7 @@ async def _register_workshop_client_api(
             appearance_preferences=appearance_preferences,
             agent_enablement=agent_enablement,
             human_avatars=human_avatars,
+            collaboration_policy=collaboration_policy,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -2241,6 +2244,7 @@ async def _register_workshop_client_api(
                 request_lock=request_lock,
                 artifact_service=artifact_service,
                 routing_policy=routing_policy,
+                collaboration_policy=collaboration_policy,
             )
         register_workshop_shell_routes(target)
 
@@ -2319,6 +2323,7 @@ async def start(
             appearance_preferences=getattr(core_services, "appearance_preferences", None),
             agent_enablement=getattr(core_services, "agent_enablement", None),
             human_avatars=getattr(core_services, "human_avatars", None),
+            collaboration_policy=getattr(core_services, "collaboration_policy", None),
         )
 
     _runner = web.AppRunner(
