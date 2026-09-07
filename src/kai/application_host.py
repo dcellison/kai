@@ -32,6 +32,7 @@ from kai.workshop.client_preferences import (
 )
 from kai.workshop.codex_model_discovery import CodexModelDiscoveryAdapter
 from kai.workshop.collaboration_context import WorkshopCollaborationContextService
+from kai.workshop.collaboration_publications import WorkshopCollaborationPublicationService
 from kai.workshop.collaboration_reactions import WorkshopCollaborationReactionService
 from kai.workshop.conversation_runs import WorkshopConversationRunService
 from kai.workshop.delivery_authority import (
@@ -213,6 +214,7 @@ class KaiCoreServices:
     agent_delegation: WorkshopAgentDelegationService
     collaboration_context: WorkshopCollaborationContextService
     collaboration_reactions: WorkshopCollaborationReactionService
+    collaboration_publications: WorkshopCollaborationPublicationService
     delivery_policy: WorkshopDeliveryBindingPolicy
 
 
@@ -397,16 +399,23 @@ class KaiApplicationHost:
                 client_store,
                 private_execution,
             )
-            scheduler = await WorkshopCanonicalScheduler.open_and_start(
-                Path(self._config.session_db_path),
-                private_execution,
-                delivery_policy,
-            )
             artifacts = WorkshopArtifactService(
                 client_store,
                 data_dir=Path(self._config.session_db_path).parent,
                 principal_storage=self._principal_storage,
                 runtime_profiles=self._runtime_profiles,
+            )
+            collaboration_publications = WorkshopCollaborationPublicationService(
+                client_store,
+                private_execution,
+                artifacts,
+                data_dir=Path(self._config.session_db_path).parent,
+                delivery_policy=delivery_policy,
+            )
+            scheduler = await WorkshopCanonicalScheduler.open_and_start(
+                Path(self._config.session_db_path),
+                private_execution,
+                delivery_policy,
             )
             human_avatars = WorkshopHumanAvatarService(
                 client_store,
@@ -519,6 +528,7 @@ class KaiApplicationHost:
                 agent_delegation=agent_delegation,
                 collaboration_context=collaboration_context,
                 collaboration_reactions=collaboration_reactions,
+                collaboration_publications=collaboration_publications,
                 delivery_policy=delivery_policy,
             )
             self._state = KaiApplicationState.READY

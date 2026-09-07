@@ -22,6 +22,8 @@ Routes are organized into these groups:
     - /api/agent-delegations - Run one bounded agent-to-agent delegation
     - /api/collaboration/context - Read exact-attempt bounded conversation context
     - /api/collaboration/reactions - Add or remove an exact-attempt reaction
+    - /api/collaboration/messages - Publish exact-attempt progress or a thread reply
+    - /api/collaboration/artifacts - Publish an exact-attempt artifact
     - /api/memory/add       - Store a structured memory (POST)
     - /api/memory/search    - Search memories by query (POST)
     - /api/memory/stats     - Memory statistics for a user (GET)
@@ -95,6 +97,10 @@ from kai.workshop.collaboration_authority import (
 )
 from kai.workshop.collaboration_context import (
     CollaborationContextValidationError,
+)
+from kai.workshop.collaboration_publications import (
+    CollaborationPublicationDenied,
+    CollaborationPublicationValidationError,
 )
 from kai.workshop.collaboration_reactions import (
     CollaborationReactionDenied,
@@ -1418,6 +1424,136 @@ async def _handle_collaboration_reaction(
     )
 
 
+def _collaboration_base_identity(principal: InternalAPIPrincipal) -> CollaborationBaseIdentity:
+    return CollaborationBaseIdentity(
+        principal_id=principal.principal_id,
+        channel_id=principal.channel_id,
+        agent_id=principal.agent_id,
+        runtime_profile_id=principal.runtime_profile_id,
+    )
+
+
+def _collaboration_publication_error(exc: Exception) -> web.Response:
+    if isinstance(exc, CollaborationProofError):
+        return web.json_response({"error": str(exc), "code": "invalid_proof"}, status=403)
+    if isinstance(exc, (CollaborationDenied, CollaborationPublicationDenied)):
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    if isinstance(exc, CollaborationPublicationValidationError):
+        return web.json_response({"error": str(exc), "code": "invalid_request"}, status=400)
+    if isinstance(exc, TimeoutError):
+        return web.json_response(
+            {"error": "Collaboration publication timed out", "code": "publication_timeout"},
+            status=504,
+        )
+    raise exc
+
+
+@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+async def _handle_collaboration_message(
+    request: web.Request,
+    principal: InternalAPIPrincipal,
+) -> web.Response:
+    """Publish one proof-bound progress update or current-thread reply."""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    required = {"kind", "body", "idempotency_key"}
+    if not isinstance(payload, dict) or set(payload) != required:
+        return web.json_response({"error": "Invalid collaboration message request"}, status=400)
+    try:
+        result = await request.app[CORE_HOST_KEY].services.collaboration_publications.publish_message(
+            _collaboration_base_identity(principal),
+            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
+            kind=payload["kind"],
+            body=payload["body"],
+            idempotency_key=payload["idempotency_key"],
+        )
+    except (
+        CollaborationProofError,
+        CollaborationDenied,
+        CollaborationPublicationDenied,
+        CollaborationPublicationValidationError,
+        TimeoutError,
+    ) as exc:
+        return _collaboration_publication_error(exc)
+    except Exception:
+        log.exception("Canonical collaboration message publication failed")
+        return web.json_response({"error": "Collaboration publication failed"}, status=500)
+    return web.json_response(
+        {
+            "version": 1,
+            "message_id": str(result.message_id),
+            "event_position": result.event_position,
+            "replayed": result.replayed,
+        }
+    )
+
+
+@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+async def _handle_collaboration_artifact(
+    request: web.Request,
+    principal: InternalAPIPrincipal,
+) -> web.Response:
+    """Publish one proof-bound file into the exact current context."""
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    if not isinstance(payload, dict) or set(payload) != {"path", "caption", "idempotency_key"}:
+        return web.json_response({"error": "Invalid collaboration artifact request"}, status=400)
+    raw_path = payload.get("path")
+    if not isinstance(raw_path, str):
+        return web.json_response({"error": "path must be a string"}, status=400)
+    path = Path(raw_path).resolve()
+    core_host = request.app.get(CORE_HOST_KEY)
+    storage_registry = request.app.get(WORKSHOP_PRINCIPAL_STORAGE_KEY)
+    if core_host is None or storage_registry is None:
+        return web.json_response({"error": "Publication storage unavailable"}, status=403)
+    try:
+        workspace = Path(
+            str(await core_host.services.runtime_pool.get_effective_workspace(_internal_execution_context(principal)))
+        ).resolve()
+        namespace = storage_registry.for_runtime_profile(principal.runtime_profile_id)
+    except Exception:
+        return web.json_response({"error": "Publication storage unavailable"}, status=403)
+    if namespace.principal_id != principal.principal_id:
+        return web.json_response({"error": "Publication storage unavailable"}, status=403)
+    allowed_roots = (workspace, namespace.files_directory(DATA_DIR).resolve())
+    if not any(path.is_relative_to(root) for root in allowed_roots):
+        return web.json_response({"error": "Path outside allowed directories"}, status=403)
+    if not path.is_file():
+        return web.json_response({"error": f"File not found: {raw_path}"}, status=404)
+    try:
+        result = await core_host.services.collaboration_publications.publish_artifact(
+            _collaboration_base_identity(principal),
+            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
+            path=path,
+            caption=payload["caption"],
+            idempotency_key=payload["idempotency_key"],
+        )
+    except (
+        CollaborationProofError,
+        CollaborationDenied,
+        CollaborationPublicationDenied,
+        CollaborationPublicationValidationError,
+        TimeoutError,
+    ) as exc:
+        return _collaboration_publication_error(exc)
+    except Exception:
+        log.exception("Canonical collaboration artifact publication failed")
+        return web.json_response({"error": "Collaboration artifact publication failed"}, status=500)
+    return web.json_response(
+        {
+            "version": 1,
+            "message_id": str(result.message_id),
+            "artifact_id": str(result.artifact_id),
+            "event_position": result.event_position,
+            "replayed": result.replayed,
+        }
+    )
+
+
 # ── File exchange ────────────────────────────────────────────────────
 
 
@@ -2028,6 +2164,8 @@ def _register_routes(
     app.router.add_post("/api/agent-delegations", _handle_agent_delegation)
     app.router.add_post("/api/collaboration/context", _handle_collaboration_context)
     app.router.add_post("/api/collaboration/reactions", _handle_collaboration_reaction)
+    app.router.add_post("/api/collaboration/messages", _handle_collaboration_message)
+    app.router.add_post("/api/collaboration/artifacts", _handle_collaboration_artifact)
 
 
 async def _register_workshop_client_api(

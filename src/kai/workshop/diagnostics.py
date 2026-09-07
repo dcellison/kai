@@ -1080,7 +1080,7 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
                 _required_payload_text(payload, "kind"),
             )
             continue
-        if envelope.event_type == WorkshopEventType.MESSAGE_CREATED and envelope.event_version not in {1, 2}:
+        if envelope.event_type == WorkshopEventType.MESSAGE_CREATED and envelope.event_version not in {1, 2, 3}:
             raise ValueError("Workshop event replay encountered an unsupported message version")
         if envelope.event_type == WorkshopEventType.CHANNEL_CREATED:
             _insert_replayed_fact(

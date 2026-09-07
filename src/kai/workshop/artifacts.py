@@ -17,12 +17,16 @@ from datetime import datetime
 from pathlib import Path
 
 from kai.workshop.domain import (
+    AgentDefinitionRevisionId,
     ArtifactId,
     ChannelId,
+    CollaborationGrantId,
     EventEnvelope,
     EventId,
     MessageId,
     PrincipalId,
+    RunAttemptId,
+    RunId,
     RuntimeProfileId,
     WorkshopEventType,
     WorkshopId,
@@ -226,6 +230,14 @@ class InboundArtifact:
                 raise ValueError("original_filename must be a bounded basename or None")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactCollaborationAttribution:
+    grant_id: CollaborationGrantId
+    agent_definition_revision_id: AgentDefinitionRevisionId
+    run_id: RunId
+    run_attempt_id: RunAttemptId
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +475,7 @@ async def record_published_artifact_in_transaction(
     artifact: InboundArtifact,
     *,
     storage_root: Path,
+    collaboration: ArtifactCollaborationAttribution | None = None,
 ) -> AppendResult:
     """Append agent-authored artifact metadata inside a publication transaction."""
     return await _record_artifact_in_transaction(
@@ -470,8 +483,9 @@ async def record_published_artifact_in_transaction(
         artifact,
         storage_root=storage_root,
         author_kind="agent",
-        event_version=2,
-        metadata_source="internal_api",
+        event_version=3 if collaboration is not None else 2,
+        metadata_source=("workshop_collaboration_publication" if collaboration is not None else "internal_api"),
+        collaboration=collaboration,
     )
 
 
@@ -483,6 +497,7 @@ async def _record_artifact_in_transaction(
     author_kind: str,
     event_version: int,
     metadata_source: str,
+    collaboration: ArtifactCollaborationAttribution | None = None,
 ) -> AppendResult:
     if not store.connection.in_transaction:
         raise RuntimeError("artifact recording requires an active transaction")
@@ -521,6 +536,16 @@ async def _record_artifact_in_transaction(
                 "storage_path": storage_path,
                 "source_transport": artifact.source_transport,
                 "source_unique_id": artifact.source_unique_id,
+                **(
+                    {
+                        "collaboration_grant_id": collaboration.grant_id,
+                        "agent_definition_revision_id": collaboration.agent_definition_revision_id,
+                        "run_id": collaboration.run_id,
+                        "run_attempt_id": collaboration.run_attempt_id,
+                    }
+                    if collaboration is not None
+                    else {}
+                ),
             },
             metadata={"source": metadata_source},
         )

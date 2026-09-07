@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 69
+WORKSHOP_SCHEMA_VERSION = 70
 
 
 @dataclass(frozen=True, slots=True)
@@ -3039,6 +3039,64 @@ _AGENT_AUTHORED_REACTION_SCHEMA = SchemaMigration(
     ),
 )
 
+_AGENT_AUTHORED_PUBLICATION_SCHEMA = SchemaMigration(
+    version=70,
+    name="agent_authored_collaboration_publications",
+    statements=(
+        "ALTER TABLE messages ADD COLUMN agent_definition_revision_id TEXT "
+        "REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT",
+        "ALTER TABLE messages ADD COLUMN run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT",
+        "ALTER TABLE messages ADD COLUMN run_attempt_id TEXT REFERENCES run_attempts(id) ON DELETE RESTRICT",
+        "ALTER TABLE messages ADD COLUMN collaboration_grant_id TEXT "
+        "REFERENCES collaboration_grants(id) ON DELETE RESTRICT",
+        "ALTER TABLE messages ADD COLUMN collaboration_operation TEXT CHECK "
+        "(collaboration_operation IN ('progress_publish', 'thread_reply', 'artifact_publish'))",
+        "CREATE INDEX messages_collaboration_run_idx ON messages "
+        "(run_id, run_attempt_id, created_event_position) WHERE collaboration_grant_id IS NOT NULL",
+        "ALTER TABLE artifacts ADD COLUMN agent_definition_revision_id TEXT "
+        "REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT",
+        "ALTER TABLE artifacts ADD COLUMN run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT",
+        "ALTER TABLE artifacts ADD COLUMN run_attempt_id TEXT REFERENCES run_attempts(id) ON DELETE RESTRICT",
+        "ALTER TABLE artifacts ADD COLUMN collaboration_grant_id TEXT "
+        "REFERENCES collaboration_grants(id) ON DELETE RESTRICT",
+        "CREATE INDEX artifacts_collaboration_run_idx ON artifacts "
+        "(run_id, run_attempt_id, created_event_position) WHERE collaboration_grant_id IS NOT NULL",
+        """
+        CREATE TABLE collaboration_publication_receipts (
+            grant_id TEXT NOT NULL REFERENCES collaboration_grants(id) ON DELETE CASCADE,
+            operation TEXT NOT NULL CHECK (
+                operation IN ('progress_publish', 'thread_reply', 'artifact_publish')
+            ),
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+            outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'denied')),
+            denial_code TEXT,
+            message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            artifact_id TEXT REFERENCES artifacts(id) ON DELETE RESTRICT,
+            agent_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            agent_definition_revision_id TEXT NOT NULL
+                REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+            run_attempt_id TEXT NOT NULL REFERENCES run_attempts(id) ON DELETE RESTRICT,
+            recorded_at TEXT NOT NULL,
+            recorded_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (grant_id, operation, idempotency_key),
+            CHECK (
+                (outcome = 'succeeded' AND denial_code IS NULL AND message_id IS NOT NULL
+                    AND ((operation = 'artifact_publish' AND artifact_id IS NOT NULL)
+                        OR (operation != 'artifact_publish' AND artifact_id IS NULL)))
+                OR
+                (outcome = 'denied' AND denial_code IS NOT NULL
+                    AND message_id IS NULL AND artifact_id IS NULL)
+            )
+        )
+        """,
+        "CREATE INDEX collaboration_publication_receipts_run_idx ON "
+        "collaboration_publication_receipts (run_id, recorded_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3109,6 +3167,7 @@ _MIGRATIONS = (
     _ATTEMPT_SCOPED_COLLABORATION_AUTHORITY_SCHEMA,
     _COLLABORATION_OPERATION_DECISION_SCHEMA,
     _AGENT_AUTHORED_REACTION_SCHEMA,
+    _AGENT_AUTHORED_PUBLICATION_SCHEMA,
 )
 
 

@@ -30,6 +30,7 @@ from kai.workshop.domain import (
     AgentDelegationId,
     AgentEnablementId,
     AgentId,
+    ArtifactId,
     ChannelId,
     ChannelReadPositionId,
     CollaborationGrantId,
@@ -1226,6 +1227,119 @@ async def _apply_collaboration_grant_event(
         )
         return
 
+    if envelope.event_type == WorkshopEventType.COLLABORATION_PUBLICATION_RECORDED:
+        _require_exact_payload(
+            payload,
+            {
+                "operation",
+                "idempotency_key",
+                "request_hash",
+                "outcome",
+                "denial_code",
+                "message_id",
+                "artifact_id",
+            },
+        )
+        operation = _required_text(payload, "operation")
+        idempotency_key = _required_text(payload, "idempotency_key")
+        request_hash = _required_text(payload, "request_hash")
+        outcome = _required_text(payload, "outcome")
+        denial_value = payload.get("denial_code")
+        denial_code = str(denial_value) if denial_value is not None else None
+        message_value = payload.get("message_id")
+        artifact_value = payload.get("artifact_id")
+        message_id = MessageId(str(message_value)) if message_value is not None else None
+        artifact_id = ArtifactId(str(artifact_value)) if artifact_value is not None else None
+        if (
+            operation not in {"progress_publish", "thread_reply", "artifact_publish"}
+            or not _COLLABORATION_IDEMPOTENCY_PATTERN.fullmatch(idempotency_key)
+            or not _SHA256_PATTERN.fullmatch(request_hash)
+            or outcome not in {"succeeded", "denied"}
+            or (denial_code is not None and not _RUN_TERMINAL_CODE_PATTERN.fullmatch(denial_code))
+            or (
+                outcome == "succeeded"
+                and (
+                    denial_code is not None
+                    or message_id is None
+                    or (operation == "artifact_publish") != (artifact_id is not None)
+                )
+            )
+            or (outcome == "denied" and (denial_code is None or message_id is not None or artifact_id is not None))
+        ):
+            raise ValueError("Workshop collaboration publication receipt is malformed")
+        async with connection.execute(
+            "SELECT agent_principal_id, agent_definition_revision_id, run_id, attempt_id "
+            "FROM collaboration_grants WHERE id = ?",
+            (envelope.aggregate_id,),
+        ) as cursor:
+            grant_row = await cursor.fetchone()
+        if grant_row is None or envelope.actor_principal_id != PrincipalId(str(grant_row[0])):
+            raise ValueError("Workshop collaboration publication receipt has no matching grant")
+        async with connection.execute(
+            "SELECT decision FROM collaboration_operation_decisions WHERE grant_id = ? "
+            "AND operation = ? AND idempotency_key = ? AND request_hash = ?",
+            (envelope.aggregate_id, operation, idempotency_key, request_hash),
+        ) as cursor:
+            decision_row = await cursor.fetchone()
+        if decision_row is None or str(decision_row[0]) != "authorized":
+            raise ValueError("Workshop collaboration publication receipt was not authorized")
+        if outcome == "succeeded":
+            async with connection.execute(
+                "SELECT author_principal_id, agent_definition_revision_id, run_id, "
+                "run_attempt_id, collaboration_grant_id, collaboration_operation "
+                "FROM messages WHERE id = ?",
+                (message_id,),
+            ) as cursor:
+                message_row = await cursor.fetchone()
+            if message_row is None or tuple(str(value) for value in message_row) != (
+                str(grant_row[0]),
+                str(grant_row[1]),
+                str(grant_row[2]),
+                str(grant_row[3]),
+                str(envelope.aggregate_id),
+                operation,
+            ):
+                raise ValueError("Workshop collaboration publication message attribution is invalid")
+            if artifact_id is not None:
+                async with connection.execute(
+                    "SELECT message_id, agent_definition_revision_id, run_id, run_attempt_id, "
+                    "collaboration_grant_id FROM artifacts WHERE id = ?",
+                    (artifact_id,),
+                ) as cursor:
+                    artifact_row = await cursor.fetchone()
+                if artifact_row is None or tuple(str(value) for value in artifact_row) != (
+                    str(message_id),
+                    str(grant_row[1]),
+                    str(grant_row[2]),
+                    str(grant_row[3]),
+                    str(envelope.aggregate_id),
+                ):
+                    raise ValueError("Workshop collaboration publication artifact attribution is invalid")
+        await connection.execute(
+            "INSERT INTO collaboration_publication_receipts "
+            "(grant_id, operation, idempotency_key, request_hash, outcome, denial_code, "
+            "message_id, artifact_id, agent_principal_id, agent_definition_revision_id, "
+            "run_id, run_attempt_id, recorded_at, recorded_event_position) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                envelope.aggregate_id,
+                operation,
+                idempotency_key,
+                request_hash,
+                outcome,
+                denial_code,
+                message_id,
+                artifact_id,
+                grant_row[0],
+                grant_row[1],
+                grant_row[2],
+                grant_row[3],
+                occurred_at.isoformat(),
+                event.position,
+            ),
+        )
+        return
+
     raise ValueError(f"Unsupported Workshop collaboration-grant event: {envelope.event_type}")
 
 
@@ -1532,7 +1646,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 29
+    version = 30
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1547,8 +1661,22 @@ class CanonicalConversationProjection:
             "parent_run_id",
         ):
             await connection.execute("UPDATE runs SET parent_run_id = NULL")
+        if "messages" in existing_tables and await _table_has_column(
+            connection,
+            "messages",
+            "collaboration_grant_id",
+        ):
+            # Collaboration messages point back to the run whose active
+            # attempt authored them, while every run points to its inbound
+            # message. Break only those derived attribution links before the
+            # deterministic event replay restores them.
+            await connection.execute(
+                "UPDATE messages SET agent_definition_revision_id = NULL, run_id = NULL, "
+                "run_attempt_id = NULL, collaboration_grant_id = NULL, collaboration_operation = NULL"
+            )
         for table in (
             "deliveries",
+            "collaboration_publication_receipts",
             "artifacts",
             "agent_delegations",
             "message_reactions",
@@ -1594,6 +1722,7 @@ class CanonicalConversationProjection:
             WorkshopEventType.COLLABORATION_GRANT_REVOKED,
             WorkshopEventType.COLLABORATION_OPERATION_DECIDED,
             WorkshopEventType.COLLABORATION_REACTION_RECORDED,
+            WorkshopEventType.COLLABORATION_PUBLICATION_RECORDED,
         }:
             await _apply_collaboration_grant_event(connection, event)
             return
@@ -2174,10 +2303,18 @@ class CanonicalConversationProjection:
                 or envelope.aggregate_type != "agent_definition_revision"
             ):
                 raise ValueError("Workshop agent revision creation requires a typed revision aggregate")
-            _require_exact_payload(
-                payload,
-                {"definition_id", "revision_number", "purpose", "instructions", "capabilities"},
-            )
+            if envelope.event_version not in {1, 2}:
+                raise ValueError("Unsupported Workshop agent revision event version")
+            revision_keys = {
+                "definition_id",
+                "revision_number",
+                "purpose",
+                "instructions",
+                "capabilities",
+            }
+            if envelope.event_version == 2:
+                revision_keys.add("collaboration_operations")
+            _require_exact_payload(payload, revision_keys)
             definition_id = AgentDefinitionId(_required_text(payload, "definition_id"))
             revision_number = payload.get("revision_number")
             if not isinstance(revision_number, int) or isinstance(revision_number, bool) or revision_number < 1:
@@ -2187,7 +2324,11 @@ class CanonicalConversationProjection:
                 payload.get("instructions"), field="instructions", maximum=MAX_AGENT_INSTRUCTIONS
             )
             capabilities = validate_agent_capabilities(payload.get("capabilities"))
-            collaboration_operations = collaboration_operations_for_capabilities(capabilities)
+            collaboration_operations = (
+                validate_collaboration_operations(payload.get("collaboration_operations"))
+                if envelope.event_version == 2
+                else collaboration_operations_for_capabilities(capabilities)
+            )
             async with connection.execute(
                 "SELECT workshop_id FROM agent_definitions WHERE id = ?", (definition_id,)
             ) as cursor:
@@ -2816,8 +2957,74 @@ class CanonicalConversationProjection:
                     (runtime_profile_id, channel_id, agent_id),
                 )
         elif envelope.event_type == WorkshopEventType.MESSAGE_CREATED:
-            if envelope.event_version not in {1, 2}:
+            if envelope.event_version not in {1, 2, 3}:
                 raise ValueError("Unsupported Workshop message creation event version")
+            collaboration_attribution: tuple[str, str, str, str, str] | None = None
+            if envelope.event_version == 3:
+                _require_exact_payload(
+                    payload,
+                    {
+                        "channel_id",
+                        "author_principal_id",
+                        "body",
+                        "mentions",
+                        "reply_to_message_id",
+                        "thread_root_id",
+                        "collaboration_operation",
+                        "collaboration_grant_id",
+                        "agent_definition_revision_id",
+                        "run_id",
+                        "run_attempt_id",
+                    },
+                )
+                operation = _required_text(payload, "collaboration_operation")
+                grant_id = CollaborationGrantId(_required_text(payload, "collaboration_grant_id"))
+                revision_id = AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
+                run_id = RunId(_required_text(payload, "run_id"))
+                attempt_id = RunAttemptId(_required_text(payload, "run_attempt_id"))
+                if operation not in {"progress_publish", "thread_reply", "artifact_publish"}:
+                    raise ValueError("Workshop collaboration publication operation is invalid")
+                async with connection.execute(
+                    "SELECT agent_principal_id, agent_definition_revision_id, run_id, attempt_id, "
+                    "channel_id, thread_root_id FROM collaboration_grants WHERE id = ?",
+                    (grant_id,),
+                ) as cursor:
+                    grant_row = await cursor.fetchone()
+                expected_thread = str(grant_row[5]) if grant_row is not None and grant_row[5] is not None else None
+                if (
+                    grant_row is None
+                    or envelope.actor_principal_id != PrincipalId(str(grant_row[0]))
+                    or _required_text(payload, "author_principal_id") != str(grant_row[0])
+                    or revision_id != AgentDefinitionRevisionId(str(grant_row[1]))
+                    or run_id != RunId(str(grant_row[2]))
+                    or attempt_id != RunAttemptId(str(grant_row[3]))
+                    or _required_text(payload, "channel_id") != str(grant_row[4])
+                    or (operation == "progress_publish" and expected_thread is not None)
+                    or (operation == "thread_reply" and expected_thread is None)
+                    or (
+                        operation in {"thread_reply", "artifact_publish"}
+                        and expected_thread is not None
+                        and (
+                            payload.get("reply_to_message_id") != expected_thread
+                            or payload.get("thread_root_id") != expected_thread
+                        )
+                    )
+                    or (
+                        operation in {"progress_publish", "artifact_publish"}
+                        and expected_thread is None
+                        and (
+                            payload.get("reply_to_message_id") is not None or payload.get("thread_root_id") is not None
+                        )
+                    )
+                ):
+                    raise ValueError("Workshop collaboration publication does not match its grant")
+                collaboration_attribution = (
+                    str(revision_id),
+                    str(run_id),
+                    str(attempt_id),
+                    str(grant_id),
+                    operation,
+                )
             reply_to = payload.get("reply_to_message_id")
             if reply_to is not None and not isinstance(reply_to, str):
                 raise ValueError("Workshop reply_to_message_id must be a string or null")
@@ -2841,7 +3048,7 @@ class CanonicalConversationProjection:
                 channel_id,
                 body,
                 payload.get("mentions", []),
-                canonical_handles=envelope.event_version == 2,
+                canonical_handles=envelope.event_version >= 2,
             )
             await connection.execute(
                 "INSERT INTO messages "
@@ -2857,6 +3064,13 @@ class CanonicalConversationProjection:
                     occurred_at,
                 ),
             )
+            if collaboration_attribution is not None:
+                await connection.execute(
+                    "UPDATE messages SET agent_definition_revision_id = ?, run_id = ?, "
+                    "run_attempt_id = ?, collaboration_grant_id = ?, collaboration_operation = ? "
+                    "WHERE id = ?",
+                    (*collaboration_attribution, envelope.aggregate_id),
+                )
             # Empty mentions use the column default, which keeps the current
             # projection executable in migration tests frozen before schema
             # v41. Accepted mention spans require the v41 authority column.
@@ -3431,8 +3645,28 @@ class CanonicalConversationProjection:
                 if cursor.rowcount != 1:
                     raise ValueError("Workshop message reaction removal has no matching reaction")
         elif envelope.event_type == WorkshopEventType.ARTIFACT_CREATED:
-            if envelope.event_version not in {1, 2}:
+            if envelope.event_version not in {1, 2, 3}:
                 raise ValueError("Unsupported Workshop artifact event version")
+            artifact_attribution: tuple[str, str, str, str] | None = None
+            if envelope.event_version == 3:
+                expected = {
+                    "channel_id",
+                    "message_id",
+                    "created_by_principal_id",
+                    "kind",
+                    "media_type",
+                    "byte_size",
+                    "content_sha256",
+                    "original_filename",
+                    "storage_path",
+                    "source_transport",
+                    "source_unique_id",
+                    "collaboration_grant_id",
+                    "agent_definition_revision_id",
+                    "run_id",
+                    "run_attempt_id",
+                }
+                _require_exact_payload(payload, expected)
             created_by = _required_text(payload, "created_by_principal_id")
             if envelope.actor_principal_id != created_by:
                 raise ValueError("Workshop artifact actor must match created_by_principal_id")
@@ -3454,6 +3688,31 @@ class CanonicalConversationProjection:
                 expected_author_kind,
             ):
                 raise ValueError("Workshop artifact must belong to a message with the event-version author kind")
+            if envelope.event_version == 3:
+                grant_id = CollaborationGrantId(_required_text(payload, "collaboration_grant_id"))
+                revision_id = AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
+                run_id = RunId(_required_text(payload, "run_id"))
+                attempt_id = RunAttemptId(_required_text(payload, "run_attempt_id"))
+                async with connection.execute(
+                    "SELECT agent_principal_id, agent_definition_revision_id, run_id, attempt_id, "
+                    "channel_id FROM collaboration_grants WHERE id = ?",
+                    (grant_id,),
+                ) as cursor:
+                    grant_row = await cursor.fetchone()
+                if grant_row is None or tuple(str(value) for value in grant_row) != (
+                    created_by,
+                    str(revision_id),
+                    str(run_id),
+                    str(attempt_id),
+                    channel_id,
+                ):
+                    raise ValueError("Workshop collaboration artifact does not match its grant")
+                artifact_attribution = (
+                    str(revision_id),
+                    str(run_id),
+                    str(attempt_id),
+                    str(grant_id),
+                )
             kind = _required_text(payload, "kind")
             if kind not in {"photo", "document", "voice"}:
                 raise ValueError("Workshop artifact kind is unsupported")
@@ -3511,6 +3770,12 @@ class CanonicalConversationProjection:
                     occurred_at,
                 ),
             )
+            if artifact_attribution is not None:
+                await connection.execute(
+                    "UPDATE artifacts SET agent_definition_revision_id = ?, run_id = ?, "
+                    "run_attempt_id = ?, collaboration_grant_id = ? WHERE id = ?",
+                    (*artifact_attribution, envelope.aggregate_id),
+                )
         elif envelope.event_type in {
             WorkshopEventType.DELIVERY_SUCCEEDED,
             WorkshopEventType.DELIVERY_FAILED,

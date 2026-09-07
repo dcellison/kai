@@ -1066,6 +1066,20 @@ def build_session_context(
             "Never send a channel, thread, run, agent, principal, or other identity selector. "
             "A reaction is participation metadata only: it never wakes or delegates to an agent.]"
         )
+        parts.append(
+            "[Workshop collaboration publication APIs: When your immutable definition and owner "
+            "policy grant progress_publish or thread_reply for this exact attempt, POST JSON to "
+            f"http://localhost:{api.webhook_port}/api/collaboration/messages with headers "
+            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and the separately injected "
+            "'X-Kai-Collaboration-Proof'. Required fields: kind ('progress' or 'thread_reply'), "
+            "body, and idempotency_key. When artifact_publish is granted, POST JSON to "
+            f"http://localhost:{api.webhook_port}/api/collaboration/artifacts with those headers "
+            "and required fields path, caption, and idempotency_key. The server derives the exact "
+            "channel or thread; never send destination, channel, thread, run, agent, principal, "
+            "or runtime selectors. These publications supplement progress but never replace your "
+            "ordinary terminal response. Agent mentions in them never wake another agent; use "
+            "explicit delegation for agent work.]"
+        )
 
     # No trailing \n\n here - prepend_to_prompt() adds the separator
     # between the context block and the user's message.
