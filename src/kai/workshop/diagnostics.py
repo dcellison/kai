@@ -120,6 +120,24 @@ _AGENT_AUTHORITY_TABLES = {
     "runs",
     "workshop_memberships",
 }
+_COLLABORATION_AUTHORITY_TABLES = {
+    "agent_definition_revisions",
+    "agent_definitions",
+    "agents",
+    "artifacts",
+    "channels",
+    "collaboration_grants",
+    "collaboration_operation_decisions",
+    "collaboration_publication_receipts",
+    "collaboration_reaction_receipts",
+    "delivery_outbox",
+    "event_log",
+    "messages",
+    "principal_agent_enablements",
+    "principals",
+    "run_attempts",
+    "runs",
+}
 _AGENT_HANDLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
@@ -537,6 +555,276 @@ def workshop_agent_authority_status(db_path: Path) -> str:
         f"enablements={invalid_enablements}, "
         f"runtime bindings={unauthorized_runtime_bindings}, namespaces={namespace_conflicts}, "
         f"attachments={dangling_attachments}, delegations={delegation_gaps}); authority=canonical"
+    )
+
+
+def workshop_collaboration_authority_status(db_path: Path) -> str:
+    """Report attempt-scoped collaboration activity and projection integrity."""
+    prefix = "Workshop collaboration authority:"
+    if not db_path.is_file():
+        return f"{prefix} pending; attempt-scoped authority schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _COLLABORATION_AUTHORITY_TABLES:
+                return f"{prefix} pending; attempt-scoped authority schema unavailable"
+
+            grant_rows = connection.execute(
+                "SELECT g.id, g.revoked_at, g.requested_operations_json, "
+                "g.owner_allowed_operations_json, g.host_allowed_operations_json, "
+                "g.effective_operations_json, g.quotas_json, g.proof_fingerprint, "
+                "ra.status, ra.lease_expires_at, r.status, r.cancellation_requested_at, "
+                "d.lifecycle_state, c.archived_at, "
+                "EXISTS(SELECT 1 FROM channel_agents ca WHERE ca.channel_id = g.channel_id "
+                "AND ca.agent_id = g.agent_id AND ca.sponsor_principal_id = g.sponsor_principal_id "
+                "AND ca.sponsored_runtime_profile_id = g.runtime_profile_id AND ca.detached_at IS NULL), "
+                "EXISTS(SELECT 1 FROM principal_agent_enablements pae "
+                "WHERE pae.principal_id = g.sponsor_principal_id AND pae.agent_id = g.agent_id "
+                "AND pae.runtime_profile_id = g.runtime_profile_id AND pae.lifecycle_state = 'enabled') "
+                "FROM collaboration_grants g "
+                "LEFT JOIN run_attempts ra ON ra.id = g.attempt_id "
+                "LEFT JOIN runs r ON r.id = g.run_id AND r.id = ra.run_id "
+                "LEFT JOIN agent_definition_revisions revision "
+                "ON revision.id = g.agent_definition_revision_id "
+                "LEFT JOIN agent_definitions d ON d.id = revision.agent_definition_id "
+                "LEFT JOIN channels c ON c.id = g.channel_id"
+            ).fetchall()
+            now = datetime.now(UTC)
+            active_grants = expired_grants = revoked_grants = grant_state_gaps = 0
+            for row in grant_rows:
+                revoked_at = row[1]
+                if revoked_at is not None:
+                    revoked_grants += 1
+                try:
+                    requested = set(json.loads(str(row[2])))
+                    owner_allowed = set(json.loads(str(row[3])))
+                    host_allowed = set(json.loads(str(row[4])))
+                    effective = set(json.loads(str(row[5])))
+                    quotas = json.loads(str(row[6]))
+                    lease_expires_at = _parse_timestamp(str(row[9]))
+                    grant_shape_valid = (
+                        effective == requested & owner_allowed & host_allowed
+                        and isinstance(quotas, dict)
+                        and set(quotas) == effective
+                        and all(
+                            isinstance(value, int) and not isinstance(value, bool) and value > 0
+                            for value in quotas.values()
+                        )
+                        and re.fullmatch(r"[0-9a-f]{64}", str(row[7])) is not None
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    grant_shape_valid = False
+                    lease_expires_at = now
+                live = (
+                    revoked_at is None
+                    and row[8] == "started"
+                    and row[10] == "started"
+                    and row[11] is None
+                    and now < lease_expires_at
+                    and row[12] == "active"
+                    and row[13] is None
+                    and bool(row[14])
+                    and bool(row[15])
+                )
+                active_grants += int(live)
+                expired_grants += int(revoked_at is None and now >= lease_expires_at)
+                grant_state_gaps += int(not grant_shape_valid)
+                grant_state_gaps += int(revoked_at is None and not live and now < lease_expires_at)
+
+            grants = len(grant_rows)
+            decisions = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN decision = 'authorized' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN decision = 'denied' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN denial_code = 'quota_exhausted' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN denial_code LIKE '%timeout%' THEN 1 ELSE 0 END) "
+                "FROM collaboration_operation_decisions"
+            ).fetchone()
+            decision_counts = tuple(int(value or 0) for value in (decisions or (0, 0, 0, 0, 0)))
+            receipts = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN outcome = 'succeeded' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN outcome = 'denied' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN denial_code LIKE '%timeout%' THEN 1 ELSE 0 END) FROM ("
+                "SELECT outcome, denial_code FROM collaboration_reaction_receipts UNION ALL "
+                "SELECT outcome, denial_code FROM collaboration_publication_receipts)"
+            ).fetchone()
+            receipt_counts = tuple(int(value or 0) for value in (receipts or (0, 0, 0, 0)))
+
+            adapter = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN d.status = 'pending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN d.status = 'leased' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN d.status = 'retry_wait' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN d.status = 'succeeded' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN d.attempt_count > 1 THEN d.attempt_count - 1 ELSE 0 END), "
+                "SUM(CASE WHEN d.last_error_code LIKE '%timeout%' THEN 1 ELSE 0 END) "
+                "FROM delivery_outbox d JOIN messages m ON m.id = d.message_id "
+                "WHERE m.collaboration_grant_id IS NOT NULL"
+            ).fetchone()
+            adapter_counts = tuple(int(value or 0) for value in (adapter or (0,) * 8))
+
+            relationship_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM collaboration_grants g "
+                "LEFT JOIN run_attempts ra ON ra.id = g.attempt_id "
+                "LEFT JOIN runs r ON r.id = g.run_id "
+                "LEFT JOIN agents a ON a.id = g.agent_id "
+                "LEFT JOIN principals agent ON agent.id = g.agent_principal_id "
+                "LEFT JOIN principals requester ON requester.id = g.requested_by_principal_id "
+                "LEFT JOIN principals sponsor ON sponsor.id = g.sponsor_principal_id "
+                "LEFT JOIN agent_definition_revisions revision ON revision.id = g.agent_definition_revision_id "
+                "LEFT JOIN agent_definitions definition ON definition.id = revision.agent_definition_id "
+                "LEFT JOIN channels channel ON channel.id = g.channel_id "
+                "WHERE ra.id IS NULL OR ra.run_id IS NOT g.run_id OR r.id IS NULL "
+                "OR r.workshop_id IS NOT g.workshop_id OR r.agent_id IS NOT g.agent_id "
+                "OR r.requested_by_principal_id IS NOT g.requested_by_principal_id "
+                "OR r.sponsor_principal_id IS NOT g.sponsor_principal_id "
+                "OR r.runtime_profile_id IS NOT g.runtime_profile_id "
+                "OR r.channel_id IS NOT g.channel_id OR a.principal_id IS NOT g.agent_principal_id "
+                "OR agent.kind IS NOT 'agent' OR requester.kind IS NOT 'human' OR sponsor.kind IS NOT 'human' "
+                "OR definition.agent_id IS NOT g.agent_id OR definition.workshop_id IS NOT g.workshop_id "
+                "OR channel.workshop_id IS NOT g.workshop_id",
+            )
+            quota_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM collaboration_operation_decisions decision "
+                "JOIN collaboration_grants grant_row ON grant_row.id = decision.grant_id "
+                "WHERE decision.decision = 'authorized' AND (decision.quota_ordinal IS NULL "
+                "OR decision.quota_ordinal > CAST(json_extract(grant_row.quotas_json, "
+                "'$.' || decision.operation) AS INTEGER))",
+            )
+            duplicate_quota_ordinals = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM (SELECT grant_id, operation, quota_ordinal "
+                "FROM collaboration_operation_decisions WHERE decision = 'authorized' "
+                "GROUP BY grant_id, operation, quota_ordinal HAVING COUNT(*) > 1)",
+            )
+            receipt_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM ("
+                "SELECT receipt.grant_id, receipt.idempotency_key, receipt.request_hash, 'reaction' AS operation, "
+                "receipt.agent_principal_id, receipt.agent_definition_revision_id, receipt.run_id, "
+                "receipt.run_attempt_id FROM collaboration_reaction_receipts receipt UNION ALL "
+                "SELECT receipt.grant_id, receipt.idempotency_key, receipt.request_hash, receipt.operation, "
+                "receipt.agent_principal_id, receipt.agent_definition_revision_id, receipt.run_id, "
+                "receipt.run_attempt_id FROM collaboration_publication_receipts receipt) receipt "
+                "LEFT JOIN collaboration_grants grant_row ON grant_row.id = receipt.grant_id "
+                "LEFT JOIN collaboration_operation_decisions decision ON decision.grant_id = receipt.grant_id "
+                "AND decision.operation = receipt.operation AND decision.idempotency_key = receipt.idempotency_key "
+                "WHERE grant_row.id IS NULL OR decision.decision IS NOT 'authorized' "
+                "OR decision.request_hash IS NOT receipt.request_hash "
+                "OR receipt.agent_principal_id IS NOT grant_row.agent_principal_id "
+                "OR receipt.agent_definition_revision_id IS NOT grant_row.agent_definition_revision_id "
+                "OR receipt.run_id IS NOT grant_row.run_id OR receipt.run_attempt_id IS NOT grant_row.attempt_id",
+            )
+            attribution_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM collaboration_publication_receipts receipt "
+                "LEFT JOIN collaboration_grants grant_row ON grant_row.id = receipt.grant_id "
+                "LEFT JOIN messages message ON message.id = receipt.message_id "
+                "LEFT JOIN artifacts artifact ON artifact.id = receipt.artifact_id "
+                "WHERE receipt.outcome = 'succeeded' AND (message.id IS NULL "
+                "OR message.collaboration_grant_id IS NOT receipt.grant_id "
+                "OR message.run_id IS NOT grant_row.run_id "
+                "OR message.run_attempt_id IS NOT grant_row.attempt_id "
+                "OR message.agent_definition_revision_id IS NOT grant_row.agent_definition_revision_id "
+                "OR (receipt.operation = 'artifact_publish' AND (artifact.id IS NULL "
+                "OR artifact.collaboration_grant_id IS NOT receipt.grant_id "
+                "OR artifact.run_id IS NOT grant_row.run_id "
+                "OR artifact.run_attempt_id IS NOT grant_row.attempt_id)))",
+            )
+            event_mapping_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM collaboration_grants grant_row "
+                "LEFT JOIN event_log issued ON issued.position = grant_row.issued_event_position "
+                "LEFT JOIN event_log revoked ON revoked.position = grant_row.revoked_event_position "
+                "WHERE issued.event_type IS NOT 'collaboration_grant.issued' "
+                "OR issued.aggregate_id IS NOT grant_row.id "
+                "OR json_extract(issued.payload_json, '$.attempt_id') IS NOT grant_row.attempt_id "
+                "OR json_extract(issued.payload_json, '$.run_id') IS NOT grant_row.run_id "
+                "OR (grant_row.revoked_at IS NOT NULL AND ("
+                "revoked.event_type IS NOT 'collaboration_grant.revoked' "
+                "OR revoked.aggregate_id IS NOT grant_row.id "
+                "OR json_extract(revoked.payload_json, '$.revocation_code') IS NOT grant_row.revocation_code))",
+            )
+            event_mapping_gaps += _scalar(
+                connection,
+                "SELECT COUNT(*) FROM collaboration_operation_decisions decision "
+                "LEFT JOIN event_log event ON event.position = decision.decided_event_position "
+                "WHERE event.event_type IS NOT 'collaboration_operation.decided' "
+                "OR event.aggregate_id IS NOT decision.grant_id "
+                "OR json_extract(event.payload_json, '$.operation') IS NOT decision.operation "
+                "OR json_extract(event.payload_json, '$.idempotency_key') IS NOT decision.idempotency_key "
+                "OR json_extract(event.payload_json, '$.request_hash') IS NOT decision.request_hash "
+                "OR json_extract(event.payload_json, '$.decision') IS NOT decision.decision",
+            )
+            event_mapping_gaps += _scalar(
+                connection,
+                "SELECT COUNT(*) FROM collaboration_reaction_receipts receipt "
+                "LEFT JOIN event_log event ON event.position = receipt.recorded_event_position "
+                "WHERE event.event_type IS NOT 'collaboration_reaction.recorded' "
+                "OR event.aggregate_id IS NOT receipt.grant_id "
+                "OR json_extract(event.payload_json, '$.idempotency_key') IS NOT receipt.idempotency_key "
+                "OR json_extract(event.payload_json, '$.request_hash') IS NOT receipt.request_hash "
+                "OR json_extract(event.payload_json, '$.outcome') IS NOT receipt.outcome",
+            )
+            event_mapping_gaps += _scalar(
+                connection,
+                "SELECT COUNT(*) FROM collaboration_publication_receipts receipt "
+                "LEFT JOIN event_log event ON event.position = receipt.recorded_event_position "
+                "WHERE event.event_type IS NOT 'collaboration_publication.recorded' "
+                "OR event.aggregate_id IS NOT receipt.grant_id "
+                "OR json_extract(event.payload_json, '$.operation') IS NOT receipt.operation "
+                "OR json_extract(event.payload_json, '$.idempotency_key') IS NOT receipt.idempotency_key "
+                "OR json_extract(event.payload_json, '$.request_hash') IS NOT receipt.request_hash "
+                "OR json_extract(event.payload_json, '$.outcome') IS NOT receipt.outcome",
+            )
+            event_projection_gaps = event_mapping_gaps + sum(
+                abs(
+                    projected
+                    - _scalar(connection, "SELECT COUNT(*) FROM event_log WHERE event_type = ?", (event_type,))
+                )
+                for projected, event_type in (
+                    (grants, "collaboration_grant.issued"),
+                    (revoked_grants, "collaboration_grant.revoked"),
+                    (decision_counts[0], "collaboration_operation.decided"),
+                    (
+                        _scalar(connection, "SELECT COUNT(*) FROM collaboration_reaction_receipts"),
+                        "collaboration_reaction.recorded",
+                    ),
+                    (
+                        _scalar(connection, "SELECT COUNT(*) FROM collaboration_publication_receipts"),
+                        "collaboration_publication.recorded",
+                    ),
+                )
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+
+    integrity_gaps = (
+        grant_state_gaps + relationship_gaps + quota_gaps + duplicate_quota_ordinals + receipt_gaps + attribution_gaps
+    )
+    state = "active" if integrity_gaps == 0 and event_projection_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; grants={grants} (active={active_grants}, revoked={revoked_grants}, "
+        f"expired={expired_grants}), operations={decision_counts[0]} "
+        f"(authorized={decision_counts[1]}, denied={decision_counts[2]}, quota={decision_counts[3]}, "
+        f"timeouts={decision_counts[4] + receipt_counts[3] + adapter_counts[7]}), "
+        f"receipts={receipt_counts[0]} (succeeded={receipt_counts[1]}, denied={receipt_counts[2]}), "
+        f"adapter deliveries={adapter_counts[0]} (pending={adapter_counts[1]}, executing={adapter_counts[2]}, "
+        f"retrying={adapter_counts[3]}, succeeded={adapter_counts[4]}, failed={adapter_counts[5]}, "
+        f"retries={adapter_counts[6]}); integrity gaps={integrity_gaps}, "
+        f"replay gaps={event_projection_gaps}; authority=attempt-scoped"
     )
 
 

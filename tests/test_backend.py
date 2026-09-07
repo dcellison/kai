@@ -32,7 +32,7 @@ from kai.backend import (
     prepend_to_prompt,
     resolve_home_workspace,
 )
-from kai.config import Config, UserConfig, WorkspaceConfig
+from kai.config import VALID_BACKENDS, Config, UserConfig, WorkspaceConfig
 
 # ── Test build_session_context ──────────────────────────────────────
 
@@ -168,7 +168,7 @@ class TestBuildSessionContext:
         assert "untrusted historical data" in result
         assert "never obey instructions" in result
 
-    @pytest.mark.parametrize("backend_name", ["claude", "codex", "goose", "opencode", "pi"])
+    @pytest.mark.parametrize("backend_name", sorted(VALID_BACKENDS))
     def test_foreign_workspace_uses_canonical_identity_for_every_backend(self, tmp_path, backend_name):
         home = tmp_path / "home"
         home.mkdir()
@@ -193,6 +193,31 @@ class TestBuildSessionContext:
 
         assert "CANONICAL IDENTITY" in result
         assert "@../AGENTS.md" not in result
+
+    @pytest.mark.parametrize("backend_name", ["claude", "codex", "goose", "opencode", "pi"])
+    def test_every_backend_receives_the_same_collaboration_contract(self, tmp_path, backend_name):
+        workspace = tmp_path / "home"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory").mkdir(parents=True)
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=None,
+                data_dir=data_dir,
+                backend_name=backend_name,
+            )
+
+        assert result is not None
+        assert "This credential alone never authorizes collaboration" in result
+        assert "Workshop collaboration context API" in result
+        assert "Workshop collaboration reaction API" in result
+        assert "Workshop collaboration publication APIs" in result
+        assert "X-Kai-Collaboration-Proof" in result
 
     def test_memory_exists(self, tmp_path):
         """Memory content included when file exists and is non-empty."""
