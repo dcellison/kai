@@ -855,6 +855,19 @@ export interface WorkshopMessageReaction {
   reaction: WorkshopReaction;
 }
 
+export interface WorkshopReactionReactor {
+  displayName: string;
+  handle: string | null;
+  kind: "human" | "agent";
+  principalId: string;
+}
+
+export interface WorkshopReactionReactors {
+  reactors: WorkshopReactionReactor[];
+  total: number;
+  truncated: boolean;
+}
+
 export interface WorkshopMessageMention {
   kind: "human" | "agent";
   length: number;

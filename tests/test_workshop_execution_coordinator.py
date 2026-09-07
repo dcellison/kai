@@ -308,7 +308,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 68
+            assert await upgraded.schema_version() == 69
             assert await load_runtime_session(upgraded, run.channel_id, run.agent_id) is None
             after = workshop_runtime_session_status(path)
             assert after.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
@@ -336,7 +336,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 68
+            assert await upgraded.schema_version() == 69
             session = await load_runtime_session(upgraded, run.channel_id, run.agent_id)
             assert session is not None
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID

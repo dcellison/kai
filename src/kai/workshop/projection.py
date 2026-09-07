@@ -1094,6 +1094,138 @@ async def _apply_collaboration_grant_event(
         )
         return
 
+    if envelope.event_type == WorkshopEventType.COLLABORATION_REACTION_RECORDED:
+        _require_exact_payload(
+            payload,
+            {
+                "idempotency_key",
+                "request_hash",
+                "message_id",
+                "reaction",
+                "active",
+                "outcome",
+                "denial_code",
+                "changed",
+                "mutation_event_position",
+            },
+        )
+        idempotency_key = _required_text(payload, "idempotency_key")
+        request_hash = _required_text(payload, "request_hash")
+        message_id = MessageId(_required_text(payload, "message_id"))
+        reaction = _required_text(payload, "reaction")
+        active = payload.get("active")
+        outcome = _required_text(payload, "outcome")
+        denial_value = payload.get("denial_code")
+        denial_code = str(denial_value) if denial_value is not None else None
+        changed = payload.get("changed")
+        mutation_position = payload.get("mutation_event_position")
+        if (
+            not _COLLABORATION_IDEMPOTENCY_PATTERN.fullmatch(idempotency_key)
+            or not _SHA256_PATTERN.fullmatch(request_hash)
+            or reaction
+            not in {
+                "thumbs_up",
+                "thumbs_down",
+                "heart",
+                "laugh",
+                "celebrate",
+                "eyes",
+                "check",
+                "thinking",
+                "surprised",
+                "sad",
+                "fire",
+                "question",
+            }
+            or not isinstance(active, bool)
+            or outcome not in {"succeeded", "denied"}
+            or (denial_code is not None and not _RUN_TERMINAL_CODE_PATTERN.fullmatch(denial_code))
+            or (
+                outcome == "succeeded"
+                and (
+                    denial_code is not None
+                    or not isinstance(changed, bool)
+                    or (changed and (not isinstance(mutation_position, int) or isinstance(mutation_position, bool)))
+                    or (not changed and mutation_position is not None)
+                )
+            )
+            or (outcome == "denied" and (denial_code is None or changed is not None or mutation_position is not None))
+        ):
+            raise ValueError("Workshop collaboration reaction receipt is malformed")
+        async with connection.execute(
+            "SELECT agent_principal_id, agent_definition_revision_id, run_id, attempt_id, channel_id "
+            "FROM collaboration_grants WHERE id = ?",
+            (envelope.aggregate_id,),
+        ) as cursor:
+            grant_row = await cursor.fetchone()
+        if grant_row is None or envelope.actor_principal_id != PrincipalId(str(grant_row[0])):
+            raise ValueError("Workshop collaboration reaction receipt has no matching grant")
+        async with connection.execute(
+            "SELECT decision FROM collaboration_operation_decisions WHERE grant_id = ? "
+            "AND operation = 'reaction' AND idempotency_key = ? AND request_hash = ?",
+            (envelope.aggregate_id, idempotency_key, request_hash),
+        ) as cursor:
+            decision_row = await cursor.fetchone()
+        if decision_row is None or str(decision_row[0]) != "authorized":
+            raise ValueError("Workshop collaboration reaction receipt was not authorized")
+        if outcome == "succeeded" and changed:
+            expected_type = (
+                WorkshopEventType.MESSAGE_REACTION_ADDED.value
+                if active
+                else WorkshopEventType.MESSAGE_REACTION_REMOVED.value
+            )
+            async with connection.execute(
+                "SELECT aggregate_id, actor_principal_id, payload_json FROM event_log "
+                "WHERE position = ? AND event_type = ? AND event_version = 2",
+                (mutation_position, expected_type),
+            ) as cursor:
+                mutation_row = await cursor.fetchone()
+            mutation_payload = json.loads(str(mutation_row[2])) if mutation_row is not None else None
+            if (
+                mutation_row is None
+                or MessageId(str(mutation_row[0])) != message_id
+                or PrincipalId(str(mutation_row[1])) != PrincipalId(str(grant_row[0]))
+                or not isinstance(mutation_payload, dict)
+                or mutation_payload.get("reaction") != reaction
+                or mutation_payload.get("collaboration_grant_id") != str(envelope.aggregate_id)
+            ):
+                raise ValueError("Workshop collaboration reaction receipt mutation is invalid")
+        elif outcome == "succeeded":
+            async with connection.execute(
+                "SELECT 1 FROM message_reactions WHERE message_id = ? AND principal_id = ? AND reaction = ?",
+                (message_id, grant_row[0], reaction),
+            ) as cursor:
+                current_active = await cursor.fetchone() is not None
+            if current_active != active:
+                raise ValueError("Workshop collaboration no-op reaction does not match canonical state")
+        await connection.execute(
+            "INSERT INTO collaboration_reaction_receipts "
+            "(grant_id, idempotency_key, request_hash, message_id, reaction, active, outcome, "
+            "denial_code, changed, "
+            "mutation_event_position, agent_principal_id, agent_definition_revision_id, run_id, "
+            "run_attempt_id, recorded_at, recorded_event_position) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                envelope.aggregate_id,
+                idempotency_key,
+                request_hash,
+                message_id,
+                reaction,
+                int(active),
+                outcome,
+                denial_code,
+                int(changed) if isinstance(changed, bool) else None,
+                mutation_position,
+                grant_row[0],
+                grant_row[1],
+                grant_row[2],
+                grant_row[3],
+                occurred_at.isoformat(),
+                event.position,
+            ),
+        )
+        return
+
     raise ValueError(f"Unsupported Workshop collaboration-grant event: {envelope.event_type}")
 
 
@@ -1400,7 +1532,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 28
+    version = 29
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1419,11 +1551,12 @@ class CanonicalConversationProjection:
             "deliveries",
             "artifacts",
             "agent_delegations",
+            "message_reactions",
+            "collaboration_reaction_receipts",
             "collaboration_operation_decisions",
             "collaboration_grants",
             "run_attempts",
             "runs",
-            "message_reactions",
             "human_notification_adapter_delivery_decisions",
             "human_notification_publications",
             "human_notifications",
@@ -1460,6 +1593,7 @@ class CanonicalConversationProjection:
             WorkshopEventType.COLLABORATION_GRANT_ISSUED,
             WorkshopEventType.COLLABORATION_GRANT_REVOKED,
             WorkshopEventType.COLLABORATION_OPERATION_DECIDED,
+            WorkshopEventType.COLLABORATION_REACTION_RECORDED,
         }:
             await _apply_collaboration_grant_event(connection, event)
             return
@@ -3188,9 +3322,22 @@ class CanonicalConversationProjection:
             WorkshopEventType.MESSAGE_REACTION_ADDED,
             WorkshopEventType.MESSAGE_REACTION_REMOVED,
         }:
-            if not isinstance(envelope.aggregate_id, MessageId) or envelope.aggregate_type != "message":
-                raise ValueError("Workshop message reaction requires a typed message aggregate")
-            _require_exact_payload(payload, {"channel_id", "principal_id", "reaction"})
+            if (
+                not isinstance(envelope.aggregate_id, MessageId)
+                or envelope.aggregate_type != "message"
+                or envelope.event_version not in {1, 2}
+            ):
+                raise ValueError("Workshop message reaction requires a typed v1 or v2 message aggregate")
+            agent_fields = {
+                "collaboration_grant_id",
+                "agent_definition_revision_id",
+                "run_id",
+                "run_attempt_id",
+            }
+            _require_exact_payload(
+                payload,
+                {"channel_id", "principal_id", "reaction"} | (agent_fields if envelope.event_version == 2 else set()),
+            )
             channel_id = ChannelId(_required_text(payload, "channel_id"))
             await _require_active_channel(connection, channel_id)
             principal_id = PrincipalId(_required_text(payload, "principal_id"))
@@ -3212,21 +3359,69 @@ class CanonicalConversationProjection:
                 raise ValueError("Unsupported Workshop message reaction")
             if envelope.actor_principal_id != principal_id:
                 raise ValueError("Workshop message reaction actor must match its principal")
-            async with connection.execute(
-                "SELECT 1 FROM messages m "
-                "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
-                "AND cm.principal_id = ? "
-                "WHERE m.id = ? AND m.channel_id = ?",
-                (principal_id, envelope.aggregate_id, channel_id),
-            ) as cursor:
-                if await cursor.fetchone() is None:
-                    raise ValueError("Workshop message reaction requires channel membership")
+            attribution: tuple[object, object, object, object]
+            if envelope.event_version == 1:
+                async with connection.execute(
+                    "SELECT 1 FROM messages m "
+                    "JOIN channel_memberships cm ON cm.channel_id = m.channel_id "
+                    "AND cm.principal_id = ? "
+                    "WHERE m.id = ? AND m.channel_id = ?",
+                    (principal_id, envelope.aggregate_id, channel_id),
+                ) as cursor:
+                    if await cursor.fetchone() is None:
+                        raise ValueError("Workshop message reaction requires channel membership")
+                attribution = (None, None, None, None)
+            else:
+                grant_id = CollaborationGrantId(_required_text(payload, "collaboration_grant_id"))
+                revision_id = AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
+                run_id = RunId(_required_text(payload, "run_id"))
+                attempt_id = RunAttemptId(_required_text(payload, "run_attempt_id"))
+                async with connection.execute(
+                    "SELECT g.agent_principal_id, g.agent_definition_revision_id, g.run_id, g.attempt_id, "
+                    "g.channel_id, g.thread_root_id, g.issued_event_position, m.thread_root_id, "
+                    "m.created_event_position, c.kind FROM collaboration_grants g JOIN messages m "
+                    "ON m.id = ? AND m.channel_id = g.channel_id JOIN channels c ON c.id = g.channel_id "
+                    "WHERE g.id = ?",
+                    (envelope.aggregate_id, grant_id),
+                ) as cursor:
+                    grant_row = await cursor.fetchone()
+                target_thread = (
+                    MessageId(str(grant_row[7])) if grant_row is not None and grant_row[7] is not None else None
+                )
+                granted_thread = (
+                    MessageId(str(grant_row[5])) if grant_row is not None and grant_row[5] is not None else None
+                )
+                in_granted_thread = (
+                    (str(grant_row[9]) == "direct" or target_thread is None)
+                    if granted_thread is None and grant_row is not None
+                    else envelope.aggregate_id == granted_thread or target_thread == granted_thread
+                )
+                if (
+                    grant_row is None
+                    or principal_id != PrincipalId(str(grant_row[0]))
+                    or revision_id != AgentDefinitionRevisionId(str(grant_row[1]))
+                    or run_id != RunId(str(grant_row[2]))
+                    or attempt_id != RunAttemptId(str(grant_row[3]))
+                    or channel_id != ChannelId(str(grant_row[4]))
+                    or int(grant_row[8]) > int(grant_row[6])
+                    or not in_granted_thread
+                ):
+                    raise ValueError("Workshop agent reaction exceeds its collaboration grant")
+                attribution = (revision_id, run_id, attempt_id, grant_id)
             if envelope.event_type == WorkshopEventType.MESSAGE_REACTION_ADDED:
                 await connection.execute(
                     "INSERT INTO message_reactions "
-                    "(message_id, principal_id, reaction, created_at, created_event_position) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (envelope.aggregate_id, principal_id, reaction, occurred_at, event.position),
+                    "(message_id, principal_id, reaction, created_at, created_event_position, "
+                    "agent_definition_revision_id, run_id, run_attempt_id, collaboration_grant_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        envelope.aggregate_id,
+                        principal_id,
+                        reaction,
+                        occurred_at,
+                        event.position,
+                        *attribution,
+                    ),
                 )
             else:
                 cursor = await connection.execute(

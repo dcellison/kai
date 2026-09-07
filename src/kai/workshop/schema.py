@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 68
+WORKSHOP_SCHEMA_VERSION = 69
 
 
 @dataclass(frozen=True, slots=True)
@@ -2984,6 +2984,61 @@ _COLLABORATION_OPERATION_DECISION_SCHEMA = SchemaMigration(
     ),
 )
 
+_AGENT_AUTHORED_REACTION_SCHEMA = SchemaMigration(
+    version=69,
+    name="agent_authored_reactions",
+    statements=(
+        "ALTER TABLE message_reactions ADD COLUMN agent_definition_revision_id TEXT "
+        "REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT",
+        "ALTER TABLE message_reactions ADD COLUMN run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT",
+        "ALTER TABLE message_reactions ADD COLUMN run_attempt_id TEXT REFERENCES run_attempts(id) ON DELETE RESTRICT",
+        "ALTER TABLE message_reactions ADD COLUMN collaboration_grant_id TEXT "
+        "REFERENCES collaboration_grants(id) ON DELETE RESTRICT",
+        "CREATE INDEX message_reactions_agent_idx ON message_reactions "
+        "(principal_id, agent_definition_revision_id, created_event_position)",
+        """
+        CREATE TABLE collaboration_reaction_receipts (
+            grant_id TEXT NOT NULL
+                REFERENCES collaboration_grants(id) ON DELETE CASCADE,
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+            message_id TEXT NOT NULL,
+            reaction TEXT NOT NULL CHECK (
+                reaction IN (
+                    'thumbs_up', 'thumbs_down', 'heart', 'laugh', 'celebrate',
+                    'eyes', 'check', 'thinking', 'surprised', 'sad', 'fire', 'question'
+                )
+            ),
+            active INTEGER NOT NULL CHECK (active IN (0, 1)),
+            outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'denied')),
+            denial_code TEXT,
+            changed INTEGER CHECK (changed IN (0, 1)),
+            mutation_event_position INTEGER UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            agent_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            agent_definition_revision_id TEXT NOT NULL
+                REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+            run_attempt_id TEXT NOT NULL REFERENCES run_attempts(id) ON DELETE RESTRICT,
+            recorded_at TEXT NOT NULL,
+            recorded_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (grant_id, idempotency_key),
+            CHECK (
+                (outcome = 'succeeded' AND denial_code IS NULL AND changed = 1
+                    AND mutation_event_position IS NOT NULL)
+                OR (outcome = 'succeeded' AND denial_code IS NULL AND changed = 0
+                    AND mutation_event_position IS NULL)
+                OR (outcome = 'denied' AND denial_code IS NOT NULL AND changed IS NULL
+                    AND mutation_event_position IS NULL)
+            )
+        )
+        """,
+        "CREATE INDEX collaboration_reaction_receipts_run_idx ON "
+        "collaboration_reaction_receipts (run_id, recorded_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3053,6 +3108,7 @@ _MIGRATIONS = (
     _EXPANDED_MESSAGE_REACTIONS_SCHEMA,
     _ATTEMPT_SCOPED_COLLABORATION_AUTHORITY_SCHEMA,
     _COLLABORATION_OPERATION_DECISION_SCHEMA,
+    _AGENT_AUTHORED_REACTION_SCHEMA,
 )
 
 

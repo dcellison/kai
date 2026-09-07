@@ -4545,6 +4545,14 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                 headers={"Authorization": "Bearer alice-token"},
                 json={"reaction": "arbitrary", "active": True},
             )
+            reactors = await client.get(
+                f"{path}/fire/reactors",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            denied_reactors = await client.get(
+                f"{path}/fire/reactors",
+                headers={"Authorization": "Bearer bob-token"},
+            )
             timeline = await client.get(
                 f"/v1/channels/{alice_channel}/timeline",
                 headers={"Authorization": "Bearer alice-token"},
@@ -4574,6 +4582,21 @@ class TestWorkshopTimelineEventStreamHTTPContract:
             assert denied.status == 403
             assert invalid.status == 400
             assert (await timeline.json())["messages"][0]["reactions"] == added_payload["reactions"]
+            assert reactors.status == 200
+            assert await reactors.json() == {
+                "version": 1,
+                "total": 1,
+                "truncated": False,
+                "reactors": [
+                    {
+                        "principal_id": str(alice_id),
+                        "kind": "human",
+                        "display_name": "Alice",
+                        "handle": "alice",
+                    }
+                ],
+            }
+            assert denied_reactors.status == 403
             assert len(events.events) == 1
             assert isinstance(events.events[0], ClientMessageReactionsEvent)
             assert events.events[0].message_id == message_id

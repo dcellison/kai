@@ -212,6 +212,7 @@ from kai.workshop.memory_queries import (
 from kai.workshop.message_reactions import (
     MessageReactionAccessDeniedError,
     MessageReactionValidationError,
+    load_message_reactors,
     set_message_reaction,
 )
 from kai.workshop.model_catalogue import (
@@ -306,6 +307,7 @@ _CHANNEL_MESSAGE_PATH = "/v1/channels/{channel_id}/messages/{message_id}"
 _THREAD_TIMELINE_PATH = "/v1/channels/{channel_id}/threads/{root_message_id}"
 _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _MESSAGE_REACTIONS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions"
+_MESSAGE_REACTORS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions/{reaction}/reactors"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
 _CHANNEL_CREATION_PATH = "/v1/channels"
 _CHANNEL_ARCHIVAL_PATH = "/v1/channels/{channel_id}/archive"
@@ -5111,6 +5113,55 @@ async def _handle_message_reaction(
     )
 
 
+async def _handle_message_reactors(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+) -> web.Response:
+    """Return bounded identities for one aggregate reaction chip on demand."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid reactor request")
+    try:
+        snapshot = await load_message_reactors(
+            store,
+            viewer_principal_id=principal_id,
+            channel_id=ChannelId(request.match_info["channel_id"]),
+            message_id=MessageId(request.match_info["message_id"]),
+            reaction=request.match_info["reaction"],
+        )
+    except MessageReactionAccessDeniedError:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except (MessageReactionValidationError, TypeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid reactor request")
+    return _json_response(
+        {
+            "version": 1,
+            "total": snapshot.total,
+            "truncated": snapshot.truncated,
+            "reactors": [
+                {
+                    "principal_id": str(reactor.principal_id),
+                    "kind": reactor.kind,
+                    "display_name": reactor.display_name,
+                    "handle": reactor.handle,
+                }
+                for reactor in snapshot.reactors
+            ],
+        },
+        status=200,
+    )
+
+
 async def _handle_channel_timeline(
     request: web.Request,
     *,
@@ -7720,6 +7771,14 @@ def register_workshop_read_routes(
             request_lock=request_lock,
         )
 
+    async def handle_message_reactors(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_message_reactors(
+                request,
+                store=store,
+                authenticator=authenticator,
+            )
+
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_PRINCIPAL_EVENTS_PATH, handle_principal_event_stream)
     app.router.add_get(_CHANNEL_UNREAD_PATH, handle_channel_unread_snapshot)
@@ -7799,6 +7858,7 @@ def register_workshop_read_routes(
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
     app.router.add_put(_MESSAGE_REACTIONS_PATH, handle_message_reaction)
+    app.router.add_get(_MESSAGE_REACTORS_PATH, handle_message_reactors)
 
     async def handle_human_profile(request: web.Request) -> web.Response:
         async with request_lock:

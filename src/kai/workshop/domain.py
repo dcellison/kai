@@ -82,6 +82,7 @@ class WorkshopEventType(StrEnum):
     COLLABORATION_GRANT_ISSUED = "collaboration_grant.issued"
     COLLABORATION_GRANT_REVOKED = "collaboration_grant.revoked"
     COLLABORATION_OPERATION_DECIDED = "collaboration_operation.decided"
+    COLLABORATION_REACTION_RECORDED = "collaboration_reaction.recorded"
     AGENT_DELEGATION_REQUESTED = "agent_delegation.requested"
     AGENT_DELEGATION_STARTED = "agent_delegation.started"
     AGENT_DELEGATION_COMPLETED = "agent_delegation.completed"

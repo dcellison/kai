@@ -32,6 +32,7 @@ from kai.workshop.client_preferences import (
 )
 from kai.workshop.codex_model_discovery import CodexModelDiscoveryAdapter
 from kai.workshop.collaboration_context import WorkshopCollaborationContextService
+from kai.workshop.collaboration_reactions import WorkshopCollaborationReactionService
 from kai.workshop.conversation_runs import WorkshopConversationRunService
 from kai.workshop.delivery_authority import (
     DeliveryAuthorityEpoch,
@@ -211,6 +212,7 @@ class KaiCoreServices:
     post_run_effects: WorkshopPostRunEffectService
     agent_delegation: WorkshopAgentDelegationService
     collaboration_context: WorkshopCollaborationContextService
+    collaboration_reactions: WorkshopCollaborationReactionService
     delivery_policy: WorkshopDeliveryBindingPolicy
 
 
@@ -391,6 +393,10 @@ class KaiApplicationHost:
                 client_store,
                 private_execution,
             )
+            collaboration_reactions = WorkshopCollaborationReactionService(
+                client_store,
+                private_execution,
+            )
             scheduler = await WorkshopCanonicalScheduler.open_and_start(
                 Path(self._config.session_db_path),
                 private_execution,
@@ -512,6 +518,7 @@ class KaiApplicationHost:
                 post_run_effects=post_run_effects,
                 agent_delegation=agent_delegation,
                 collaboration_context=collaboration_context,
+                collaboration_reactions=collaboration_reactions,
                 delivery_policy=delivery_policy,
             )
             self._state = KaiApplicationState.READY
