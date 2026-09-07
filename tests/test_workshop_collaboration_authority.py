@@ -339,21 +339,64 @@ async def test_old_attempt_proof_cannot_act_during_later_attempt_on_same_runtime
         await store.close()
 
 
-async def test_archive_and_detach_immediately_fence_live_grant(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("fence", "expected_code"),
+    [
+        ("agent_archive", "agent_unavailable"),
+        ("channel_archive", "agent_unavailable"),
+        ("attachment_detach", "authority_detached"),
+        ("principal_disable", "authority_detached"),
+        ("cancellation", "attempt_not_active"),
+        ("lease_expiry", "grant_expired"),
+    ],
+)
+async def test_agent_lifecycle_and_attempt_boundaries_immediately_fence_live_grant(
+    tmp_path: Path,
+    fence: str,
+    expected_code: str,
+) -> None:
     store, _execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
         authority = WorkshopCollaborationAuthority(
             store,
             token_factory=lambda: "attempt-proof-000000000000000000000000000005",
         )
-        _grant, invocation = await authority.issue(
+        grant, invocation = await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
-        await store.connection.execute(
-            "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE agent_id = ?",
-            (started.run.agent_id,),
-        )
+        if fence == "agent_archive":
+            await store.connection.execute(
+                "UPDATE agent_definitions SET lifecycle_state = 'archived' WHERE agent_id = ?",
+                (started.run.agent_id,),
+            )
+        elif fence == "channel_archive":
+            await store.connection.execute(
+                "UPDATE channels SET archived_at = ? WHERE id = ?",
+                ((_NOW + timedelta(seconds=4)).isoformat(), grant.channel_id),
+            )
+        elif fence == "attachment_detach":
+            await store.connection.execute(
+                "UPDATE channel_agents SET detached_at = ? WHERE channel_id = ? AND agent_id = ?",
+                ((_NOW + timedelta(seconds=4)).isoformat(), grant.channel_id, grant.agent_id),
+            )
+        elif fence == "principal_disable":
+            await store.connection.execute(
+                "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled' "
+                "WHERE principal_id = ? AND agent_id = ?",
+                (grant.sponsor_principal_id, grant.agent_id),
+            )
+        elif fence == "cancellation":
+            await store.connection.execute(
+                "UPDATE runs SET cancellation_requested_at = ? WHERE id = ?",
+                ((_NOW + timedelta(seconds=4)).isoformat(), grant.run_id),
+            )
+        else:
+            assert fence == "lease_expiry"
+            await store.connection.execute(
+                "UPDATE run_attempts SET lease_expires_at = ? WHERE id = ?",
+                ((_NOW + timedelta(seconds=3)).isoformat(), grant.attempt_id),
+            )
         await store.connection.commit()
 
         with pytest.raises(CollaborationDenied) as denied:
@@ -362,7 +405,7 @@ async def test_archive_and_detach_immediately_fence_live_grant(tmp_path: Path) -
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=4),
             )
-        assert denied.value.code == "agent_unavailable"
+        assert denied.value.code == expected_code
     finally:
         await store.close()
 
