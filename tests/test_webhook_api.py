@@ -27,7 +27,9 @@ from kai.webhook import (
     WORKSHOP_INTEGRATION_NOTIFICATIONS_KEY,
     WORKSHOP_PRINCIPAL_STORAGE_KEY,
     _handle_agent_delegation,
+    _handle_collaboration_artifact,
     _handle_collaboration_context,
+    _handle_collaboration_message,
     _handle_collaboration_reaction,
     _handle_delete_job,
     _handle_generic,
@@ -229,6 +231,10 @@ def mock_request(tmp_path):
                 agent_delegation=SimpleNamespace(delegate=AsyncMock()),
                 collaboration_context=SimpleNamespace(read=AsyncMock()),
                 collaboration_reactions=SimpleNamespace(react=AsyncMock()),
+                collaboration_publications=SimpleNamespace(
+                    publish_message=AsyncMock(),
+                    publish_artifact=AsyncMock(),
+                ),
                 runtime_pool=SimpleNamespace(
                     get_effective_workspace=AsyncMock(return_value=tmp_path),
                 ),
@@ -428,6 +434,57 @@ class TestCollaborationReaction:
             response = await _handle_collaboration_reaction(mock_request)
             assert response.status == 400
         service.react.assert_not_awaited()
+
+
+class TestCollaborationPublication:
+    async def test_message_credential_binds_context_and_forwards_no_destination(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.collaboration_publications
+        message_id = MessageId.new()
+        service.publish_message.return_value = SimpleNamespace(
+            message_id=message_id,
+            event_position=81,
+            replayed=False,
+        )
+        mock_request.headers = {
+            "X-Webhook-Secret": "test-secret",
+            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
+        }
+        mock_request.json = AsyncMock(
+            return_value={
+                "kind": "progress",
+                "body": "Working on it",
+                "idempotency_key": "progress-one",
+            }
+        )
+
+        response = await _handle_collaboration_message(mock_request)
+
+        assert response.status == 200
+        assert json.loads(response.body.decode()) == {
+            "version": 1,
+            "message_id": str(message_id),
+            "event_position": 81,
+            "replayed": False,
+        }
+        identity = service.publish_message.await_args.args[0]
+        assert identity.principal_id == _internal_api_context(123).principal_id
+        assert identity.channel_id == _internal_api_context(123).channel_id
+        assert service.publish_message.await_args.kwargs == {
+            "proof": mock_request.headers["X-Kai-Collaboration-Proof"],
+            "kind": "progress",
+            "body": "Working on it",
+            "idempotency_key": "progress-one",
+        }
+
+    async def test_message_rejects_every_destination_selector(self, mock_request):
+        service = mock_request.app[CORE_HOST_KEY].services.collaboration_publications
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        base = {"kind": "progress", "body": "No routing", "idempotency_key": "selector"}
+        for selector in ("channel_id", "thread_root_id", "principal_id", "run_id", "agent_id"):
+            mock_request.json = AsyncMock(return_value={**base, selector: "forbidden"})
+            response = await _handle_collaboration_message(mock_request)
+            assert response.status == 400
+        service.publish_message.assert_not_awaited()
 
 
 # ── POST /api/schedule ────────────────────────────────────────────────
@@ -3801,6 +3858,8 @@ _NON_OBJECT_HANDLERS = [
     pytest.param(_handle_agent_delegation, lambda r: None, id="agent_delegation"),
     pytest.param(_handle_collaboration_context, lambda r: None, id="collaboration_context"),
     pytest.param(_handle_collaboration_reaction, lambda r: None, id="collaboration_reaction"),
+    pytest.param(_handle_collaboration_message, lambda r: None, id="collaboration_message"),
+    pytest.param(_handle_collaboration_artifact, lambda r: None, id="collaboration_artifact"),
     pytest.param(
         _handle_update_job,
         lambda r: r.match_info.update({"id": "1"}),
