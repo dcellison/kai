@@ -1315,9 +1315,10 @@ button:disabled {
   justify-content: flex-start;
   gap: 0.55rem;
   flex: none;
-  width: 100%;
+  width: calc(100% + 0.55rem);
   min-width: 0;
   min-height: 2.35rem;
+  margin-left: -0.55rem;
   border: 1px solid transparent;
   border-radius: 0.48rem;
   padding: 0.26rem 0.55rem;
