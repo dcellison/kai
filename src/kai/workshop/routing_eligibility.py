@@ -264,7 +264,14 @@ class WorkshopRoutingEligibilityService:
             authority.channel_id,
             authority.agent_id,
             authority.runtime_profile_id,
-            private_context=not sponsored_channel,
+            # Sponsored-channel eligibility reads the agent owner's canonical
+            # runtime settings through the owner's direct settings lane.  It
+            # must therefore use that lane's real private identity here.  The
+            # eventual group-channel execution is prepared separately with a
+            # requester-neutral, non-private context; marking this settings
+            # lookup non-private would instead collide with an already-live
+            # owner direct lane that has the same channel/agent/profile key.
+            private_context=True,
         )
         workspace = await self._runtime_pool.get_effective_workspace(runtime_authority)
         selected_backend, selected_provider = self._runtime_pool.get_backend_provider(runtime_authority)
