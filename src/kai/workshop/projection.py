@@ -2492,7 +2492,7 @@ class CanonicalConversationProjection:
                 raise ValueError("Workshop agent archival requires a typed definition aggregate")
             _require_exact_payload(payload, set())
             async with connection.execute(
-                "SELECT workshop_id, lifecycle_state FROM agent_definitions WHERE id = ?",
+                "SELECT workshop_id, lifecycle_state, agent_id FROM agent_definitions WHERE id = ?",
                 (envelope.aggregate_id,),
             ) as cursor:
                 definition_row = await cursor.fetchone()
@@ -2510,6 +2510,18 @@ class CanonicalConversationProjection:
                 "UPDATE principal_agent_enablements SET lifecycle_state = 'disabled', "
                 "updated_at = ? WHERE agent_definition_id = ? AND lifecycle_state = 'enabled'",
                 (occurred_at, envelope.aggregate_id),
+            )
+            agent_id = AgentId(str(definition_row[2]))
+            await connection.execute(
+                "UPDATE channel_agents SET detached_at = ?, detached_event_position = ? "
+                "WHERE agent_id = ? AND detached_at IS NULL AND EXISTS ("
+                "SELECT 1 FROM channels c WHERE c.id = channel_agents.channel_id "
+                "AND c.kind = 'group')",
+                (occurred_at, event.position, agent_id),
+            )
+            await connection.execute(
+                "DELETE FROM channel_agent_runtime_sessions WHERE agent_id = ?",
+                (agent_id,),
             )
         elif envelope.event_type == WorkshopEventType.AGENT_DEFINITION_AUTHORITY_ASSIGNED:
             if (

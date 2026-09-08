@@ -21,9 +21,10 @@ from kai.workshop.agent_lifecycle import (
     WorkshopAgentLifecycleService,
 )
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.client_api import _read_agent_lifecycle_events
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
-from kai.workshop.diagnostics import workshop_agent_authority_status
+from kai.workshop.diagnostics import workshop_agent_authority_status, workshop_runtime_session_status
 from kai.workshop.domain import AgentDefinitionId, AgentEnablementId, ChannelId, MessageId, PrincipalId, RunId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.inbound import InboundMessage, record_inbound_message
@@ -317,6 +318,44 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
             idempotency_key="archive-runtime-enable",
         )
         assert enabled.direct_channel_id is not None
+        group = await WorkshopChannelLifecycleService(store).create_group(
+            daniel,
+            name="Archive cleanup qualification",
+            agent_ids=[enabled.agent_id],
+            origin_channel_id=enabled.direct_channel_id,
+        )
+        async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
+            context_position = int((await cursor.fetchone())[0])
+        for index, channel_id in enumerate(
+            (enabled.direct_channel_id, group.channel_id),
+            start=1,
+        ):
+            await store.connection.execute("BEGIN IMMEDIATE")
+            await settle_runtime_session_in_transaction(
+                store,
+                RuntimeSessionSettlement(
+                    channel_id=channel_id,
+                    agent_id=enabled.agent_id,
+                    runtime_profile_id=profile_id(101),
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol", "openai"),
+                    workspace="/private/tmp/archive-cleanup",
+                    provider_session_id=f"archive-provider-session-{index}",
+                    run_id=RunId.new(),
+                ),
+                result_message_id=MessageId.new(),
+                context_through_event_position=context_position,
+                occurred_at=datetime.now(UTC),
+            )
+            await store.connection.commit()
+        async with store.connection.execute(
+            "SELECT channel_id, agent_id, runtime_profile_id, backend, provider, model, "
+            "workspace, provider_session_id, last_run_id, last_result_message_id, "
+            "context_through_event_position, created_at, updated_at "
+            "FROM channel_agent_runtime_sessions WHERE agent_id = ? ORDER BY channel_id",
+            (enabled.agent_id,),
+        ) as cursor:
+            archived_session_rows = [tuple(row) for row in await cursor.fetchall()]
+        assert len(archived_session_rows) == 2
         current = await WorkshopAgentLifecycleService(store).get_visible(daniel, definition_id)
 
         archived = await WorkshopAgentLifecycleService(store).archive(
@@ -331,6 +370,8 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
         assert runtime_pool.suspended[-1].channel_id == enabled.direct_channel_id
         assert execution.maybe_for_principal_channel(daniel, enabled.direct_channel_id) is None
         assert all(context.channel_id != enabled.direct_channel_id for context in contexts.contexts)
+        assert await load_runtime_session(store, enabled.direct_channel_id, enabled.agent_id) is None
+        assert await load_runtime_session(store, group.channel_id, enabled.agent_id) is None
         async with store.connection.execute(
             "SELECT lifecycle_state FROM principal_agent_enablements "
             "WHERE agent_definition_id = ? AND principal_id = ?",
@@ -343,6 +384,45 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
             (enabled.direct_channel_id,),
         ) as cursor:
             assert int((await cursor.fetchone())[0]) == 1
+        async with store.connection.execute(
+            "SELECT detached_at FROM channel_agents WHERE channel_id = ? AND agent_id = ?",
+            (enabled.direct_channel_id, enabled.agent_id),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] is None
+        async with store.connection.execute(
+            "SELECT detached_at FROM channel_agents WHERE channel_id = ? AND agent_id = ?",
+            (group.channel_id, enabled.agent_id),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] is not None
+
+        await store.connection.execute(
+            "UPDATE channel_agents SET detached_at = NULL, detached_event_position = NULL "
+            "WHERE channel_id = ? AND agent_id = ?",
+            (group.channel_id, enabled.agent_id),
+        )
+        await store.connection.executemany(
+            "INSERT INTO channel_agent_runtime_sessions ("
+            "channel_id, agent_id, runtime_profile_id, backend, provider, model, workspace, "
+            "provider_session_id, last_run_id, last_result_message_id, "
+            "context_through_event_position, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            archived_session_rows,
+        )
+        await store.connection.commit()
+
+        reconciliation = await reconcile_single_owner_agent_authority(
+            store,
+            profile_registry(101, 202),
+        )
+        assert reconciliation.retired_attachments == 1
+        assert reconciliation.retired_sessions == 2
+        assert await load_runtime_session(store, enabled.direct_channel_id, enabled.agent_id) is None
+        assert await load_runtime_session(store, group.channel_id, enabled.agent_id) is None
+        async with store.connection.execute(
+            "SELECT detached_at FROM channel_agents WHERE channel_id = ? AND agent_id = ?",
+            (group.channel_id, enabled.agent_id),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] is not None
 
         restarted_execution = await WorkshopExecutionStateRegistry.from_store(
             store,
@@ -357,6 +437,9 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
         authority_status = workshop_agent_authority_status(tmp_path / "kai.db")
         assert authority_status.startswith("Workshop agent authority: active;")
         assert "owner runtimes=0" in authority_status.split("integrity gaps=", 1)[1]
+        assert workshop_runtime_session_status(tmp_path / "kai.db").startswith(
+            "Workshop conversation continuity: active; successful lanes=0, sessions=0"
+        )
     finally:
         await store.close()
 

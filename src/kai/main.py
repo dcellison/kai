@@ -564,10 +564,13 @@ def _start() -> None:
         )
         agent_authority = await sessions.reconcile_workshop_agent_authority(runtime_profiles)
         logging.info(
-            "Workshop agent authority ready (definitions=%d, owners=%d, runtimes=%d)",
+            "Workshop agent authority ready (definitions=%d, owners=%d, runtimes=%d, "
+            "retired_attachments=%d, retired_sessions=%d)",
             agent_authority.definitions,
             agent_authority.assigned_owners,
             agent_authority.assigned_runtimes,
+            agent_authority.retired_attachments,
+            agent_authority.retired_sessions,
         )
         principal_storage = await sessions.load_workshop_principal_storage_registry(runtime_profiles)
         from kai.backend import configure_principal_storage_namespaces

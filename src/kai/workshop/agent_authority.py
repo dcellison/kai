@@ -29,6 +29,8 @@ class WorkshopAgentAuthorityReconciliation:
     definitions: int
     assigned_owners: int
     assigned_runtimes: int
+    retired_attachments: int
+    retired_sessions: int
 
 
 async def reconcile_single_owner_agent_authority(
@@ -40,6 +42,8 @@ async def reconcile_single_owner_agent_authority(
     captured = 0
     owners = 0
     runtimes = 0
+    retired_attachments = 0
+    retired_sessions = 0
     try:
         await connection.execute("BEGIN IMMEDIATE")
         for profile in runtime_profiles.profiles:
@@ -67,6 +71,8 @@ async def reconcile_single_owner_agent_authority(
                     (profile.profile_id, str(owner_rows[0][0])),
                 )
                 captured += 1
+
+        retired_attachments, retired_sessions = await _retire_archived_agent_lanes(store)
 
         async with connection.execute(
             "SELECT d.id, d.workshop_id, d.owner_principal_id, e.actor_principal_id "
@@ -172,7 +178,39 @@ async def reconcile_single_owner_agent_authority(
         definitions=len(definitions),
         assigned_owners=owners,
         assigned_runtimes=runtimes,
+        retired_attachments=retired_attachments,
+        retired_sessions=retired_sessions,
     )
+
+
+async def _retire_archived_agent_lanes(store: WorkshopEventStore) -> tuple[int, int]:
+    """Converge live-state residue for definitions archived by canonical events."""
+    connection = store.connection
+    async with connection.execute(
+        "SELECT d.agent_id, e.occurred_at, e.position FROM agent_definitions d "
+        "JOIN event_log e ON e.aggregate_id = d.id "
+        "AND e.event_type = 'agent_definition.archived' "
+        "WHERE d.lifecycle_state = 'archived' ORDER BY d.agent_id, e.position"
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    archived = {str(row[0]): (str(row[1]), int(row[2])) for row in rows}
+    retired_attachments = 0
+    retired_sessions = 0
+    for agent_id, (archived_at, event_position) in archived.items():
+        attachment_cursor = await connection.execute(
+            "UPDATE channel_agents SET detached_at = ?, detached_event_position = ? "
+            "WHERE agent_id = ? AND detached_at IS NULL AND EXISTS ("
+            "SELECT 1 FROM channels c WHERE c.id = channel_agents.channel_id "
+            "AND c.kind = 'group')",
+            (archived_at, event_position, agent_id),
+        )
+        retired_attachments += attachment_cursor.rowcount
+        session_cursor = await connection.execute(
+            "DELETE FROM channel_agent_runtime_sessions WHERE agent_id = ?",
+            (agent_id,),
+        )
+        retired_sessions += session_cursor.rowcount
+    return retired_attachments, retired_sessions
 
 
 async def _resolve_initial_owner(
