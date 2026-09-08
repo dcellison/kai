@@ -243,7 +243,7 @@ def test_installed_registry_file_must_be_root_owned(tmp_path, monkeypatch):
     """Installed mode treats the registry as an admin-owned capability map."""
     registry = tmp_path / "backends.yaml"
     registry.write_text("version: 1\nbackends: {}\n")
-    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+    monkeypatch.setenv("KAI_DEPLOYMENT_MODE", "protected")
     monkeypatch.setattr("kai.backend_registry.DEFAULT_BACKENDS_YAML", registry)
     real_stat = Path.stat
 
@@ -265,7 +265,7 @@ def test_explicit_dev_registry_does_not_require_root_owner(tmp_path, monkeypatch
     registry.write_text("version: 1\nbackends: {}\n")
     registry.chmod(0o644)
     monkeypatch.setenv("KAI_BACKENDS_YAML", str(registry))
-    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+    monkeypatch.setenv("KAI_DEPLOYMENT_MODE", "single_user")
 
     assert load_backend_registry() == {}
 
@@ -300,7 +300,7 @@ def test_registry_command_must_not_be_group_or_world_writable(tmp_path, monkeypa
 
 def test_default_missing_registry_uses_legacy_path_resolution(monkeypatch):
     monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
-    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+    monkeypatch.setenv("KAI_DEPLOYMENT_MODE", "single_user")
     monkeypatch.delenv("CLAUDE_BIN", raising=False)
     monkeypatch.setattr("kai.backend_registry.DEFAULT_BACKENDS_YAML", Path("/does/not/exist"))
     monkeypatch.setattr("kai.backend_registry.shutil.which", lambda name: f"/fake/{name}")
@@ -310,7 +310,7 @@ def test_default_missing_registry_uses_legacy_path_resolution(monkeypatch):
 
 def test_installed_mode_missing_registry_fails(monkeypatch):
     monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
-    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+    monkeypatch.setenv("KAI_DEPLOYMENT_MODE", "protected")
     monkeypatch.setenv("CLAUDE_BIN", "/tmp/legacy-claude")
     monkeypatch.setattr("kai.backend_registry.DEFAULT_BACKENDS_YAML", Path("/does/not/exist"))
 
@@ -330,12 +330,25 @@ def test_pi_dev_resolution_uses_path_and_has_no_pi_bin_override(tmp_path, monkey
     real_pi = _exe(tmp_path / "pi")
     attacker_pi = _exe(tmp_path / "attacker-pi")
     monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
-    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
+    monkeypatch.setenv("KAI_DEPLOYMENT_MODE", "single_user")
     monkeypatch.setenv("PI_BIN", str(attacker_pi))
     monkeypatch.setenv("PATH", str(tmp_path))
 
     assert resolve_backend_command("pi") == str(real_pi)
     assert resolve_backend_command("pi", allow_bare_fallback=True) == "pi"
+
+
+def test_single_user_ignores_ambient_install_dir(monkeypatch, tmp_path):
+    """A stale protected layout variable cannot activate registry authority."""
+    monkeypatch.delenv("KAI_BACKENDS_YAML", raising=False)
+    monkeypatch.setenv("KAI_DEPLOYMENT_MODE", "single_user")
+    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
+    claude = _exe(tmp_path / "local-claude")
+    monkeypatch.setenv("CLAUDE_BIN", str(claude))
+    monkeypatch.setattr("kai.backend_registry.DEFAULT_BACKENDS_YAML", Path("/does/not/exist"))
+
+    assert not backend_registry_is_authoritative()
+    assert resolve_backend_command("claude") == str(claude)
 
 
 def test_render_backend_registry_is_stable():

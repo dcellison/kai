@@ -23,7 +23,7 @@ from kai.protected_config import ProtectedConfigError, validate_protected_file_m
 
 DEFAULT_BACKENDS_YAML = Path("/etc/kai/backends.yaml")
 BACKENDS_YAML_ENV = "KAI_BACKENDS_YAML"
-INSTALL_DIR_ENV = "KAI_INSTALL_DIR"
+DEPLOYMENT_MODE_ENV = "KAI_DEPLOYMENT_MODE"
 
 _BACKEND_ENV_VARS: dict[str, str] = {
     "claude": "CLAUDE_BIN",
@@ -33,6 +33,11 @@ _BACKEND_ENV_VARS: dict[str, str] = {
 }
 _SUPPORTED_BACKENDS = frozenset((*_BACKEND_ENV_VARS, "pi"))
 _SUPPORTED_RUNTIME = "local_process"
+
+
+def _protected_deployment() -> bool:
+    """Return the startup-resolved protected-mode authority."""
+    return os.environ.get(DEPLOYMENT_MODE_ENV, "").strip() == "protected"
 
 
 class BackendRegistryError(Exception):
@@ -64,14 +69,14 @@ def backend_registry_exists(path: Path | None = None) -> bool:
         return path.is_file()
     if os.environ.get(BACKENDS_YAML_ENV, "").strip():
         return backend_registry_path().is_file()
-    if not os.environ.get(INSTALL_DIR_ENV, "").strip():
+    if not _protected_deployment():
         return False
     return backend_registry_path().is_file()
 
 
 def backend_registry_required() -> bool:
     """Return whether this process must use the backend registry."""
-    return bool(os.environ.get(BACKENDS_YAML_ENV, "").strip() or os.environ.get(INSTALL_DIR_ENV, "").strip())
+    return bool(os.environ.get(BACKENDS_YAML_ENV, "").strip() or _protected_deployment())
 
 
 def backend_registry_is_authoritative() -> bool:
@@ -88,7 +93,8 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
     registry, is a configuration error because runtime and sudoers path
     decisions must not silently fall back to unrelated binaries.
     """
-    explicit_path = path is not None or backend_registry_required()
+    explicit_override = path is not None or bool(os.environ.get(BACKENDS_YAML_ENV, "").strip())
+    explicit_path = explicit_override or backend_registry_required()
     registry_path = path or backend_registry_path()
     if not registry_path.is_file():
         if explicit_path:
@@ -98,7 +104,7 @@ def load_backend_registry(path: Path | None = None) -> dict[str, BackendRegistry
         validate_protected_file_metadata(
             registry_path,
             max_mode=0o644,
-            require_root_owner=bool(os.environ.get(INSTALL_DIR_ENV, "").strip()),
+            require_root_owner=_protected_deployment() and not explicit_override,
         )
     except ProtectedConfigError as e:
         raise BackendRegistryError(str(e)) from e

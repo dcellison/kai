@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kai.backend import AgentResponse, StreamEvent
-from kai.config import Config, UserConfig
+from kai.config import Config, DeploymentMode, UserConfig
 from kai.internal_api_auth import InternalAPIScope
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.internal_api_contexts import (
@@ -350,7 +350,7 @@ def test_unavailable_explicit_profile_home_fails_only_that_runtime(tmp_path, mon
         default_backend="codex",
         default_provider="openai",
         default_model="gpt-5.6-sol",
-        protected_install=True,
+        deployment_mode=DeploymentMode.PROTECTED,
         session_db_path=tmp_path / "kai.db",
         user_configs={},
     )
@@ -393,7 +393,7 @@ def test_profile_only_canonical_home_error_has_actionable_remediation(tmp_path, 
         default_backend="codex",
         default_provider="openai",
         default_model="gpt-5.6-sol",
-        protected_install=True,
+        deployment_mode=DeploymentMode.PROTECTED,
         user_configs={},
     )
     runtime_profile_id = RuntimeProfileId("rtp_58585858585858585858585858585858")

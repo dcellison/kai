@@ -33,7 +33,6 @@ _PROFILE_DERIVATION_DOMAIN = b"kai-workshop-runtime-profile:v1\0"
 _V1_LEGACY_KEY_DERIVATION_DOMAIN = b"kai-workshop-runtime-compatibility-key:v1\0"
 DEFAULT_RUNTIME_PROFILES_YAML = Path("/etc/kai/runtime-profiles.yaml")
 RUNTIME_PROFILES_YAML_ENV = "KAI_RUNTIME_PROFILES_YAML"
-INSTALL_DIR_ENV = "KAI_INSTALL_DIR"
 _OS_USER_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 RUNTIME_KEY_ARCHIVE_REMOVAL_GATE = "canonical_runtime_state_v1"
 DEFAULT_MAXIMUM_TIMEOUT_SECONDS = 600
@@ -281,10 +280,10 @@ def _positive_legacy_key(value: object, *, profile_id: RuntimeProfileId) -> int:
     return value
 
 
-def _policy_text(path: Path) -> str:
+def _policy_text(path: Path, *, protected: bool) -> str:
     """Read an explicit/dev file directly or the canonical protected file via sudo."""
     canonical = path == DEFAULT_RUNTIME_PROFILES_YAML and not os.environ.get(RUNTIME_PROFILES_YAML_ENV, "").strip()
-    if canonical:
+    if canonical and protected:
         content = _read_protected_file(str(path))
         if content is None:
             raise WorkshopRuntimeProfileError(f"Protected runtime policy {path} is missing or unreadable")
@@ -722,10 +721,13 @@ class WorkshopRuntimeProfileRegistry:
         """Load installed policy, failing closed when protected policy is absent."""
         policy_path = path or runtime_profiles_path()
         explicit = path is not None or bool(os.environ.get(RUNTIME_PROFILES_YAML_ENV, "").strip())
-        protected = bool(os.environ.get(INSTALL_DIR_ENV, "").strip())
+        protected = config.protected_install
         if not explicit and not protected:
             return cls.from_config(config)
-        registry = cls.from_yaml(_policy_text(policy_path), backend_registry=load_backend_registry())
+        registry = cls.from_yaml(
+            _policy_text(policy_path, protected=protected),
+            backend_registry=load_backend_registry(),
+        )
         if protected:
             service_uid = os.geteuid()
             try:

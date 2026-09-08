@@ -13,6 +13,7 @@ derived from this file's location in the source tree: src/kai/config.py -> proje
 """
 
 import ipaddress
+import json
 import logging
 import os
 import pwd
@@ -96,6 +97,16 @@ VALID_BACKENDS = {"claude", "goose", "codex", "opencode", "pi"}
 # deployment so upgrades do not silently disable Telegram.
 VALID_CLIENT_ADAPTERS: frozenset[str] = frozenset({"telegram", "workshop"})
 DEFAULT_CLIENT_ADAPTERS: frozenset[str] = VALID_CLIENT_ADAPTERS
+
+
+class DeploymentMode(StrEnum):
+    """One startup-wide authority for protected versus single-user paths."""
+
+    PROTECTED = "protected"
+    SINGLE_USER = "single_user"
+
+
+DEPLOYMENT_MODE_ENV = "KAI_DEPLOYMENT_MODE"
 
 
 def parse_enabled_adapters(value: str | None) -> frozenset[str]:
@@ -1574,11 +1585,9 @@ class Config:
     workshop_lan_host: str = ""
     github_webhook_secret: str = ""
     generic_webhook_secret: str = ""
-    # True when load_config() populated secrets from the protected
-    # installation env file (/etc/kai/env). Runtime code uses this to
-    # tighten boundaries that would break local single-user installs if
-    # enforced unconditionally.
-    protected_install: bool = False
+    # Resolved once at startup from installer-owned policy. Runtime code must
+    # branch on this value rather than probing individual /etc/kai files.
+    deployment_mode: DeploymentMode = DeploymentMode.SINGLE_USER
 
     # Voice input (speech-to-text via whisper-cpp)
     voice_enabled: bool = False
@@ -1787,6 +1796,11 @@ class Config:
         """
         return self.workspace_configs.get(workspace.resolve())
 
+    @property
+    def protected_install(self) -> bool:
+        """Compatibility spelling backed by the canonical deployment mode."""
+        return self.deployment_mode is DeploymentMode.PROTECTED
+
     def get_user_config(self, user_id: int) -> UserConfig | None:
         """Get per-user config by Telegram user ID, or None if not configured."""
         return self.user_configs.get(user_id)
@@ -1887,7 +1901,7 @@ def _xdg_config_home() -> Path:
     return Path.home() / ".config"
 
 
-def _resolve_users_yaml_path(protected_env_was_loaded: bool) -> Path:
+def _resolve_users_yaml_path(deployment_mode: DeploymentMode) -> Path:
     """Resolve the canonical users.yaml path for this deployment.
 
     Resolution order, first match wins:
@@ -1895,12 +1909,9 @@ def _resolve_users_yaml_path(protected_env_was_loaded: bool) -> Path:
          only; the README does not document this as a normal operator
          path. Lets tests pin a tmp path without faking
          protected-env-loaded state.
-      2. `/etc/kai/users.yaml` when `protected_env_was_loaded` is True.
-         The signal is "_read_protected_file('/etc/kai/env') returned
-         non-empty content during this load_config call." Ambient env
-         vars like `KAI_INSTALL_DIR` and `KAI_DATA_DIR` deliberately
-         do NOT participate: they are path overrides for data and
-         install layout but do not imply protected deployment mode.
+      2. `/etc/kai/users.yaml` in protected deployment mode. Ambient
+         path variables like `KAI_INSTALL_DIR` and `KAI_DATA_DIR`
+         deliberately do NOT participate in deployment-mode resolution.
       3. `${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml` otherwise.
          The single-user repo install lives entirely under the
          operator's home; no `/etc/kai/` writes, no sudo at startup.
@@ -1912,7 +1923,7 @@ def _resolve_users_yaml_path(protected_env_was_loaded: bool) -> Path:
     override = os.environ.get("KAI_USERS_YAML", "").strip()
     if override:
         return Path(override).expanduser()
-    if protected_env_was_loaded:
+    if deployment_mode is DeploymentMode.PROTECTED:
         return Path("/etc/kai/users.yaml")
     return _xdg_config_home() / "kai" / "users.yaml"
 
@@ -1998,7 +2009,76 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return env
 
 
-def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
+def _deployment_mode_value(value: object, *, source: str) -> DeploymentMode:
+    """Validate one recorded deployment-mode value with source context."""
+    try:
+        return DeploymentMode(str(value).strip())
+    except ValueError:
+        choices = ", ".join(mode.value for mode in DeploymentMode)
+        raise SystemExit(f"{source} must be one of: {choices}") from None
+
+
+def _recorded_local_deployment_mode() -> DeploymentMode | None:
+    """Read installer-recorded local mode without loading local secrets.
+
+    A protected source checkout commonly retains ``install.conf`` but has no
+    local ``.env``. Requiring the local runtime file before consulting that
+    installer artifact prevents an unrelated checkout from overriding a
+    protected daemon. Existing single-user installs have both files, so their
+    top-level ``deployment_mode`` remains a migration source even before the
+    next wizard run writes the explicit runtime marker.
+    """
+    local_env_path = PROJECT_ROOT / ".env"
+    if not local_env_path.is_file():
+        return None
+    local_mode_raw = parse_env_file(local_env_path).get(DEPLOYMENT_MODE_ENV, "").strip()
+    local_mode = (
+        _deployment_mode_value(local_mode_raw, source=f"{local_env_path} {DEPLOYMENT_MODE_ENV}")
+        if local_mode_raw
+        else None
+    )
+
+    install_conf_path = PROJECT_ROOT / "install.conf"
+    install_mode: DeploymentMode | None = None
+    if install_conf_path.is_file():
+        try:
+            document = json.loads(install_conf_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"Could not read deployment mode from {install_conf_path}: {exc}") from exc
+        if not isinstance(document, dict):
+            raise SystemExit(f"{install_conf_path} must contain a JSON object")
+        install_mode_raw = document.get("deployment_mode")
+        if install_mode_raw is not None:
+            install_mode = _deployment_mode_value(
+                install_mode_raw,
+                source=f"{install_conf_path} deployment_mode",
+            )
+
+    if local_mode is not None and install_mode is not None and local_mode is not install_mode:
+        raise SystemExit(
+            f"Deployment mode disagrees between {local_env_path} ({local_mode.value}) "
+            f"and {install_conf_path} ({install_mode.value}); re-run 'make config'"
+        )
+    return local_mode or install_mode
+
+
+def _resolve_deployment_mode() -> tuple[DeploymentMode, str | None]:
+    """Resolve deployment mode once and return any protected env already read."""
+    explicit = os.environ.get(DEPLOYMENT_MODE_ENV, "").strip()
+    recorded = (
+        _deployment_mode_value(explicit, source=DEPLOYMENT_MODE_ENV) if explicit else _recorded_local_deployment_mode()
+    )
+    if recorded is DeploymentMode.SINGLE_USER:
+        return recorded, None
+
+    protected_env = _read_protected_file("/etc/kai/env")
+    resolved = recorded or (DeploymentMode.PROTECTED if protected_env else DeploymentMode.SINGLE_USER)
+    return resolved, protected_env
+
+
+def _load_workspace_configs(
+    deployment_mode: DeploymentMode | None = None,
+) -> dict[Path, WorkspaceConfig]:
     """
     Load per-workspace configs from workspaces.yaml.
 
@@ -2012,7 +2092,7 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
     # protected file stops loading entirely rather than silently
     # falling through to a local file (which could contain stale
     # or dev config on a production system).
-    data = _read_protected_yaml("workspaces.yaml")
+    data = _read_protected_yaml("workspaces.yaml") if deployment_mode is not DeploymentMode.SINGLE_USER else None
     if data is _YAML_MALFORMED:
         # Fail open: return empty dict so the system continues without
         # workspace overrides. Workspace config is convenience, not
@@ -2165,7 +2245,9 @@ def _load_workspace_configs() -> dict[Path, WorkspaceConfig]:
     return configs
 
 
-def _load_memory_project_configs() -> dict[str, MemoryProjectConfig]:
+def _load_memory_project_configs(
+    deployment_mode: DeploymentMode | None = None,
+) -> dict[str, MemoryProjectConfig]:
     """
     Load the memory project registry from memory-projects.yaml.
 
@@ -2198,7 +2280,7 @@ def _load_memory_project_configs() -> dict[str, MemoryProjectConfig]:
     # through to the local file (avoid silently using dev config on
     # a production system); fail closed with an empty registry
     # instead.
-    data = _read_protected_yaml("memory-projects.yaml")
+    data = _read_protected_yaml("memory-projects.yaml") if deployment_mode is not DeploymentMode.SINGLE_USER else None
     if data is _YAML_MALFORMED:
         log.warning("Skipping memory project registry: /etc/kai/memory-projects.yaml is malformed or empty")
         return {}
@@ -2551,7 +2633,7 @@ def _load_user_configs(
             Defaults to `/etc/kai/users.yaml` to preserve protected-install
             ergonomics for tests that do not exercise XDG resolution.
             Production callers in `load_config` pass the result of
-            `_resolve_users_yaml_path(protected_env_was_loaded)`.
+            `_resolve_users_yaml_path(deployment_mode)`.
 
     Returns a dict keyed by telegram_id for O(1) lookup.
     """
@@ -3119,12 +3201,13 @@ def load_config() -> Config:
     Raises:
         SystemExit: If required environment variables are missing or invalid.
     """
-    # Try protected config first (/etc/kai/env, root-owned). In a protected
-    # installation, secrets live here instead of .env. Falls back to local
-    # .env for development. Uses setdefault so explicitly set env vars
-    # (e.g., from the launchd plist) take precedence - same as load_dotenv().
-    protected_env = _read_protected_file("/etc/kai/env")
-    if protected_env:
+    # Resolve the deployment boundary once. Every later protected-path
+    # decision consumes this authority; single-user startup never probes
+    # individual /etc/kai files merely because leftovers exist on the host.
+    deployment_mode, protected_env = _resolve_deployment_mode()
+    if deployment_mode is DeploymentMode.PROTECTED:
+        if protected_env is None:
+            raise SystemExit("Protected deployment mode requires readable /etc/kai/env")
         for line in protected_env.splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -3583,7 +3666,7 @@ def load_config() -> Config:
 
     # Per-workspace configuration. Loaded after ALLOWED_WORKSPACES so
     # YAML-defined workspaces can be merged into the allowed set.
-    workspace_configs = _load_workspace_configs()
+    workspace_configs = _load_workspace_configs(deployment_mode)
 
     # Merge YAML workspace paths into allowed_workspaces. Workspaces
     # defined in the config file are implicitly allowed.
@@ -3600,7 +3683,7 @@ def load_config() -> Config:
     # workspace permissions still gate which workspaces the operator
     # can enter; the registry only describes the memory boundary of
     # workspaces the user is otherwise allowed to enter.
-    memory_projects = _load_memory_project_configs()
+    memory_projects = _load_memory_project_configs(deployment_mode)
 
     # Telegram identity and compatibility configuration. users.yaml is
     # mandatory only while the Telegram adapter is enabled. A disabled
@@ -3608,18 +3691,14 @@ def load_config() -> Config:
     # because its dormant configuration is stale, unreadable, or malformed.
     # The legacy ALLOWED_USER_IDS authorization fallback is gone.
     #
-    # The path resolves based on whether `/etc/kai/env` had readable
-    # content at the top of this load_config call (protected install)
-    # or not (single-user install reads from PROJECT_ROOT/.env and
-    # places users.yaml under XDG config home). KAI_USERS_YAML is an
-    # explicit override for tests and ad-hoc development; the operator
-    # path is always one of the two resolved defaults.
-    users_yaml_path = _resolve_users_yaml_path(bool(protected_env))
+    # The path resolves from the one startup-wide deployment authority.
+    # KAI_USERS_YAML remains an explicit test/development override.
+    users_yaml_path = _resolve_users_yaml_path(deployment_mode)
     if telegram_enabled:
         user_configs = _load_user_configs(default_backend, default_provider, users_yaml_path)
     else:
         user_configs = {}
-    if protected_env and user_configs:
+    if deployment_mode is DeploymentMode.PROTECTED and user_configs:
         # A protected install gives the outer service account narrowly
         # scoped sudo access to root-owned Kai configuration.  A persistent
         # conversational agent running as that same account would inherit
@@ -3866,7 +3945,7 @@ def load_config() -> Config:
         workshop_lan_host=workshop_lan_host,
         github_webhook_secret=github_webhook_secret,
         generic_webhook_secret=generic_webhook_secret,
-        protected_install=bool(protected_env),
+        deployment_mode=deployment_mode,
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
         workspace_base=workspace_base,

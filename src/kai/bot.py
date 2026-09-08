@@ -4847,6 +4847,9 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     returns False; the user then types their code as a text message, which
     handle_message processes.
     """
+    totp_cfg: Config = context.bot_data["config"]
+    if not totp_cfg.protected_install:
+        return True
     try:
         if not await asyncio.to_thread(is_totp_configured):
             return True
@@ -4861,7 +4864,6 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         log.error("TOTP challenge denied: Telegram update has no effective message")
         return False
 
-    totp_cfg: Config = context.bot_data["config"]
     session_min = totp_cfg.totp_session_minutes
     auth_time = context.user_data.get("totp_authenticated_at", 0)
     totp_expired = time.time() - auth_time > session_min * 60
@@ -4888,6 +4890,9 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 async def _check_totp_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Run the complete text-message TOTP challenge and verification flow."""
+    totp_cfg: Config = context.bot_data["config"]
+    if not totp_cfg.protected_install:
+        return True
     try:
         if not await asyncio.to_thread(is_totp_configured):
             return True
@@ -4897,7 +4902,6 @@ async def _check_totp_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         assert update.message is not None
 
         principal_id = _user_id(update)
-        totp_cfg: Config = context.bot_data["config"]
         auth_time = context.user_data.get("totp_authenticated_at", 0)
         totp_expired = time.time() - auth_time > totp_cfg.totp_session_minutes * 60
 

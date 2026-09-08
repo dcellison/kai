@@ -32,7 +32,7 @@ from kai.backend import (
     prepend_to_prompt,
     resolve_home_workspace,
 )
-from kai.config import VALID_BACKENDS, Config, UserConfig, WorkspaceConfig
+from kai.config import VALID_BACKENDS, Config, DeploymentMode, UserConfig, WorkspaceConfig
 
 # ── Test build_session_context ──────────────────────────────────────
 
@@ -1143,7 +1143,7 @@ class TestResolveHomeWorkspace:
             allowed_user_ids={1},
             default_backend="codex",
             user_configs=user_configs if user_configs is not None else {},
-            protected_install=protected_install,
+            deployment_mode=(DeploymentMode.PROTECTED if protected_install else DeploymentMode.SINGLE_USER),
         )
 
     def test_prefers_users_yaml(self, tmp_path):

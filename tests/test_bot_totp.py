@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kai.bot import (
+    _check_totp,
     _require_sensitive_authentication,
     handle_document,
     handle_message,
@@ -94,6 +95,18 @@ def _downstream_patches() -> dict:
 
 
 # ── Common sensitive-handler middleware ─────────────────────────────
+
+
+async def test_single_user_gate_never_probes_protected_totp_state():
+    update = _make_update()
+    ctx = _make_context()
+    ctx.bot_data["config"].protected_install = False
+
+    with patch(
+        "kai.bot.is_totp_configured",
+        side_effect=AssertionError("single-user mode probed protected TOTP state"),
+    ):
+        assert await _check_totp(update, ctx)
 
 
 async def test_sensitive_middleware_requires_authorization_before_totp():

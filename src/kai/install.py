@@ -54,6 +54,7 @@ from kai.config import (
     CLAUDE_MODELS,
     CODEX_EFFORT_LEVELS,
     CODEX_MODELS,
+    DEPLOYMENT_MODE_ENV,
     EFFORT_LEVELS,
     MODEL_REGISTRY,
     ONESHOT_REASONER_BACKENDS,
@@ -2008,28 +2009,6 @@ def _cmd_config() -> None:
         print("  Telegram is disabled; the bot token will be omitted from the generated configuration.")
     print()
 
-    # Migration safety: if the operator picks single_user but a
-    # readable `/etc/kai/env` exists from a previous protected install,
-    # the runtime predicate in `config._resolve_users_yaml_path` will
-    # still see the protected env as authoritative and route at
-    # `/etc/kai/users.yaml`, silently bypassing the single-user
-    # artifacts we are about to write. The runtime cannot tell which
-    # is the operator's intent; the wizard refuses up front so the
-    # operator removes the protected leftovers before reaching that
-    # ambiguous state. A protected install on a host whose operator
-    # has the sudoers cat rule from a prior `sudo make install` is
-    # the typical trigger.
-    if deployment_mode == "single_user" and _read_protected_file("/etc/kai/env"):
-        raise SystemExit(
-            "single_user mode was selected, but /etc/kai/env is readable from a "
-            "previous protected install. The runtime would still boot from the "
-            "protected files, silently ignoring the single-user artifacts. "
-            "Remove the protected install before retrying:\n"
-            "    sudo rm -rf /etc/kai\n"
-            "    sudo rm -f /etc/sudoers.d/kai\n"
-            "Then re-run 'make config' and pick single_user."
-        )
-
     # In single-user mode the install location, data directory,
     # service user, and platform service manager are not relevant:
     # Kai runs from the cloned repo under the operator's account.
@@ -3458,7 +3437,9 @@ def _cmd_config() -> None:
         # we restrict the mode to 0600 because the file holds the same
         # secrets (bot token, webhook secret).
         env_path = PROJECT_ROOT / ".env"
-        env_path.write_text(_generate_env_file(env))
+        runtime_env = dict(env)
+        runtime_env[DEPLOYMENT_MODE_ENV] = "single_user"
+        env_path.write_text(_generate_env_file(runtime_env))
         os.chmod(env_path, 0o600)
         print(f"Wrote runtime env to {env_path}")
         if users_yaml_exists or telegram_enabled:
@@ -4813,6 +4794,8 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
                 <string>{data_dir}</string>
                 <key>KAI_INSTALL_DIR</key>
                 <string>{install_dir}</string>
+                <key>{DEPLOYMENT_MODE_ENV}</key>
+                <string>protected</string>
             </dict>
 
             <key>StandardErrorPath</key>
@@ -4876,6 +4859,7 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
         Environment=PATH={user_home}/.local/bin:/usr/local/bin:/usr/bin:/bin
         Environment=KAI_DATA_DIR={data_dir}
         Environment=KAI_INSTALL_DIR={install_dir}
+        Environment={DEPLOYMENT_MODE_ENV}=protected
 
         [Install]
         WantedBy=multi-user.target

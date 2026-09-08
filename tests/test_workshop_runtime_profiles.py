@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from kai.backend_registry import BackendRegistryEntry
-from kai.config import Config, UserConfig
+from kai.config import Config, DeploymentMode, UserConfig
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.runtime_profiles import (
     ProtectedRuntimeProfile,
@@ -18,13 +18,14 @@ from kai.workshop.runtime_profiles import (
 )
 
 
-def _config() -> Config:
+def _config(*, protected: bool = False) -> Config:
     return Config(
         telegram_bot_token="test",
         allowed_user_ids={101, 202},
         default_backend="codex",
         default_provider="openai",
         default_model="gpt-5.6-sol",
+        deployment_mode=(DeploymentMode.PROTECTED if protected else DeploymentMode.SINGLE_USER),
         user_configs={
             101: UserConfig(
                 telegram_id=101,
@@ -1015,7 +1016,6 @@ runtime_profiles:
 
 
 def test_uninstalled_development_without_policy_uses_compatibility_projection(monkeypatch):
-    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
     monkeypatch.delenv("KAI_RUNTIME_PROFILES_YAML", raising=False)
     monkeypatch.setattr(
         "kai.workshop.runtime_profiles.runtime_profiles_path",
@@ -1028,7 +1028,6 @@ def test_uninstalled_development_without_policy_uses_compatibility_projection(mo
 
 
 def test_uninstalled_development_ignores_existing_canonical_policy(monkeypatch):
-    monkeypatch.delenv("KAI_INSTALL_DIR", raising=False)
     monkeypatch.delenv("KAI_RUNTIME_PROFILES_YAML", raising=False)
     monkeypatch.setattr(
         "kai.workshop.runtime_profiles._policy_text",
@@ -1041,12 +1040,11 @@ def test_uninstalled_development_ignores_existing_canonical_policy(monkeypatch):
 
 
 def test_protected_startup_fails_closed_when_policy_is_unreadable(monkeypatch):
-    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
     monkeypatch.delenv("KAI_RUNTIME_PROFILES_YAML", raising=False)
     monkeypatch.setattr("kai.workshop.runtime_profiles._read_protected_file", lambda _path: None)
 
     with pytest.raises(WorkshopRuntimeProfileError, match="missing or unreadable"):
-        WorkshopRuntimeProfileRegistry.load(_config())
+        WorkshopRuntimeProfileRegistry.load(_config(protected=True))
 
 
 def test_protected_startup_validates_runtime_profile_execution_account(tmp_path, monkeypatch):
@@ -1065,7 +1063,6 @@ runtime_profiles:
     allowed_workspaces: []
 """
     )
-    monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
     monkeypatch.setattr(
         "kai.workshop.runtime_profiles.load_backend_registry",
         lambda: {"codex": {}},
@@ -1076,4 +1073,4 @@ runtime_profiles:
     )
 
     with pytest.raises(WorkshopRuntimeProfileError, match="maps to service account"):
-        WorkshopRuntimeProfileRegistry.load(_config(), path=policy)
+        WorkshopRuntimeProfileRegistry.load(_config(protected=True), path=policy)

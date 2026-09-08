@@ -21,6 +21,7 @@ import pytest
 import yaml
 
 import kai.install
+from kai.config import DeploymentMode
 from kai.install import (
     _LAUNCHD_LABEL,
     ServiceStartError,
@@ -1184,6 +1185,11 @@ class TestGenerateLaunchdPlist:
         result = _generate_launchd_plist("/opt/kai", "/var/lib/kai", "kai")
         assert "KAI_DATA_DIR" in result
 
+    def test_sets_protected_deployment_mode(self):
+        result = _generate_launchd_plist("/opt/kai", "/var/lib/kai", "kai")
+        assert "<key>KAI_DEPLOYMENT_MODE</key>" in result
+        assert "<string>protected</string>" in result
+
     def test_valid_xml_structure(self):
         result = _generate_launchd_plist("/opt/kai", "/var/lib/kai", "kai")
         assert result.startswith("<?xml")
@@ -1230,6 +1236,10 @@ class TestGenerateSystemdUnit:
     def test_contains_data_dir_env(self):
         result = _generate_systemd_unit("/opt/kai", "/var/lib/kai", "kai")
         assert "KAI_DATA_DIR=/var/lib/kai" in result
+
+    def test_sets_protected_deployment_mode(self):
+        result = _generate_systemd_unit("/opt/kai", "/var/lib/kai", "kai")
+        assert "Environment=KAI_DEPLOYMENT_MODE=protected" in result
 
     def test_network_dependency(self):
         result = _generate_systemd_unit("/opt/kai", "/var/lib/kai", "kai")
@@ -11713,7 +11723,7 @@ class TestResolveUsersYamlPath:
     the XDG single-user path. The spec carves three rules:
 
       1. KAI_USERS_YAML wins outright when set (test / development override).
-      2. Otherwise, protected_env_was_loaded -> /etc/kai/users.yaml.
+      2. Otherwise, protected mode -> /etc/kai/users.yaml.
       3. Otherwise -> ${XDG_CONFIG_HOME:-$HOME/.config}/kai/users.yaml.
 
     `KAI_INSTALL_DIR` and `KAI_DATA_DIR` deliberately do NOT participate
@@ -11725,7 +11735,7 @@ class TestResolveUsersYamlPath:
         from kai.config import _resolve_users_yaml_path
 
         monkeypatch.delenv("KAI_USERS_YAML", raising=False)
-        assert _resolve_users_yaml_path(True) == Path("/etc/kai/users.yaml")
+        assert _resolve_users_yaml_path(DeploymentMode.PROTECTED) == Path("/etc/kai/users.yaml")
 
     def test_no_protected_env_routes_xdg(self, monkeypatch, tmp_path):
         from kai.config import _resolve_users_yaml_path
@@ -11733,7 +11743,7 @@ class TestResolveUsersYamlPath:
         monkeypatch.delenv("KAI_USERS_YAML", raising=False)
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert _resolve_users_yaml_path(False) == tmp_path / ".config" / "kai" / "users.yaml"
+        assert _resolve_users_yaml_path(DeploymentMode.SINGLE_USER) == tmp_path / ".config" / "kai" / "users.yaml"
 
     def test_xdg_config_home_overrides_home(self, monkeypatch, tmp_path):
         from kai.config import _resolve_users_yaml_path
@@ -11741,15 +11751,15 @@ class TestResolveUsersYamlPath:
         monkeypatch.delenv("KAI_USERS_YAML", raising=False)
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
         monkeypatch.setenv("HOME", str(tmp_path / "should-not-be-used"))
-        assert _resolve_users_yaml_path(False) == tmp_path / "xdg" / "kai" / "users.yaml"
+        assert _resolve_users_yaml_path(DeploymentMode.SINGLE_USER) == tmp_path / "xdg" / "kai" / "users.yaml"
 
     def test_explicit_override_wins_in_both_modes(self, monkeypatch, tmp_path):
         from kai.config import _resolve_users_yaml_path
 
         override = tmp_path / "explicit-users.yaml"
         monkeypatch.setenv("KAI_USERS_YAML", str(override))
-        assert _resolve_users_yaml_path(True) == override
-        assert _resolve_users_yaml_path(False) == override
+        assert _resolve_users_yaml_path(DeploymentMode.PROTECTED) == override
+        assert _resolve_users_yaml_path(DeploymentMode.SINGLE_USER) == override
 
     def test_kai_install_dir_does_not_route_protected(self, monkeypatch, tmp_path):
         """Pins the spec's blast-radius rule: a single-user host with
@@ -11763,9 +11773,7 @@ class TestResolveUsersYamlPath:
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("KAI_INSTALL_DIR", "/opt/kai")
         monkeypatch.setenv("KAI_DATA_DIR", "/var/lib/kai")
-        # protected_env_was_loaded is False (no /etc/kai/env content);
-        # the env vars above must NOT override that decision.
-        assert _resolve_users_yaml_path(False) == tmp_path / ".config" / "kai" / "users.yaml"
+        assert _resolve_users_yaml_path(DeploymentMode.SINGLE_USER) == tmp_path / ".config" / "kai" / "users.yaml"
 
 
 # ── Single-user wizard branch ─────────────────────────────────────────
@@ -11874,14 +11882,8 @@ class TestCmdConfigSingleUserMode:
         # business consuming.
         assert "users_yaml_staging_path" not in conf
 
-    def test_refuses_single_user_when_protected_env_is_readable(self, tmp_path, monkeypatch):
-        """Migration guard: a host with a previous protected install
-        leaves /etc/kai/env readable through the sudoers rule. The
-        runtime's resolver would still see that as authoritative and
-        boot from the protected artifacts, silently ignoring the
-        single-user files the wizard is about to write. The wizard
-        refuses up front with an actionable removal recipe.
-        """
+    def test_single_user_records_authority_despite_readable_protected_env(self, tmp_path, monkeypatch):
+        """Leftover protected state does not prevent explicit single-user mode."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")
         monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path)
@@ -11893,13 +11895,13 @@ class TestCmdConfigSingleUserMode:
             lambda path: "TELEGRAM_BOT_TOKEN=leftover\n" if path == "/etc/kai/env" else None,
         )
 
-        # Only the deployment_mode prompt is reached before the refusal
-        # fires; the rest of the chain is unused but kept here so the
-        # test does not depend on prompt-count specifics.
-        inputs = iter(["single_user", "hybrid"] + ["x"] * 50)
+        inputs = iter(self._single_user_inputs())
         monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
-        with pytest.raises(SystemExit, match="single_user mode was selected"):
-            _cmd_config()
+        _cmd_config()
+
+        conf = json.loads((tmp_path / "install.conf").read_text())
+        assert conf["deployment_mode"] == "single_user"
+        assert 'KAI_DEPLOYMENT_MODE="single_user"' in (tmp_path / ".env").read_text()
 
     def test_protected_mode_unaffected_by_protected_env_check(self, tmp_path, monkeypatch):
         """Protected mode does not consult the single-user refusal
