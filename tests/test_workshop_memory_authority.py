@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,15 @@ from kai import memory, sessions
 from kai.memory_extraction import _store_facts
 from kai.workshop.bootstrap import BootstrapHuman
 from kai.workshop.diagnostics import workshop_memory_authority_status
-from kai.workshop.domain import AgentId, ChannelId, PrincipalId
+from kai.workshop.domain import (
+    AgentId,
+    ChannelAgentId,
+    ChannelId,
+    EventEnvelope,
+    PrincipalId,
+    RuntimeAssignmentId,
+    WorkshopId,
+)
 from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
@@ -470,8 +479,80 @@ class TestCanonicalMemoryAuthorityMigration:
                 (ChannelId.new(),),
             )
             await sessions._get_db().commit()
+            assert workshop_memory_authority_status(database, memory_enabled=True).startswith(
+                "Workshop memory authority: INCOMPLETE; profiles=1, migrated=0, missing=1, stale=1,"
+            )
             with pytest.raises(WorkshopMemoryAuthorityError, match="conflicts"):
                 await sessions.initialize_workshop_memory_authority(registry)
+        finally:
+            await sessions.close_db()
+
+    async def test_group_runtime_assignment_does_not_inflate_memory_profiles(self, tmp_path: Path):
+        database = tmp_path / "kai.db"
+        await sessions.init_db(database)
+        try:
+            await sessions.bootstrap_workshop_foundation(
+                (BootstrapHuman("Human 101", "admin", "telegram", "101", "101", profile_id(101)),)
+            )
+            registry, _ = await sessions.initialize_workshop_execution_state(profile_registry(101))
+            memory._memory = _FakeMem0()
+            await sessions.initialize_workshop_memory_authority(registry)
+
+            connection = sessions._get_db()
+            async with connection.execute(
+                "SELECT w.id, a.id FROM workshops w JOIN agents a ON a.workshop_id = w.id LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            workshop_id = WorkshopId(str(row[0]))
+            agent_id = AgentId(str(row[1]))
+            group_id = ChannelId.new()
+            store = WorkshopEventStore.from_initialized_connection(connection)
+            event = await store.append(
+                EventEnvelope.create(
+                    event_type="qualification.runtime_assigned",
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="channel",
+                    aggregate_id=group_id,
+                    occurred_at=datetime.now(UTC),
+                    payload={},
+                )
+            )
+            created_at = event.event.envelope.occurred_at.isoformat()
+            await connection.execute(
+                "INSERT INTO channels (id, workshop_id, kind, name, created_at) "
+                "VALUES (?, ?, 'group', 'Memory diagnostic qualification', ?)",
+                (group_id, workshop_id, created_at),
+            )
+            await connection.execute(
+                "INSERT INTO channel_agents (id, channel_id, agent_id, created_at) VALUES (?, ?, ?, ?)",
+                (ChannelAgentId.new(), group_id, agent_id, created_at),
+            )
+            await connection.execute(
+                "INSERT INTO channel_agent_runtime_assignments "
+                "(id, channel_id, agent_id, runtime_profile_id, created_at, created_event_position) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    RuntimeAssignmentId.new(),
+                    group_id,
+                    agent_id,
+                    profile_id(101),
+                    created_at,
+                    event.event.position,
+                ),
+            )
+            await connection.commit()
+
+            assert workshop_memory_authority_status(database, memory_enabled=True).startswith(
+                "Workshop memory authority: active; profiles=1, migrated=1, missing=0, stale=0,"
+            )
+
+            await connection.execute("DELETE FROM workshop_memory_authority_migrations")
+            await connection.commit()
+            assert workshop_memory_authority_status(database, memory_enabled=True).startswith(
+                "Workshop memory authority: INCOMPLETE; profiles=1, migrated=0, missing=1, stale=0,"
+            )
         finally:
             await sessions.close_db()
 

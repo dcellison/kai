@@ -1186,17 +1186,26 @@ def workshop_memory_authority_status(db_path: Path, *, memory_enabled: bool | No
             }
             if not tables >= _MEMORY_AUTHORITY_TABLES:
                 return f"{prefix} pending; canonical memory schema unavailable"
-            profiles = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_runtime_assignments")
-            migrated = _scalar(connection, "SELECT COUNT(*) FROM workshop_memory_authority_migrations")
-            missing = _scalar(
-                connection,
-                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a "
+            eligible_lanes = (
+                " FROM channel_agent_runtime_assignments a "
                 "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' "
                 "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
                 "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
                 "JOIN workshop_execution_state_migrations e "
                 "ON e.runtime_profile_id = a.runtime_profile_id AND e.channel_id = a.channel_id "
-                "AND e.agent_id = a.agent_id AND e.principal_id = cm.principal_id "
+                "AND e.agent_id = a.agent_id AND e.principal_id = cm.principal_id"
+            )
+            profiles = _scalar(connection, "SELECT COUNT(*)" + eligible_lanes)
+            migrated = _scalar(
+                connection,
+                "SELECT COUNT(*)" + eligible_lanes + " JOIN workshop_memory_authority_migrations m "
+                "ON m.runtime_profile_id = a.runtime_profile_id "
+                "AND m.runtime_config_id = e.runtime_config_id AND m.channel_id = a.channel_id "
+                "AND m.agent_id = a.agent_id AND m.principal_id = cm.principal_id",
+            )
+            missing = _scalar(
+                connection,
+                "SELECT COUNT(*)" + eligible_lanes + " "
                 "WHERE NOT EXISTS (SELECT 1 FROM workshop_memory_authority_migrations m "
                 "WHERE m.runtime_profile_id = a.runtime_profile_id "
                 "AND m.runtime_config_id = e.runtime_config_id AND m.channel_id = a.channel_id "
