@@ -107,6 +107,7 @@ from kai.workshop.collaboration_reactions import (
     CollaborationReactionDenied,
     CollaborationReactionValidationError,
 )
+from kai.workshop.domain import PrincipalId
 from kai.workshop.github_automation import (
     GitHubSubscriptionRoute,
     WorkshopGitHubAutomationService,
@@ -300,7 +301,7 @@ def _reject_internal_identity_selectors(payload: dict) -> None:
 
 def _scheduled_job_authority(principal: InternalAPIPrincipal) -> WorkshopScheduledJobAuthority:
     return WorkshopScheduledJobAuthority(
-        principal.principal_id,
+        _bound_principal_id(principal),
         principal.channel_id,
         principal.agent_id,
         principal.runtime_profile_id,
@@ -312,7 +313,7 @@ def _internal_execution_context(
 ) -> WorkshopInternalAPIExecutionContext:
     """Recover the exact canonical lane already bound to one credential."""
     return WorkshopInternalAPIExecutionContext(
-        principal.principal_id,
+        _bound_principal_id(principal),
         principal.channel_id,
         principal.agent_id,
         principal.runtime_profile_id,
@@ -1143,7 +1144,7 @@ async def _handle_service_call(request: web.Request, principal: InternalAPIPrinc
 
 def _proactive_authority(principal: InternalAPIPrincipal) -> ProactivePublicationAuthority:
     return ProactivePublicationAuthority(
-        principal_id=principal.principal_id,
+        principal_id=_bound_principal_id(principal),
         channel_id=principal.channel_id,
         agent_id=principal.agent_id,
         runtime_profile_id=principal.runtime_profile_id,
@@ -1255,12 +1256,7 @@ async def _handle_agent_delegation(
     try:
         proof = request.headers.get("X-Kai-Collaboration-Proof", "")
         result = await request.app[CORE_HOST_KEY].services.agent_delegation.delegate(
-            CollaborationBaseIdentity(
-                principal_id=principal.principal_id,
-                channel_id=principal.channel_id,
-                agent_id=principal.agent_id,
-                runtime_profile_id=principal.runtime_profile_id,
-            ),
+            _collaboration_base_identity(principal),
             proof=proof,
             target_handle=payload["target_handle"],
             task=payload["task"],
@@ -1334,12 +1330,7 @@ async def _handle_collaboration_context(
         return web.json_response({"error": "Missing required field: idempotency_key"}, status=400)
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_context.read(
-            CollaborationBaseIdentity(
-                principal_id=principal.principal_id,
-                channel_id=principal.channel_id,
-                agent_id=principal.agent_id,
-                runtime_profile_id=principal.runtime_profile_id,
-            ),
+            _collaboration_base_identity(principal),
             proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
             cursor=payload.get("cursor"),
             limit=payload.get("limit", 20),
@@ -1384,12 +1375,7 @@ async def _handle_collaboration_reaction(
         return web.json_response({"error": "Invalid collaboration reaction request"}, status=400)
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_reactions.react(
-            CollaborationBaseIdentity(
-                principal_id=principal.principal_id,
-                channel_id=principal.channel_id,
-                agent_id=principal.agent_id,
-                runtime_profile_id=principal.runtime_profile_id,
-            ),
+            _collaboration_base_identity(principal),
             proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
             message_id=payload["message_id"],
             reaction=payload["reaction"],
@@ -1427,11 +1413,18 @@ async def _handle_collaboration_reaction(
 
 def _collaboration_base_identity(principal: InternalAPIPrincipal) -> CollaborationBaseIdentity:
     return CollaborationBaseIdentity(
-        principal_id=principal.principal_id,
+        principal_id=(principal.principal_id if principal.requesting_principal_bound else None),
         channel_id=principal.channel_id,
         agent_id=principal.agent_id,
         runtime_profile_id=principal.runtime_profile_id,
     )
+
+
+def _bound_principal_id(principal: InternalAPIPrincipal) -> PrincipalId:
+    """Return the human identity carried only by principal-bound credentials."""
+    if principal.principal_id is None:
+        raise RuntimeError("Internal API credential is not bound to a requesting principal")
+    return principal.principal_id
 
 
 def _collaboration_publication_error(exc: Exception) -> web.Response:

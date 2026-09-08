@@ -84,7 +84,11 @@ class CollaborationGrantConflict(CollaborationAuthorityError):
 class CollaborationBaseIdentity:
     """Stable process identity that must agree with a transient proof."""
 
-    principal_id: PrincipalId
+    # Shared group-channel processes are deliberately requester-neutral.  In
+    # that case the exact attempt proof supplies the requesting principal,
+    # while the persistent credential still has to match channel, agent, and
+    # runtime.  Direct-channel processes remain principal-bound.
+    principal_id: PrincipalId | None
     channel_id: ChannelId
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
@@ -420,7 +424,7 @@ class WorkshopCollaborationAuthority:
         if not hmac.compare_digest(fingerprint, grant.proof_fingerprint):
             raise CollaborationProofError("Invalid collaboration proof")
         if base_identity is not None and (
-            base_identity.principal_id != grant.requested_by_principal_id
+            (base_identity.principal_id is not None and base_identity.principal_id != grant.requested_by_principal_id)
             or base_identity.channel_id != grant.channel_id
             or base_identity.agent_id != grant.agent_id
             or base_identity.runtime_profile_id != grant.runtime_profile_id
@@ -470,7 +474,7 @@ class WorkshopCollaborationAuthority:
         except CollaborationDenied as exc:
             denial = exc
         if denial is None and (
-            base_identity.principal_id != grant.requested_by_principal_id
+            (base_identity.principal_id is not None and base_identity.principal_id != grant.requested_by_principal_id)
             or base_identity.channel_id != grant.channel_id
             or base_identity.agent_id != grant.agent_id
             or base_identity.runtime_profile_id != grant.runtime_profile_id

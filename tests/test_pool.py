@@ -23,7 +23,7 @@ from kai.config import Config, ModelRole, UserConfig, WorkspaceConfig, get_model
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIScope
 from kai.pool import SubprocessPool
-from kai.workshop.domain import AgentId, ChannelId
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId
 from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
     WorkshopInternalAPIExecutionContext,
@@ -151,6 +151,81 @@ class TestInstanceCreation:
         assert (
             pool.internal_api_auth.authenticate(second._api_context.webhook_secret).channel_id == secondary.channel_id
         )
+
+    @pytest.mark.asyncio
+    async def test_group_channel_requesters_share_instance_but_keep_per_turn_identity(self, tmp_path):
+        runtime_id = profile_id(111)
+        owner = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        channel_id = ChannelId("chn_" + "c" * 32)
+        agent_id = AgentId("agt_" + "d" * 32)
+        first = WorkshopInternalAPIExecutionContext(
+            PrincipalId("prn_" + "1" * 32),
+            channel_id,
+            agent_id,
+            runtime_id,
+            private_context=False,
+            sponsor_principal_id=owner.principal_id,
+            settings_channel_id=owner.channel_id,
+        )
+        second = WorkshopInternalAPIExecutionContext(
+            PrincipalId("prn_" + "2" * 32),
+            channel_id,
+            agent_id,
+            runtime_id,
+            private_context=False,
+            sponsor_principal_id=owner.principal_id,
+            settings_channel_id=owner.channel_id,
+        )
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="shared policy",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((owner,)),
+        )
+
+        instance = pool.get(first)
+        assert pool.get(second) is instance
+        assert len(pool._pool) == 1
+        lane_principal = pool.internal_api_auth.authenticate(instance._api_context.webhook_secret)
+        assert lane_principal is not None
+        assert lane_principal.requesting_principal_bound is False
+
+        async def response_events():
+            yield StreamEvent(
+                text_so_far="done",
+                done=True,
+                response=AgentResponse(text="done", success=True),
+            )
+
+        instance.send = MagicMock(side_effect=lambda *_args, **_kwargs: response_events())
+        pool._prepare_instance = AsyncMock(return_value=instance)
+        pool._pending_workspace_restore.clear()
+        pool._pending_settings_restore.clear()
+
+        first_prepared = await pool.prepare_execution(first)
+        assert [event async for event in first_prepared.stream("first")]
+        second_prepared = await pool.prepare_execution(second)
+        assert [event async for event in second_prepared.stream("second")]
+
+        assert [call.kwargs["runtime_identity"] for call in instance.send.call_args_list] == [first, second]
 
     def test_internal_api_credential_exists_without_external_webhooks(self):
         """Disabling public ingress must not remove the agent's scoped API."""

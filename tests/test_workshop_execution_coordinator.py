@@ -12,16 +12,17 @@ import pytest
 from kai.agent_failure import AgentFailureKind
 from kai.backend import AgentResponse, StreamEvent, TraceEntry
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.diagnostics import workshop_runtime_session_status
-from kai.workshop.domain import RunExecutionOwnerId, RuntimeProfileId
+from kai.workshop.domain import ChannelId, PrincipalId, RunExecutionOwnerId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
     CanonicalExecutionDisposition,
     WorkshopCanonicalExecutionCoordinator,
 )
-from kai.workshop.inbound import InboundMessage
+from kai.workshop.inbound import ClientInboundMessage, InboundMessage
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.protected_execution import ProtectedExecutionRoutingRejected
 from kai.workshop.routing_eligibility import RoutingTaskClass
@@ -113,6 +114,14 @@ class _Preparation:
         return self.prepared
 
 
+class _PreparationByRun:
+    def __init__(self, prepared: tuple[_Prepared, ...]) -> None:
+        self.prepared = {item.run.run_id: item for item in prepared}
+
+    async def prepare(self, run_id):
+        return self.prepared[run_id]
+
+
 class _RejectedPreparation:
     def __init__(self, run) -> None:
         self.run = run
@@ -167,6 +176,63 @@ async def _accepted(path: Path, *, suffix: str = "1"):
     return store, result.run
 
 
+async def _accepted_group_pair(path: Path):
+    store = await WorkshopEventStore.open(path)
+    bootstrap = await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman("Daniel", "admin", "desktop", "daniel", "daniel", _RUNTIME_PROFILE_ID),
+            BootstrapHuman("Scott", "member", "desktop", "scott", "scott", RuntimeProfileId.new()),
+        ),
+    )
+    async with store.connection.execute(
+        "SELECT e.external_subject, e.principal_id, cb.channel_id "
+        "FROM external_identities e JOIN channel_bindings cb "
+        "ON cb.transport = e.provider AND cb.external_channel_id = e.external_subject "
+        "ORDER BY e.external_subject"
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    identities = {str(row[0]): (PrincipalId(str(row[1])), ChannelId(str(row[2]))) for row in rows}
+    daniel_id, daniel_direct = identities["daniel"]
+    scott_id, _scott_direct = identities["scott"]
+    lifecycle = WorkshopChannelLifecycleService(store)
+    group = await lifecycle.create_group(
+        daniel_id,
+        name="Shared execution lane",
+        agent_ids=[bootstrap.agent_id],
+        origin_channel_id=daniel_direct,
+    )
+    membership = await lifecycle.human_members(daniel_id, group.channel_id)
+    await lifecycle.add_human_member(
+        daniel_id,
+        group.channel_id,
+        scott_id,
+        expected_state_version=membership.state_version,
+        client_operation_id="add-scott-to-shared-execution-lane",
+    )
+    commands = WorkshopConversationCommandService(store)
+    first = await commands.accept_client(
+        ClientInboundMessage(
+            daniel_id,
+            group.channel_id,
+            "shared-lane-daniel",
+            "@Kai first",
+            _NOW,
+        )
+    )
+    second = await commands.accept_client(
+        ClientInboundMessage(
+            scott_id,
+            group.channel_id,
+            "shared-lane-scott",
+            "@Kai second",
+            _NOW + timedelta(seconds=1),
+        )
+    )
+    await WorkshopConversationDeliveryAuthority(store).activate()
+    return store, first.command.runs[0], second.command.runs[0]
+
+
 def _coordinator(store, preparation, *, lease_seconds: int = 60):
     return WorkshopCanonicalExecutionCoordinator(
         store,
@@ -184,6 +250,44 @@ async def _terminal_bodies(store: WorkshopEventStore) -> list[str]:
 
 
 class TestCanonicalExecutionCoordinator:
+    async def test_two_humans_alternate_in_one_group_agent_lane_in_order(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, first_run, second_run = await _accepted_group_pair(tmp_path / "kai.db")
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        dispatch_order: list[PrincipalId] = []
+
+        async def start_first() -> None:
+            dispatch_order.append(first_run.requested_by_principal_id)
+            first_started.set()
+
+        async def start_second() -> None:
+            dispatch_order.append(second_run.requested_by_principal_id)
+
+        first = _Prepared(first_run, wait=release_first, on_stream=start_first)
+        second = _Prepared(second_run, on_stream=start_second)
+        coordinator = _coordinator(store, _PreparationByRun((first, second)))
+        try:
+            first_execution = asyncio.create_task(coordinator.execute(first_run.run_id))
+            await first_started.wait()
+            second_execution = asyncio.create_task(coordinator.execute(second_run.run_id))
+            await asyncio.sleep(0)
+
+            assert second.prompts == []
+            release_first.set()
+            first_result, second_result = await asyncio.gather(first_execution, second_execution)
+
+            assert first_result.disposition == CanonicalExecutionDisposition.COMPLETED
+            assert second_result.disposition == CanonicalExecutionDisposition.COMPLETED
+            assert dispatch_order == [
+                first_run.requested_by_principal_id,
+                second_run.requested_by_principal_id,
+            ]
+        finally:
+            await store.close()
+
     async def test_ineligible_explicit_route_fails_without_backend_dispatch(self, tmp_path: Path):
         store, run = await _accepted(tmp_path / "kai.db")
         try:
