@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -118,7 +119,15 @@ from kai.workshop.bootstrap import (
     bootstrap_default_workshop,
     bootstrap_human_principal_id,
 )
-from kai.workshop.domain import RuntimeProfileId, WorkshopId
+from kai.workshop.domain import (
+    ChannelId,
+    EventEnvelope,
+    PrincipalId,
+    RuntimeProfileId,
+    WorkshopEventType,
+    WorkshopId,
+)
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id
@@ -14238,6 +14247,100 @@ class TestProtectedRuntimeStorageProvisioning:
             (BootstrapHuman("Other", "admin", "workshop", "other", "other-direct", None),),
         )
         await store.close()
+
+        with pytest.raises(RuntimeError, match="exactly one canonical human owner"):
+            _runtime_storage_targets(
+                data_path,
+                WorkshopRuntimeProfileRegistry((profile,)),
+                users_yaml,
+            )
+
+    @pytest.mark.asyncio
+    async def test_preflight_accepts_runtime_owner_pending_legacy_channel_recovery(
+        self,
+        tmp_path,
+    ):
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        users_yaml = tmp_path / "users.yaml"
+        users_yaml.write_text("users: []\n")
+        profile = self._profile("codex")
+        store = await WorkshopEventStore.open(data_path / "kai.db")
+        try:
+            await bootstrap_default_workshop(
+                store,
+                (
+                    BootstrapHuman(
+                        "Browser human",
+                        "admin",
+                        "workshop",
+                        "browser-human",
+                        "browser-direct",
+                        profile.profile_id,
+                    ),
+                ),
+            )
+            async with store.connection.execute(
+                "SELECT c.id, cm.principal_id, c.workshop_id FROM channels c "
+                "JOIN channel_agent_runtime_assignments ra ON ra.channel_id = c.id "
+                "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+                "WHERE ra.runtime_profile_id = ?",
+                (profile.profile_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+            channel_id = ChannelId(str(row[0]))
+            principal_id = PrincipalId(str(row[1]))
+            workshop_id = WorkshopId(str(row[2]))
+            await store.connection.execute(
+                "UPDATE event_log SET idempotency_key = ? WHERE aggregate_id = ? AND event_type = 'channel.created'",
+                (
+                    f"operator:human-provisioning:{principal_id}:direct-channel",
+                    channel_id,
+                ),
+            )
+            await store.connection.execute(
+                "DELETE FROM principal_agent_enablements WHERE direct_channel_id = ?",
+                (channel_id,),
+            )
+            await store.connection.commit()
+            await store.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.CHANNEL_ARCHIVED,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="channel",
+                    aggregate_id=channel_id,
+                    actor_principal_id=principal_id,
+                    occurred_at=datetime.now(UTC),
+                    idempotency_key=f"human-provisioning-migration:{channel_id}:archive",
+                    payload={},
+                    metadata={"source": "human_provisioning_migration"},
+                )
+            )
+            await store.project_pending(CanonicalConversationProjection())
+        finally:
+            await store.close()
+
+        targets = _runtime_storage_targets(
+            data_path,
+            WorkshopRuntimeProfileRegistry((profile,)),
+            users_yaml,
+        )
+
+        assert len(targets) == 1
+        assert targets[0].profile_id == str(profile.profile_id)
+        assert targets[0].storage_name == str(principal_id)
+
+        connection = sqlite3.connect(data_path / "kai.db")
+        try:
+            connection.execute(
+                "UPDATE event_log SET metadata_json = '{}' WHERE aggregate_id = ? AND event_type = 'channel.archived'",
+                (channel_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
         with pytest.raises(RuntimeError, match="exactly one canonical human owner"):
             _runtime_storage_targets(

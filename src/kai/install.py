@@ -5592,6 +5592,7 @@ def _runtime_profile_principal_names(
                 "channel_agent_runtime_assignments",
                 "channels",
                 "channel_memberships",
+                "event_log",
                 "principals",
                 "workshops",
             }
@@ -5607,7 +5608,16 @@ def _runtime_profile_principal_names(
             rows = connection.execute(
                 "SELECT ra.runtime_profile_id, cm.principal_id "
                 "FROM channel_agent_runtime_assignments ra "
-                "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
+                "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND ("
+                "c.archived_at IS NULL OR ("
+                "EXISTS(SELECT 1 FROM event_log created WHERE created.aggregate_id = c.id "
+                "AND created.event_type = 'channel.created' AND created.idempotency_key LIKE "
+                "'operator:human-provisioning:%:direct-channel') "
+                "AND EXISTS(SELECT 1 FROM event_log lifecycle "
+                "WHERE lifecycle.position = c.lifecycle_event_position "
+                "AND lifecycle.event_type = 'channel.archived' "
+                "AND json_extract(lifecycle.metadata_json, '$.source') = "
+                "'human_provisioning_migration'))) "
                 "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
                 "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
                 "ORDER BY ra.runtime_profile_id, cm.principal_id"
