@@ -54,12 +54,13 @@ _NOTIFICATION_SCOPES = frozenset({InternalAPIScope.MESSAGES_SEND})
 class InternalAPIPrincipal:
     """Identity and authority resolved from an internal API credential."""
 
-    principal_id: PrincipalId
+    principal_id: PrincipalId | None
     channel_id: ChannelId
     agent_id: AgentId
     runtime_profile_id: RuntimeProfileId
     scopes: frozenset[InternalAPIScope]
     private_context: bool = True
+    requesting_principal_bound: bool = True
     allowed_services: frozenset[str] = frozenset()
 
     def allows(self, scope: InternalAPIScope) -> bool:
@@ -156,16 +157,25 @@ class InternalAPIAuth:
     ) -> InternalAPIPrincipal:
         """Build the persistent-agent principal for one canonical context."""
         allowed_services = self._allowed_services_by_profile.get(context.runtime_profile_id, frozenset())
-        scopes = set(_PERSISTENT_AGENT_BASE_SCOPES)
-        if not context.private_context:
-            scopes.discard(InternalAPIScope.MEMORY_READ)
-            scopes.discard(InternalAPIScope.MEMORY_ADD)
+        if context.private_context:
+            scopes = set(_PERSISTENT_AGENT_BASE_SCOPES)
+        else:
+            # A group-channel process is shared by every human who wakes the
+            # same agent in that channel.  Its persistent credential therefore
+            # cannot carry whichever human happened to start the process.
+            # Stateful collaboration is authorized by the exact-attempt proof;
+            # principal-owned memory, jobs, and legacy proactive publication
+            # fail closed instead of being attributed to the first requester.
+            scopes = {InternalAPIScope.COLLABORATION_INVOKE}
         if allowed_services:
             scopes.add(InternalAPIScope.SERVICES_CALL)
         return self._principal(
             context,
             frozenset(scopes),
             allowed_services,
+            principal_id=(context.principal_id if context.private_context else None),
+            bind_context_principal=context.private_context,
+            requesting_principal_bound=context.private_context,
         )
 
     @staticmethod
@@ -173,14 +183,19 @@ class InternalAPIAuth:
         context: WorkshopInternalAPIExecutionContext,
         scopes: frozenset[InternalAPIScope],
         allowed_services: frozenset[str] = frozenset(),
+        *,
+        principal_id: PrincipalId | None = None,
+        bind_context_principal: bool = True,
+        requesting_principal_bound: bool = True,
     ) -> InternalAPIPrincipal:
         return InternalAPIPrincipal(
-            principal_id=context.principal_id,
+            principal_id=(context.principal_id if bind_context_principal else principal_id),
             channel_id=context.channel_id,
             agent_id=context.agent_id,
             runtime_profile_id=context.runtime_profile_id,
             scopes=scopes,
             private_context=context.private_context,
+            requesting_principal_bound=requesting_principal_bound,
             allowed_services=allowed_services,
         )
 

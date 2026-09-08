@@ -64,14 +64,16 @@ def test_persistent_agent_profile_is_explicit_and_excludes_delete_all() -> None:
     assert not principal.allows(InternalAPIScope.MEMORY_DELETE_ALL)
 
 
-def test_shared_channel_agent_credential_cannot_access_personal_memory() -> None:
+def test_shared_channel_agent_credential_is_requester_neutral_and_attempt_scoped() -> None:
     direct = _context(123)
+    requester = PrincipalId("prn_00000000000000000000000000000456")
     shared = WorkshopInternalAPIExecutionContext(
-        principal_id=direct.principal_id,
+        principal_id=requester,
         channel_id=ChannelId("chn_00000000000000000000000000000456"),
         agent_id=direct.agent_id,
         runtime_profile_id=direct.runtime_profile_id,
         private_context=False,
+        sponsor_principal_id=direct.principal_id,
     )
     auth = InternalAPIAuth.for_execution_contexts({direct, shared})
 
@@ -79,9 +81,39 @@ def test_shared_channel_agent_credential_cannot_access_personal_memory() -> None
 
     assert principal is not None
     assert principal.private_context is False
+    assert principal.requesting_principal_bound is False
+    assert principal.principal_id is None
+    assert principal.scopes == frozenset({InternalAPIScope.COLLABORATION_INVOKE})
     assert not principal.allows(InternalAPIScope.MEMORY_READ)
     assert not principal.allows(InternalAPIScope.MEMORY_ADD)
-    assert principal.allows(InternalAPIScope.MESSAGES_SEND)
+    assert not principal.allows(InternalAPIScope.JOBS_READ)
+    assert not principal.allows(InternalAPIScope.JOBS_WRITE)
+    assert not principal.allows(InternalAPIScope.MESSAGES_SEND)
+    assert not principal.allows(InternalAPIScope.FILES_SEND)
+
+
+def test_shared_channel_requesters_receive_one_lane_credential() -> None:
+    direct = _context(123)
+    channel_id = ChannelId("chn_00000000000000000000000000000456")
+    first = WorkshopInternalAPIExecutionContext(
+        principal_id=PrincipalId("prn_00000000000000000000000000000456"),
+        channel_id=channel_id,
+        agent_id=direct.agent_id,
+        runtime_profile_id=direct.runtime_profile_id,
+        private_context=False,
+        sponsor_principal_id=direct.principal_id,
+    )
+    second = WorkshopInternalAPIExecutionContext(
+        principal_id=PrincipalId("prn_00000000000000000000000000000789"),
+        channel_id=channel_id,
+        agent_id=direct.agent_id,
+        runtime_profile_id=direct.runtime_profile_id,
+        private_context=False,
+        sponsor_principal_id=direct.principal_id,
+    )
+    auth = InternalAPIAuth.for_execution_contexts({direct})
+
+    assert auth.agent_credential_for(first) == auth.agent_credential_for(second)
 
 
 def test_persistent_agent_service_scope_requires_explicit_names() -> None:

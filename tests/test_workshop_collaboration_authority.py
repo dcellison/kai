@@ -21,7 +21,7 @@ from kai.workshop.collaboration_authority import (
 )
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.domain import RunExecutionOwnerId, RuntimeProfileId
+from kai.workshop.domain import ChannelId, RunExecutionOwnerId, RuntimeProfileId
 from kai.workshop.inbound import InboundMessage
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.projection import CanonicalConversationProjection
@@ -608,5 +608,54 @@ async def test_mismatched_base_identity_is_denied_and_audited(tmp_path: Path) ->
             "SELECT decision, denial_code FROM collaboration_operation_decisions"
         ) as cursor:
             assert tuple(await cursor.fetchone()) == ("denied", "base_identity_mismatch")
+    finally:
+        await store.close()
+
+
+async def test_requester_neutral_base_identity_uses_proof_principal_but_still_fences_lane(
+    tmp_path: Path,
+) -> None:
+    store, _execution, started = await _running_attempt(tmp_path / "kai.db")
+    try:
+        authority = WorkshopCollaborationAuthority(
+            store,
+            token_factory=lambda: "attempt-proof-000000000000000000000000000010",
+        )
+        _grant, invocation = await authority.issue(
+            started.claim,
+            occurred_at=_NOW + timedelta(seconds=3),
+        )
+        correct = _base_identity(started)
+        neutral = CollaborationBaseIdentity(
+            principal_id=None,
+            channel_id=correct.channel_id,
+            agent_id=correct.agent_id,
+            runtime_profile_id=correct.runtime_profile_id,
+        )
+
+        authorized = await authority.authorize(
+            invocation.token,
+            CollaborationOperation.AGENT_DELEGATION,
+            base_identity=neutral,
+            idempotency_key="requester-neutral-lane",
+            request_hash="d" * 64,
+            occurred_at=_NOW + timedelta(seconds=4),
+        )
+        assert authorized.grant.requested_by_principal_id == started.run.requested_by_principal_id
+
+        wrong_lane = CollaborationBaseIdentity(
+            principal_id=None,
+            channel_id=ChannelId.new(),
+            agent_id=correct.agent_id,
+            runtime_profile_id=correct.runtime_profile_id,
+        )
+        with pytest.raises(CollaborationDenied) as denied:
+            await authority.authenticate(
+                invocation.token,
+                CollaborationOperation.AGENT_DELEGATION,
+                base_identity=wrong_lane,
+                occurred_at=_NOW + timedelta(seconds=5),
+            )
+        assert denied.value.code == "base_identity_mismatch"
     finally:
         await store.close()
