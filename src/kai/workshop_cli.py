@@ -77,7 +77,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     provision = client_actions.add_parser(
         "provision-human",
-        help="create a canonical human and direct channel without transport or runtime access",
+        help="create a canonical human identity without transport, channel, agent, or runtime access",
     )
     provision.add_argument("--provisioning-key", required=True)
     provision.add_argument("--display-name", required=True)
@@ -520,11 +520,11 @@ async def _run(args: argparse.Namespace) -> int:
                 print(f"Handle: @{human.handle}")
                 print(f"Principal: {human.principal_id}")
                 print(f"Workshop: {human.workshop_id}")
-                print(f"Direct channel: {human.channel_id}")
                 print(f"Role: {human.role}")
                 print(f"Provisioning key: {human.provisioning_key}")
                 print(f"Status: {'created' if human.created else 'already provisioned'}")
                 print("Transport access: not assigned")
+                print("Agent access: not assigned")
                 print("Runtime access: not assigned")
                 return 0
             if args.action == "list-runtime-profiles":

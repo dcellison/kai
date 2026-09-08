@@ -4083,7 +4083,7 @@ async def _handle_client_navigation(
         "AND sponsored.lifecycle_state = 'enabled' "
         "LEFT JOIN principal_direct_message_archives dma "
         "ON dma.principal_id = cm.principal_id AND dma.channel_id = c.id "
-        "WHERE cm.principal_id = ? "
+        "WHERE cm.principal_id = ? AND (c.kind != 'direct' OR c.archived_at IS NULL) "
         "ORDER BY c.workshop_id, "
         "CASE c.kind WHEN 'direct' THEN 0 WHEN 'group' THEN 1 "
         "WHEN 'notification' THEN 2 ELSE 3 END, lower(coalesce(c.name, '')), c.id, a.name, a.id",
@@ -4106,7 +4106,7 @@ async def _handle_client_navigation(
         "LEFT JOIN agent_definitions ad ON ad.agent_id = peer_agent.id "
         "LEFT JOIN channel_agents active_agent ON active_agent.channel_id = c.id "
         "AND active_agent.agent_id = peer_agent.id AND active_agent.detached_at IS NULL "
-        "WHERE own_cm.principal_id = ? "
+        "WHERE own_cm.principal_id = ? AND (c.kind != 'direct' OR c.archived_at IS NULL) "
         "AND (peer.kind != 'agent' OR active_agent.id IS NOT NULL) "
         "ORDER BY c.workshop_id, c.id, lower(peer.display_name), peer.id",
         (principal_id,),

@@ -3445,9 +3445,13 @@ class TestCmdConfig:
 class TestInstalledInitialWorkshopEnrollment:
     def test_issues_as_service_user_for_the_canonical_human(self, monkeypatch):
         plan = kai.install.WorkshopInitialProvisioning.create("Daniel")
-        principal_id, channel_id = kai.install.provisioned_human_ids(
+        principal_id = kai.install.provisioned_human_ids(
             plan.workshop_id,
             plan.provisioning_key,
+        )
+        _enablement_id, channel_id = kai.install.initial_kai_enablement_ids(
+            plan.workshop_id,
+            principal_id,
         )
         completed = subprocess.CompletedProcess(
             args=[],
@@ -5360,7 +5364,7 @@ class TestCmdStatus:
             "CREATE TABLE channel_agent_runtime_assignments (channel_id TEXT);"
             "CREATE TABLE channel_bindings (channel_id TEXT);"
             "CREATE TABLE event_log (position INTEGER PRIMARY KEY, aggregate_id TEXT, "
-            "aggregate_type TEXT, event_type TEXT);"
+            "aggregate_type TEXT, event_type TEXT, metadata_json TEXT);"
             "INSERT INTO channels VALUES "
             "('chn_active','wsp_one','group','Active',NULL,NULL,NULL),"
             "('chn_archived','wsp_one','group','Archived','2026-08-30T15:00:00Z',7,NULL);"
@@ -5370,7 +5374,7 @@ class TestCmdStatus:
             "INSERT INTO workshop_memberships VALUES ('wsp_one','prn_one'),('wsp_one','prn_two');"
             "INSERT INTO human_handles VALUES ('wsp_one','prn_one'),('wsp_one','prn_two');"
             "INSERT INTO event_log VALUES "
-            "(7,'chn_archived','channel','channel.archived');"
+            "(7,'chn_archived','channel','channel.archived','{}');"
         )
         connection.commit()
         connection.close()
@@ -5419,7 +5423,7 @@ class TestCmdStatus:
         connection.executescript(
             "CREATE TABLE channel_agent_runtime_assignments "
             "(runtime_profile_id TEXT, channel_id TEXT, agent_id TEXT);"
-            "CREATE TABLE channels (id TEXT, kind TEXT, workshop_id TEXT);"
+            "CREATE TABLE channels (id TEXT, kind TEXT, workshop_id TEXT, archived_at TEXT);"
             "CREATE TABLE agents (id TEXT, workshop_id TEXT);"
             "CREATE TABLE channel_agents (channel_id TEXT, agent_id TEXT);"
             "CREATE TABLE channel_memberships (channel_id TEXT, principal_id TEXT, role TEXT);"
@@ -5430,7 +5434,7 @@ class TestCmdStatus:
             "CREATE TABLE artifacts (id TEXT);"
             "CREATE TABLE delivery_outbox (id TEXT);"
             "INSERT INTO channel_agent_runtime_assignments VALUES ('rtp_one','chn_one','agt_one');"
-            "INSERT INTO channels VALUES ('chn_one','direct','wsp_one');"
+            "INSERT INTO channels VALUES ('chn_one','direct','wsp_one',NULL);"
             "INSERT INTO agents VALUES ('agt_one','wsp_one');"
             "INSERT INTO channel_agents VALUES ('chn_one','agt_one');"
             "INSERT INTO channel_memberships VALUES ('chn_one','prn_one','owner');"

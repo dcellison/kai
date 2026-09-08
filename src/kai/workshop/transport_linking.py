@@ -160,7 +160,7 @@ class WorkshopTransportLinker:
         async with self._store.connection.execute(
             "SELECT c.workshop_id, cm.principal_id, c.id "
             "FROM channel_agent_runtime_assignments ra "
-            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
             "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
             "WHERE ra.runtime_profile_id = ?",

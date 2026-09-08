@@ -80,6 +80,7 @@ class WorkshopChannelHistoryRegistry:
             "SELECT ra.runtime_profile_id, ra.channel_id, c.kind, ra.created_event_position "
             "FROM channel_agent_runtime_assignments ra "
             "JOIN channels c ON c.id = ra.channel_id "
+            "AND (c.kind != 'direct' OR c.archived_at IS NULL) "
             "ORDER BY ra.runtime_profile_id, "
             "CASE c.kind WHEN 'direct' THEN 0 ELSE 1 END, ra.created_event_position, ra.channel_id"
         ) as cursor:
@@ -205,7 +206,7 @@ class WorkshopPrincipalStorageRegistry:
         async with store.connection.execute(
             "SELECT ra.runtime_profile_id, cm.principal_id "
             "FROM channel_agent_runtime_assignments ra "
-            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
             "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
             "ORDER BY ra.runtime_profile_id, cm.principal_id"

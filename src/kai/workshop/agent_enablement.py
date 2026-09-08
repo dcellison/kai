@@ -83,6 +83,276 @@ class PrincipalAgentEnablement:
     conversation_started: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class InitialAgentEnablement:
+    """Canonical direct lane created for the first Workshop administrator."""
+
+    principal_id: PrincipalId
+    definition_id: AgentDefinitionId
+    agent_id: AgentId
+    direct_channel_id: ChannelId
+    runtime_profile_id: RuntimeProfileId
+    created: bool
+
+
+def principal_agent_enablement_ids(
+    definition_id: AgentDefinitionId,
+    principal_id: PrincipalId,
+) -> tuple[AgentEnablementId, ChannelId]:
+    """Return the canonical enablement and direct-channel identities."""
+    enablement_id = AgentEnablementId.derived(definition_id, f"principal:{principal_id}")
+    return enablement_id, ChannelId.derived(enablement_id, "direct-channel")
+
+
+def initial_kai_enablement_ids(
+    workshop_id: WorkshopId,
+    principal_id: PrincipalId,
+) -> tuple[AgentEnablementId, ChannelId]:
+    """Return the bootstrap Kai enablement identities without database access."""
+    agent_id = AgentId.derived(workshop_id, "agent:kai")
+    definition_id = AgentDefinitionId.derived(agent_id, "definition")
+    return principal_agent_enablement_ids(definition_id, principal_id)
+
+
+def _agent_enablement_event(
+    workshop_id: WorkshopId,
+    principal_id: PrincipalId,
+    definition_id: AgentDefinitionId,
+    agent_id: AgentId,
+    enablement_id: AgentEnablementId,
+    channel_id: ChannelId,
+    runtime_profile_id: RuntimeProfileId,
+    now: datetime,
+    operation_key: str,
+    metadata: dict[str, str],
+) -> EventEnvelope:
+    return EventEnvelope.create(
+        event_type=WorkshopEventType.PRINCIPAL_AGENT_ENABLED,
+        event_version=1,
+        workshop_id=workshop_id,
+        aggregate_type="agent_enablement",
+        aggregate_id=enablement_id,
+        actor_principal_id=principal_id,
+        occurred_at=now,
+        idempotency_key=operation_key,
+        payload={
+            "principal_id": principal_id,
+            "agent_definition_id": definition_id,
+            "agent_id": agent_id,
+            "direct_channel_id": channel_id,
+            "runtime_profile_id": runtime_profile_id,
+        },
+        metadata=metadata,
+    )
+
+
+def agent_enablement_creation_events(
+    workshop_id: WorkshopId,
+    principal_id: PrincipalId,
+    definition_id: AgentDefinitionId,
+    agent_id: AgentId,
+    agent_principal_id: PrincipalId,
+    display_name: str,
+    enablement_id: AgentEnablementId,
+    channel_id: ChannelId,
+    runtime_profile_id: RuntimeProfileId,
+    now: datetime,
+    operation_key: str,
+    metadata: dict[str, str],
+) -> list[EventEnvelope]:
+    """Build the one canonical event shape for a new agent access lane."""
+    assignment_id = RuntimeAssignmentId.derived(channel_id, f"runtime-profile:{agent_id}")
+    return [
+        EventEnvelope.create(
+            event_type=WorkshopEventType.CHANNEL_CREATED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="channel",
+            aggregate_id=channel_id,
+            actor_principal_id=principal_id,
+            occurred_at=now,
+            idempotency_key=f"{operation_key}:channel",
+            payload={"kind": "direct", "name": display_name},
+            metadata=metadata,
+        ),
+        EventEnvelope.create(
+            event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="channel_membership",
+            aggregate_id=ChannelMembershipId.derived(channel_id, f"human:{principal_id}"),
+            actor_principal_id=principal_id,
+            occurred_at=now,
+            idempotency_key=f"{operation_key}:human",
+            payload={"channel_id": channel_id, "principal_id": principal_id, "role": "owner"},
+            metadata=metadata,
+        ),
+        EventEnvelope.create(
+            event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="channel_membership",
+            aggregate_id=ChannelMembershipId.derived(channel_id, f"agent:{agent_principal_id}"),
+            actor_principal_id=principal_id,
+            occurred_at=now,
+            idempotency_key=f"{operation_key}:agent-member",
+            payload={
+                "channel_id": channel_id,
+                "principal_id": agent_principal_id,
+                "role": "participant",
+            },
+            metadata=metadata,
+        ),
+        EventEnvelope.create(
+            event_type=WorkshopEventType.CHANNEL_AGENT_ATTACHED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="channel_agent",
+            aggregate_id=ChannelAgentId.derived(channel_id, f"agent:{agent_id}"),
+            actor_principal_id=principal_id,
+            occurred_at=now,
+            idempotency_key=f"{operation_key}:attachment",
+            payload={"channel_id": channel_id, "agent_id": agent_id},
+            metadata=metadata,
+        ),
+        EventEnvelope.create(
+            event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
+            event_version=1,
+            workshop_id=workshop_id,
+            aggregate_type="runtime_assignment",
+            aggregate_id=assignment_id,
+            actor_principal_id=principal_id,
+            occurred_at=now,
+            idempotency_key=f"{operation_key}:assignment",
+            payload={
+                "channel_id": channel_id,
+                "agent_id": agent_id,
+                "runtime_profile_id": runtime_profile_id,
+            },
+            metadata=metadata,
+        ),
+        _agent_enablement_event(
+            workshop_id,
+            principal_id,
+            definition_id,
+            agent_id,
+            enablement_id,
+            channel_id,
+            runtime_profile_id,
+            now,
+            operation_key,
+            metadata,
+        ),
+    ]
+
+
+async def enable_initial_workshop_agent(
+    store: WorkshopEventStore,
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+    principal_id: PrincipalId,
+    runtime_profile_id: RuntimeProfileId,
+) -> InitialAgentEnablement:
+    """Enable canonical Kai for the first transport-free administrator."""
+    runtime_profiles.resolve(runtime_profile_id)
+    async with store.connection.execute(
+        "SELECT wm.workshop_id FROM workshop_memberships wm JOIN principals p "
+        "ON p.id = wm.principal_id AND p.kind = 'human' "
+        "WHERE wm.principal_id = ? AND wm.role = 'admin'",
+        (principal_id,),
+    ) as cursor:
+        membership_rows = list(await cursor.fetchall())
+    if len(membership_rows) != 1:
+        raise WorkshopAgentEnablementAccessDenied("Initial agent enablement requires one Workshop administrator")
+    workshop_id = WorkshopId(str(membership_rows[0][0]))
+    async with store.connection.execute(
+        "SELECT d.id, d.agent_id, a.principal_id, d.display_name "
+        "FROM agent_definitions d JOIN agents a ON a.id = d.agent_id "
+        "WHERE d.workshop_id = ? AND d.handle = 'kai' COLLATE NOCASE "
+        "AND d.lifecycle_state = 'active' AND d.active_revision_id IS NOT NULL",
+        (workshop_id,),
+    ) as cursor:
+        definition_rows = list(await cursor.fetchall())
+    if len(definition_rows) != 1:
+        raise WorkshopAgentEnablementAccessDenied("Canonical Kai agent definition is unavailable")
+    definition_id = AgentDefinitionId(str(definition_rows[0][0]))
+    agent_id = AgentId(str(definition_rows[0][1]))
+    agent_principal_id = PrincipalId(str(definition_rows[0][2]))
+    display_name = str(definition_rows[0][3])
+    enablement_id, channel_id = principal_agent_enablement_ids(definition_id, principal_id)
+    operation_key = f"initial-agent-enablement:{workshop_id}:{principal_id}:{definition_id}"
+    metadata = {
+        "source": "initial_workshop_provisioning",
+        "operation": "enable",
+        "definition_id": str(definition_id),
+    }
+    created = False
+    connection = store.connection
+    try:
+        await connection.execute("BEGIN IMMEDIATE")
+        async with connection.execute(
+            "SELECT direct_channel_id, runtime_profile_id, lifecycle_state, conversation_started_at "
+            "FROM principal_agent_enablements WHERE id = ?",
+            (enablement_id,),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing is None:
+            now = datetime.now(UTC)
+            for event in agent_enablement_creation_events(
+                workshop_id,
+                principal_id,
+                definition_id,
+                agent_id,
+                agent_principal_id,
+                display_name,
+                enablement_id,
+                channel_id,
+                runtime_profile_id,
+                now,
+                operation_key,
+                metadata,
+            ):
+                await store.append_in_transaction(event)
+            created = True
+            conversation_started = False
+        else:
+            if (
+                str(existing[0]) != str(channel_id)
+                or str(existing[1]) != str(runtime_profile_id)
+                or str(existing[2]) != "enabled"
+            ):
+                raise WorkshopAgentEnablementConflict("Initial agent enablement conflicts with canonical state")
+            conversation_started = existing[3] is not None
+            now = datetime.now(UTC)
+        if not conversation_started:
+            await store.append_in_transaction(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.PRINCIPAL_AGENT_CONVERSATION_STARTED,
+                    event_version=1,
+                    workshop_id=workshop_id,
+                    aggregate_type="agent_enablement",
+                    aggregate_id=enablement_id,
+                    actor_principal_id=principal_id,
+                    occurred_at=now,
+                    idempotency_key=f"{operation_key}:conversation",
+                    payload={},
+                    metadata=metadata,
+                )
+            )
+        await store.project_pending_in_transaction(CanonicalConversationProjection())
+        await connection.commit()
+    except Exception:
+        await connection.rollback()
+        raise
+    return InitialAgentEnablement(
+        principal_id,
+        definition_id,
+        agent_id,
+        channel_id,
+        runtime_profile_id,
+        created,
+    )
+
+
 class WorkshopAgentEnablementService:
     """Enable an active agent in an isolated direct lane owned by one human."""
 
@@ -175,8 +445,7 @@ class WorkshopAgentEnablementService:
             }
             if current.enablement_id is None:
                 created = True
-                enablement_id = AgentEnablementId.derived(definition_id, f"principal:{principal_id}")
-                channel_id = ChannelId.derived(enablement_id, "direct-channel")
+                enablement_id, channel_id = principal_agent_enablement_ids(definition_id, principal_id)
                 events = self._creation_events(
                     workshop_id,
                     principal_id,
@@ -517,7 +786,7 @@ class WorkshopAgentEnablementService:
     ) -> tuple[EligibleAgentRuntime, ...]:
         async with self._store.connection.execute(
             "SELECT ra.runtime_profile_id FROM channel_agent_runtime_assignments ra "
-            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
             "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
             "GROUP BY ra.runtime_profile_id HAVING COUNT(DISTINCT cm.principal_id) = 1 "
@@ -636,89 +905,20 @@ class WorkshopAgentEnablementService:
         metadata: dict[str, str],
     ) -> list[EventEnvelope]:
         agent_id, agent_principal_id, _handle, display_name, _owner, _owner_runtime, _owner_channel = definition
-        assignment_id = RuntimeAssignmentId.derived(channel_id, f"runtime-profile:{agent_id}")
-        return [
-            EventEnvelope.create(
-                event_type=WorkshopEventType.CHANNEL_CREATED,
-                event_version=1,
-                workshop_id=workshop_id,
-                aggregate_type="channel",
-                aggregate_id=channel_id,
-                actor_principal_id=principal_id,
-                occurred_at=now,
-                idempotency_key=f"{operation_key}:channel",
-                payload={"kind": "direct", "name": display_name},
-                metadata=metadata,
-            ),
-            EventEnvelope.create(
-                event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
-                event_version=1,
-                workshop_id=workshop_id,
-                aggregate_type="channel_membership",
-                aggregate_id=ChannelMembershipId.derived(channel_id, f"human:{principal_id}"),
-                actor_principal_id=principal_id,
-                occurred_at=now,
-                idempotency_key=f"{operation_key}:human",
-                payload={"channel_id": channel_id, "principal_id": principal_id, "role": "owner"},
-                metadata=metadata,
-            ),
-            EventEnvelope.create(
-                event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
-                event_version=1,
-                workshop_id=workshop_id,
-                aggregate_type="channel_membership",
-                aggregate_id=ChannelMembershipId.derived(channel_id, f"agent:{agent_principal_id}"),
-                actor_principal_id=principal_id,
-                occurred_at=now,
-                idempotency_key=f"{operation_key}:agent-member",
-                payload={
-                    "channel_id": channel_id,
-                    "principal_id": agent_principal_id,
-                    "role": "participant",
-                },
-                metadata=metadata,
-            ),
-            EventEnvelope.create(
-                event_type=WorkshopEventType.CHANNEL_AGENT_ATTACHED,
-                event_version=1,
-                workshop_id=workshop_id,
-                aggregate_type="channel_agent",
-                aggregate_id=ChannelAgentId.derived(channel_id, f"agent:{agent_id}"),
-                actor_principal_id=principal_id,
-                occurred_at=now,
-                idempotency_key=f"{operation_key}:attachment",
-                payload={"channel_id": channel_id, "agent_id": agent_id},
-                metadata=metadata,
-            ),
-            EventEnvelope.create(
-                event_type=WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
-                event_version=1,
-                workshop_id=workshop_id,
-                aggregate_type="runtime_assignment",
-                aggregate_id=assignment_id,
-                actor_principal_id=principal_id,
-                occurred_at=now,
-                idempotency_key=f"{operation_key}:assignment",
-                payload={
-                    "channel_id": channel_id,
-                    "agent_id": agent_id,
-                    "runtime_profile_id": runtime_profile_id,
-                },
-                metadata=metadata,
-            ),
-            self._enablement_event(
-                workshop_id,
-                principal_id,
-                definition_id,
-                agent_id,
-                enablement_id,
-                channel_id,
-                runtime_profile_id,
-                now,
-                operation_key,
-                metadata,
-            ),
-        ]
+        return agent_enablement_creation_events(
+            workshop_id,
+            principal_id,
+            definition_id,
+            agent_id,
+            agent_principal_id,
+            display_name,
+            enablement_id,
+            channel_id,
+            runtime_profile_id,
+            now,
+            operation_key,
+            metadata,
+        )
 
     @staticmethod
     def _enablement_event(
@@ -733,23 +933,17 @@ class WorkshopAgentEnablementService:
         operation_key: str,
         metadata: dict[str, str],
     ) -> EventEnvelope:
-        return EventEnvelope.create(
-            event_type=WorkshopEventType.PRINCIPAL_AGENT_ENABLED,
-            event_version=1,
-            workshop_id=workshop_id,
-            aggregate_type="agent_enablement",
-            aggregate_id=enablement_id,
-            actor_principal_id=principal_id,
-            occurred_at=now,
-            idempotency_key=operation_key,
-            payload={
-                "principal_id": principal_id,
-                "agent_definition_id": definition_id,
-                "agent_id": agent_id,
-                "direct_channel_id": channel_id,
-                "runtime_profile_id": runtime_profile_id,
-            },
-            metadata=metadata,
+        return _agent_enablement_event(
+            workshop_id,
+            principal_id,
+            definition_id,
+            agent_id,
+            enablement_id,
+            channel_id,
+            runtime_profile_id,
+            now,
+            operation_key,
+            metadata,
         )
 
     async def _replayed(

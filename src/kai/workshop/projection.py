@@ -2036,6 +2036,9 @@ class CanonicalConversationProjection:
             if envelope.actor_principal_id is None:
                 raise ValueError("Workshop channel lifecycle events require a human actor")
             archived = envelope.event_type == WorkshopEventType.CHANNEL_ARCHIVED
+            legacy_provisioning_retirement = (
+                archived and envelope.metadata.get("source") == "human_provisioning_migration"
+            )
             if archived:
                 async with connection.execute(
                     "SELECT 1 FROM runs WHERE channel_id = ? AND status IN ('accepted', 'started') LIMIT 1",
@@ -2045,19 +2048,24 @@ class CanonicalConversationProjection:
                         raise ValueError("Workshop channel cannot be archived with a nonterminal run")
             cursor = await connection.execute(
                 "UPDATE channels SET archived_at = ?, lifecycle_event_position = ? "
-                "WHERE id = ? AND workshop_id = ? AND kind = 'group' "
+                "WHERE id = ? AND workshop_id = ? "
+                "AND (kind = 'group' OR (? = 1 AND kind = 'direct')) "
                 "AND ((? = 1 AND archived_at IS NULL) OR (? = 0 AND archived_at IS NOT NULL)) "
                 "AND EXISTS (SELECT 1 FROM channel_memberships owner "
                 "WHERE owner.channel_id = channels.id AND owner.principal_id = ? "
-                "AND owner.role = 'owner')",
+                "AND owner.role = 'owner') "
+                "AND (? = 0 OR NOT EXISTS (SELECT 1 FROM principal_agent_enablements pae "
+                "WHERE pae.direct_channel_id = channels.id))",
                 (
                     occurred_at if archived else None,
                     event.position,
                     envelope.aggregate_id,
                     envelope.workshop_id,
+                    int(legacy_provisioning_retirement),
                     int(archived),
                     int(archived),
                     envelope.actor_principal_id,
+                    int(legacy_provisioning_retirement),
                 ),
             )
             if cursor.rowcount != 1:

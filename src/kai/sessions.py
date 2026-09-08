@@ -45,6 +45,10 @@ from typing import TYPE_CHECKING, TypedDict
 import aiosqlite
 
 from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
+from kai.workshop.agent_enablement import (
+    InitialAgentEnablement,
+    enable_initial_workshop_agent,
+)
 from kai.workshop.artifacts import InboundArtifact, record_inbound_artifact
 from kai.workshop.bootstrap import (
     BootstrapHuman,
@@ -71,9 +75,10 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateRegistry,
     reconcile_legacy_execution_state,
 )
-from kai.workshop.human_provisioning import (
-    ProvisionedWorkshopHuman,
-    WorkshopHumanProvisioner,
+from kai.workshop.human_provisioning import WorkshopHumanProvisioner
+from kai.workshop.human_provisioning_migration import (
+    WorkshopHumanProvisioningMigration,
+    reconcile_legacy_human_provisioning_channels,
 )
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.initial_provisioning import WorkshopInitialProvisioning
@@ -109,7 +114,6 @@ from kai.workshop.transport_linking import WorkshopTransportLinker
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
-from kai.workshop.runtime_assignments import WorkshopRuntimeAssignmentService
 from kai.workshop.runtime_key_cutover import (
     WorkshopRuntimeKeyCutover,
     reconcile_workshop_runtime_key_cutover,
@@ -394,8 +398,8 @@ async def bootstrap_workshop_foundation(
 async def reconcile_initial_workshop_human(
     plan: WorkshopInitialProvisioning,
     runtime_profiles: WorkshopRuntimeProfileRegistry,
-) -> ProvisionedWorkshopHuman:
-    """Idempotently provision and assign the first transport-free human."""
+) -> InitialAgentEnablement:
+    """Idempotently provision the first human and enable canonical Kai."""
     if _workshop_event_lock is None:
         raise RuntimeError("Database not initialized - call init_db() first")
     runtime_profiles.resolve(plan.runtime_profile_id)
@@ -407,12 +411,21 @@ async def reconcile_initial_workshop_human(
             plan.role,
             workshop_id=plan.workshop_id,
         )
-        await WorkshopRuntimeAssignmentService(store, runtime_profiles).assign(
+        return await enable_initial_workshop_agent(
+            store,
+            runtime_profiles,
             provisioned.principal_id,
-            provisioned.channel_id,
             plan.runtime_profile_id,
         )
-        return provisioned
+
+
+async def reconcile_workshop_human_provisioning() -> WorkshopHumanProvisioningMigration:
+    """Retire direct channels emitted by the legacy identity provisioner."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        store = WorkshopEventStore.from_initialized_connection(_get_db())
+        return await reconcile_legacy_human_provisioning_channels(store)
 
 
 async def link_workshop_transport_profile(

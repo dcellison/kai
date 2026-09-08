@@ -284,11 +284,12 @@ class TestWorkshopClientAccessCLI:
         assert "Handle: @charlie" in output
         assert "Principal: prn_" in output
         assert "Workshop: wsp_" in output
-        assert "Direct channel: chn_" in output
+        assert "Direct channel:" not in output
         assert "Role: member" in output
         assert "Provisioning key: charlie" in output
         assert "Status: created" in output
         assert "Transport access: not assigned" in output
+        assert "Agent access: not assigned" in output
         assert "Runtime access: not assigned" in output
 
     async def test_issue_command_prints_the_token_once_with_qualification_coordinates(
