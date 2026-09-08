@@ -258,35 +258,51 @@ def workshop_human_provisioning_status(db_path: Path) -> str:
                 "AND idempotency_key LIKE 'operator:human-provisioning:%:principal'",
             )
             legacy = connection.execute(
-                "SELECT COUNT(*), "
-                "SUM(CASE WHEN pae.id IS NOT NULL THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN pae.id IS NULL AND c.archived_at IS NOT NULL THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN pae.id IS NULL AND c.archived_at IS NULL THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN c.archived_at IS NOT NULL AND (archive.position IS NULL "
-                "OR json_extract(archive.metadata_json, '$.source') != 'human_provisioning_migration') "
-                "THEN 1 ELSE 0 END) "
+                "WITH legacy AS (SELECT c.id, c.archived_at, c.lifecycle_event_position, "
+                "CASE WHEN pae.id IS NOT NULL "
+                "OR EXISTS(SELECT 1 FROM channel_agent_runtime_assignments ra "
+                "WHERE ra.channel_id = c.id) "
+                "OR EXISTS(SELECT 1 FROM messages m WHERE m.channel_id = c.id) "
+                "OR EXISTS(SELECT 1 FROM runs r WHERE r.channel_id = c.id) "
+                "OR EXISTS(SELECT 1 FROM channel_bindings cb WHERE cb.channel_id = c.id) "
+                "THEN 1 ELSE 0 END AS operational, "
+                "CASE WHEN EXISTS(SELECT 1 FROM event_log restored "
+                "WHERE restored.aggregate_id = c.id AND restored.event_type = 'channel.restored' "
+                "AND json_extract(restored.metadata_json, '$.source') = "
+                "'human_provisioning_migration') THEN 1 ELSE 0 END AS restored "
                 "FROM event_log created "
                 "JOIN channels c ON c.id = created.aggregate_id AND c.kind = 'direct' "
                 "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
-                "LEFT JOIN event_log archive ON archive.position = c.lifecycle_event_position "
                 "WHERE created.event_type = 'channel.created' "
-                "AND created.idempotency_key LIKE 'operator:human-provisioning:%:direct-channel'"
+                "AND created.idempotency_key LIKE 'operator:human-provisioning:%:direct-channel') "
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN operational = 1 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN operational = 0 AND archived_at IS NOT NULL THEN 1 ELSE 0 END), "
+                "SUM(restored), "
+                "SUM(CASE WHEN operational = 0 AND archived_at IS NULL THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN operational = 1 AND archived_at IS NOT NULL THEN 1 "
+                "WHEN operational = 0 AND archived_at IS NOT NULL AND NOT EXISTS("
+                "SELECT 1 FROM event_log lifecycle WHERE lifecycle.position = "
+                "legacy.lifecycle_event_position AND json_extract(lifecycle.metadata_json, "
+                "'$.source') = 'human_provisioning_migration') THEN 1 ELSE 0 END) FROM legacy"
             ).fetchone()
         finally:
             connection.close()
     except (OSError, sqlite3.Error) as exc:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
     if legacy is None:
-        legacy = (0, 0, 0, 0, 0)
+        legacy = (0, 0, 0, 0, 0, 0)
     legacy_channels = int(legacy[0] or 0)
     retained = int(legacy[1] or 0)
     archived = int(legacy[2] or 0)
-    unresolved = int(legacy[3] or 0)
-    invalid = int(legacy[4] or 0)
+    restored = int(legacy[3] or 0)
+    unresolved = int(legacy[4] or 0)
+    invalid = int(legacy[5] or 0)
     state = "active" if unresolved == 0 and invalid == 0 else "INCOMPLETE"
     return (
         f"{prefix} {state}; identities={identities}, legacy channels={legacy_channels} "
-        f"(retained={retained}, archived={archived}, unresolved={unresolved}), "
+        f"(retained={retained}, archived={archived}, restored={restored}, "
+        f"unresolved={unresolved}), "
         f"integrity gaps={invalid}; authority=identity-only"
     )
 

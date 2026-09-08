@@ -554,11 +554,12 @@ def _start() -> None:
         human_provisioning = await sessions.reconcile_workshop_human_provisioning()
         logging.info(
             "Workshop human provisioning ready (identities=%d, legacy_channels=%d, "
-            "retained=%d, archived=%d, unresolved=%d)",
+            "retained=%d, archived=%d, restored=%d, unresolved=%d)",
             human_provisioning.identities,
             human_provisioning.legacy_channels,
             human_provisioning.retained_channels,
             human_provisioning.archived_channels,
+            human_provisioning.restored_channels,
             human_provisioning.unresolved_channels,
         )
         agent_authority = await sessions.reconcile_workshop_agent_authority(runtime_profiles)

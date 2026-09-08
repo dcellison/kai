@@ -2036,9 +2036,8 @@ class CanonicalConversationProjection:
             if envelope.actor_principal_id is None:
                 raise ValueError("Workshop channel lifecycle events require a human actor")
             archived = envelope.event_type == WorkshopEventType.CHANNEL_ARCHIVED
-            legacy_provisioning_retirement = (
-                archived and envelope.metadata.get("source") == "human_provisioning_migration"
-            )
+            legacy_provisioning_lifecycle = envelope.metadata.get("source") == "human_provisioning_migration"
+            legacy_provisioning_retirement = archived and legacy_provisioning_lifecycle
             if archived:
                 async with connection.execute(
                     "SELECT 1 FROM runs WHERE channel_id = ? AND status IN ('accepted', 'started') LIMIT 1",
@@ -2055,17 +2054,22 @@ class CanonicalConversationProjection:
                 "WHERE owner.channel_id = channels.id AND owner.principal_id = ? "
                 "AND owner.role = 'owner') "
                 "AND (? = 0 OR NOT EXISTS (SELECT 1 FROM principal_agent_enablements pae "
-                "WHERE pae.direct_channel_id = channels.id))",
+                "WHERE pae.direct_channel_id = channels.id)) "
+                "AND (? = 0 OR EXISTS (SELECT 1 FROM event_log created "
+                "WHERE created.aggregate_id = channels.id AND created.event_type = 'channel.created' "
+                "AND created.idempotency_key LIKE "
+                "'operator:human-provisioning:%:direct-channel'))",
                 (
                     occurred_at if archived else None,
                     event.position,
                     envelope.aggregate_id,
                     envelope.workshop_id,
-                    int(legacy_provisioning_retirement),
+                    int(legacy_provisioning_lifecycle),
                     int(archived),
                     int(archived),
                     envelope.actor_principal_id,
                     int(legacy_provisioning_retirement),
+                    int(legacy_provisioning_lifecycle),
                 ),
             )
             if cursor.rowcount != 1:
