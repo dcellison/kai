@@ -617,7 +617,7 @@ class TestStartCrashExit:
     """Unexpected runtime crashes must not look like clean process exits."""
 
     @staticmethod
-    def _patch_minimal_config(monkeypatch):
+    def _patch_minimal_config(monkeypatch, *, protected_install: bool = True):
         monkeypatch.setattr(
             "kai.main.load_config",
             lambda: SimpleNamespace(
@@ -626,6 +626,7 @@ class TestStartCrashExit:
                 telegram_enabled=False,
                 telegram_webhook_url=None,
                 session_db_path=":memory:",
+                protected_install=protected_install,
             ),
         )
 
@@ -689,6 +690,26 @@ class TestStartCrashExit:
         monkeypatch.setattr(
             "kai.main.services.load_services_from_string",
             lambda text: calls.append(("protected", text)) or {},
+        )
+        monkeypatch.setattr(
+            "kai.main.services.load_services",
+            lambda path: calls.append(("local", str(path))) or {},
+        )
+        self._patch_asyncio_crash(monkeypatch)
+
+        with pytest.raises(SystemExit):
+            _start()
+
+        assert calls == [("local", str(Path(__file__).resolve().parents[1] / "services.yaml"))]
+
+    def test_single_user_services_never_probe_protected_path(self, monkeypatch):
+        from kai.main import _start
+
+        calls: list[tuple[str, str]] = []
+        self._patch_minimal_config(monkeypatch, protected_install=False)
+        monkeypatch.setattr(
+            "kai.main._read_protected_file",
+            lambda path: pytest.fail(f"single-user startup probed protected file {path}"),
         )
         monkeypatch.setattr(
             "kai.main.services.load_services",

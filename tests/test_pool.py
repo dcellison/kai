@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.backend import AgentResponse, StreamEvent
-from kai.config import Config, ModelRole, UserConfig, WorkspaceConfig, get_model_for
+from kai.config import Config, DeploymentMode, ModelRole, UserConfig, WorkspaceConfig, get_model_for
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIScope
 from kai.pool import SubprocessPool
@@ -89,7 +89,7 @@ class TestInstanceCreation:
             match="Protected runtime requires canonical internal API execution contexts",
         ):
             SubprocessPool(
-                config=_make_config(protected_install=True),
+                config=_make_config(deployment_mode=DeploymentMode.PROTECTED),
                 services_info=[],
             )
 
@@ -654,7 +654,7 @@ class TestPerUserBackendRouting:
         for chat_id in users:
             (tmp_path / "home" / str(chat_id)).mkdir(parents=True)
         config = _make_config(
-            protected_install=True,
+            deployment_mode=DeploymentMode.PROTECTED,
             allowed_user_ids=set(users),
             user_configs=users,
         )

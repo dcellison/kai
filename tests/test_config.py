@@ -14,18 +14,96 @@ from kai.config import (
     MODEL_REGISTRY,
     ONESHOT_REASONER_BACKENDS,
     Config,
+    DeploymentMode,
     ModelRole,
     UserConfig,
     _check_model_registry_complete,
     _load_memory_project_configs,
+    _load_workspace_configs,
     _read_protected_file,
+    _resolve_deployment_mode,
     get_model_for,
     load_config,
     resolve_claude_user,
 )
 
+
+class TestDeploymentModeResolution:
+    """Pins the one startup-wide authority and mixed-host boundary."""
+
+    def test_recorded_single_user_never_reads_protected_state(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        monkeypatch.delenv("KAI_DEPLOYMENT_MODE", raising=False)
+        (tmp_path / ".env").write_text("KAI_DEPLOYMENT_MODE=single_user\n")
+        monkeypatch.setattr(
+            "kai.config._read_protected_file",
+            lambda path: pytest.fail(f"single-user startup probed protected file {path}"),
+        )
+        monkeypatch.setattr(
+            "kai.config._read_protected_yaml",
+            lambda name: pytest.fail(f"single-user startup probed protected YAML {name}"),
+        )
+
+        mode, protected_env = _resolve_deployment_mode()
+
+        assert mode is DeploymentMode.SINGLE_USER
+        assert protected_env is None
+        assert _load_memory_project_configs(mode) == {}
+        assert _load_workspace_configs(mode) == {}
+
+    def test_install_conf_migrates_existing_single_user_env(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        monkeypatch.delenv("KAI_DEPLOYMENT_MODE", raising=False)
+        (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=local\n")
+        (tmp_path / "install.conf").write_text('{"deployment_mode":"single_user"}\n')
+        monkeypatch.setattr(
+            "kai.config._read_protected_file",
+            lambda path: pytest.fail(f"single-user startup probed protected file {path}"),
+        )
+
+        mode, protected_env = _resolve_deployment_mode()
+
+        assert mode is DeploymentMode.SINGLE_USER
+        assert protected_env is None
+
+    def test_legacy_install_falls_back_to_protected_env_probe(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        monkeypatch.delenv("KAI_DEPLOYMENT_MODE", raising=False)
+        monkeypatch.setattr(
+            "kai.config._read_protected_file",
+            lambda path: "TOKEN=protected\n" if path == "/etc/kai/env" else None,
+        )
+
+        mode, protected_env = _resolve_deployment_mode()
+
+        assert mode is DeploymentMode.PROTECTED
+        assert protected_env == "TOKEN=protected\n"
+        assert "KAI_DEPLOYMENT_MODE" not in os.environ
+
+    def test_explicit_protected_mode_does_not_fall_back_to_local_env(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        monkeypatch.setenv("KAI_DEPLOYMENT_MODE", "protected")
+        (tmp_path / ".env").write_text("TELEGRAM_BOT_TOKEN=must-not-load\n")
+        monkeypatch.setattr("kai.config._read_protected_file", lambda _path: None)
+
+        with pytest.raises(SystemExit, match="requires readable /etc/kai/env"):
+            load_config()
+
+        assert os.environ.get("TELEGRAM_BOT_TOKEN") != "must-not-load"
+
+    def test_conflicting_local_records_fail_closed(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("kai.config.PROJECT_ROOT", tmp_path)
+        monkeypatch.delenv("KAI_DEPLOYMENT_MODE", raising=False)
+        (tmp_path / ".env").write_text("KAI_DEPLOYMENT_MODE=single_user\n")
+        (tmp_path / "install.conf").write_text('{"deployment_mode":"protected"}\n')
+
+        with pytest.raises(SystemExit, match="Deployment mode disagrees"):
+            _resolve_deployment_mode()
+
+
 # All env vars that load_config reads
 _CONFIG_ENV_VARS = [
+    "KAI_DEPLOYMENT_MODE",
     "KAI_ENABLED_ADAPTERS",
     "KAI_WORKSHOP_BOOTSTRAP",
     "TELEGRAM_BOT_TOKEN",

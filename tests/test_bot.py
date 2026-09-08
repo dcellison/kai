@@ -79,6 +79,7 @@ from kai.bot import (
 from kai.config import (
     PROVIDER_MODELS,
     Config,
+    DeploymentMode,
     ModelRole,
     UserConfig,
     get_default_model_for_backend,
@@ -4096,7 +4097,7 @@ class TestHandleSettings:
     async def test_show_settings_ignores_invalid_protected_model_override(self):
         """The display matches the model that protected execution will use."""
         update = _make_update(text="/settings")
-        config = _make_config(protected_install=True)
+        config = _make_config(deployment_mode=DeploymentMode.PROTECTED)
         pool = _make_mock_claude()
         pool.get_runtime_profile.return_value = profile_registry(12345).profile_for_legacy_runtime_key(12345)
         pool.get_backend_provider.return_value = ("codex", "openai")
@@ -5972,7 +5973,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update()
         config = _make_config(
-            protected_install=True,
+            deployment_mode=DeploymentMode.PROTECTED,
             user_configs={
                 1: UserConfig(
                     telegram_id=1,
@@ -6465,7 +6466,7 @@ class TestHandleReviewCommand:
         monkeypatch.setattr("kai.bot._REVIEW_TMP_DIR", tmp_path)
         update = _make_update(user_id=1)
         config = _make_config(
-            protected_install=True,
+            deployment_mode=DeploymentMode.PROTECTED,
             allowed_user_ids={1},
             user_configs={
                 1: UserConfig(
