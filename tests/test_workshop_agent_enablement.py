@@ -25,7 +25,18 @@ from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.client_api import _read_agent_lifecycle_events
 from kai.workshop.conversation_runs import resolve_canonical_conversation_run
 from kai.workshop.diagnostics import workshop_agent_authority_status, workshop_runtime_session_status
-from kai.workshop.domain import AgentDefinitionId, AgentEnablementId, ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.domain import (
+    AgentDefinitionId,
+    AgentEnablementId,
+    ChannelAgentId,
+    ChannelId,
+    EventEnvelope,
+    MessageId,
+    PrincipalId,
+    RunId,
+    WorkshopEventType,
+    WorkshopId,
+)
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.internal_api_contexts import (
@@ -324,6 +335,19 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
             agent_ids=[enabled.agent_id],
             origin_channel_id=enabled.direct_channel_id,
         )
+        async with store.connection.execute(
+            "SELECT ca.id, c.workshop_id, ca.sponsor_principal_id, "
+            "ca.sponsored_runtime_profile_id FROM channel_agents ca "
+            "JOIN channels c ON c.id = ca.channel_id "
+            "WHERE ca.channel_id = ? AND ca.agent_id = ?",
+            (group.channel_id, enabled.agent_id),
+        ) as cursor:
+            attachment_row = await cursor.fetchone()
+        assert attachment_row is not None
+        attachment_id = ChannelAgentId(str(attachment_row[0]))
+        workshop_id = WorkshopId(str(attachment_row[1]))
+        sponsor_principal_id = PrincipalId(str(attachment_row[2]))
+        sponsored_runtime_profile_id = str(attachment_row[3])
         async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
             context_position = int((await cursor.fetchone())[0])
         for index, channel_id in enumerate(
@@ -395,6 +419,33 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
         ) as cursor:
             assert (await cursor.fetchone())[0] is not None
 
+        late_detachment = await store.append(
+            EventEnvelope.create(
+                event_type=WorkshopEventType.CHANNEL_AGENT_DETACHED,
+                event_version=1,
+                workshop_id=workshop_id,
+                aggregate_type="channel_agent",
+                aggregate_id=attachment_id,
+                actor_principal_id=daniel,
+                occurred_at=datetime.now(UTC),
+                idempotency_key="archive-cleanup-late-explicit-detachment",
+                payload={
+                    "channel_id": group.channel_id,
+                    "agent_id": enabled.agent_id,
+                    "sponsor_principal_id": sponsor_principal_id,
+                    "runtime_profile_id": sponsored_runtime_profile_id,
+                },
+                metadata={"source": "workshop_client"},
+            )
+        )
+        await store.project_pending(CanonicalConversationProjection())
+        await store.rebuild_projection(CanonicalConversationProjection())
+        async with store.connection.execute(
+            "SELECT detached_event_position FROM channel_agents WHERE channel_id = ? AND agent_id = ?",
+            (group.channel_id, enabled.agent_id),
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == late_detachment.event.position
+
         await store.connection.execute(
             "UPDATE channel_agents SET detached_at = NULL, detached_event_position = NULL "
             "WHERE channel_id = ? AND agent_id = ?",
@@ -440,6 +491,33 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
         assert workshop_runtime_session_status(tmp_path / "kai.db").startswith(
             "Workshop conversation continuity: active; successful lanes=0, sessions=0"
         )
+
+        await store.rebuild_projection(CanonicalConversationProjection())
+        await store.append(
+            EventEnvelope.create(
+                event_type=WorkshopEventType.CHANNEL_AGENT_DETACHED,
+                event_version=1,
+                workshop_id=workshop_id,
+                aggregate_type="channel_agent",
+                aggregate_id=attachment_id,
+                actor_principal_id=daniel,
+                occurred_at=datetime.now(UTC),
+                idempotency_key="archive-cleanup-duplicate-explicit-detachment",
+                payload={
+                    "channel_id": group.channel_id,
+                    "agent_id": enabled.agent_id,
+                    "sponsor_principal_id": sponsor_principal_id,
+                    "runtime_profile_id": sponsored_runtime_profile_id,
+                },
+                metadata={"source": "workshop_client"},
+            )
+        )
+        with pytest.raises(
+            ValueError,
+            match="Workshop channel-agent detachment has no matching active attachment",
+        ):
+            await store.project_pending(CanonicalConversationProjection())
+
     finally:
         await store.close()
 
