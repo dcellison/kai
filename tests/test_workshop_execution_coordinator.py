@@ -699,7 +699,7 @@ class TestCanonicalExecutionCoordinator:
         finally:
             await store.close()
 
-    async def test_runtime_drift_leaves_retryable_grant_until_expiry(self, tmp_path: Path):
+    async def test_runtime_drift_leaves_retryable_grant_until_expiry(self, tmp_path: Path, caplog):
         store, run = await _accepted(tmp_path / "kai.db")
         prepared = _Prepared(run)
         prepared.reject_validation = True
@@ -709,6 +709,8 @@ class TestCanonicalExecutionCoordinator:
             deferred = await coordinator.execute(run.run_id)
             assert deferred.disposition == CanonicalExecutionDisposition.PREPARATION_DEFERRED
             assert (await WorkshopRunLifecycle(store).state(run.run_id)).status == RunStatus.ACCEPTED
+            assert f"Workshop run {run.run_id} preparation deferred" in caplog.text
+            assert "runtime drift" in caplog.text
 
             recovered = await coordinator.recover_expired(occurred_at=_NOW + timedelta(seconds=16))
             assert recovered.expired_before_dispatch == 1

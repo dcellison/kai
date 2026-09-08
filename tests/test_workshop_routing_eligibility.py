@@ -155,23 +155,34 @@ class _Catalogue:
 
 
 class _RuntimePool:
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, namespace: WorkshopExecutionStateNamespace) -> None:
         self.workspace = workspace
+        self.namespace = namespace
         self.selection_reads = 0
         self.selected_backend = ("claude", "anthropic")
         self.authorities: list[object] = []
 
-    async def get_effective_workspace(self, runtime_authority):
+    def _record(self, runtime_authority) -> None:
+        if (
+            getattr(runtime_authority, "channel_id", None) == self.namespace.channel_id
+            and getattr(runtime_authority, "agent_id", None) == self.namespace.agent_id
+            and getattr(runtime_authority, "runtime_profile_id", None) == self.namespace.runtime_profile_id
+            and getattr(runtime_authority, "private_context", None) is not True
+        ):
+            raise RuntimeError("runtime lane conflicts with registered owner direct lane")
         self.authorities.append(runtime_authority)
+
+    async def get_effective_workspace(self, runtime_authority):
+        self._record(runtime_authority)
         return self.workspace
 
     async def get_effective_model(self, runtime_authority):
-        self.authorities.append(runtime_authority)
+        self._record(runtime_authority)
         self.selection_reads += 1
         return "selected-model"
 
     def get_backend_provider(self, runtime_authority):
-        self.authorities.append(runtime_authority)
+        self._record(runtime_authority)
         return self.selected_backend
 
     def runtime_profile(self, _runtime_profile_id):
@@ -182,7 +193,7 @@ def _service(tmp_path: Path, lanes: tuple[object, ...], snapshots: dict[str, Mod
     namespace = _namespace(1)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pool = _RuntimePool(workspace)
+    pool = _RuntimePool(workspace, namespace)
     catalogue = _Catalogue(snapshots)
     service = WorkshopRoutingEligibilityService(
         execution_state=WorkshopExecutionStateRegistry((namespace,)),
@@ -348,7 +359,7 @@ async def test_cross_principal_authority_and_unknown_task_fail_closed(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_sponsored_channel_uses_profile_owner_without_private_lane_access(
+async def test_sponsored_channel_reads_profile_owner_settings_through_real_direct_lane(
     tmp_path: Path,
 ) -> None:
     namespace = _namespace(1)
@@ -358,12 +369,12 @@ async def test_sponsored_channel_uses_profile_owner_without_private_lane_access(
         (lane,),
         {lane.option_id: _snapshot(namespace, lane, image_input=True)},
     )
-    group_channel = _id(ChannelId, 20)
-    group_agent = _id(AgentId, 21)
+    owner_channel = namespace.channel_id
+    owned_agent = namespace.agent_id
     authority = service.authority_for_sponsored_channel(
         namespace.principal_id,
-        group_channel,
-        group_agent,
+        owner_channel,
+        owned_agent,
         namespace.runtime_profile_id,
     )
 
@@ -373,18 +384,19 @@ async def test_sponsored_channel_uses_profile_owner_without_private_lane_access(
     )
 
     assert report.principal_id == namespace.principal_id
-    assert report.channel_id == group_channel
-    assert report.agent_id == group_agent
+    assert report.channel_id == owner_channel
+    assert report.agent_id == owned_agent
     assert report.runtime_profile_id == namespace.runtime_profile_id
     assert pool.authorities
-    assert all(getattr(item, "private_context", None) is False for item in pool.authorities)
-    with pytest.raises(RoutingEligibilityAccessDenied):
-        await service.inspect(authority, RoutingTaskClass.CONVERSATION)
+    # This authority is used only to inspect the owner's policy-bounded
+    # settings.  The eventual group execution receives its own non-private
+    # authority from protected preparation.
+    assert all(getattr(item, "private_context", None) is True for item in pool.authorities)
     with pytest.raises(RoutingEligibilityAccessDenied):
         service.authority_for_sponsored_channel(
             _id(PrincipalId, 2),
-            group_channel,
-            group_agent,
+            owner_channel,
+            owned_agent,
             namespace.runtime_profile_id,
         )
 

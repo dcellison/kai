@@ -504,6 +504,7 @@ class WorkshopCanonicalExecutionCoordinator:
                     workspace=str(active.prepared.workspace) if active.prepared is not None else None,
                     selection=active.prepared.selection if active.prepared is not None else None,
                 )
+            log.exception("Workshop run %s preparation deferred", run.run_id)
             return CanonicalExecutionResult(
                 CanonicalExecutionDisposition.PREPARATION_DEFERRED, await self._run(run.run_id)
             )
