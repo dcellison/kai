@@ -76,6 +76,7 @@ from kai.config import (
 from kai.named_access import replace_named_inherited_read_access, replace_named_read_access
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
+from kai.workshop.agent_enablement import initial_kai_enablement_ids
 from kai.workshop.bootstrap import bootstrap_human_principal_id
 from kai.workshop.diagnostics import (
     workshop_agent_authority_status,
@@ -90,6 +91,7 @@ from kai.workshop.diagnostics import (
     workshop_human_avatar_status,
     workshop_human_handle_status,
     workshop_human_notification_status,
+    workshop_human_provisioning_status,
     workshop_legacy_jsonl_archive_status,
     workshop_memory_authority_status,
     workshop_operational_state_status,
@@ -923,7 +925,7 @@ async def _provision_single_user_workshop(
         )
         return await sessions.issue_workshop_enrollment(
             provisioned.principal_id,
-            provisioned.channel_id,
+            provisioned.direct_channel_id,
         )
     finally:
         await sessions.close_db()
@@ -5605,7 +5607,7 @@ def _runtime_profile_principal_names(
             rows = connection.execute(
                 "SELECT ra.runtime_profile_id, cm.principal_id "
                 "FROM channel_agent_runtime_assignments ra "
-                "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+                "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
                 "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
                 "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
                 "ORDER BY ra.runtime_profile_id, cm.principal_id"
@@ -5681,7 +5683,7 @@ def _runtime_storage_targets(
                     provisioned_human_ids(
                         initial_plan.workshop_id,
                         initial_plan.provisioning_key,
-                    )[0]
+                    )
                 )
             elif runtime_config_id is None or runtime_config_id not in compatibility_ids:
                 raise RuntimeError(
@@ -6788,10 +6790,11 @@ def _issue_installed_initial_enrollment(
     service_user: str,
 ) -> str:
     """Issue the staged first browser enrollment as the database owner."""
-    principal_id, channel_id = provisioned_human_ids(
+    principal_id = provisioned_human_ids(
         plan.workshop_id,
         plan.provisioning_key,
     )
+    _enablement_id, channel_id = initial_kai_enablement_ids(plan.workshop_id, principal_id)
     command = [
         "sudo",
         "-H",
@@ -9539,6 +9542,7 @@ def _cmd_status() -> None:
             expected_humans=expected_humans,
         )
     )
+    print(workshop_human_provisioning_status(Path(data_dir) / "kai.db"))
     print(workshop_agent_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_collaboration_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_human_handle_status(Path(data_dir) / "kai.db"))
@@ -10189,7 +10193,9 @@ def _channel_lifecycle_status(db_path: Path) -> str:
                     "LEFT JOIN latest l ON l.aggregate_id = c.id "
                     "LEFT JOIN event_log e ON e.position = l.position "
                     "WHERE (c.kind != 'group' AND (c.archived_at IS NOT NULL "
-                    "OR c.lifecycle_event_position IS NOT NULL)) "
+                    "OR c.lifecycle_event_position IS NOT NULL) AND NOT ("
+                    "c.kind = 'direct' AND e.event_type = 'channel.archived' "
+                    "AND json_extract(e.metadata_json, '$.source') = 'human_provisioning_migration')) "
                     "OR (c.kind = 'group' AND c.archived_at IS NOT NULL AND ("
                     "e.event_type IS NULL OR e.event_type != 'channel.archived' "
                     "OR c.lifecycle_event_position != e.position)) "
@@ -10327,7 +10333,7 @@ def _internal_api_authority_status(db_path: Path) -> str:
                     "SELECT COUNT(*) FROM ("
                     "SELECT ra.runtime_profile_id, ra.channel_id, ra.agent_id, cm.principal_id "
                     "FROM channel_agent_runtime_assignments ra "
-                    "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+                    "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
                     "JOIN agents a ON a.id = ra.agent_id AND a.workshop_id = c.workshop_id "
                     "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = a.id "
                     "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "

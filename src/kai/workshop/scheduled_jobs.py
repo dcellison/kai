@@ -85,7 +85,7 @@ class WorkshopScheduledJobStore:
         """Require one complete direct-channel execution assignment."""
         async with self._store.connection.execute(
             "SELECT COUNT(*) FROM channel_agent_runtime_assignments ra "
-            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
             "JOIN agents a ON a.id = ra.agent_id AND a.workshop_id = c.workshop_id "
             "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = a.id "
             "JOIN channel_memberships cm ON cm.channel_id = c.id "

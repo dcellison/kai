@@ -7,10 +7,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from kai.workshop.domain import (
-    AgentId,
-    ChannelAgentId,
-    ChannelId,
-    ChannelMembershipId,
     EventEnvelope,
     PrincipalId,
     WorkshopEventType,
@@ -30,7 +26,6 @@ class WorkshopHumanProvisioningError(RuntimeError):
 class ProvisionedWorkshopHuman:
     workshop_id: WorkshopId
     principal_id: PrincipalId
-    channel_id: ChannelId
     display_name: str
     role: str
     provisioning_key: str
@@ -44,14 +39,11 @@ _PROVISIONING_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 def provisioned_human_ids(
     workshop_id: WorkshopId,
     provisioning_key: str,
-) -> tuple[PrincipalId, ChannelId]:
-    """Return the stable principal/direct-channel IDs for operator provisioning."""
+) -> PrincipalId:
+    """Return the stable principal ID for operator provisioning."""
     normalized_key = _normalize_provisioning_key(provisioning_key)
     stable_prefix = f"operator-human:{normalized_key}"
-    return (
-        PrincipalId.derived(workshop_id, stable_prefix),
-        ChannelId.derived(workshop_id, f"{stable_prefix}:direct-channel"),
-    )
+    return PrincipalId.derived(workshop_id, stable_prefix)
 
 
 def _normalize_display_name(value: object) -> str:
@@ -106,9 +98,8 @@ class WorkshopHumanProvisioner:
         try:
             await connection.execute("BEGIN IMMEDIATE")
             resolved_workshop_id = await self._resolve_workshop(workshop_id)
-            agent_id, agent_principal_id = await self._resolve_kai_agent(resolved_workshop_id)
             stable_prefix = f"operator-human:{normalized_key}"
-            principal_id, channel_id = provisioned_human_ids(
+            principal_id = provisioned_human_ids(
                 resolved_workshop_id,
                 normalized_key,
             )
@@ -121,26 +112,11 @@ class WorkshopHumanProvisioner:
                 resolved_workshop_id,
                 f"{stable_prefix}:workshop-membership",
             )
-            human_channel_membership_id = ChannelMembershipId.derived(
-                resolved_workshop_id,
-                f"{stable_prefix}:human-channel-membership",
-            )
-            agent_channel_membership_id = ChannelMembershipId.derived(
-                resolved_workshop_id,
-                f"{stable_prefix}:agent-channel-membership",
-            )
-            channel_agent_id = ChannelAgentId.derived(
-                resolved_workshop_id,
-                f"{stable_prefix}:channel-agent",
-            )
             principal_event_key = f"operator:human-provisioning:{principal_id}:principal"
             if await self._store.event_by_idempotency_key(principal_event_key) is not None:
                 if not await self._matches_existing_provisioning(
                     resolved_workshop_id,
                     principal_id,
-                    channel_id,
-                    agent_id,
-                    agent_principal_id,
                     normalized_name,
                     normalized_role,
                     normalized_handle,
@@ -152,7 +128,6 @@ class WorkshopHumanProvisioner:
                 return ProvisionedWorkshopHuman(
                     resolved_workshop_id,
                     principal_id,
-                    channel_id,
                     normalized_name,
                     normalized_role,
                     normalized_key,
@@ -186,58 +161,6 @@ class WorkshopHumanProvisioner:
                     payload={"principal_id": principal_id, "role": normalized_role},
                     metadata={"source": "operator_cli"},
                 ),
-                EventEnvelope.create(
-                    event_type=WorkshopEventType.CHANNEL_CREATED,
-                    event_version=1,
-                    workshop_id=resolved_workshop_id,
-                    aggregate_type="channel",
-                    aggregate_id=channel_id,
-                    occurred_at=now,
-                    idempotency_key=f"operator:human-provisioning:{principal_id}:direct-channel",
-                    payload={"kind": "direct", "name": "Direct"},
-                    metadata={"source": "operator_cli"},
-                ),
-                EventEnvelope.create(
-                    event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
-                    event_version=1,
-                    workshop_id=resolved_workshop_id,
-                    aggregate_type="channel_membership",
-                    aggregate_id=human_channel_membership_id,
-                    occurred_at=now,
-                    idempotency_key=f"operator:human-provisioning:{principal_id}:human-channel-membership",
-                    payload={
-                        "channel_id": channel_id,
-                        "principal_id": principal_id,
-                        "role": "owner",
-                    },
-                    metadata={"source": "operator_cli"},
-                ),
-                EventEnvelope.create(
-                    event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
-                    event_version=1,
-                    workshop_id=resolved_workshop_id,
-                    aggregate_type="channel_membership",
-                    aggregate_id=agent_channel_membership_id,
-                    occurred_at=now,
-                    idempotency_key=f"operator:human-provisioning:{principal_id}:agent-channel-membership",
-                    payload={
-                        "channel_id": channel_id,
-                        "principal_id": agent_principal_id,
-                        "role": "participant",
-                    },
-                    metadata={"source": "operator_cli"},
-                ),
-                EventEnvelope.create(
-                    event_type=WorkshopEventType.CHANNEL_AGENT_ATTACHED,
-                    event_version=1,
-                    workshop_id=resolved_workshop_id,
-                    aggregate_type="channel_agent",
-                    aggregate_id=channel_agent_id,
-                    occurred_at=now,
-                    idempotency_key=f"operator:human-provisioning:{principal_id}:channel-agent",
-                    payload={"channel_id": channel_id, "agent_id": agent_id},
-                    metadata={"source": "operator_cli"},
-                ),
             )
             inserted_states: set[bool] = set()
             for event in events:
@@ -258,7 +181,6 @@ class WorkshopHumanProvisioner:
         return ProvisionedWorkshopHuman(
             resolved_workshop_id,
             principal_id,
-            channel_id,
             normalized_name,
             normalized_role,
             normalized_key,
@@ -270,9 +192,6 @@ class WorkshopHumanProvisioner:
         self,
         workshop_id: WorkshopId,
         principal_id: PrincipalId,
-        channel_id: ChannelId,
-        agent_id: AgentId,
-        agent_principal_id: PrincipalId,
         display_name: str,
         role: str,
         handle: str,
@@ -283,21 +202,11 @@ class WorkshopHumanProvisioner:
             "AND wm.workshop_id = ? AND wm.role = ? "
             "JOIN human_handles hh ON hh.workshop_id = wm.workshop_id "
             "AND hh.principal_id = p.id AND hh.handle = ? COLLATE NOCASE "
-            "JOIN channels c ON c.id = ? AND c.workshop_id = wm.workshop_id "
-            "AND c.kind = 'direct' "
-            "JOIN channel_memberships human_cm ON human_cm.channel_id = c.id "
-            "AND human_cm.principal_id = p.id AND human_cm.role = 'owner' "
-            "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = ? "
-            "JOIN channel_memberships agent_cm ON agent_cm.channel_id = c.id "
-            "AND agent_cm.principal_id = ? AND agent_cm.role = 'participant' "
             "WHERE p.id = ? AND p.kind = 'human' AND p.display_name = ? LIMIT 1",
             (
                 workshop_id,
                 role,
                 handle,
-                channel_id,
-                agent_id,
-                agent_principal_id,
                 principal_id,
                 display_name,
             ),
@@ -310,7 +219,10 @@ class WorkshopHumanProvisioner:
             (f"operator:human-provisioning:{principal_id}:%",),
         ) as cursor:
             count_row = await cursor.fetchone()
-        return count_row is not None and int(count_row[0]) == 6
+        # Legacy releases emitted four additional Kai/channel events. They do
+        # not change the identity semantics of a safe retry and are reconciled
+        # separately during startup.
+        return count_row is not None and int(count_row[0]) in {2, 6}
 
     async def _require_available_handle(
         self,
@@ -348,17 +260,3 @@ class WorkshopHumanProvisioner:
         if not exists:
             raise WorkshopHumanProvisioningError("Workshop is unavailable")
         return workshop_id
-
-    async def _resolve_kai_agent(self, workshop_id: WorkshopId) -> tuple[AgentId, PrincipalId]:
-        async with self._store.connection.execute(
-            "SELECT a.id, a.principal_id FROM agents a "
-            "JOIN principals p ON p.id = a.principal_id AND p.kind = 'agent' "
-            "JOIN workshop_memberships wm ON wm.workshop_id = a.workshop_id "
-            "AND wm.principal_id = a.principal_id AND wm.role = 'agent' "
-            "WHERE a.workshop_id = ? AND a.name = 'Kai'",
-            (workshop_id,),
-        ) as cursor:
-            rows = list(await cursor.fetchall())
-        if len(rows) != 1:
-            raise WorkshopHumanProvisioningError("Workshop does not contain exactly one canonical Kai agent")
-        return AgentId(str(rows[0][0])), PrincipalId(str(rows[0][1]))

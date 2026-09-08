@@ -244,6 +244,53 @@ def workshop_bootstrap_status(db_path: Path, *, expected_humans: int | None) -> 
     )
 
 
+def workshop_human_provisioning_status(db_path: Path) -> str:
+    """Report identity-only provisioning and legacy direct-channel retirement."""
+    prefix = "Workshop human provisioning:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            identities = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM event_log WHERE event_type = 'principal.created' "
+                "AND idempotency_key LIKE 'operator:human-provisioning:%:principal'",
+            )
+            legacy = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN pae.id IS NOT NULL THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN pae.id IS NULL AND c.archived_at IS NOT NULL THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN pae.id IS NULL AND c.archived_at IS NULL THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN c.archived_at IS NOT NULL AND (archive.position IS NULL "
+                "OR json_extract(archive.metadata_json, '$.source') != 'human_provisioning_migration') "
+                "THEN 1 ELSE 0 END) "
+                "FROM event_log created "
+                "JOIN channels c ON c.id = created.aggregate_id AND c.kind = 'direct' "
+                "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
+                "LEFT JOIN event_log archive ON archive.position = c.lifecycle_event_position "
+                "WHERE created.event_type = 'channel.created' "
+                "AND created.idempotency_key LIKE 'operator:human-provisioning:%:direct-channel'"
+            ).fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    if legacy is None:
+        legacy = (0, 0, 0, 0, 0)
+    legacy_channels = int(legacy[0] or 0)
+    retained = int(legacy[1] or 0)
+    archived = int(legacy[2] or 0)
+    unresolved = int(legacy[3] or 0)
+    invalid = int(legacy[4] or 0)
+    state = "active" if unresolved == 0 and invalid == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; identities={identities}, legacy channels={legacy_channels} "
+        f"(retained={retained}, archived={archived}, unresolved={unresolved}), "
+        f"integrity gaps={invalid}; authority=identity-only"
+    )
+
+
 def workshop_agent_authority_status(db_path: Path) -> str:
     """Describe canonical multi-agent authority and integrity without exposing content."""
     prefix = "Workshop agent authority:"
@@ -394,6 +441,7 @@ def workshop_agent_authority_status(db_path: Path) -> str:
                 "OR d.active_revision_id IS NULL OR d.agent_id != e.agent_id "
                 "OR d.workshop_id != e.workshop_id OR a.workshop_id != e.workshop_id "
                 "OR ap.kind IS NULL OR ap.kind != 'agent' OR c.kind IS NULL OR c.kind != 'direct' "
+                "OR c.archived_at IS NOT NULL "
                 "OR c.workshop_id != e.workshop_id OR (SELECT COUNT(*) FROM channel_memberships cm "
                 "WHERE cm.channel_id = e.direct_channel_id) != 2 "
                 "OR NOT EXISTS (SELECT 1 FROM channel_memberships cm WHERE "
@@ -411,7 +459,7 @@ def workshop_agent_authority_status(db_path: Path) -> str:
                 "WITH runtime_owners AS (SELECT ra.runtime_profile_id, "
                 "COUNT(DISTINCT owner.principal_id) AS owner_count, "
                 "MIN(owner.principal_id) AS owner_id FROM channel_agent_runtime_assignments ra "
-                "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+                "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
                 "JOIN channel_memberships owner ON owner.channel_id = c.id AND owner.role = 'owner' "
                 "JOIN principals p ON p.id = owner.principal_id AND p.kind = 'human' "
                 "GROUP BY ra.runtime_profile_id) SELECT COUNT(*) "
@@ -423,7 +471,8 @@ def workshop_agent_authority_status(db_path: Path) -> str:
                 connection,
                 "SELECT COUNT(*) FROM (SELECT ra.runtime_profile_id FROM "
                 "channel_agent_runtime_assignments ra JOIN channels c ON c.id = ra.channel_id "
-                "AND c.kind = 'direct' JOIN channel_memberships owner ON owner.channel_id = c.id "
+                "AND c.kind = 'direct' AND c.archived_at IS NULL "
+                "JOIN channel_memberships owner ON owner.channel_id = c.id "
                 "AND owner.role = 'owner' JOIN principals p ON p.id = owner.principal_id "
                 "AND p.kind = 'human' GROUP BY ra.runtime_profile_id "
                 "HAVING COUNT(DISTINCT owner.principal_id) > 1)",

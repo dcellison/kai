@@ -105,7 +105,7 @@ class WorkshopExecutionStateRegistry:
             "SELECT ra.runtime_profile_id, ra.channel_id, ra.agent_id, cm.principal_id, "
             "ra.created_event_position "
             "FROM channel_agent_runtime_assignments ra "
-            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' "
+            "JOIN channels c ON c.id = ra.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
             "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
             "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
             "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "

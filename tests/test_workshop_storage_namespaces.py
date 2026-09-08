@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 
 from kai.install import _canonical_storage_reader_users
+from kai.workshop.agent_enablement import enable_initial_workshop_agent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.domain import ChannelId, PrincipalId
 from kai.workshop.human_provisioning import WorkshopHumanProvisioner
-from kai.workshop.runtime_assignments import WorkshopRuntimeAssignmentService
 from kai.workshop.storage_namespaces import (
     WorkshopChannelHistoryNamespace,
     WorkshopChannelHistoryRegistry,
@@ -189,11 +189,12 @@ class TestWorkshopChannelHistoryRegistry:
             human = await WorkshopHumanProvisioner(store).provision(
                 "workshop-only-human",
                 "Workshop-only human",
-                "member",
+                "admin",
             )
-            await WorkshopRuntimeAssignmentService(store, profiles).assign(
+            enabled = await enable_initial_workshop_agent(
+                store,
+                profiles,
                 human.principal_id,
-                human.channel_id,
                 profile_id(303),
             )
 
@@ -203,12 +204,12 @@ class TestWorkshopChannelHistoryRegistry:
             )
             namespace = registry.for_compatibility_chat_id(303)
 
-            assert namespace.channel_id == human.channel_id
-            assert namespace.history_directory(tmp_path) == (tmp_path / "history" / str(human.channel_id))
+            assert namespace.channel_id == enabled.direct_channel_id
+            assert namespace.history_directory(tmp_path) == (tmp_path / "history" / str(enabled.direct_channel_id))
             assert namespace.legacy_history_directory(tmp_path) == (tmp_path / "history" / "303")
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM channel_bindings WHERE channel_id = ?",
-                (human.channel_id,),
+                (enabled.direct_channel_id,),
             ) as cursor:
                 assert int((await cursor.fetchone())[0]) == 0
         finally:

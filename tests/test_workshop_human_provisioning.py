@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.client_access import WorkshopClientAccess
-from kai.workshop.client_sessions import WorkshopClientEnrollmentManager
-from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.human_provisioning import (
     WorkshopHumanProvisioner,
     WorkshopHumanProvisioningError,
 )
-from kai.workshop.inbound import ClientInboundMessage
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id
 
@@ -47,19 +41,17 @@ class TestWorkshopHumanProvisioner:
             assert provisioned.handle == "charlie_ops"
 
             async with store.connection.execute(
-                "SELECT p.display_name, hh.handle, wm.role, c.kind, cm.role "
+                "SELECT p.display_name, hh.handle, wm.role "
                 "FROM principals p "
                 "JOIN workshop_memberships wm ON wm.principal_id = p.id "
                 "JOIN human_handles hh ON hh.workshop_id = wm.workshop_id "
                 "AND hh.principal_id = p.id "
-                "JOIN channel_memberships cm ON cm.principal_id = p.id "
-                "JOIN channels c ON c.id = cm.channel_id AND c.workshop_id = wm.workshop_id "
-                "WHERE p.id = ? AND c.id = ?",
-                (provisioned.principal_id, provisioned.channel_id),
+                "WHERE p.id = ?",
+                (provisioned.principal_id,),
             ) as cursor:
                 row = await cursor.fetchone()
             assert row is not None
-            assert tuple(row) == ("Charlie", "charlie_ops", "member", "direct", "owner")
+            assert tuple(row) == ("Charlie", "charlie_ops", "member")
 
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM external_identities WHERE principal_id = ?",
@@ -67,29 +59,31 @@ class TestWorkshopHumanProvisioner:
             ) as cursor:
                 assert (await cursor.fetchone())[0] == 0
             async with store.connection.execute(
-                "SELECT COUNT(*) FROM channel_bindings WHERE channel_id = ?",
-                (provisioned.channel_id,),
+                "SELECT COUNT(*) FROM channel_memberships WHERE principal_id = ?",
+                (provisioned.principal_id,),
             ) as cursor:
                 assert (await cursor.fetchone())[0] == 0
             async with store.connection.execute(
-                "SELECT COUNT(*) FROM channel_agents ca "
-                "JOIN agents a ON a.id = ca.agent_id AND a.name = 'Kai' "
-                "JOIN channel_memberships cm ON cm.channel_id = ca.channel_id "
-                "AND cm.principal_id = a.principal_id AND cm.role = 'participant' "
-                "WHERE ca.channel_id = ?",
-                (provisioned.channel_id,),
+                "SELECT COUNT(*) FROM principal_agent_enablements WHERE principal_id = ?",
+                (provisioned.principal_id,),
             ) as cursor:
-                assert (await cursor.fetchone())[0] == 1
+                assert (await cursor.fetchone())[0] == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_agents ca JOIN channel_memberships cm "
+                "ON cm.channel_id = ca.channel_id WHERE cm.principal_id = ?",
+                (provisioned.principal_id,),
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 0
             async with store.connection.execute(
                 "SELECT COUNT(*) FROM event_log WHERE idempotency_key LIKE ? "
                 "AND json_extract(metadata_json, '$.source') = 'operator_cli'",
                 (f"operator:human-provisioning:{provisioned.principal_id}:%",),
             ) as cursor:
-                assert (await cursor.fetchone())[0] == 6
+                assert (await cursor.fetchone())[0] == 2
         finally:
             await store.close()
 
-    async def test_provisioned_human_uses_the_shared_agent_owner_runtime(
+    async def test_provisioned_human_has_no_implicit_agent_or_runtime_authority(
         self,
         tmp_path: Path,
     ):
@@ -100,32 +94,19 @@ class TestWorkshopHumanProvisioner:
                 "Charlie",
                 "member",
             )
-            access = WorkshopClientAccess(store)
-            issued = await access.issue_enrollment(
-                provisioned.principal_id,
-                provisioned.channel_id,
-            )
-            redeemed = await WorkshopClientEnrollmentManager(store).redeem_grant(
-                issued.grant.token,
-                "Charlie's laptop",
-            )
-
-            assert redeemed.device.principal_id == provisioned.principal_id
-            assert await CanonicalChannelAuthorizer(store).can_read_channel(
-                provisioned.principal_id,
-                provisioned.channel_id,
-            )
-            accepted = await WorkshopConversationCommandService(store).accept_client(
-                ClientInboundMessage(
-                    principal_id=provisioned.principal_id,
-                    channel_id=provisioned.channel_id,
-                    client_message_id="provisioned-human-shared-agent-runtime",
-                    body="Use the shared agent owner's runtime",
-                    occurred_at=datetime.now(UTC),
-                )
-            )
-            assert accepted.runtime_profile_id == profile_id(101)
-            assert accepted.run.requested_by_principal_id == provisioned.principal_id
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channels c JOIN channel_memberships cm "
+                "ON cm.channel_id = c.id WHERE cm.principal_id = ?",
+                (provisioned.principal_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_agent_runtime_assignments ra "
+                "JOIN channel_memberships cm ON cm.channel_id = ra.channel_id "
+                "WHERE cm.principal_id = ?",
+                (provisioned.principal_id,),
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
         finally:
             await store.close()
 
@@ -142,7 +123,6 @@ class TestWorkshopHumanProvisioner:
             assert first.created is True
             assert retried.created is False
             assert retried.principal_id == first.principal_id
-            assert retried.channel_id == first.channel_id
             async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
                 assert (await cursor.fetchone())[0] == after_first
 
@@ -177,7 +157,7 @@ class TestWorkshopHumanProvisioner:
         finally:
             await store.close()
 
-    async def test_missing_canonical_kai_agent_rolls_back_without_partial_human(
+    async def test_identity_provisioning_does_not_depend_on_a_kai_agent(
         self,
         tmp_path: Path,
     ):
@@ -186,22 +166,16 @@ class TestWorkshopHumanProvisioner:
             await store.connection.execute("DELETE FROM channel_agents")
             await store.connection.execute("DELETE FROM agents")
             await store.connection.commit()
-            async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
-                before_events = (await cursor.fetchone())[0]
-            async with store.connection.execute("SELECT COUNT(*) FROM principals") as cursor:
-                before_principals = (await cursor.fetchone())[0]
-
-            with pytest.raises(WorkshopHumanProvisioningError, match="canonical Kai agent"):
-                await WorkshopHumanProvisioner(store).provision(
-                    "charlie",
-                    "Charlie",
-                    "member",
-                )
-
-            async with store.connection.execute("SELECT COUNT(*) FROM event_log") as cursor:
-                assert (await cursor.fetchone())[0] == before_events
-            async with store.connection.execute("SELECT COUNT(*) FROM principals") as cursor:
-                assert (await cursor.fetchone())[0] == before_principals
+            provisioned = await WorkshopHumanProvisioner(store).provision(
+                "charlie",
+                "Charlie",
+                "member",
+            )
+            async with store.connection.execute(
+                "SELECT display_name FROM principals WHERE id = ?",
+                (provisioned.principal_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("Charlie",)
         finally:
             await store.close()
 
