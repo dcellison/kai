@@ -304,6 +304,10 @@ async def test_overflow_pauses_explicitly_and_retains_inspectable_omitted_range(
         assert state.overflow_through_event_position == results[3].event.position
         assert [len(batch.message_ids) for batch in await observation.pending_batches(state)] == [2]
         assert "paused overflow=1" in workshop_standing_observation_status(path)
+        assert (
+            "cursors=1 (delivery boundary initialized=1, backlog beyond boundary=1)"
+            in workshop_standing_observation_status(path)
+        )
         assert "integrity gaps=0, replay gaps=0" in workshop_standing_observation_status(path)
     finally:
         await store.close()

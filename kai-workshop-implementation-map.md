@@ -1,8 +1,12 @@
 # Kai Workshop: Phase 0 Implementation Map
 
-**Status:** Active migration plan; first canonical conversation delivery authority live
-**Date:** 2026-08-12
+**Status:** Canonical Workshop active; standing participation implemented and pending final installed qualification
+**Date:** 2026-09-09
 **Scope:** Map and execute the current Kai implementation's migration onto the proposed Kai Workshop architecture.
+
+This document is a chronological implementation map. Earlier sections preserve
+the system state and migration decisions at their implementation dates; the
+highest-numbered sections describe the current authority.
 
 ## 1. Naming and scope
 
@@ -2274,3 +2278,50 @@ restart continuity, memory, scheduling, integration publication, and unchanged
 optional Telegram delivery. Supported backends for which the operator has no
 configured authenticated account are not falsely reported as active and do not
 block this architectural boundary.
+
+## 49. Standing agent participation
+
+**Implementation date:** 2026-09-09
+
+Workshop group channels can opt into standing participation. An eligible agent
+begins standing only after a human explicitly mentions it in an opted-in
+channel. The resulting subscription is canonical, durable, versioned, and
+separate from both transient mention engagement and the short-lived
+collaboration grant used by any individual run. Channel policy remains off by
+default, agent owners must explicitly allow the operation, and host policy
+provides the final authority and hard resource ceilings.
+
+A standing agent observes canonical messages from every adapter through one
+bounded channel or thread inbox. Messages are coalesced into immutable ordered
+batches with durable considered, pending, and delivered cursors. Backlog count
+and age limits pause a scope visibly rather than dropping unseen input; an
+authorized human can deliberately resume from the recorded boundary or dismiss
+the agent. Subscription and observation state rebuild from the event log.
+
+Observation uses the same long-lived `(channel, agent, runtime profile)` lane
+and provider session as ordinary responses. It does not create a model process
+per message. Each observe attempt receives fresh, attempt-scoped authority and
+rechecks the current subscription, definition, owner policy, channel policy,
+attachment, host policy, cancellation state, and quotas before dispatch and
+again before publication. A backend or model switch replaces an incompatible
+provider session while rebuilding context from the canonical timeline.
+
+The exact output `<<silent>>` is a successful, message-free outcome. Empty
+output is failure, and mixed sentinel text is visible and recorded as a
+protocol anomaly rather than silently altered. Inference and visible
+publication budgets are independent. At most one standing contribution per
+agent and human anchor may be published, so multiple standing agents cannot
+form an unbounded visible response loop. Respond runs take priority over
+observation work.
+
+Dismissal, quiet expiry, overflow, detachment, channel archive, definition
+archive, access or revision loss, owner-policy revocation, channel-policy
+disablement, and emergency host revocation all fail closed. Suppressed proposed
+output remains protected and is never added to the conversation. Workshop
+shows compact standing controls, subscription state, overflow recovery, and
+authorized run inspection; silent observations remain hidden by default.
+
+Installed diagnostics report subscription lifecycle, observation cursors and
+overflow, run outcomes, quota use, protected-output counts, protocol anomalies,
+and replay or integrity gaps. Final installed qualification under #1470 is the
+closure gate for this section and epic #1465.

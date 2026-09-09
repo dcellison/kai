@@ -1023,6 +1023,12 @@ def workshop_standing_observation_status(db_path: Path) -> str:
             scopes, idle, pending, paused, pending_messages, unanchored = tuple(
                 int(value or 0) for value in (counts or (0, 0, 0, 0, 0, 0))
             )
+            cursor_counts = connection.execute(
+                "SELECT SUM(CASE WHEN delivered_through_event_position > 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN considered_through_event_position > delivered_through_event_position "
+                "THEN 1 ELSE 0 END) FROM channel_agent_observation_states"
+            ).fetchone()
+            delivered_cursors, awaiting_cursors = tuple(int(value or 0) for value in (cursor_counts or (0, 0)))
             integrity_gaps = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM channel_agent_observation_states o "
@@ -1063,6 +1069,8 @@ def workshop_standing_observation_status(db_path: Path) -> str:
     return (
         f"{prefix} {state}; host={host_state}, scopes={scopes} "
         f"(idle={idle}, pending={pending}, paused overflow={paused}), "
+        f"cursors={scopes} (delivery boundary initialized={delivered_cursors}, "
+        f"backlog beyond boundary={awaiting_cursors}), "
         f"pending messages={pending_messages}, unanchored={unanchored}; {limits}; "
         f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; authority=canonical-message"
     )
@@ -1101,6 +1109,7 @@ def workshop_standing_observe_execution_status(db_path: Path) -> str:
             )
             protected = _scalar(connection, "SELECT COUNT(*) FROM standing_observation_suppressed_outputs")
             anomalies = _scalar(connection, "SELECT COUNT(*) FROM standing_observation_protocol_anomalies")
+            publications = _scalar(connection, "SELECT COUNT(*) FROM standing_observation_publications")
             integrity_gaps = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM runs r LEFT JOIN standing_observation_publications p ON p.run_id = r.id "
@@ -1136,6 +1145,7 @@ def workshop_standing_observe_execution_status(db_path: Path) -> str:
     return (
         f"{prefix} {state}; host={host_state}, runs={total} (nonterminal={nonterminal}, "
         f"spoke={spoke}, silent={silent}, suppressed={suppressed}, failed={failed}), "
+        f"quota ledger=(inferences={total}, publications={publications}), "
         f"protected outputs={protected}, protocol anomalies={anomalies}; {limits}; "
         f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; "
         "authority=canonical/attempt-scoped"

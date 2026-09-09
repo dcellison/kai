@@ -112,7 +112,11 @@ class CollaborationOwnerPolicy:
 class StandingParticipationHostPolicy:
     """Host-owned standing-participation rollout switch and hard limits."""
 
-    enabled: bool = False
+    # The staged implementation shipped fail-closed while subscription,
+    # observation, execution, and UI authority were qualified independently.
+    # The final rollout enables the completed path by default.  Supplying an
+    # explicit disabled policy remains the emergency host revocation boundary.
+    enabled: bool = True
     max_agents_per_channel: int = 2
     coalescing_grace_seconds: int = 2
     max_messages_per_observe_run: int = 40
@@ -155,7 +159,10 @@ class StandingParticipationHostPolicy:
 class CollaborationHostPolicy:
     """Server-owned maxima that no agent revision or owner can exceed."""
 
-    version: int = 2
+    # Version 3 is the production standing-participation rollout.  Existing
+    # subscription evidence keeps its recorded version while every new start
+    # records the enabled-by-default host policy.
+    version: int = 3
     allowed_operations: frozenset[CollaborationOperation] = frozenset(CollaborationOperation)
     quotas: Mapping[CollaborationOperation, int] = field(
         default_factory=lambda: {
