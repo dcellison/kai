@@ -1028,6 +1028,14 @@ async def test_standing_participation_api_is_principal_scoped_versioned_and_repl
             "host_enabled": True,
             "host_policy_version": 2,
             "max_agents_per_channel": 2,
+            "coalescing_grace_seconds": 2,
+            "max_messages_per_observe_run": 40,
+            "max_pending_messages_per_scope": 500,
+            "max_pending_age_seconds": 86400,
+            "max_observe_runs_per_hour": 30,
+            "max_unsolicited_messages_per_hour": 12,
+            "minimum_unsolicited_interval_seconds": 60,
+            "quiet_expiry_seconds": 259200,
         }
 
         changed = await client.put(path, headers=headers, json=request)
@@ -4437,6 +4445,8 @@ class TestWorkshopTimelineHTTPContract:
                         "reply_participant_count": 0,
                         "reply_participants": [],
                         "latest_reply_at": None,
+                        "standing_contribution": False,
+                        "source_run_id": None,
                         "mentions": [],
                         "reactions": [],
                         "artifacts": [],
@@ -5067,6 +5077,8 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                     "reply_participant_count": 0,
                     "reply_participants": [],
                     "latest_reply_at": None,
+                    "standing_contribution": False,
+                    "source_run_id": None,
                     "mentions": [],
                     "reactions": [],
                     "artifacts": [],
@@ -5096,6 +5108,48 @@ class TestWorkshopTimelineEventStreamHTTPContract:
 
             assert event["event"] == "timeline.message.created"
             assert event["data"]["message"]["body"] == "Message 1"
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await reader.close()
+            await writer.close()
+
+    async def test_future_only_stream_signals_standing_policy_changes(self, tmp_path: Path):
+        database = tmp_path / "kai.db"
+        writer, alice_id, alice_channel, _, _ = await _open_store(database)
+        channel_id = await _create_group_channel(writer, alice_id, alice_channel)
+        reader = await WorkshopEventStore.open(database)
+        client = await _open_client(reader, _Authenticator({"alice-token": alice_id}))
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{channel_id}/events",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            standing = WorkshopStandingParticipationService(
+                writer,
+                CollaborationHostPolicy(
+                    standing_participation=StandingParticipationHostPolicy(enabled=True),
+                ),
+            )
+            mutation = await standing.set_channel_policy(
+                alice_id,
+                channel_id,
+                enabled=True,
+                expected_policy_version=0,
+                client_operation_id="standing-stream-policy-1",
+            )
+
+            event = await _read_sse_event(response)
+
+            assert mutation.snapshot.policy.enabled is True
+            assert event["event"] == "standing.participation.changed"
+            assert event["data"] == {
+                "version": 1,
+                "channel_id": channel_id,
+                "event_position": int(str(event["id"])),
+            }
         finally:
             if response is not None:
                 response.close()

@@ -309,6 +309,69 @@ async def test_overflow_pauses_explicitly_and_retains_inspectable_omitted_range(
         await store.close()
 
 
+async def test_member_resume_discards_overflow_backlog_idempotently_and_rebuilds_exactly(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "kai.db"
+    store, human_id, channel_id, agent_id, _standing = await _observation_authority(path)
+    policy = _host_policy(max_pending_messages_per_scope=2)
+    observation = WorkshopStandingObservationService(store, policy)
+    standing = WorkshopStandingParticipationService(store, policy)
+    try:
+        await observation.synchronize_host_policy()
+        for index in range(4):
+            await _append_message(
+                store,
+                channel_id,
+                human_id,
+                f"resume-overflow-{index}",
+                offset_seconds=index + 1,
+            )
+        paused = (
+            await observation.inspect(
+                channel_id,
+                agent_id,
+                current_at=_NOW + timedelta(seconds=5),
+            )
+        )[0]
+        assert paused.lifecycle_state == "paused_overflow"
+
+        resumed = await standing.resume_observation(
+            human_id,
+            channel_id,
+            agent_id,
+            scope_id=paused.scope_id,
+            expected_state_version=paused.state_version,
+            client_operation_id="resume-overflow-1",
+        )
+        replay = await standing.resume_observation(
+            human_id,
+            channel_id,
+            agent_id,
+            scope_id=paused.scope_id,
+            expected_state_version=paused.state_version,
+            client_operation_id="resume-overflow-1",
+        )
+        state = next(item for item in resumed.observations if item.scope_id == paused.scope_id)
+        replayed = next(item for item in replay.observations if item.scope_id == paused.scope_id)
+
+        assert state.lifecycle_state == "idle"
+        assert state.pending_message_count == 0
+        assert state.delivered_through_event_position == paused.considered_through_event_position
+        assert state.overflow_reason is None
+        assert replayed == state
+
+        await store.rebuild_projection(CanonicalConversationProjection())
+        rebuilt = next(
+            item
+            for item in (await standing.inspect(human_id, channel_id)).observations
+            if item.scope_id == paused.scope_id
+        )
+        assert rebuilt == state
+    finally:
+        await store.close()
+
+
 async def test_pending_age_reconciliation_pauses_without_advancing_delivery(tmp_path: Path) -> None:
     store, human_id, channel_id, agent_id, _standing = await _observation_authority(tmp_path / "kai.db")
     policy = _host_policy(max_pending_age_seconds=5)

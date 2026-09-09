@@ -75,6 +75,14 @@ class ChannelStandingPolicy:
     host_enabled: bool
     host_policy_version: int
     max_agents_per_channel: int
+    coalescing_grace_seconds: int
+    max_messages_per_observe_run: int
+    max_pending_messages_per_scope: int
+    max_pending_age_seconds: int
+    max_observe_runs_per_hour: int
+    max_unsolicited_messages_per_hour: int
+    minimum_unsolicited_interval_seconds: int
+    quiet_expiry_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,12 +100,56 @@ class StandingSubscription:
     quiet_expires_at: datetime | None
     state_version: int
     end_reason: str | None
+    agent_display_name: str
+    agent_handle: str
+    started_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StandingObservationSummary:
+    agent_id: AgentId
+    scope_kind: str
+    scope_id: str
+    delivered_through_event_position: int
+    pending_through_event_position: int
+    considered_through_event_position: int
+    pending_message_count: int
+    not_before: datetime | None
+    lifecycle_state: str
+    overflowed_at: datetime | None
+    overflow_reason: str | None
+    overflow_from_event_position: int | None
+    overflow_through_event_position: int | None
+    state_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class StandingRunSummary:
+    run_id: str
+    agent_id: AgentId
+    agent_display_name: str
+    status: str
+    accepted_at: datetime
+    started_at: datetime | None
+    terminal_at: datetime | None
+    terminal_code: str | None
+    scope_kind: str
+    scope_id: str
+    observed_from_event_position: int
+    observed_through_event_position: int
+    observed_message_count: int
+    human_anchor_message_id: MessageId
+    collaboration_grant_id: str | None
+    outcome: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class ChannelStandingSnapshot:
     policy: ChannelStandingPolicy
     subscriptions: tuple[StandingSubscription, ...]
+    observations: tuple[StandingObservationSummary, ...] = ()
+    recent_runs: tuple[StandingRunSummary, ...] = ()
+    can_inspect_silent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +384,57 @@ async def apply_standing_participation_event(
             ),
         )
         return
+    if envelope.event_type == WorkshopEventType.CHANNEL_AGENT_STANDING_OBSERVATION_RESUMED:
+        required = {
+            "agent_id",
+            "scope_id",
+            "expected_state_version",
+            "state_version",
+            "resumed_through_event_position",
+        }
+        if set(payload) != required:
+            raise ValueError("Standing observation resume payload is invalid")
+        agent_id = AgentId(str(payload["agent_id"]))
+        scope_id = str(payload["scope_id"])
+        expected = payload["expected_state_version"]
+        version = payload["state_version"]
+        through = payload["resumed_through_event_position"]
+        if (
+            not scope_id
+            or not isinstance(expected, int)
+            or isinstance(expected, bool)
+            or expected < 1
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != expected + 1
+            or not isinstance(through, int)
+            or isinstance(through, bool)
+            or through < 0
+        ):
+            raise ValueError("Standing observation resume values are invalid")
+        async with connection.execute(
+            "SELECT o.lifecycle_state, o.state_version, o.considered_through_event_position "
+            "FROM channel_agent_observation_states o JOIN channel_agent_standings s "
+            "ON s.channel_id = o.channel_id AND s.agent_id = o.agent_id "
+            "JOIN channel_memberships cm ON cm.channel_id = o.channel_id "
+            "AND cm.principal_id = ? JOIN principals p ON p.id = cm.principal_id "
+            "AND p.kind = 'human' WHERE o.channel_id = ? AND o.agent_id = ? AND o.scope_id = ? "
+            "AND s.lifecycle_state = 'active'",
+            (envelope.actor_principal_id, channel_id, agent_id, scope_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None or str(row[0]) != "paused_overflow" or int(row[1]) != expected or int(row[2]) != through:
+            raise ValueError("Standing observation resume state is stale")
+        await connection.execute(
+            "UPDATE channel_agent_observation_states SET delivered_through_event_position = ?, "
+            "pending_through_event_position = ?, oldest_pending_event_position = NULL, "
+            "pending_message_count = 0, not_before = NULL, lifecycle_state = 'idle', "
+            "overflowed_at = NULL, overflow_reason = NULL, overflow_from_event_position = NULL, "
+            "overflow_through_event_position = NULL, state_version = ?, last_event_position = ? "
+            "WHERE channel_id = ? AND agent_id = ? AND scope_id = ?",
+            (through, through, version, event.position, channel_id, agent_id, scope_id),
+        )
+        return
     raise ValueError("Unsupported standing-participation event")
 
 
@@ -371,28 +474,47 @@ class WorkshopStandingParticipationService:
 
         return CanonicalConversationProjection()
 
-    async def inspect(self, principal_id: PrincipalId, channel_id: ChannelId) -> ChannelStandingSnapshot:
-        can_manage = await self._channel_access(principal_id, channel_id)
+    async def inspect(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        *,
+        include_silent: bool = False,
+    ) -> ChannelStandingSnapshot:
+        if not isinstance(include_silent, bool):
+            raise WorkshopStandingParticipationValidationError("include_silent must be a boolean")
+        workshop_id, can_manage = await self._channel_access_row(principal_id, channel_id)
         await self._reconcile_current(channel_id)
         async with self._store.connection.execute(
             "SELECT enabled, policy_version FROM channel_standing_participation_policies WHERE channel_id = ?",
             (channel_id,),
         ) as cursor:
             policy_row = await cursor.fetchone()
+        host = self._host_policy.standing_participation
         policy = ChannelStandingPolicy(
             channel_id=channel_id,
             enabled=bool(policy_row[0]) if policy_row else False,
             policy_version=int(policy_row[1]) if policy_row else 0,
             can_manage=can_manage,
-            host_enabled=self._host_policy.standing_participation.enabled,
+            host_enabled=host.enabled,
             host_policy_version=self._host_policy.version,
-            max_agents_per_channel=self._host_policy.standing_participation.max_agents_per_channel,
+            max_agents_per_channel=host.max_agents_per_channel,
+            coalescing_grace_seconds=host.coalescing_grace_seconds,
+            max_messages_per_observe_run=host.max_messages_per_observe_run,
+            max_pending_messages_per_scope=host.max_pending_messages_per_scope,
+            max_pending_age_seconds=host.max_pending_age_seconds,
+            max_observe_runs_per_hour=host.max_observe_runs_per_hour,
+            max_unsolicited_messages_per_hour=host.max_unsolicited_messages_per_hour,
+            minimum_unsolicited_interval_seconds=host.minimum_unsolicited_interval_seconds,
+            quiet_expiry_seconds=host.quiet_expiry_seconds,
         )
         async with self._store.connection.execute(
-            "SELECT agent_id, agent_definition_id, agent_definition_revision_id, lifecycle_state, "
-            "started_by_principal_id, started_by_message_id, owner_policy_version, channel_policy_version, "
-            "host_policy_version, quiet_expires_at, state_version, end_reason "
-            "FROM channel_agent_standings WHERE channel_id = ? ORDER BY started_event_position, agent_id",
+            "SELECT s.agent_id, s.agent_definition_id, s.agent_definition_revision_id, s.lifecycle_state, "
+            "s.started_by_principal_id, s.started_by_message_id, s.owner_policy_version, s.channel_policy_version, "
+            "s.host_policy_version, s.quiet_expires_at, s.state_version, s.end_reason, "
+            "d.display_name, d.handle, s.started_at "
+            "FROM channel_agent_standings s JOIN agent_definitions d ON d.id = s.agent_definition_id "
+            "WHERE s.channel_id = ? ORDER BY s.started_event_position, s.agent_id",
             (channel_id,),
         ) as cursor:
             rows = list(await cursor.fetchall())
@@ -411,10 +533,175 @@ class WorkshopStandingParticipationService:
                 _timestamp(row[9], field="quiet_expires_at") if row[9] is not None else None,
                 int(row[10]),
                 str(row[11]) if row[11] is not None else None,
+                str(row[12]),
+                str(row[13]),
+                _timestamp(row[14], field="started_at"),
             )
             for row in rows
         )
-        return ChannelStandingSnapshot(policy, subscriptions)
+        async with self._store.connection.execute(
+            "SELECT agent_id, scope_kind, scope_id, delivered_through_event_position, "
+            "pending_through_event_position, considered_through_event_position, pending_message_count, "
+            "not_before, lifecycle_state, overflowed_at, overflow_reason, overflow_from_event_position, "
+            "overflow_through_event_position, state_version FROM channel_agent_observation_states "
+            "WHERE channel_id = ? ORDER BY agent_id, scope_kind, scope_id",
+            (channel_id,),
+        ) as cursor:
+            observation_rows = list(await cursor.fetchall())
+        observations = tuple(
+            StandingObservationSummary(
+                AgentId(str(row[0])),
+                str(row[1]),
+                str(row[2]),
+                int(row[3]),
+                int(row[4]),
+                int(row[5]),
+                int(row[6]),
+                _timestamp(row[7], field="not_before") if row[7] is not None else None,
+                str(row[8]),
+                _timestamp(row[9], field="overflowed_at") if row[9] is not None else None,
+                str(row[10]) if row[10] is not None else None,
+                int(row[11]) if row[11] is not None else None,
+                int(row[12]) if row[12] is not None else None,
+                int(row[13]),
+            )
+            for row in observation_rows
+        )
+        async with self._store.connection.execute(
+            "SELECT wm.role = 'admin' FROM workshop_memberships wm WHERE wm.workshop_id = ? AND wm.principal_id = ?",
+            (workshop_id, principal_id),
+        ) as cursor:
+            admin_row = await cursor.fetchone()
+        is_admin = bool(admin_row[0]) if admin_row is not None else False
+        async with self._store.connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM channel_agents ca JOIN agent_definitions d ON d.agent_id = ca.agent_id "
+            "WHERE ca.channel_id = ? AND ca.detached_at IS NULL AND d.owner_principal_id = ?)",
+            (channel_id, principal_id),
+        ) as cursor:
+            owner_row = await cursor.fetchone()
+        can_inspect_silent = is_admin or bool(owner_row[0] if owner_row is not None else False)
+        async with self._store.connection.execute(
+            "SELECT r.id, r.agent_id, d.display_name, r.status, r.accepted_at, r.started_at, r.terminal_at, "
+            "r.terminal_code, r.observation_scope_kind, r.observation_scope_id, "
+            "r.observed_from_event_position, r.observed_through_event_position, "
+            "json_array_length(r.observed_message_ids_json), r.human_anchor_message_id, "
+            "(SELECT g.id FROM collaboration_grants g WHERE g.run_id = r.id "
+            "ORDER BY g.issued_event_position DESC LIMIT 1), r.standing_outcome, d.owner_principal_id "
+            "FROM runs r JOIN agents a ON a.id = r.agent_id "
+            "JOIN agent_definition_revisions rev ON rev.id = r.agent_definition_revision_id "
+            "JOIN agent_definitions d ON d.id = rev.agent_definition_id AND d.agent_id = a.id "
+            "WHERE r.channel_id = ? AND r.kind = 'observe' ORDER BY r.accepted_at DESC, r.id DESC LIMIT 50",
+            (channel_id,),
+        ) as cursor:
+            run_rows = list(await cursor.fetchall())
+        recent_runs = tuple(
+            StandingRunSummary(
+                run_id=str(row[0]),
+                agent_id=AgentId(str(row[1])),
+                agent_display_name=str(row[2]),
+                status=str(row[3]),
+                accepted_at=_timestamp(row[4], field="accepted_at"),
+                started_at=_timestamp(row[5], field="started_at") if row[5] is not None else None,
+                terminal_at=_timestamp(row[6], field="terminal_at") if row[6] is not None else None,
+                terminal_code=str(row[7]) if row[7] is not None else None,
+                scope_kind=str(row[8]),
+                scope_id=str(row[9]),
+                observed_from_event_position=int(row[10]),
+                observed_through_event_position=int(row[11]),
+                observed_message_count=int(row[12]),
+                human_anchor_message_id=MessageId(str(row[13])),
+                collaboration_grant_id=str(row[14]) if row[14] is not None else None,
+                outcome=str(row[15]) if row[15] is not None else None,
+            )
+            for row in run_rows
+            if str(row[15]) != "silent" or (include_silent and (is_admin or str(row[16]) == str(principal_id)))
+        )
+        return ChannelStandingSnapshot(policy, subscriptions, observations, recent_runs, can_inspect_silent)
+
+    async def resume_observation(
+        self,
+        principal_id: PrincipalId,
+        channel_id: ChannelId,
+        agent_id: AgentId,
+        *,
+        scope_id: object,
+        expected_state_version: object,
+        client_operation_id: object,
+    ) -> ChannelStandingSnapshot:
+        if not isinstance(scope_id, str) or not scope_id or len(scope_id) > 128:
+            raise WorkshopStandingParticipationValidationError("scope_id is invalid")
+        if (
+            not isinstance(expected_state_version, int)
+            or isinstance(expected_state_version, bool)
+            or expected_state_version < 1
+        ):
+            raise WorkshopStandingParticipationValidationError("expected_state_version is invalid")
+        if not isinstance(client_operation_id, str) or not _OPERATION_ID.fullmatch(client_operation_id):
+            raise WorkshopStandingParticipationValidationError("client_operation_id is invalid")
+        workshop_id, _can_manage = await self._channel_access_row(principal_id, channel_id)
+        connection = self._store.connection
+        request = {
+            "agent_id": str(agent_id),
+            "scope_id": scope_id,
+            "expected_state_version": expected_state_version,
+        }
+        digest = _request_hash(request)
+        key = f"standing-observation-resume:v1:{channel_id}:{agent_id}:{scope_id}:{client_operation_id}"
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            existing = await self._store.event_by_idempotency_key(key)
+            if existing is not None:
+                if existing.envelope.metadata.get("request_hash") != digest:
+                    raise WorkshopStandingParticipationConflict("Operation identity was reused with different content")
+                await connection.rollback()
+                return await self.inspect(principal_id, channel_id)
+            async with connection.execute(
+                "SELECT considered_through_event_position, state_version, lifecycle_state "
+                "FROM channel_agent_observation_states WHERE channel_id = ? AND agent_id = ? AND scope_id = ?",
+                (channel_id, agent_id, scope_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or str(row[2]) != "paused_overflow":
+                raise WorkshopStandingParticipationConflict("Standing observation is not paused for overflow")
+            if int(row[1]) != expected_state_version:
+                raise WorkshopStandingParticipationConflict("Standing observation changed; refresh and retry")
+            through = int(row[0])
+            event = EventEnvelope.create(
+                event_id=EventId.derived(
+                    channel_id,
+                    f"standing-observation-resume:{agent_id}:{scope_id}:{client_operation_id}",
+                ),
+                event_type=WorkshopEventType.CHANNEL_AGENT_STANDING_OBSERVATION_RESUMED,
+                event_version=1,
+                workshop_id=workshop_id,
+                aggregate_type="channel",
+                aggregate_id=channel_id,
+                actor_principal_id=principal_id,
+                occurred_at=datetime.now(UTC),
+                idempotency_key=key,
+                payload={
+                    "agent_id": agent_id,
+                    "scope_id": scope_id,
+                    "expected_state_version": expected_state_version,
+                    "state_version": expected_state_version + 1,
+                    "resumed_through_event_position": through,
+                },
+                metadata={"source": "workshop_client", "request_hash": digest},
+            )
+            result = await self._store.append_in_transaction(event)
+            if result.inserted:
+                await self._store.project_pending_in_transaction(self._projection())
+            await connection.commit()
+        except WorkshopStandingParticipationError:
+            await connection.rollback()
+            raise
+        except IdempotencyConflictError as exc:
+            await connection.rollback()
+            raise WorkshopStandingParticipationConflict("Operation identity conflicted") from exc
+        except aiosqlite.Error as exc:
+            await connection.rollback()
+            raise WorkshopStandingParticipationStorageError("Standing observation could not be resumed") from exc
+        return await self.inspect(principal_id, channel_id)
 
     async def set_channel_policy(
         self,

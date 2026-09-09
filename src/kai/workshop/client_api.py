@@ -97,6 +97,7 @@ from kai.workshop.client_events import (
     ClientChannelEventBatch,
     ClientMessageReactionsEvent,
     ClientRunLifecycleEvent,
+    ClientStandingParticipationEvent,
     ClientTimelineMessageEvent,
     read_client_channel_events,
 )
@@ -355,6 +356,7 @@ _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
 _AGENT_ATTACHMENT_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/attach"
 _AGENT_DETACHMENT_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/detach"
 _CHANNEL_STANDING_PARTICIPATION_PATH = "/v1/channels/{channel_id}/standing-participation"
+_CHANNEL_STANDING_OBSERVATION_RESUME_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/standing-participation/resume"
 _ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/content"
 _ARTIFACT_DOWNLOAD_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/download"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
@@ -1120,6 +1122,14 @@ def _serialize_standing_participation(snapshot: ChannelStandingSnapshot) -> dict
             "host_enabled": policy.host_enabled,
             "host_policy_version": policy.host_policy_version,
             "max_agents_per_channel": policy.max_agents_per_channel,
+            "coalescing_grace_seconds": policy.coalescing_grace_seconds,
+            "max_messages_per_observe_run": policy.max_messages_per_observe_run,
+            "max_pending_messages_per_scope": policy.max_pending_messages_per_scope,
+            "max_pending_age_seconds": policy.max_pending_age_seconds,
+            "max_observe_runs_per_hour": policy.max_observe_runs_per_hour,
+            "max_unsolicited_messages_per_hour": policy.max_unsolicited_messages_per_hour,
+            "minimum_unsolicited_interval_seconds": policy.minimum_unsolicited_interval_seconds,
+            "quiet_expiry_seconds": policy.quiet_expiry_seconds,
         },
         "subscriptions": [
             {
@@ -1135,9 +1145,53 @@ def _serialize_standing_participation(snapshot: ChannelStandingSnapshot) -> dict
                 "quiet_expires_at": item.quiet_expires_at.isoformat() if item.quiet_expires_at else None,
                 "state_version": item.state_version,
                 "end_reason": item.end_reason,
+                "agent_display_name": item.agent_display_name,
+                "agent_handle": item.agent_handle,
+                "started_at": _format_timestamp(item.started_at),
             }
             for item in snapshot.subscriptions
         ],
+        "observations": [
+            {
+                "agent_id": str(item.agent_id),
+                "scope_kind": item.scope_kind,
+                "scope_id": item.scope_id,
+                "delivered_through_event_position": item.delivered_through_event_position,
+                "pending_through_event_position": item.pending_through_event_position,
+                "considered_through_event_position": item.considered_through_event_position,
+                "pending_message_count": item.pending_message_count,
+                "not_before": _format_timestamp(item.not_before) if item.not_before else None,
+                "lifecycle_state": item.lifecycle_state,
+                "overflowed_at": _format_timestamp(item.overflowed_at) if item.overflowed_at else None,
+                "overflow_reason": item.overflow_reason,
+                "overflow_from_event_position": item.overflow_from_event_position,
+                "overflow_through_event_position": item.overflow_through_event_position,
+                "state_version": item.state_version,
+            }
+            for item in snapshot.observations
+        ],
+        "recent_runs": [
+            {
+                "run_id": item.run_id,
+                "agent_id": str(item.agent_id),
+                "agent_display_name": item.agent_display_name,
+                "status": item.status,
+                "accepted_at": _format_timestamp(item.accepted_at),
+                "started_at": _format_timestamp(item.started_at) if item.started_at else None,
+                "terminal_at": _format_timestamp(item.terminal_at) if item.terminal_at else None,
+                "terminal_code": item.terminal_code,
+                "scope_kind": item.scope_kind,
+                "scope_id": item.scope_id,
+                "observed_from_event_position": item.observed_from_event_position,
+                "observed_through_event_position": item.observed_through_event_position,
+                "observed_message_count": item.observed_message_count,
+                "human_anchor_message_id": str(item.human_anchor_message_id),
+                "collaboration_grant_id": item.collaboration_grant_id,
+                "outcome": item.outcome,
+            }
+            for item in snapshot.recent_runs
+        ],
+        "can_inspect_silent": snapshot.can_inspect_silent,
     }
 
 
@@ -1170,9 +1224,16 @@ async def _handle_channel_standing_participation(
     try:
         channel_id = ChannelId(request.match_info["channel_id"])
         if request.method == "GET":
-            if request.query or request.can_read_body:
+            if not set(request.query).issubset({"include_silent"}) or request.can_read_body:
                 return _error_response(status=400, code="invalid_request", message="Invalid policy request")
-            snapshot = await service.inspect(principal_id, channel_id)
+            raw_include_silent = _single_query_value(request, "include_silent")
+            if raw_include_silent not in {None, "0", "1"}:
+                return _error_response(status=400, code="invalid_request", message="Invalid policy request")
+            snapshot = await service.inspect(
+                principal_id,
+                channel_id,
+                include_silent=raw_include_silent == "1",
+            )
             return _json_response(
                 {"version": 1, "standing_participation": _serialize_standing_participation(snapshot)},
                 status=200,
@@ -1204,6 +1265,44 @@ async def _handle_channel_standing_participation(
             "changed": mutation.changed,
             "replayed": mutation.replayed,
         },
+        status=200,
+    )
+
+
+async def _handle_standing_observation_resume(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopStandingParticipationService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid resume request")
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict) or set(payload) != {
+            "scope_id",
+            "expected_state_version",
+            "client_operation_id",
+        }:
+            raise ValueError
+        snapshot = await service.resume_observation(
+            principal_id,
+            ChannelId(request.match_info["channel_id"]),
+            AgentId(request.match_info["agent_id"]),
+            scope_id=payload["scope_id"],
+            expected_state_version=payload["expected_state_version"],
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid resume request")
+    except WorkshopStandingParticipationError as exc:
+        return _standing_participation_error_response(exc)
+    return _json_response(
+        {"version": 1, "standing_participation": _serialize_standing_participation(snapshot)},
         status=200,
     )
 
@@ -3857,6 +3956,8 @@ def _serialize_message(message: TimelineMessage) -> dict[str, object]:
         "latest_reply_at": (
             _format_timestamp(message.latest_reply_at) if message.latest_reply_at is not None else None
         ),
+        "standing_contribution": message.standing_contribution,
+        "source_run_id": str(message.source_run_id) if message.source_run_id is not None else None,
         "mentions": [
             {
                 "principal_id": str(mention.principal_id),
@@ -5604,6 +5705,15 @@ def _serialize_run_lifecycle_event(
     return (f"id: {activity.event_position}\nevent: run.lifecycle.changed\ndata: {payload}\n\n").encode()
 
 
+def _serialize_standing_participation_event(event: ClientStandingParticipationEvent) -> bytes:
+    payload = json.dumps(
+        {"version": 1, "channel_id": str(event.channel_id), "event_position": event.event_position},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (f"id: {event.event_position}\nevent: standing.participation.changed\ndata: {payload}\n\n").encode()
+
+
 def _serialize_run_preview_event(preview: RunPreview) -> bytes:
     """Render one ephemeral preview event.
 
@@ -6974,6 +7084,8 @@ async def _handle_channel_event_stream(
                         await response.write(_serialize_timeline_event(event.message))
                     elif isinstance(event, ClientMessageReactionsEvent):
                         await response.write(_serialize_message_reactions_event(event))
+                    elif isinstance(event, ClientStandingParticipationEvent):
+                        await response.write(_serialize_standing_participation_event(event))
                     else:
                         decision = (
                             await routing_policy.load_decision(event.run.run_id) if routing_policy is not None else None
@@ -8091,8 +8203,17 @@ def register_workshop_read_routes(
                     service=standing_participation,
                 )
 
+        async def handle_standing_observation_resume(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_standing_observation_resume(
+                    request,
+                    authenticator=authenticator,
+                    service=standing_participation,
+                )
+
         app.router.add_get(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
         app.router.add_put(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
+        app.router.add_post(_CHANNEL_STANDING_OBSERVATION_RESUME_PATH, handle_standing_observation_resume)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
     app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)
     app.router.add_get(_AGENT_EVENTS_PATH, handle_agent_event_stream)

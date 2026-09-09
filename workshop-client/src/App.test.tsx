@@ -41,6 +41,7 @@ import {
   loadRun,
   loadRunTrace,
   loadSettingsWorkspace,
+  loadStandingParticipation,
   loadTimeline,
   loadThreadTimeline,
   loadThreadUnread,
@@ -48,6 +49,7 @@ import {
   redeemEnrollment,
   restoreChannel,
   restoreDirectMessage,
+  resumeStandingObservation,
   markHumanNotificationRead,
   markHumanNotificationUnread,
   markHumanNotificationsRead,
@@ -59,6 +61,7 @@ import {
   startHumanConversation,
   submitCommand,
   switchWorkspace,
+  updateStandingParticipation,
 } from "./api";
 import type {
   WorkshopMemoryRecord,
@@ -73,6 +76,7 @@ import type {
   WorkshopChannelUnreadState,
   WorkshopThreadUnreadState,
   WorkshopFollowedThread,
+  WorkshopStandingParticipation,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -117,10 +121,12 @@ vi.mock("./api", async (importOriginal) => {
     loadRun: vi.fn(),
     loadRunTrace: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
+    loadStandingParticipation: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     redeemEnrollment: vi.fn(),
     restoreChannel: vi.fn(),
     restoreDirectMessage: vi.fn(),
+    resumeStandingObservation: vi.fn(),
     markHumanNotificationRead: vi.fn(),
     markHumanNotificationUnread: vi.fn(),
     markHumanNotificationsRead: vi.fn(),
@@ -132,6 +138,7 @@ vi.mock("./api", async (importOriginal) => {
     startHumanConversation: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
+    updateStandingParticipation: vi.fn(),
   };
 });
 
@@ -290,6 +297,8 @@ const historyMessage: TimelineMessage = {
   replyToMessageId: null,
   latestReplyAt: null,
   threadRootId: null,
+  standingContribution: false,
+  sourceRunId: null,
 };
 
 function unreadState(
@@ -523,6 +532,30 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
   ],
 };
 
+const standingParticipation: WorkshopStandingParticipation = {
+  canInspectSilent: true,
+  channelId: secondChannelId,
+  observations: [],
+  policy: {
+    canManage: true,
+    coalescingGraceSeconds: 2,
+    enabled: false,
+    hostEnabled: false,
+    hostPolicyVersion: 2,
+    maxAgentsPerChannel: 2,
+    maxMessagesPerObserveRun: 40,
+    maxObserveRunsPerHour: 30,
+    maxPendingAgeSeconds: 86400,
+    maxPendingMessagesPerScope: 500,
+    maxUnsolicitedMessagesPerHour: 12,
+    minimumUnsolicitedIntervalSeconds: 60,
+    policyVersion: 0,
+    quietExpirySeconds: 259200,
+  },
+  recentRuns: [],
+  subscriptions: [],
+};
+
 type StreamHandlers = Parameters<typeof streamTimeline>[2];
 type PrincipalEventStreamHandlers = Parameters<typeof streamPrincipalEvents>[2];
 
@@ -739,6 +772,9 @@ describe("Workshop React client", () => {
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ collaborationActivity: [], entries: [], hasMore: false });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
+    vi.mocked(loadStandingParticipation).mockResolvedValue(standingParticipation);
+    vi.mocked(updateStandingParticipation).mockResolvedValue(standingParticipation);
+    vi.mocked(resumeStandingObservation).mockResolvedValue(standingParticipation);
     vi.mocked(loadPreferenceDocument).mockResolvedValue({
       content: "# Preferences\n\nBe concise.\n",
       editable: true,
@@ -3150,13 +3186,79 @@ describe("Workshop React client", () => {
 
     render(<App />);
     expect(await screen.findByText("Awake in this channel")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    await user.click(screen.getByRole("button", { name: "Dismiss Kai" }));
 
     await waitFor(() => expect(dismissChannelAgent).toHaveBeenCalledOnce());
     expect(vi.mocked(dismissChannelAgent).mock.calls[0]?.[1]).toBe(
       "agt_00000000000000000000000000000001",
     );
-    expect(await screen.findByText("Available · not engaged")).toBeVisible();
+    expect(await screen.findByText("Available · not standing")).toBeVisible();
+  });
+
+  it("shows standing state, owner controls, and contribution provenance", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(
+      navigationWithGroup({ role: "owner" }),
+    );
+    vi.mocked(loadStandingParticipation).mockResolvedValue({
+      ...standingParticipation,
+      policy: {
+        ...standingParticipation.policy,
+        enabled: true,
+        hostEnabled: true,
+        policyVersion: 1,
+      },
+      subscriptions: [
+        {
+          agentDefinitionId: definitionId,
+          agentDisplayName: "Kai",
+          agentHandle: "kai",
+          agentId: agentDefinition.agentId,
+          agentRevisionId: revisionId,
+          channelPolicyVersion: 1,
+          endReason: null,
+          hostPolicyVersion: 2,
+          lifecycleState: "active",
+          ownerPolicyVersion: 1,
+          quietExpiresAt: "2026-09-12T09:00:00Z",
+          startedAt: "2026-09-09T09:00:00Z",
+          startedByMessageId: historyMessage.messageId,
+          startedByPrincipalId: navigation.principal.principalId,
+          stateVersion: 1,
+        },
+      ],
+    });
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{
+        ...historyMessage,
+        channelId: secondChannelId,
+        sourceRunId: "run_00000000000000000000000000000001",
+        standingContribution: true,
+      }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(/Joined in .* · standing/)).toBeVisible();
+    expect(await screen.findByTitle("Agent contribution from standing participation")).toBeVisible();
+    const policy = screen.getByRole("checkbox", { name: /Standing participation/ });
+    expect(policy).toBeChecked();
+    expect(screen.getByRole("button", {
+      name: "Dismiss Kai from standing participation",
+    })).toBeVisible();
+    await user.click(policy);
+    expect(updateStandingParticipation).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      false,
+      1,
+      expect.any(String),
+    );
   });
 
   it("lets a channel owner manage explicit sponsored agent attachments", async () => {

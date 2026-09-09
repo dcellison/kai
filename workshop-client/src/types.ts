@@ -303,6 +303,86 @@ export interface WorkshopCollaborationPolicy {
   policyVersion: number;
 }
 
+export interface WorkshopStandingPolicy {
+  canManage: boolean;
+  coalescingGraceSeconds: number;
+  enabled: boolean;
+  hostEnabled: boolean;
+  hostPolicyVersion: number;
+  maxAgentsPerChannel: number;
+  maxMessagesPerObserveRun: number;
+  maxObserveRunsPerHour: number;
+  maxPendingAgeSeconds: number;
+  maxPendingMessagesPerScope: number;
+  maxUnsolicitedMessagesPerHour: number;
+  minimumUnsolicitedIntervalSeconds: number;
+  policyVersion: number;
+  quietExpirySeconds: number;
+}
+
+export interface WorkshopStandingSubscription {
+  agentDefinitionId: string;
+  agentDisplayName: string;
+  agentHandle: string;
+  agentId: string;
+  agentRevisionId: string;
+  channelPolicyVersion: number;
+  endReason: string | null;
+  hostPolicyVersion: number;
+  lifecycleState: "active" | "paused_overflow" | "ended";
+  ownerPolicyVersion: number;
+  quietExpiresAt: string | null;
+  startedAt: string;
+  startedByMessageId: string;
+  startedByPrincipalId: string;
+  stateVersion: number;
+}
+
+export interface WorkshopStandingObservation {
+  agentId: string;
+  consideredThroughEventPosition: number;
+  deliveredThroughEventPosition: number;
+  lifecycleState: "idle" | "pending" | "paused_overflow";
+  notBefore: string | null;
+  overflowFromEventPosition: number | null;
+  overflowReason: string | null;
+  overflowThroughEventPosition: number | null;
+  overflowedAt: string | null;
+  pendingMessageCount: number;
+  pendingThroughEventPosition: number;
+  scopeId: string;
+  scopeKind: "channel" | "thread";
+  stateVersion: number;
+}
+
+export interface WorkshopStandingRun {
+  acceptedAt: string;
+  agentDisplayName: string;
+  agentId: string;
+  collaborationGrantId: string | null;
+  humanAnchorMessageId: string;
+  observedFromEventPosition: number;
+  observedMessageCount: number;
+  observedThroughEventPosition: number;
+  outcome: "spoke" | "silent" | "publication_suppressed" | null;
+  runId: string;
+  scopeId: string;
+  scopeKind: "channel" | "thread";
+  startedAt: string | null;
+  status: WorkshopRunStatus;
+  terminalAt: string | null;
+  terminalCode: string | null;
+}
+
+export interface WorkshopStandingParticipation {
+  canInspectSilent: boolean;
+  channelId: string;
+  observations: WorkshopStandingObservation[];
+  policy: WorkshopStandingPolicy;
+  recentRuns: WorkshopStandingRun[];
+  subscriptions: WorkshopStandingSubscription[];
+}
+
 export interface WorkshopAgentDefinition {
   activeRevisionId: string | null;
   agentId: string;
@@ -856,6 +936,8 @@ export interface TimelineMessage {
   replyToMessageId: string | null;
   latestReplyAt: string | null;
   threadRootId: string | null;
+  standingContribution: boolean;
+  sourceRunId: string | null;
 }
 
 export interface WorkshopReplyParticipant {

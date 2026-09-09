@@ -112,6 +112,7 @@ export function useWorkshopTimeline(
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
   runTrace: WorkshopRunTraceSignal | null;
+  standingParticipationVersion: number;
   earlier: EarlierHistoryState;
   later: LaterHistoryState;
   loadEarlier: () => void;
@@ -130,6 +131,7 @@ export function useWorkshopTimeline(
   const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
   const [runPreview, setRunPreview] = useState<WorkshopRunPreview | null>(null);
   const [runTrace, setRunTrace] = useState<WorkshopRunTraceSignal | null>(null);
+  const [standingParticipationVersion, setStandingParticipationVersion] = useState(0);
   const [connection, setConnection] = useState<ConnectionState>({
     label: "Waiting",
     tone: "connecting",
@@ -345,6 +347,12 @@ export function useWorkshopTimeline(
               },
               onMessage: (message, eventId) => {
                 lastEventId = eventId;
+                // Every canonical channel message advances or overflows the
+                // standing-observation inbox. Refresh its compact snapshot so
+                // backlog and paused state do not wait for a later run event.
+                setStandingParticipationVersion((current) =>
+                  Math.max(current, message.eventPosition),
+                );
                 if (knownMessageIds.has(message.messageId)) {
                   return;
                 }
@@ -394,6 +402,12 @@ export function useWorkshopTimeline(
                   current && current.runId === trace.runId && current.seq >= trace.seq
                     ? current
                     : trace,
+                );
+              },
+              onStandingParticipationChanged: (eventPosition, eventId) => {
+                lastEventId = eventId;
+                setStandingParticipationVersion((current) =>
+                  Math.max(current, eventPosition),
                 );
               },
             },
@@ -446,6 +460,7 @@ export function useWorkshopTimeline(
     runActivity,
     runPreview,
     runTrace,
+    standingParticipationVersion,
     earlier,
     later,
     loadEarlier,

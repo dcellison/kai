@@ -2093,6 +2093,7 @@ class CanonicalConversationProjection:
             WorkshopEventType.CHANNEL_STANDING_PARTICIPATION_POLICY_SET,
             WorkshopEventType.CHANNEL_AGENT_STANDING_STARTED,
             WorkshopEventType.CHANNEL_AGENT_STANDING_ENDED,
+            WorkshopEventType.CHANNEL_AGENT_STANDING_OBSERVATION_RESUMED,
         }:
             from kai.workshop.standing_participation import apply_standing_participation_event
 

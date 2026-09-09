@@ -53,6 +53,7 @@ class WorkshopEventType(StrEnum):
     CHANNEL_STANDING_PARTICIPATION_POLICY_SET = "channel.standing_participation_policy_set"
     CHANNEL_AGENT_STANDING_STARTED = "channel.agent_standing_started"
     CHANNEL_AGENT_STANDING_ENDED = "channel.agent_standing_ended"
+    CHANNEL_AGENT_STANDING_OBSERVATION_RESUMED = "channel.agent_standing_observation_resumed"
     RUNTIME_PROFILE_ASSIGNED = "runtime_profile.assigned"
     RUNTIME_PROFILE_REASSIGNED = "runtime_profile.reassigned"
     MESSAGE_CREATED = "message.created"

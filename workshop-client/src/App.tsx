@@ -37,16 +37,19 @@ import {
   loadRun,
   loadRunTrace,
   loadSettingsWorkspace,
+  loadStandingParticipation,
   loadThreadTimeline,
   loadThreadUnread,
   redeemEnrollment,
   restoreChannel,
   restoreDirectMessage,
+  resumeStandingObservation,
   setMessageReaction,
   setThreadFollowed,
   startHumanConversation,
   submitCommand,
   switchWorkspace,
+  updateStandingParticipation,
 } from "./api";
 import type {
   CommandSubmissionResult,
@@ -66,6 +69,8 @@ import type {
   WorkshopNotificationPreferences,
   WorkshopSession,
   WorkshopSettingsWorkspace,
+  WorkshopStandingObservation,
+  WorkshopStandingParticipation,
   WorkshopSummary,
   WorkshopArtifactSummary,
   WorkshopAgentSummary,
@@ -1087,7 +1092,18 @@ function MessageItem({
           </div>
         )}
         <header className="message-meta">
-          <strong>{displayName}</strong>
+          <span className="message-author">
+            <strong>{displayName}</strong>
+            {message.standingContribution && (
+              <span
+                className="standing-contribution-mark"
+                aria-label="Agent contribution from standing participation"
+                title="Agent contribution from standing participation"
+              >
+                <StandingEyeIcon />
+              </span>
+            )}
+          </span>
           <time dateTime={message.createdAt}>
             {formatTimestamp(message.createdAt)}
           </time>
@@ -2288,7 +2304,25 @@ function ViewIcon(): React.JSX.Element {
   );
 }
 
+function StandingEyeIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.8" />
+      <circle cx="12" cy="12" r="2.5" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function StandingSuppressedIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path d="M3 3l18 18M9.6 6.4A10.8 10.8 0 0 1 12 6c6 0 9.5 6 9.5 6a17 17 0 0 1-2.1 2.8M6.2 7.7C3.8 9.5 2.5 12 2.5 12s3.5 6 9.5 6c1 0 1.9-.2 2.7-.4M9.9 9.9a3 3 0 0 0 4.2 4.2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
 function ThreadPane({
+  activeStandingAgentIds,
   channelName,
   liveMessages,
   focusedMessage,
@@ -2300,6 +2334,7 @@ function ThreadPane({
   onLoadReactors,
   onAdvanceThreadRead,
   onSetThreadFollowed,
+  onSuppressStanding,
   onMessageVisible,
   onSetReaction,
   onSubmitCommand,
@@ -2309,6 +2344,7 @@ function ThreadPane({
   rootMessage,
   runActive,
 }: {
+  activeStandingAgentIds: string[];
   channelName: string;
   liveMessages: TimelineMessage[];
   focusedMessage: TimelineMessage | null;
@@ -2330,6 +2366,7 @@ function ThreadPane({
     expectedStateVersion: number,
     clientOperationId: string,
   ) => Promise<WorkshopThreadUnreadMutation>;
+  onSuppressStanding: (agentId: string, threadRootId: string) => Promise<void>;
   onSetReaction: (
     messageId: string,
     reaction: WorkshopReaction,
@@ -2355,6 +2392,7 @@ function ThreadPane({
   const [unreadState, setUnreadState] = useState<WorkshopThreadUnreadState | null>(null);
   const [unreadBoundaryMessageId, setUnreadBoundaryMessageId] = useState<string | null>(null);
   const [followBusy, setFollowBusy] = useState(false);
+  const [standingBusy, setStandingBusy] = useState(false);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const unreadStateRef = useRef(unreadState);
   const pendingReadRef = useRef<TimelineMessage | null>(null);
@@ -2551,6 +2589,23 @@ function ThreadPane({
     void drain();
   }, [onAdvanceThreadRead, onLoadThreadUnread, onMessageVisible, replies, rootMessage.messageId]);
 
+  const suppressStanding = async (): Promise<void> => {
+    if (standingBusy || activeStandingAgentIds.length === 0) return;
+    setStandingBusy(true);
+    setError(null);
+    try {
+      await Promise.all(
+        activeStandingAgentIds.map((agentId) =>
+          onSuppressStanding(agentId, rootMessage.messageId),
+        ),
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not suppress standing observation.");
+    } finally {
+      setStandingBusy(false);
+    }
+  };
+
   return (
     <div className="thread-pane">
       <header className="thread-header">
@@ -2559,6 +2614,18 @@ function ThreadPane({
           <h2>{replies.length} {replies.length === 1 ? "reply" : "replies"}</h2>
         </div>
         <div className="thread-header-actions">
+          {activeStandingAgentIds.length > 0 && !readOnly && (
+            <button
+              className="panel-icon-button"
+              type="button"
+              aria-label="Suppress standing agents in this thread"
+              title="Suppress standing agents in this thread"
+              disabled={standingBusy}
+              onClick={() => void suppressStanding()}
+            >
+              <StandingSuppressedIcon />
+            </button>
+          )}
           {unreadState && !readOnly && (
             <button
               className={`panel-icon-button thread-follow-button${unreadState.followed ? " followed" : ""}`}
@@ -2710,6 +2777,7 @@ function WorkshopView({
   runActivity,
   runPreview,
   runTrace,
+  standingParticipationVersion,
   reactionUpdates,
   workshop,
   onForget,
@@ -2792,6 +2860,7 @@ function WorkshopView({
   runActivity: WorkshopRunActivity | null;
   runPreview: WorkshopRunPreview | null;
   runTrace: WorkshopRunTraceSignal | null;
+  standingParticipationVersion: number;
   reactionUpdates: Record<string, TimelineMessage["reactions"]>;
   workshop: WorkshopSummary;
   onForget: () => void;
@@ -2801,7 +2870,11 @@ function WorkshopView({
   onAttachAgent: (agentId: string, clientOperationId: string) => Promise<void>;
   onCancelRun: (runId: string) => Promise<WorkshopRun>;
   onCreateChannel: (input: ChannelCreationRequest) => Promise<void>;
-  onDismissAgent: (agentId: string, clientDismissalId: string) => Promise<void>;
+  onDismissAgent: (
+    agentId: string,
+    clientDismissalId: string,
+    threadRootId?: string | null,
+  ) => Promise<void>;
   onDetachAgent: (agentId: string, clientOperationId: string) => Promise<void>;
   onDownloadArtifact: (artifactId: string) => void;
   onLoadEarlier: () => void;
@@ -2946,6 +3019,15 @@ function WorkshopView({
   const [mentionSelection, setMentionSelection] = useState(0);
   const [notificationPreferences, setNotificationPreferences] =
     useState<WorkshopNotificationPreferences | null>(null);
+  const [standingParticipation, setStandingParticipation] =
+    useState<WorkshopStandingParticipation | null>(null);
+  const [standingLoading, setStandingLoading] = useState(false);
+  const [standingError, setStandingError] = useState<string | null>(null);
+  const [standingPolicyBusy, setStandingPolicyBusy] = useState(false);
+  const [standingResumeKey, setStandingResumeKey] = useState<string | null>(null);
+  const [showSilentObservations, setShowSilentObservations] = useState(false);
+  const [standingNotice, setStandingNotice] = useState<string | null>(null);
+  const standingAgentsRef = useRef<Set<string> | null>(null);
   const [threadRootMessageId, setThreadRootMessageId] = useState<string | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -3174,6 +3256,85 @@ function WorkshopView({
       active = false;
     };
   }, [channel.kind, settingsSession]);
+
+  const applyStandingSnapshot = useCallback((snapshot: WorkshopStandingParticipation): void => {
+    const active = new Set(
+      snapshot.subscriptions
+        .filter((subscription) => subscription.lifecycleState === "active")
+        .map((subscription) => subscription.agentId),
+    );
+    const previous = standingAgentsRef.current;
+    if (previous !== null) {
+      const joined = snapshot.subscriptions.filter(
+        (subscription) =>
+          subscription.lifecycleState === "active" && !previous.has(subscription.agentId),
+      );
+      if (joined.length > 0) {
+        setStandingNotice(
+          `${joined.map((subscription) => subscription.agentDisplayName).join(", ")} joined in as ${joined.length === 1 ? "a standing participant" : "standing participants"}.`,
+        );
+      }
+    }
+    standingAgentsRef.current = active;
+    setStandingParticipation(snapshot);
+  }, []);
+
+  const refreshStandingParticipation = useCallback(async (
+    includeSilent = showSilentObservations,
+  ): Promise<WorkshopStandingParticipation | null> => {
+    if (channel.kind !== "group") return null;
+    const snapshot = await loadStandingParticipation(
+      { channelId, token: memoryToken },
+      includeSilent,
+    );
+    applyStandingSnapshot(snapshot);
+    return snapshot;
+  }, [applyStandingSnapshot, channel.kind, channelId, memoryToken, showSilentObservations]);
+
+  useEffect(() => {
+    standingAgentsRef.current = null;
+    setStandingParticipation(null);
+    setStandingNotice(null);
+    setShowSilentObservations(false);
+  }, [channelId]);
+
+  useEffect(() => {
+    if (channel.kind !== "group") {
+      setStandingParticipation(null);
+      setStandingError(null);
+      return;
+    }
+    let active = true;
+    setStandingLoading(true);
+    setStandingError(null);
+    void loadStandingParticipation(
+      { channelId, token: memoryToken },
+      showSilentObservations,
+    ).then(
+      (snapshot) => {
+        if (active) applyStandingSnapshot(snapshot);
+      },
+      (caught: unknown) => {
+        if (active) {
+          setStandingError(
+            caught instanceof Error ? caught.message : "Could not load standing participation.",
+          );
+        }
+      },
+    ).finally(() => {
+      if (active) setStandingLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [
+    applyStandingSnapshot,
+    channel.kind,
+    channelId,
+    memoryToken,
+    showSilentObservations,
+    standingParticipationVersion,
+  ]);
   // The inspected run: the channel's active run when one exists, else
   // the most recently settled run (activeRun keeps its terminal value
   // and is seeded from replayed lifecycle events on mount).
@@ -3234,22 +3395,75 @@ function WorkshopView({
     });
   }, [channel.agents, channel.kind, dismissedAgents, engagementClock, messages]);
 
-  const dismissAgent = async (agentId: string): Promise<void> => {
+  const dismissAgent = async (
+    agentId: string,
+    threadRootId: string | null = null,
+  ): Promise<void> => {
     if (dismissingAgentId) {
       return;
     }
     setDismissingAgentId(agentId);
     setSubmissionError(null);
     try {
-      await onDismissAgent(agentId, createClientMessageId());
-      setDismissedAgents((current) => ({ ...current, [agentId]: Date.now() }));
+      await onDismissAgent(agentId, createClientMessageId(), threadRootId);
+      if (threadRootId === null) {
+        setDismissedAgents((current) => ({ ...current, [agentId]: Date.now() }));
+      }
       setEngagementClock(Date.now());
+      void refreshStandingParticipation().catch(() => undefined);
     } catch (caught) {
       setSubmissionError(
         caught instanceof Error ? caught.message : "Could not dismiss this agent.",
       );
     } finally {
       setDismissingAgentId(null);
+    }
+  };
+
+  const setStandingPolicy = async (enabled: boolean): Promise<void> => {
+    const current = standingParticipation;
+    if (!current || standingPolicyBusy) return;
+    setStandingPolicyBusy(true);
+    setStandingError(null);
+    try {
+      applyStandingSnapshot(await updateStandingParticipation(
+        { channelId, token: memoryToken },
+        enabled,
+        current.policy.policyVersion,
+        createClientMessageId(),
+      ));
+    } catch (caught) {
+      setStandingError(
+        caught instanceof Error ? caught.message : "Could not update standing participation.",
+      );
+      await refreshStandingParticipation().catch(() => undefined);
+    } finally {
+      setStandingPolicyBusy(false);
+    }
+  };
+
+  const resumeStanding = async (
+    agentId: string,
+    observation: WorkshopStandingObservation,
+  ): Promise<void> => {
+    const key = `${agentId}:${observation.scopeId}`;
+    if (standingResumeKey !== null) return;
+    setStandingResumeKey(key);
+    setStandingError(null);
+    try {
+      applyStandingSnapshot(await resumeStandingObservation(
+        { channelId, token: memoryToken },
+        agentId,
+        observation,
+        createClientMessageId(),
+      ));
+    } catch (caught) {
+      setStandingError(
+        caught instanceof Error ? caught.message : "Could not resume standing observation.",
+      );
+      await refreshStandingParticipation().catch(() => undefined);
+    } finally {
+      setStandingResumeKey(null);
     }
   };
 
@@ -4775,6 +4989,9 @@ function WorkshopView({
         />
         {threadRootMessage ? (
           <ThreadPane
+            activeStandingAgentIds={(standingParticipation?.subscriptions ?? [])
+              .filter((subscription) => subscription.lifecycleState === "active")
+              .map((subscription) => subscription.agentId)}
             channelName={channelName}
             liveMessages={threadMessages}
             focusedMessage={focusedMessage}
@@ -4787,6 +5004,8 @@ function WorkshopView({
             onMessageVisible={markVisibleMentionRead}
             onAdvanceThreadRead={onAdvanceThreadRead}
             onSetThreadFollowed={onSetThreadFollowed}
+            onSuppressStanding={(agentId, threadRootId) =>
+              dismissAgent(agentId, threadRootId)}
             onSetReaction={onSetReaction}
             onSubmitCommand={onSubmitCommand}
             reactionUpdates={reactionUpdates}
@@ -4939,7 +5158,7 @@ function WorkshopView({
             <section className="context-section agent-attention-section">
               <span className="section-number">04</span>
               <div className="context-section-heading">
-                <h3>Agent attention</h3>
+                <h3>Agent participation</h3>
                 {channel.role === "owner" && !channelIsArchived(channel) && (
                   <button
                     className="panel-icon-button"
@@ -4953,23 +5172,79 @@ function WorkshopView({
                   </button>
                 )}
               </div>
+              {standingNotice && (
+                <p className="standing-notice" role="status">{standingNotice}</p>
+              )}
+              {standingLoading && !standingParticipation && <p>Loading standing participation…</p>}
+              {standingParticipation && (
+                <>
+                  <label className="standing-policy-toggle">
+                    <input
+                      type="checkbox"
+                      checked={standingParticipation.policy.enabled}
+                      disabled={
+                        !standingParticipation.policy.canManage ||
+                        standingPolicyBusy ||
+                        channelIsArchived(channel)
+                      }
+                      onChange={(event) => void setStandingPolicy(event.target.checked)}
+                    />
+                    <span>
+                      <strong>Standing participation</strong>
+                      <small>
+                        {standingParticipation.policy.enabled
+                          ? standingParticipation.policy.hostEnabled
+                            ? "On for this channel"
+                            : "Requested here · unavailable on this host"
+                          : "Off for this channel"}
+                      </small>
+                    </span>
+                  </label>
+                  {!standingParticipation.policy.canManage && (
+                    <p>Only a channel owner can change this policy.</p>
+                  )}
+                </>
+              )}
               {channel.agents.length === 0 && <p>No agents are attached.</p>}
               <ul>
                 {channel.agents.map((agent) => {
                   const engaged = engagedAgents.some(
                     (candidate) => candidate.agentId === agent.agentId,
                   );
+                  const subscription = standingParticipation?.subscriptions.find(
+                    (candidate) => candidate.agentId === agent.agentId,
+                  );
+                  const observation = standingParticipation?.observations.find(
+                    (candidate) =>
+                      candidate.agentId === agent.agentId &&
+                      candidate.lifecycleState === "paused_overflow",
+                  );
+                  const standing = subscription?.lifecycleState === "active";
                   return (
                     <li key={agent.agentId}>
+                      {standing && (
+                        <span className="standing-agent-mark" title="Standing participant">
+                          <StandingEyeIcon />
+                        </span>
+                      )}
                       <span>
                         <strong>{agent.name}</strong>
                         <small>
-                          {agent.available
-                            ? engaged
-                              ? "Awake in this channel"
-                              : "Available · not engaged"
-                            : "Unavailable until its sponsor re-enables this runtime"}
+                          {standing
+                            ? `Joined in ${formatTimestamp(subscription.startedAt)} · standing`
+                            : subscription?.lifecycleState === "ended"
+                              ? `Standing ended${subscription.endReason ? ` · ${subscription.endReason.replaceAll("_", " ")}` : ""}`
+                              : agent.available
+                                ? engaged
+                                  ? "Awake in this channel"
+                                  : "Available · not standing"
+                                : "Unavailable until its sponsor re-enables this runtime"}
                         </small>
+                        {observation && (
+                          <small className="standing-overflow">
+                            Observation paused · {observation.pendingMessageCount} pending
+                          </small>
+                        )}
                         <small>
                           Sponsored by {agent.sponsorDisplayName ?? "unknown"} · shared-channel memory
                         </small>
@@ -4977,22 +5252,48 @@ function WorkshopView({
                           <code title={agent.runtimeProfileId}>{agent.runtimeProfileId}</code>
                         )}
                       </span>
-                      {engaged && (
+                      {observation ? (
                         <button
-                          className="quiet-button"
+                          className="panel-icon-button standing-agent-action"
                           type="button"
+                          aria-label={`Resume ${agent.name}'s standing observation`}
+                          title={`Resume ${agent.name}'s standing observation`}
+                          disabled={standingResumeKey !== null}
+                          onClick={() => void resumeStanding(agent.agentId, observation)}
+                        >
+                          <RestoreIcon />
+                        </button>
+                      ) : (standing || engaged) && (
+                        <button
+                          className="panel-icon-button standing-agent-action"
+                          type="button"
+                          aria-label={standing ? `Dismiss ${agent.name} from standing participation` : `Dismiss ${agent.name}`}
+                          title={standing ? "Dismiss standing participant" : "Dismiss agent attention"}
                           disabled={dismissingAgentId === agent.agentId}
                           onClick={() => void dismissAgent(agent.agentId)}
                         >
-                          {dismissingAgentId === agent.agentId
-                            ? "Dismissing…"
-                            : "Dismiss"}
+                          <StandingSuppressedIcon />
                         </button>
                       )}
                     </li>
                   );
                 })}
               </ul>
+              {standingParticipation && (
+                <details className="standing-limits">
+                  <summary>Host limits</summary>
+                  <dl>
+                    <div><dt>Agents</dt><dd>{standingParticipation.policy.maxAgentsPerChannel}/channel</dd></div>
+                    <div><dt>Observe batch</dt><dd>{standingParticipation.policy.maxMessagesPerObserveRun} messages</dd></div>
+                    <div><dt>Pending</dt><dd>{standingParticipation.policy.maxPendingMessagesPerScope}/scope</dd></div>
+                    <div><dt>Observation</dt><dd>{standingParticipation.policy.maxObserveRunsPerHour}/hour</dd></div>
+                    <div><dt>Contributions</dt><dd>{standingParticipation.policy.maxUnsolicitedMessagesPerHour}/hour</dd></div>
+                    <div><dt>Cooldown</dt><dd>{standingParticipation.policy.minimumUnsolicitedIntervalSeconds}s</dd></div>
+                    <div><dt>Quiet expiry</dt><dd>{standingParticipation.policy.quietExpirySeconds}s</dd></div>
+                  </dl>
+                </details>
+              )}
+              {standingError && <p className="settings-error" role="alert">{standingError}</p>}
             </section>
           )}
 
@@ -5046,6 +5347,42 @@ function WorkshopView({
               {channel.kind === "group" ? "06" : "04"}
             </span>
             <h3>Run inspector</h3>
+            {standingParticipation && (
+              <details className="standing-run-inspector">
+                <summary>
+                  Standing observations ({standingParticipation.recentRuns.length})
+                </summary>
+                {standingParticipation.canInspectSilent && (
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={showSilentObservations}
+                      onChange={(event) => setShowSilentObservations(event.target.checked)}
+                    />
+                    Show authorized silent observations
+                  </label>
+                )}
+                {standingParticipation.recentRuns.length === 0 ? (
+                  <p>No visible standing observations.</p>
+                ) : (
+                  <ol>
+                    {standingParticipation.recentRuns.map((run) => (
+                      <li key={run.runId}>
+                        <strong>{run.agentDisplayName} · {run.outcome ?? run.status}</strong>
+                        <small>
+                          {run.scopeKind} · messages {run.observedFromEventPosition}–{run.observedThroughEventPosition} · batch {run.observedMessageCount}
+                        </small>
+                        <small>Anchor {run.humanAnchorMessageId}</small>
+                        <small>
+                          Grant {run.collaborationGrantId ?? "none"} · {standingParticipation.policy.maxObserveRunsPerHour} observations/hour · {standingParticipation.policy.maxUnsolicitedMessagesPerHour} contributions/hour
+                        </small>
+                        <code title={run.runId}>{run.runId}</code>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </details>
+            )}
             <RunTraceCard
               collaborationActivity={collaborationActivity}
               entries={traceEntries}
@@ -5353,6 +5690,7 @@ function ActiveWorkshopClient({
     runActivity,
     runPreview,
     runTrace,
+    standingParticipationVersion,
     earlier,
     later,
     loadEarlier,
@@ -5539,9 +5877,13 @@ function ActiveWorkshopClient({
     [settingsSession, withAccessHandling],
   );
   const dismissSelectedAgent = useCallback(
-    (agentId: string, clientDismissalId: string) =>
+    (
+      agentId: string,
+      clientDismissalId: string,
+      threadRootId: string | null = null,
+    ) =>
       withAccessHandling(() =>
-        dismissChannelAgent(session, agentId, clientDismissalId),
+        dismissChannelAgent(session, agentId, clientDismissalId, threadRootId),
       ),
     [session, withAccessHandling],
   );
@@ -5644,6 +5986,7 @@ function ActiveWorkshopClient({
       runActivity={runActivity}
       runPreview={runPreview}
       runTrace={runTrace}
+      standingParticipationVersion={standingParticipationVersion}
       reactionUpdates={reactionUpdates}
       workshop={selected.workshop}
       onForget={onForget}
