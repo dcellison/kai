@@ -18,6 +18,7 @@ from kai.workshop.domain import (
     MessageMention,
     MessageReactionSummary,
     PrincipalId,
+    RunId,
 )
 from kai.workshop.human_avatars import human_avatar_descriptors
 from kai.workshop.message_reactions import load_message_reactions
@@ -85,6 +86,8 @@ class TimelineMessage:
     reply_participant_count: int = 0
     author_avatar_state_version: int = 0
     author_avatar_active: bool = False
+    standing_contribution: bool = False
+    source_run_id: RunId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +264,22 @@ def is_internal_scheduled_invocation(metadata_json: object, author_kind: object)
     return isinstance(metadata, dict) and metadata.get("source") == "scheduled_job"
 
 
+def parse_standing_contribution_metadata(metadata_json: object) -> tuple[bool, RunId | None]:
+    """Expose only the safe provenance fact carried by standing output."""
+    try:
+        metadata = json.loads(str(metadata_json))
+    except json.JSONDecodeError:
+        return False, None
+    if not isinstance(metadata, dict) or metadata.get("source") != "standing_participation":
+        return False, None
+    raw_run_id = metadata.get("run_id")
+    try:
+        run_id = RunId(raw_run_id) if isinstance(raw_run_id, str) else None
+    except ValueError:
+        return False, None
+    return run_id is not None, run_id
+
+
 def parse_message_mentions_json(value: object) -> tuple[MessageMention, ...]:
     """Decode mentions persisted by the canonical message projection."""
     try:
@@ -335,6 +354,7 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
     for row in rows:
         if is_internal_scheduled_invocation(row[11], row[3]):
             continue
+        standing_contribution, source_run_id = parse_standing_contribution_metadata(row[11])
         messages.append(
             TimelineMessage(
                 message_id=MessageId(str(row[0])),
@@ -352,6 +372,8 @@ def _messages_from_rows(rows: list[aiosqlite.Row]) -> tuple[TimelineMessage, ...
                 latest_reply_at=(_parse_timestamp(str(row[13])) if row[13] is not None else None),
                 author_avatar_state_version=(int(row[14]) if len(row) > 14 else 0),
                 author_avatar_active=(bool(row[15]) if len(row) > 15 else False),
+                standing_contribution=standing_contribution,
+                source_run_id=source_run_id,
             )
         )
     return tuple(messages)

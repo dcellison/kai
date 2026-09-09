@@ -30,6 +30,7 @@ from kai.workshop.store import WorkshopEventStore
 from kai.workshop.timeline import (
     TimelineAccessDeniedError,
     TimelineCursorError,
+    parse_standing_contribution_metadata,
     read_channel_message,
     read_channel_timeline,
     read_channel_timeline_from_message,
@@ -38,6 +39,18 @@ from kai.workshop.timeline import (
 from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+
+
+def test_standing_contribution_metadata_exposes_only_valid_provenance() -> None:
+    run_id = "run_00000000000000000000000000000001"
+
+    assert parse_standing_contribution_metadata(
+        json.dumps({"source": "standing_participation", "run_id": run_id, "secret": "hidden"})
+    ) == (True, run_id)
+    assert parse_standing_contribution_metadata(
+        json.dumps({"source": "standing_participation", "run_id": "not-a-run"})
+    ) == (False, None)
+    assert parse_standing_contribution_metadata(json.dumps({"source": "ordinary", "run_id": run_id})) == (False, None)
 
 
 @dataclass

@@ -24,6 +24,7 @@ from kai.workshop.timeline import (
     TimelineResumeError,
     is_internal_scheduled_invocation,
     parse_message_mentions_json,
+    parse_standing_contribution_metadata,
 )
 
 _MAX_BATCH_SIZE = 100
@@ -39,6 +40,12 @@ _RUN_EVENT_TYPES = (
 _REACTION_EVENT_TYPES = (
     WorkshopEventType.MESSAGE_REACTION_ADDED,
     WorkshopEventType.MESSAGE_REACTION_REMOVED,
+)
+_STANDING_EVENT_TYPES = (
+    WorkshopEventType.CHANNEL_STANDING_PARTICIPATION_POLICY_SET,
+    WorkshopEventType.CHANNEL_AGENT_STANDING_STARTED,
+    WorkshopEventType.CHANNEL_AGENT_STANDING_ENDED,
+    WorkshopEventType.CHANNEL_AGENT_STANDING_OBSERVATION_RESUMED,
 )
 
 
@@ -67,7 +74,18 @@ class ClientMessageReactionsEvent:
     event_position: int
 
 
-type ClientChannelEvent = ClientTimelineMessageEvent | ClientRunLifecycleEvent | ClientMessageReactionsEvent
+@dataclass(frozen=True, slots=True)
+class ClientStandingParticipationEvent:
+    channel_id: ChannelId
+    event_position: int
+
+
+type ClientChannelEvent = (
+    ClientTimelineMessageEvent
+    | ClientRunLifecycleEvent
+    | ClientMessageReactionsEvent
+    | ClientStandingParticipationEvent
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,12 +134,16 @@ async def _latest_relevant_position(
 ) -> int:
     placeholders = ", ".join("?" for _ in _RUN_EVENT_TYPES)
     reaction_placeholders = ", ".join("?" for _ in _REACTION_EVENT_TYPES)
+    standing_placeholders = ", ".join("?" for _ in _STANDING_EVENT_TYPES)
     parameters = (
         *tuple(event_type.value for event_type in _REACTION_EVENT_TYPES),
         channel_id,
         *tuple(event_type.value for event_type in _RUN_EVENT_TYPES),
         channel_id,
         principal_id,
+        channel_id,
+        *tuple(event_type.value for event_type in _STANDING_EVENT_TYPES),
+        channel_id,
         channel_id,
     )
     async with store.connection.execute(
@@ -132,7 +154,9 @@ async def _latest_relevant_position(
         f"AND e.event_type IN ({reaction_placeholders}) "
         "WHERE m.channel_id = ? OR (e.aggregate_type = 'run' "
         f"AND e.event_type IN ({placeholders}) AND r.channel_id = ? "
-        "AND r.requested_by_principal_id = ?) OR reaction_message.channel_id = ?",
+        "AND r.requested_by_principal_id = ?) OR reaction_message.channel_id = ? "
+        f"OR (e.event_type IN ({standing_placeholders}) AND e.aggregate_id = ?) "
+        "OR (e.aggregate_type = 'run' AND r.channel_id = ? AND r.kind = 'observe')",
         parameters,
     ) as cursor:
         row = await cursor.fetchone()
@@ -150,12 +174,14 @@ async def read_client_channel_events(
     after_position: int | None,
     limit: int = 100,
 ) -> ClientChannelEventBatch:
-    """Read resumable message and private run activity from one channel.
+    """Read resumable message, run activity, and standing-state doorbells.
 
     Message events follow channel read authorization. Run lifecycle events are
     additionally restricted to the requesting human, matching the existing
-    run inspection endpoint. ``None`` begins at the current relevant boundary
-    so opening a stream never replays historical activity unexpectedly.
+    run inspection endpoint. Standing-state events contain only a channel and
+    position so authorized readers can reload the canonical snapshot. ``None``
+    begins at the current relevant boundary so opening a stream never replays
+    historical activity unexpectedly.
     """
     _validate_request(principal_id, channel_id, after_position, limit)
     if await authorizer.can_read_channel(principal_id, channel_id) is not True:
@@ -174,6 +200,7 @@ async def read_client_channel_events(
 
     placeholders = ", ".join("?" for _ in _RUN_EVENT_TYPES)
     reaction_placeholders = ", ".join("?" for _ in _REACTION_EVENT_TYPES)
+    standing_placeholders = ", ".join("?" for _ in _STANDING_EVENT_TYPES)
     parameters = (
         *tuple(event_type.value for event_type in _REACTION_EVENT_TYPES),
         after_position,
@@ -181,6 +208,9 @@ async def read_client_channel_events(
         *tuple(event_type.value for event_type in _RUN_EVENT_TYPES),
         channel_id,
         principal_id,
+        channel_id,
+        *tuple(event_type.value for event_type in _STANDING_EVENT_TYPES),
+        channel_id,
         channel_id,
         limit,
     )
@@ -190,7 +220,7 @@ async def read_client_channel_events(
         "m.author_principal_id, p.kind AS author_kind, p.display_name AS author_display_name, "
         "m.reply_to_message_id, m.thread_root_id, m.body, m.created_at AS message_created_at, "
         "m.mentions_json, "
-        "e.metadata_json AS message_metadata_json, r.id AS run_id, "
+        "e.metadata_json AS message_metadata_json, r.id AS run_id, r.kind AS run_kind, "
         "reaction_message.id AS reaction_message_id "
         "FROM event_log e "
         "LEFT JOIN messages m ON m.created_event_position = e.position "
@@ -200,7 +230,9 @@ async def read_client_channel_events(
         f"AND e.event_type IN ({reaction_placeholders}) "
         "WHERE e.position > ? AND (m.channel_id = ? OR (e.aggregate_type = 'run' "
         f"AND e.event_type IN ({placeholders}) AND r.channel_id = ? "
-        "AND r.requested_by_principal_id = ?) OR reaction_message.channel_id = ?) "
+        "AND r.requested_by_principal_id = ?) OR reaction_message.channel_id = ? "
+        f"OR (e.event_type IN ({standing_placeholders}) AND e.aggregate_id = ?) "
+        "OR (e.aggregate_type = 'run' AND r.channel_id = ? AND r.kind = 'observe')) "
         "ORDER BY e.position ASC LIMIT ?",
         parameters,
     ) as cursor:
@@ -231,6 +263,7 @@ async def read_client_channel_events(
             ):
                 continue
             message_id = MessageId(str(row["message_id"]))
+            standing_contribution, source_run_id = parse_standing_contribution_metadata(row["message_metadata_json"])
             events.append(
                 ClientTimelineMessageEvent(
                     TimelineMessage(
@@ -254,9 +287,17 @@ async def read_client_channel_events(
                         artifacts=artifact_map.get(message_id, ()),
                         reply_count=0,
                         latest_reply_at=None,
+                        standing_contribution=standing_contribution,
+                        source_run_id=source_run_id,
                     )
                 )
             )
+            continue
+
+        if row["run_kind"] == "observe" or str(row["event_type"]) in {
+            event_type.value for event_type in _STANDING_EVENT_TYPES
+        }:
+            events.append(ClientStandingParticipationEvent(channel_id, position))
             continue
 
         if row["reaction_message_id"] is not None:

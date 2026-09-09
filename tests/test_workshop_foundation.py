@@ -118,6 +118,7 @@ class TestEventEnvelope:
             "channel.standing_participation_policy_set",
             "channel.agent_standing_started",
             "channel.agent_standing_ended",
+            "channel.agent_standing_observation_resumed",
             "runtime_profile.assigned",
             "runtime_profile.reassigned",
             "message.created",

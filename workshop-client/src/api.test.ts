@@ -49,6 +49,7 @@ import {
   loadRoutingPolicy,
   loadRun,
   loadRunTrace,
+  loadStandingParticipation,
   loadTimeline,
   loadThreadTimeline,
   loadThreadUnread,
@@ -68,6 +69,7 @@ import {
   searchMemories,
   restorePreferenceRevision,
   restoreDirectMessage,
+  resumeStandingObservation,
   savePreferenceDocument,
   setMessageReaction,
   setThreadFollowed,
@@ -91,6 +93,7 @@ import {
   updateClientPreference,
   updateAppearancePreference,
   updateAgentCollaborationPolicy,
+  updateStandingParticipation,
   updateWorkspaceConfig,
   upsertOperatorModel,
   revokeAgentCollaborationGrants,
@@ -165,6 +168,86 @@ function collaborationPolicyPayload(): Record<string, unknown> {
     ],
     owner_principal_id: "prn_00000000000000000000000000000001",
     policy_version: 3,
+  };
+}
+
+function standingParticipationPayload(): Record<string, unknown> {
+  return {
+    can_inspect_silent: true,
+    channel_id: channelId,
+    observations: [
+      {
+        agent_id: agentId,
+        considered_through_event_position: 44,
+        delivered_through_event_position: 40,
+        lifecycle_state: "paused_overflow",
+        not_before: null,
+        overflow_from_event_position: 41,
+        overflow_reason: "pending_count",
+        overflow_through_event_position: 44,
+        overflowed_at: "2026-09-09T11:05:00Z",
+        pending_message_count: 4,
+        pending_through_event_position: 44,
+        scope_id: channelId,
+        scope_kind: "channel",
+        state_version: 3,
+      },
+    ],
+    policy: {
+      can_manage: true,
+      coalescing_grace_seconds: 2,
+      enabled: true,
+      host_enabled: true,
+      host_policy_version: 2,
+      max_agents_per_channel: 2,
+      max_messages_per_observe_run: 40,
+      max_observe_runs_per_hour: 30,
+      max_pending_age_seconds: 86400,
+      max_pending_messages_per_scope: 500,
+      max_unsolicited_messages_per_hour: 12,
+      minimum_unsolicited_interval_seconds: 60,
+      policy_version: 4,
+      quiet_expiry_seconds: 259200,
+    },
+    recent_runs: [
+      {
+        accepted_at: "2026-09-09T11:00:00Z",
+        agent_display_name: "Builder",
+        agent_id: agentId,
+        collaboration_grant_id: "clg_00000000000000000000000000000001",
+        human_anchor_message_id: "msg_00000000000000000000000000000040",
+        observed_from_event_position: 35,
+        observed_message_count: 6,
+        observed_through_event_position: 40,
+        outcome: "spoke",
+        run_id: "run_00000000000000000000000000000040",
+        scope_id: channelId,
+        scope_kind: "channel",
+        started_at: "2026-09-09T11:00:01Z",
+        status: "completed",
+        terminal_at: "2026-09-09T11:00:03Z",
+        terminal_code: "completed",
+      },
+    ],
+    subscriptions: [
+      {
+        agent_definition_id: agentDefinitionId,
+        agent_display_name: "Builder",
+        agent_handle: "builder",
+        agent_id: agentId,
+        agent_revision_id: agentRevisionId,
+        channel_policy_version: 4,
+        end_reason: null,
+        host_policy_version: 2,
+        lifecycle_state: "active",
+        owner_policy_version: 3,
+        quiet_expires_at: "2026-09-12T11:00:00Z",
+        started_at: "2026-09-09T11:00:00Z",
+        started_by_message_id: "msg_00000000000000000000000000000035",
+        started_by_principal_id: "prn_00000000000000000000000000000001",
+        state_version: 1,
+      },
+    ],
   };
 }
 
@@ -2385,6 +2468,44 @@ describe("Workshop client API", () => {
     );
   });
 
+  it("signals canonical standing-participation changes on the timeline stream", async () => {
+    const frame = [
+      "id: 34",
+      "event: standing.participation.changed",
+      `data: ${JSON.stringify({
+        version: 1,
+        channel_id: channelId,
+        event_position: 34,
+      })}`,
+      "",
+      "",
+    ].join("\n");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(frame));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream, { status: 200 })));
+    const onStandingParticipationChanged = vi.fn();
+
+    await streamTimeline(
+      session,
+      "33",
+      {
+        onConnected: vi.fn(),
+        onMessage: vi.fn(),
+        onRunActivity: vi.fn(),
+        onRunPreview: vi.fn(),
+        onRunTrace: vi.fn(),
+        onStandingParticipationChanged,
+      },
+      new AbortController().signal,
+    );
+
+    expect(onStandingParticipationChanged).toHaveBeenCalledWith(34, "34");
+  });
+
   it("creates the stream identity without secure-context randomUUID", async () => {
     const availableCrypto = globalThis.crypto;
     vi.stubGlobal("crypto", {
@@ -2736,6 +2857,61 @@ describe("Workshop client API", () => {
     expect(loaded.canManage).toBe(false);
     expect(loaded.activeGrants).toBeNull();
     expect(loaded.operations.every((operation) => operation.ownerAllowed === null)).toBe(true);
+  });
+
+  it("loads, updates, and resumes strict standing-participation state", async () => {
+    const response = () => new Response(JSON.stringify({
+      standing_participation: standingParticipationPayload(),
+      version: 1,
+    }), { status: 200 });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(response());
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = await loadStandingParticipation(session, true);
+    expect(loaded.policy).toEqual(expect.objectContaining({
+      enabled: true,
+      maxObserveRunsPerHour: 30,
+      quietExpirySeconds: 259200,
+    }));
+    expect(loaded.subscriptions[0]).toEqual(expect.objectContaining({
+      agentDisplayName: "Builder",
+      lifecycleState: "active",
+    }));
+    expect(loaded.observations[0]).toEqual(expect.objectContaining({
+      lifecycleState: "paused_overflow",
+      pendingMessageCount: 4,
+    }));
+    expect(loaded.recentRuns[0]).toEqual(expect.objectContaining({
+      observedMessageCount: 6,
+      outcome: "spoke",
+    }));
+
+    await updateStandingParticipation(session, false, 4, "standing-policy-1");
+    await resumeStandingObservation(
+      session,
+      agentId,
+      loaded.observations[0],
+      "standing-resume-1",
+    );
+
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      `/v1/channels/${channelId}/standing-participation?include_silent=1`,
+      `/v1/channels/${channelId}/standing-participation`,
+      `/v1/channels/${channelId}/agents/${agentId}/standing-participation/resume`,
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body))).toEqual({
+      client_operation_id: "standing-policy-1",
+      enabled: false,
+      expected_policy_version: 4,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body))).toEqual({
+      client_operation_id: "standing-resume-1",
+      expected_state_version: 3,
+      scope_id: channelId,
+    });
   });
 
   it("streams typed agent changes over a distinct live connection", async () => {

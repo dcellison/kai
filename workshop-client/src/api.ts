@@ -64,6 +64,10 @@ import type {
   WorkshopAgentEnablement,
   WorkshopCollaborationOperation,
   WorkshopCollaborationPolicy,
+  WorkshopStandingParticipation,
+  WorkshopStandingObservation,
+  WorkshopStandingRun,
+  WorkshopStandingSubscription,
   WorkshopAgentSummary,
   WorkshopHumanChannelMember,
   WorkshopHumanConversation,
@@ -142,6 +146,7 @@ interface StreamHandlers {
   onRunActivity: (activity: WorkshopRunActivity, eventId: string) => void;
   onRunPreview: (preview: WorkshopRunPreview) => void;
   onRunTrace: (signal: WorkshopRunTraceSignal) => void;
+  onStandingParticipationChanged?: (eventPosition: number, eventId: string) => void;
 }
 
 const REACTIONS = new Set<WorkshopReaction>([
@@ -315,7 +320,11 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     mentions: suppliedMentions,
     reactions: suppliedReactions,
     artifacts: suppliedArtifacts,
+    standing_contribution: suppliedStandingContribution,
+    source_run_id: suppliedSourceRunId,
   } = value;
+  const standingContribution = suppliedStandingContribution ?? false;
+  const sourceRunId = suppliedSourceRunId ?? null;
   const rawArtifacts = suppliedArtifacts ?? [];
   const rawReactions = suppliedReactions ?? [];
   if (
@@ -343,7 +352,9 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     (latestReplyAt !== null && typeof latestReplyAt !== "string") ||
     !Array.isArray(suppliedMentions) ||
     !Array.isArray(rawReactions) ||
-    !Array.isArray(rawArtifacts)
+    !Array.isArray(rawArtifacts) ||
+    typeof standingContribution !== "boolean" ||
+    (sourceRunId !== null && typeof sourceRunId !== "string")
   ) {
     return null;
   }
@@ -467,6 +478,8 @@ function parseMessage(value: unknown, channelId: string): TimelineMessage | null
     replyToMessageId,
     latestReplyAt,
     threadRootId,
+    standingContribution,
+    sourceRunId,
   };
 }
 
@@ -1127,6 +1140,240 @@ export async function loadAgentCollaborationPolicy(
     `/v1/client/agents/${encodeURIComponent(definitionId)}/collaboration-policy`,
   );
   return collaborationPolicyResponse(response, "Could not load collaboration policy.");
+}
+
+function standingInteger(value: unknown, minimum = 0): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= minimum;
+}
+
+function parseStandingParticipation(
+  value: unknown,
+  channelId: string,
+): WorkshopStandingParticipation | null {
+  if (
+    !isRecord(value) || value.channel_id !== channelId || !isRecord(value.policy) ||
+    !Array.isArray(value.subscriptions) || !Array.isArray(value.observations) ||
+    !Array.isArray(value.recent_runs) || typeof value.can_inspect_silent !== "boolean"
+  ) return null;
+  const policy = value.policy;
+  if (
+    typeof policy.enabled !== "boolean" || typeof policy.can_manage !== "boolean" ||
+    typeof policy.host_enabled !== "boolean" ||
+    !standingInteger(policy.policy_version) || !standingInteger(policy.host_policy_version, 1) ||
+    !standingInteger(policy.max_agents_per_channel, 1) ||
+    !standingInteger(policy.coalescing_grace_seconds) ||
+    !standingInteger(policy.max_messages_per_observe_run, 1) ||
+    !standingInteger(policy.max_pending_messages_per_scope, 1) ||
+    !standingInteger(policy.max_pending_age_seconds, 1) ||
+    !standingInteger(policy.max_observe_runs_per_hour, 1) ||
+    !standingInteger(policy.max_unsolicited_messages_per_hour, 1) ||
+    !standingInteger(policy.minimum_unsolicited_interval_seconds, 1) ||
+    !standingInteger(policy.quiet_expiry_seconds)
+  ) return null;
+  const subscriptions: WorkshopStandingSubscription[] = [];
+  for (const item of value.subscriptions) {
+    if (
+      !isRecord(item) || typeof item.agent_id !== "string" || !AGENT_PATTERN.test(item.agent_id) ||
+      typeof item.agent_definition_id !== "string" ||
+      !AGENT_DEFINITION_PATTERN.test(item.agent_definition_id) ||
+      typeof item.agent_revision_id !== "string" || !AGENT_REVISION_PATTERN.test(item.agent_revision_id) ||
+      typeof item.agent_display_name !== "string" || typeof item.agent_handle !== "string" ||
+      !["active", "paused_overflow", "ended"].includes(String(item.lifecycle_state)) ||
+      typeof item.started_by_principal_id !== "string" ||
+      !PRINCIPAL_PATTERN.test(item.started_by_principal_id) ||
+      typeof item.started_by_message_id !== "string" || !MESSAGE_PATTERN.test(item.started_by_message_id) ||
+      !standingInteger(item.owner_policy_version) || !standingInteger(item.channel_policy_version, 1) ||
+      !standingInteger(item.host_policy_version, 1) || !standingInteger(item.state_version, 1) ||
+      typeof item.started_at !== "string" ||
+      (item.quiet_expires_at !== null && typeof item.quiet_expires_at !== "string") ||
+      (item.end_reason !== null && typeof item.end_reason !== "string")
+    ) return null;
+    subscriptions.push({
+      agentDefinitionId: item.agent_definition_id,
+      agentDisplayName: item.agent_display_name,
+      agentHandle: item.agent_handle,
+      agentId: item.agent_id,
+      agentRevisionId: item.agent_revision_id,
+      channelPolicyVersion: item.channel_policy_version,
+      endReason: item.end_reason,
+      hostPolicyVersion: item.host_policy_version,
+      lifecycleState: item.lifecycle_state as WorkshopStandingSubscription["lifecycleState"],
+      ownerPolicyVersion: item.owner_policy_version,
+      quietExpiresAt: item.quiet_expires_at,
+      startedAt: item.started_at,
+      startedByMessageId: item.started_by_message_id,
+      startedByPrincipalId: item.started_by_principal_id,
+      stateVersion: item.state_version,
+    });
+  }
+  const observations: WorkshopStandingObservation[] = [];
+  for (const item of value.observations) {
+    if (
+      !isRecord(item) || typeof item.agent_id !== "string" || !AGENT_PATTERN.test(item.agent_id) ||
+      !["channel", "thread"].includes(String(item.scope_kind)) || typeof item.scope_id !== "string" ||
+      !standingInteger(item.delivered_through_event_position) ||
+      !standingInteger(item.pending_through_event_position) ||
+      !standingInteger(item.considered_through_event_position) ||
+      !standingInteger(item.pending_message_count) || !standingInteger(item.state_version, 1) ||
+      !["idle", "pending", "paused_overflow"].includes(String(item.lifecycle_state)) ||
+      (item.not_before !== null && typeof item.not_before !== "string") ||
+      (item.overflowed_at !== null && typeof item.overflowed_at !== "string") ||
+      (item.overflow_reason !== null && typeof item.overflow_reason !== "string") ||
+      (item.overflow_from_event_position !== null && !standingInteger(item.overflow_from_event_position)) ||
+      (item.overflow_through_event_position !== null && !standingInteger(item.overflow_through_event_position))
+    ) return null;
+    observations.push({
+      agentId: item.agent_id,
+      consideredThroughEventPosition: item.considered_through_event_position,
+      deliveredThroughEventPosition: item.delivered_through_event_position,
+      lifecycleState: item.lifecycle_state as WorkshopStandingObservation["lifecycleState"],
+      notBefore: item.not_before,
+      overflowFromEventPosition: item.overflow_from_event_position,
+      overflowReason: item.overflow_reason,
+      overflowThroughEventPosition: item.overflow_through_event_position,
+      overflowedAt: item.overflowed_at,
+      pendingMessageCount: item.pending_message_count,
+      pendingThroughEventPosition: item.pending_through_event_position,
+      scopeId: item.scope_id,
+      scopeKind: item.scope_kind as WorkshopStandingObservation["scopeKind"],
+      stateVersion: item.state_version,
+    });
+  }
+  const recentRuns: WorkshopStandingRun[] = [];
+  for (const item of value.recent_runs) {
+    if (
+      !isRecord(item) || typeof item.run_id !== "string" || typeof item.agent_id !== "string" ||
+      !AGENT_PATTERN.test(item.agent_id) || typeof item.agent_display_name !== "string" ||
+      typeof item.status !== "string" || !RUN_STATUSES.has(item.status as WorkshopRunStatus) ||
+      typeof item.accepted_at !== "string" ||
+      (item.started_at !== null && typeof item.started_at !== "string") ||
+      (item.terminal_at !== null && typeof item.terminal_at !== "string") ||
+      (item.terminal_code !== null && typeof item.terminal_code !== "string") ||
+      !["channel", "thread"].includes(String(item.scope_kind)) || typeof item.scope_id !== "string" ||
+      !standingInteger(item.observed_from_event_position) ||
+      !standingInteger(item.observed_through_event_position) ||
+      !standingInteger(item.observed_message_count, 1) ||
+      typeof item.human_anchor_message_id !== "string" ||
+      !MESSAGE_PATTERN.test(item.human_anchor_message_id) ||
+      (item.collaboration_grant_id !== null && typeof item.collaboration_grant_id !== "string") ||
+      (item.outcome !== null &&
+        item.outcome !== "spoke" &&
+        item.outcome !== "silent" &&
+        item.outcome !== "publication_suppressed")
+    ) return null;
+    recentRuns.push({
+      acceptedAt: item.accepted_at,
+      agentDisplayName: item.agent_display_name,
+      agentId: item.agent_id,
+      collaborationGrantId: item.collaboration_grant_id,
+      humanAnchorMessageId: item.human_anchor_message_id,
+      observedFromEventPosition: item.observed_from_event_position,
+      observedMessageCount: item.observed_message_count,
+      observedThroughEventPosition: item.observed_through_event_position,
+      outcome: item.outcome as WorkshopStandingRun["outcome"],
+      runId: item.run_id,
+      scopeId: item.scope_id,
+      scopeKind: item.scope_kind as WorkshopStandingRun["scopeKind"],
+      startedAt: item.started_at,
+      status: item.status as WorkshopRunStatus,
+      terminalAt: item.terminal_at,
+      terminalCode: item.terminal_code,
+    });
+  }
+  return {
+    canInspectSilent: value.can_inspect_silent,
+    channelId,
+    observations,
+    policy: {
+      canManage: policy.can_manage,
+      coalescingGraceSeconds: policy.coalescing_grace_seconds,
+      enabled: policy.enabled,
+      hostEnabled: policy.host_enabled,
+      hostPolicyVersion: policy.host_policy_version,
+      maxAgentsPerChannel: policy.max_agents_per_channel,
+      maxMessagesPerObserveRun: policy.max_messages_per_observe_run,
+      maxObserveRunsPerHour: policy.max_observe_runs_per_hour,
+      maxPendingAgeSeconds: policy.max_pending_age_seconds,
+      maxPendingMessagesPerScope: policy.max_pending_messages_per_scope,
+      maxUnsolicitedMessagesPerHour: policy.max_unsolicited_messages_per_hour,
+      minimumUnsolicitedIntervalSeconds: policy.minimum_unsolicited_interval_seconds,
+      policyVersion: policy.policy_version,
+      quietExpirySeconds: policy.quiet_expiry_seconds,
+    },
+    recentRuns,
+    subscriptions,
+  };
+}
+
+async function standingParticipationResponse(
+  response: Response,
+  channelId: string,
+  fallback: string,
+): Promise<WorkshopStandingParticipation> {
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, fallback));
+  const snapshot = isRecord(payload) && payload.version === 1
+    ? parseStandingParticipation(payload.standing_participation, channelId)
+    : null;
+  if (!snapshot) throw new Error("Kai returned unsupported standing-participation state.");
+  return snapshot;
+}
+
+export async function loadStandingParticipation(
+  session: WorkshopSession,
+  includeSilent = false,
+): Promise<WorkshopStandingParticipation> {
+  const suffix = includeSilent ? "?include_silent=1" : "";
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/standing-participation${suffix}`,
+  );
+  return standingParticipationResponse(response, session.channelId, "Could not load standing participation.");
+}
+
+export async function updateStandingParticipation(
+  session: WorkshopSession,
+  enabled: boolean,
+  expectedPolicyVersion: number,
+  clientOperationId: string,
+): Promise<WorkshopStandingParticipation> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/standing-participation`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        enabled,
+        expected_policy_version: expectedPolicyVersion,
+        client_operation_id: clientOperationId,
+      }),
+    },
+  );
+  return standingParticipationResponse(response, session.channelId, "Could not update standing participation.");
+}
+
+export async function resumeStandingObservation(
+  session: WorkshopSession,
+  agentId: string,
+  observation: WorkshopStandingObservation,
+  clientOperationId: string,
+): Promise<WorkshopStandingParticipation> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/agents/${encodeURIComponent(agentId)}` +
+      "/standing-participation/resume",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scope_id: observation.scopeId,
+        expected_state_version: observation.stateVersion,
+        client_operation_id: clientOperationId,
+      }),
+    },
+  );
+  return standingParticipationResponse(response, session.channelId, "Could not resume standing observation.");
 }
 
 export async function updateAgentCollaborationPolicy(
@@ -5642,6 +5889,13 @@ export async function streamTimeline(
           continue;
         }
         handlers.onReactions?.(messageId, reactions, event.eventId);
+        continue;
+      }
+      if (event.eventName === "standing.participation.changed") {
+        if (payload.event_position !== eventPosition) {
+          continue;
+        }
+        handlers.onStandingParticipationChanged?.(eventPosition, event.eventId);
         continue;
       }
       if (event.eventName === "run.lifecycle.changed") {
