@@ -11,6 +11,7 @@ from kai.workshop.artifacts import StagedArtifact
 from kai.workshop.collaboration_authority import (
     CollaborationAuthorization,
     CollaborationBaseIdentity,
+    CollaborationHostPolicy,
     CollaborationOperation,
     WorkshopCollaborationAuthority,
 )
@@ -35,6 +36,7 @@ from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_lifecycle import WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.transcript_export import CanonicalTranscriptProjection
 
@@ -62,6 +64,7 @@ class WorkshopPrivateTextExecutionService:
         database_lock: asyncio.Lock,
         runtime_pool: WorkshopRuntimePool,
         routing_policy: WorkshopRoutingPolicyService,
+        standing_participation: WorkshopStandingParticipationService,
     ) -> None:
         self._store = store
         self._coordinator = coordinator
@@ -69,6 +72,7 @@ class WorkshopPrivateTextExecutionService:
         self._database_lock = database_lock
         self._runtime_pool = runtime_pool
         self.routing_policy = routing_policy
+        self.standing_participation = standing_participation
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -82,6 +86,7 @@ class WorkshopPrivateTextExecutionService:
         registered_backend_ids: frozenset[str],
         delivery_policy: WorkshopDeliveryBindingPolicy,
         routing_eligibility: WorkshopRoutingEligibilityService,
+        collaboration_host_policy: CollaborationHostPolicy | None = None,
     ) -> WorkshopPrivateTextExecutionService:
         store = await WorkshopEventStore.open(database_path)
         database_lock = asyncio.Lock()
@@ -103,6 +108,11 @@ class WorkshopPrivateTextExecutionService:
             transcript_projection=CanonicalTranscriptProjection(database_path.parent / "history"),
             artifact_storage_root=database_path.parent / "files",
             delivery_policy=delivery_policy,
+            collaboration_host_policy=collaboration_host_policy,
+        )
+        standing_participation = WorkshopStandingParticipationService(
+            store,
+            coordinator.collaboration_authority.host_policy,
         )
         service = cls(
             store,
@@ -111,10 +121,12 @@ class WorkshopPrivateTextExecutionService:
                 store,
                 artifact_storage_root=database_path.parent / "files",
                 delivery_policy=delivery_policy,
+                standing_participation=standing_participation,
             ),
             database_lock,
             runtime_pool,
             routing_policy,
+            standing_participation,
         )
         try:
             await coordinator.recover_expired()

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 71
+WORKSHOP_SCHEMA_VERSION = 72
 
 
 @dataclass(frozen=True, slots=True)
@@ -3121,6 +3121,65 @@ _AGENT_COLLABORATION_OWNER_POLICY_SCHEMA = SchemaMigration(
     ),
 )
 
+_STANDING_PARTICIPATION_AUTHORITY_SCHEMA = SchemaMigration(
+    version=72,
+    name="standing_participation_authority",
+    statements=(
+        """
+        CREATE TABLE channel_standing_participation_policies (
+            channel_id TEXT PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            policy_version INTEGER NOT NULL CHECK (policy_version > 0),
+            updated_by_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            host_policy_version INTEGER NOT NULL CHECK (host_policy_version > 0),
+            updated_at TEXT NOT NULL,
+            updated_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE channel_agent_standings (
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            agent_definition_id TEXT NOT NULL REFERENCES agent_definitions(id) ON DELETE CASCADE,
+            agent_definition_revision_id TEXT NOT NULL
+                REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            started_by_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            started_by_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+            owner_policy_version INTEGER NOT NULL CHECK (owner_policy_version >= 0),
+            channel_policy_version INTEGER NOT NULL CHECK (channel_policy_version > 0),
+            host_policy_version INTEGER NOT NULL CHECK (host_policy_version > 0),
+            lifecycle_state TEXT NOT NULL CHECK (
+                lifecycle_state IN ('active', 'paused_overflow', 'ended')
+            ),
+            quiet_expires_at TEXT,
+            started_at TEXT NOT NULL,
+            started_event_position INTEGER NOT NULL
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            ended_at TEXT,
+            end_reason TEXT,
+            cause_event_id TEXT,
+            ended_event_position INTEGER REFERENCES event_log(position) ON DELETE RESTRICT,
+            state_version INTEGER NOT NULL CHECK (state_version > 0),
+            last_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (channel_id, agent_id),
+            CHECK (
+                (lifecycle_state != 'active' AND ended_at IS NOT NULL AND end_reason IS NOT NULL
+                    AND ended_event_position IS NOT NULL)
+                OR
+                (lifecycle_state = 'active' AND ended_at IS NULL AND end_reason IS NULL
+                    AND ended_event_position IS NULL)
+            )
+        )
+        """,
+        "CREATE INDEX channel_agent_standings_state_idx ON "
+        "channel_agent_standings (channel_id, lifecycle_state, last_event_position)",
+        "CREATE INDEX channel_agent_standings_definition_idx ON "
+        "channel_agent_standings (agent_definition_id, lifecycle_state)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3193,6 +3252,7 @@ _MIGRATIONS = (
     _AGENT_AUTHORED_REACTION_SCHEMA,
     _AGENT_AUTHORED_PUBLICATION_SCHEMA,
     _AGENT_COLLABORATION_OWNER_POLICY_SCHEMA,
+    _STANDING_PARTICIPATION_AUTHORITY_SCHEMA,
 )
 
 

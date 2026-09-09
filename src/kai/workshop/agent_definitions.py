@@ -28,6 +28,7 @@ COLLABORATION_OPERATIONS = frozenset(
         "thread_reply",
         "artifact_publish",
         "agent_delegation",
+        "standing_participation",
     }
 )
 MAX_AGENT_DISPLAY_NAME = 80

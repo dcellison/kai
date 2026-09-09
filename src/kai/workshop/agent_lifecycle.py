@@ -32,6 +32,7 @@ from kai.workshop.domain import (
     WorkshopMembershipId,
 )
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.standing_participation import end_active_standings_in_transaction
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -485,7 +486,7 @@ class WorkshopAgentLifecycleService:
                 payload=payload,
                 metadata=self._metadata(operation, fingerprint, definition_id),
             )
-            await self._store.append_in_transaction(event)
+            lifecycle = await self._store.append_in_transaction(event)
             for index, enablement_id in enumerate(retirement_ids):
                 await self._store.append_in_transaction(
                     EventEnvelope.create(
@@ -502,6 +503,15 @@ class WorkshopAgentLifecycleService:
                     )
                 )
             await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            if operation == "archive":
+                await end_active_standings_in_transaction(
+                    self._store,
+                    definition_id=definition_id,
+                    reason="definition_archived",
+                    occurred_at=event.occurred_at,
+                    cause_event_id=lifecycle.event.envelope.event_id,
+                    actor_principal_id=principal_id,
+                )
             result = await self._snapshot(definition_id, workshop_id=workshop_id)
             await connection.commit()
             return result

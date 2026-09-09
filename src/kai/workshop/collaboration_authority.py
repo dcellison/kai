@@ -54,6 +54,7 @@ class CollaborationOperation(StrEnum):
     THREAD_REPLY = "thread_reply"
     ARTIFACT_PUBLISH = "artifact_publish"
     AGENT_DELEGATION = "agent_delegation"
+    STANDING_PARTICIPATION = "standing_participation"
 
 
 if {item.value for item in CollaborationOperation} != COLLABORATION_OPERATIONS:
@@ -108,10 +109,44 @@ class CollaborationOwnerPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class StandingParticipationHostPolicy:
+    """Host-owned standing-participation rollout switch and hard limits."""
+
+    enabled: bool = False
+    max_agents_per_channel: int = 2
+    quiet_expiry_seconds: int = 259_200
+    max_pending_messages_per_scope: int = 500
+    max_pending_age_seconds: int = 86_400
+    max_observe_runs_per_hour: int = 30
+    max_unsolicited_messages_per_hour: int = 12
+    minimum_unsolicited_interval_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("standing participation enabled must be a boolean")
+        positive = (
+            self.max_agents_per_channel,
+            self.max_pending_messages_per_scope,
+            self.max_pending_age_seconds,
+            self.max_observe_runs_per_hour,
+            self.max_unsolicited_messages_per_hour,
+            self.minimum_unsolicited_interval_seconds,
+        )
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in positive):
+            raise ValueError("standing participation host limits must be positive integers")
+        if (
+            not isinstance(self.quiet_expiry_seconds, int)
+            or isinstance(self.quiet_expiry_seconds, bool)
+            or self.quiet_expiry_seconds < 0
+        ):
+            raise ValueError("standing participation quiet expiry must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
 class CollaborationHostPolicy:
     """Server-owned maxima that no agent revision or owner can exceed."""
 
-    version: int = 1
+    version: int = 2
     allowed_operations: frozenset[CollaborationOperation] = frozenset(CollaborationOperation)
     quotas: Mapping[CollaborationOperation, int] = field(
         default_factory=lambda: {
@@ -121,8 +156,10 @@ class CollaborationHostPolicy:
             CollaborationOperation.THREAD_REPLY: 32,
             CollaborationOperation.ARTIFACT_PUBLISH: 16,
             CollaborationOperation.AGENT_DELEGATION: 12,
+            CollaborationOperation.STANDING_PARTICIPATION: 30,
         }
     )
+    standing_participation: StandingParticipationHostPolicy = field(default_factory=StandingParticipationHostPolicy)
 
     def __post_init__(self) -> None:
         if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
@@ -132,6 +169,12 @@ class CollaborationHostPolicy:
             raise ValueError("host quotas must cover exactly the host-allowed operations")
         if any(not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 for limit in self.quotas.values()):
             raise ValueError("host quotas must be positive integers")
+
+    @property
+    def effective_allowed_operations(self) -> frozenset[CollaborationOperation]:
+        if self.standing_participation.enabled:
+            return self.allowed_operations
+        return self.allowed_operations - {CollaborationOperation.STANDING_PARTICIPATION}
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,7 +380,7 @@ class WorkshopCollaborationAuthority:
                 raise CollaborationGrantConflict("Collaboration revision is unavailable")
             requested = frozenset(CollaborationOperation(item) for item in revision.collaboration_operations)
             owner_policy = await self.owner_policy_for_revision(revision)
-            host_allowed = self._host_policy.allowed_operations
+            host_allowed = self._host_policy.effective_allowed_operations
             effective = requested & owner_policy.allowed_operations & host_allowed
             grant_id = CollaborationGrantId.derived(claim.attempt_id, "collaboration-grant")
             key = f"workshop-collaboration-grant:v1:{grant_id}:issued"

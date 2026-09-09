@@ -138,6 +138,16 @@ _COLLABORATION_AUTHORITY_TABLES = {
     "run_attempts",
     "runs",
 }
+_STANDING_PARTICIPATION_TABLES = {
+    "agent_collaboration_owner_policies",
+    "agent_definition_revisions",
+    "agent_definitions",
+    "channel_agent_standings",
+    "channel_agents",
+    "channel_standing_participation_policies",
+    "channels",
+    "event_log",
+}
 _AGENT_HANDLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
@@ -890,6 +900,77 @@ def workshop_collaboration_authority_status(db_path: Path) -> str:
         f"retrying={adapter_counts[3]}, succeeded={adapter_counts[4]}, failed={adapter_counts[5]}, "
         f"retries={adapter_counts[6]}); integrity gaps={integrity_gaps}, "
         f"replay gaps={event_projection_gaps}; authority=attempt-scoped"
+    )
+
+
+def workshop_standing_participation_status(
+    db_path: Path,
+    *,
+    host_enabled: bool | None = None,
+) -> str:
+    """Report canonical standing policy/subscription state and current-authority drift."""
+    prefix = "Workshop standing participation:"
+    if not db_path.is_file():
+        return f"{prefix} pending; standing-participation schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _STANDING_PARTICIPATION_TABLES:
+                return f"{prefix} pending; standing-participation schema unavailable"
+            policies = connection.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) "
+                "FROM channel_standing_participation_policies"
+            ).fetchone()
+            policy_count, enabled_policies = tuple(int(value or 0) for value in (policies or (0, 0)))
+            subscriptions = connection.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN lifecycle_state = 'active' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN lifecycle_state = 'paused_overflow' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN lifecycle_state = 'ended' THEN 1 ELSE 0 END) FROM channel_agent_standings"
+            ).fetchone()
+            subscription_count, active, paused, ended = tuple(
+                int(value or 0) for value in (subscriptions or (0, 0, 0, 0))
+            )
+            integrity_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_standings s "
+                "LEFT JOIN channels c ON c.id = s.channel_id "
+                "LEFT JOIN channel_agents ca ON ca.channel_id = s.channel_id AND ca.agent_id = s.agent_id "
+                "LEFT JOIN agent_definitions d ON d.id = s.agent_definition_id AND d.agent_id = s.agent_id "
+                "LEFT JOIN agent_definition_revisions r ON r.id = s.agent_definition_revision_id "
+                "AND r.agent_definition_id = d.id "
+                "LEFT JOIN channel_standing_participation_policies cp ON cp.channel_id = s.channel_id "
+                "LEFT JOIN agent_collaboration_owner_policies op ON op.agent_definition_id = d.id "
+                "WHERE c.id IS NULL OR ca.id IS NULL OR d.id IS NULL OR r.id IS NULL OR "
+                "(s.lifecycle_state = 'active' AND (c.archived_at IS NOT NULL OR ca.detached_at IS NOT NULL "
+                "OR d.lifecycle_state != 'active' OR d.active_revision_id IS NOT s.agent_definition_revision_id "
+                "OR cp.enabled IS NOT 1 OR NOT EXISTS (SELECT 1 FROM json_each(r.collaboration_operations_json) "
+                "WHERE value = 'standing_participation') OR NOT EXISTS (SELECT 1 FROM "
+                "json_each(op.allowed_operations_json) WHERE value = 'standing_participation')))",
+            )
+            replay_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_standings s WHERE s.last_event_position != ("
+                "SELECT MAX(e.position) FROM event_log e WHERE e.aggregate_id = s.channel_id "
+                "AND e.event_type IN ('channel.agent_standing_started', 'channel.agent_standing_ended') "
+                "AND json_extract(e.payload_json, '$.agent_id') = s.agent_id)",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError):
+        return f"{prefix} INCOMPLETE; diagnostics unavailable"
+    host_policy_gaps = active if host_enabled is False else 0
+    integrity_gaps += host_policy_gaps
+    host_state = "unknown" if host_enabled is None else ("enabled" if host_enabled else "disabled")
+    state = "active" if integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; host={host_state}, channel policies={policy_count} (enabled={enabled_policies}), "
+        f"subscriptions={subscription_count} (active={active}, paused overflow={paused}, ended={ended}); "
+        f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; authority=canonical"
     )
 
 

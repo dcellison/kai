@@ -122,7 +122,7 @@ async def test_grant_snapshots_revision_owner_host_context_and_limits(tmp_path: 
         )
         assert grant.effective_operations == frozenset({CollaborationOperation.AGENT_DELEGATION})
         assert grant.owner_policy_version == 7
-        assert grant.host_policy_version == 1
+        assert grant.host_policy_version == 2
         assert grant.quotas[CollaborationOperation.AGENT_DELEGATION] == 12
         assert grant.proof_fingerprint != invocation.token
         assert invocation.token not in repr(invocation)
@@ -451,7 +451,7 @@ async def test_version_sixty_seven_migrates_only_legacy_delegation_requests(
 
     upgraded = await WorkshopEventStore.open(path)
     try:
-        assert await upgraded.schema_version() == 71
+        assert await upgraded.schema_version() == 72
         async with upgraded.connection.execute(
             "SELECT id, capabilities_json, collaboration_operations_json "
             "FROM agent_definition_revisions ORDER BY revision_number"

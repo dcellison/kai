@@ -70,6 +70,7 @@ const COLLABORATION_TOOLS: {
   { description: "Reply inside an existing thread.", label: "Thread replies", value: "thread_reply" },
   { description: "Publish a bounded artifact with provenance.", label: "Artifacts", value: "artifact_publish" },
   { description: "Delegate bounded work to another active agent.", label: "Agent delegation", value: "agent_delegation" },
+  { description: "Remain available for bounded observation in opted-in group channels.", label: "Standing participation", value: "standing_participation" },
 ];
 
 interface DefinitionFormState {

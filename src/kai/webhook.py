@@ -136,6 +136,7 @@ from kai.workshop.scheduled_jobs import (
 )
 from kai.workshop.scheduler import WorkshopScheduledJobRegistrationError
 from kai.workshop.settings_workspaces import WorkshopSettingsWorkspaceService
+from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
     WorkshopStorageNamespaceError,
@@ -2182,6 +2183,7 @@ async def _register_workshop_client_api(
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
+    standing_participation: WorkshopStandingParticipationService | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -2227,6 +2229,7 @@ async def _register_workshop_client_api(
             agent_enablement=agent_enablement,
             human_avatars=human_avatars,
             collaboration_policy=collaboration_policy,
+            standing_participation=standing_participation,
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -2317,6 +2320,7 @@ async def start(
             agent_enablement=getattr(core_services, "agent_enablement", None),
             human_avatars=getattr(core_services, "human_avatars", None),
             collaboration_policy=getattr(core_services, "collaboration_policy", None),
+            standing_participation=getattr(core_services, "standing_participation", None),
         )
 
     _runner = web.AppRunner(
