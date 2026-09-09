@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 72
+WORKSHOP_SCHEMA_VERSION = 73
 
 
 @dataclass(frozen=True, slots=True)
@@ -3180,6 +3180,89 @@ _STANDING_PARTICIPATION_AUTHORITY_SCHEMA = SchemaMigration(
     ),
 )
 
+_STANDING_OBSERVATION_INBOX_SCHEMA = SchemaMigration(
+    version=73,
+    name="standing_observation_inbox",
+    statements=(
+        """
+        CREATE TABLE standing_participation_host_policy (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            host_policy_version INTEGER NOT NULL CHECK (host_policy_version > 0),
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            coalescing_grace_seconds INTEGER NOT NULL CHECK (coalescing_grace_seconds >= 0),
+            max_messages_per_observe_run INTEGER NOT NULL CHECK (max_messages_per_observe_run > 0),
+            max_pending_messages_per_scope INTEGER NOT NULL CHECK (max_pending_messages_per_scope > 0),
+            max_pending_age_seconds INTEGER NOT NULL CHECK (max_pending_age_seconds > 0),
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE channel_agent_observation_states (
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('channel', 'thread')),
+            scope_id TEXT NOT NULL,
+            delivered_through_event_position INTEGER NOT NULL
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            pending_through_event_position INTEGER NOT NULL
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            considered_through_event_position INTEGER NOT NULL
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            oldest_pending_event_position INTEGER
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            pending_message_count INTEGER NOT NULL CHECK (pending_message_count >= 0),
+            latest_human_anchor_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            latest_human_anchor_event_position INTEGER
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            not_before TEXT,
+            lifecycle_state TEXT NOT NULL CHECK (
+                lifecycle_state IN ('idle', 'pending', 'paused_overflow')
+            ),
+            overflowed_at TEXT,
+            overflow_reason TEXT CHECK (
+                overflow_reason IS NULL OR overflow_reason IN ('pending_count', 'pending_age', 'retention')
+            ),
+            overflow_from_event_position INTEGER
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            overflow_through_event_position INTEGER
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            projection_version INTEGER NOT NULL CHECK (projection_version = 1),
+            state_version INTEGER NOT NULL CHECK (state_version > 0),
+            last_event_position INTEGER NOT NULL
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (channel_id, agent_id, scope_id),
+            FOREIGN KEY (channel_id, agent_id)
+                REFERENCES channel_agent_standings(channel_id, agent_id) ON DELETE CASCADE,
+            CHECK (delivered_through_event_position <= pending_through_event_position),
+            CHECK (pending_through_event_position <= considered_through_event_position),
+            CHECK (
+                (pending_message_count = 0 AND oldest_pending_event_position IS NULL AND not_before IS NULL)
+                OR
+                (pending_message_count > 0 AND oldest_pending_event_position IS NOT NULL AND not_before IS NOT NULL)
+            ),
+            CHECK (
+                (latest_human_anchor_message_id IS NULL AND latest_human_anchor_event_position IS NULL)
+                OR
+                (latest_human_anchor_message_id IS NOT NULL AND latest_human_anchor_event_position IS NOT NULL)
+            ),
+            CHECK (
+                (lifecycle_state = 'paused_overflow' AND overflowed_at IS NOT NULL
+                    AND overflow_reason IS NOT NULL AND overflow_from_event_position IS NOT NULL
+                    AND overflow_through_event_position IS NOT NULL)
+                OR
+                (lifecycle_state != 'paused_overflow' AND overflowed_at IS NULL
+                    AND overflow_reason IS NULL AND overflow_from_event_position IS NULL
+                    AND overflow_through_event_position IS NULL)
+            )
+        )
+        """,
+        "CREATE INDEX channel_agent_observation_ready_idx ON "
+        "channel_agent_observation_states (lifecycle_state, not_before, oldest_pending_event_position)",
+        "CREATE INDEX channel_agent_observation_channel_idx ON "
+        "channel_agent_observation_states (channel_id, agent_id, considered_through_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3253,6 +3336,7 @@ _MIGRATIONS = (
     _AGENT_AUTHORED_PUBLICATION_SCHEMA,
     _AGENT_COLLABORATION_OWNER_POLICY_SCHEMA,
     _STANDING_PARTICIPATION_AUTHORITY_SCHEMA,
+    _STANDING_OBSERVATION_INBOX_SCHEMA,
 )
 
 

@@ -114,6 +114,8 @@ class StandingParticipationHostPolicy:
 
     enabled: bool = False
     max_agents_per_channel: int = 2
+    coalescing_grace_seconds: int = 2
+    max_messages_per_observe_run: int = 40
     quiet_expiry_seconds: int = 259_200
     max_pending_messages_per_scope: int = 500
     max_pending_age_seconds: int = 86_400
@@ -126,6 +128,7 @@ class StandingParticipationHostPolicy:
             raise TypeError("standing participation enabled must be a boolean")
         positive = (
             self.max_agents_per_channel,
+            self.max_messages_per_observe_run,
             self.max_pending_messages_per_scope,
             self.max_pending_age_seconds,
             self.max_observe_runs_per_hour,
@@ -134,6 +137,12 @@ class StandingParticipationHostPolicy:
         )
         if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in positive):
             raise ValueError("standing participation host limits must be positive integers")
+        if (
+            not isinstance(self.coalescing_grace_seconds, int)
+            or isinstance(self.coalescing_grace_seconds, bool)
+            or self.coalescing_grace_seconds < 0
+        ):
+            raise ValueError("standing participation coalescing grace must be a non-negative integer")
         if (
             not isinstance(self.quiet_expiry_seconds, int)
             or isinstance(self.quiet_expiry_seconds, bool)

@@ -148,6 +148,11 @@ _STANDING_PARTICIPATION_TABLES = {
     "channels",
     "event_log",
 }
+_STANDING_OBSERVATION_TABLES = _STANDING_PARTICIPATION_TABLES | {
+    "channel_agent_observation_states",
+    "messages",
+    "standing_participation_host_policy",
+}
 _AGENT_HANDLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
@@ -959,6 +964,12 @@ def workshop_standing_participation_status(
                 "AND e.event_type IN ('channel.agent_standing_started', 'channel.agent_standing_ended') "
                 "AND json_extract(e.payload_json, '$.agent_id') = s.agent_id)",
             )
+            if host_enabled is None and "standing_participation_host_policy" in tables:
+                host_row = connection.execute(
+                    "SELECT enabled FROM standing_participation_host_policy WHERE singleton = 1"
+                ).fetchone()
+                if host_row is not None:
+                    host_enabled = bool(host_row[0])
         finally:
             connection.close()
     except (OSError, sqlite3.Error, ValueError):
@@ -971,6 +982,82 @@ def workshop_standing_participation_status(
         f"{prefix} {state}; host={host_state}, channel policies={policy_count} (enabled={enabled_policies}), "
         f"subscriptions={subscription_count} (active={active}, paused overflow={paused}, ended={ended}); "
         f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; authority=canonical"
+    )
+
+
+def workshop_standing_observation_status(db_path: Path) -> str:
+    """Report bounded standing-agent observation cursors and continuity gaps."""
+    prefix = "Workshop standing observation inbox:"
+    if not db_path.is_file():
+        return f"{prefix} pending; observation schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _STANDING_OBSERVATION_TABLES:
+                return f"{prefix} pending; observation schema unavailable"
+            host = connection.execute(
+                "SELECT enabled, coalescing_grace_seconds, max_messages_per_observe_run, "
+                "max_pending_messages_per_scope, max_pending_age_seconds "
+                "FROM standing_participation_host_policy WHERE singleton = 1"
+            ).fetchone()
+            counts = connection.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN lifecycle_state = 'idle' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN lifecycle_state = 'pending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN lifecycle_state = 'paused_overflow' THEN 1 ELSE 0 END), "
+                "SUM(pending_message_count), "
+                "SUM(CASE WHEN pending_message_count > 0 AND latest_human_anchor_message_id IS NULL "
+                "THEN 1 ELSE 0 END) FROM channel_agent_observation_states"
+            ).fetchone()
+            scopes, idle, pending, paused, pending_messages, unanchored = tuple(
+                int(value or 0) for value in (counts or (0, 0, 0, 0, 0, 0))
+            )
+            integrity_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_observation_states o "
+                "LEFT JOIN channel_agent_standings s ON s.channel_id = o.channel_id AND s.agent_id = o.agent_id "
+                "LEFT JOIN channels c ON c.id = o.channel_id "
+                "LEFT JOIN agents a ON a.id = o.agent_id "
+                "LEFT JOIN messages anchor ON anchor.id = o.latest_human_anchor_message_id "
+                "LEFT JOIN principals anchor_author ON anchor_author.id = anchor.author_principal_id "
+                "WHERE s.channel_id IS NULL OR c.id IS NULL OR a.id IS NULL "
+                "OR o.projection_version != 1 OR o.last_event_position != o.considered_through_event_position "
+                "OR o.delivered_through_event_position > o.pending_through_event_position "
+                "OR o.pending_through_event_position > o.considered_through_event_position "
+                "OR (o.pending_message_count = 0 AND o.oldest_pending_event_position IS NOT NULL) "
+                "OR (o.pending_message_count > 0 AND o.oldest_pending_event_position IS NULL) "
+                "OR (o.latest_human_anchor_message_id IS NULL) != "
+                "(o.latest_human_anchor_event_position IS NULL) "
+                "OR (o.latest_human_anchor_message_id IS NOT NULL AND "
+                "(anchor.id IS NULL OR anchor.channel_id != o.channel_id OR anchor_author.kind != 'human')) "
+                "OR (o.lifecycle_state = 'paused_overflow') != (o.overflowed_at IS NOT NULL)",
+            )
+            replay_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_observation_states o LEFT JOIN event_log e "
+                "ON e.position = o.last_event_position AND e.event_type = 'message.created' "
+                "WHERE e.position IS NULL",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return f"{prefix} INCOMPLETE; diagnostics unavailable"
+    host_state = "unknown" if host is None else ("enabled" if bool(host[0]) else "disabled")
+    limits = (
+        "limits=unknown"
+        if host is None
+        else f"grace={int(host[1])}s, batch={int(host[2])}, pending={int(host[3])}, age={int(host[4])}s"
+    )
+    state = "active" if integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; host={host_state}, scopes={scopes} "
+        f"(idle={idle}, pending={pending}, paused overflow={paused}), "
+        f"pending messages={pending_messages}, unanchored={unanchored}; {limits}; "
+        f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; authority=canonical-message"
     )
 
 

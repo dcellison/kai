@@ -451,7 +451,7 @@ async def test_version_sixty_seven_migrates_only_legacy_delegation_requests(
 
     upgraded = await WorkshopEventStore.open(path)
     try:
-        assert await upgraded.schema_version() == 72
+        assert await upgraded.schema_version() == 73
         async with upgraded.connection.execute(
             "SELECT id, capabilities_json, collaboration_operations_json "
             "FROM agent_definition_revisions ORDER BY revision_number"
