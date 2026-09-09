@@ -1646,7 +1646,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 31
+    version = 32
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1675,6 +1675,7 @@ class CanonicalConversationProjection:
                 "run_attempt_id = NULL, collaboration_grant_id = NULL, collaboration_operation = NULL"
             )
         for table in (
+            "channel_agent_observation_states",
             "channel_agent_standings",
             "channel_standing_participation_policies",
             "deliveries",
@@ -3263,6 +3264,11 @@ class CanonicalConversationProjection:
                                 occurred_at,
                             ),
                         )
+            from kai.workshop.standing_observation import (
+                apply_canonical_message_to_standing_observations,
+            )
+
+            await apply_canonical_message_to_standing_observations(connection, event)
         elif envelope.event_type == WorkshopEventType.HUMAN_NOTIFICATION_CREATED:
             if not isinstance(envelope.aggregate_id, HumanNotificationId):
                 raise ValueError("Workshop human notification requires a typed notification aggregate")

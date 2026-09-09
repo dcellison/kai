@@ -579,7 +579,7 @@ async def test_version_fifty_seven_archived_enablement_is_retired_on_upgrade(
 
     upgraded = await WorkshopEventStore.open(path)
     try:
-        assert await upgraded.schema_version() == 72
+        assert await upgraded.schema_version() == 73
         async with upgraded.connection.execute(
             "SELECT lifecycle_state, conversation_started_at "
             "FROM principal_agent_enablements WHERE agent_definition_id = ?",

@@ -346,6 +346,25 @@ class WorkshopStandingParticipationService:
         self._store = store
         self._host_policy = host_policy
 
+    async def synchronize_host_policy(self) -> None:
+        """Publish current host limits for the universal message projection."""
+        from kai.workshop.standing_observation import (
+            synchronize_standing_observation_host_policy_in_transaction,
+        )
+
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await synchronize_standing_observation_host_policy_in_transaction(
+                connection,
+                self._host_policy,
+                occurred_at=datetime.now(UTC),
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+
     @staticmethod
     def _projection() -> Projection:
         from kai.workshop.projection import CanonicalConversationProjection
@@ -424,6 +443,15 @@ class WorkshopStandingParticipationService:
         digest = _request_hash(request)
         try:
             await connection.execute("BEGIN IMMEDIATE")
+            from kai.workshop.standing_observation import (
+                synchronize_standing_observation_host_policy_in_transaction,
+            )
+
+            await synchronize_standing_observation_host_policy_in_transaction(
+                connection,
+                self._host_policy,
+                occurred_at=datetime.now(UTC),
+            )
             workshop_id, can_manage = await self._channel_access_row(principal_id, channel_id)
             if not can_manage:
                 raise WorkshopStandingParticipationAccessDenied("Only a channel owner may change this policy")
@@ -493,6 +521,15 @@ class WorkshopStandingParticipationService:
         *,
         occurred_at: datetime,
     ) -> None:
+        from kai.workshop.standing_observation import (
+            synchronize_standing_observation_host_policy_in_transaction,
+        )
+
+        await synchronize_standing_observation_host_policy_in_transaction(
+            self._store.connection,
+            self._host_policy,
+            occurred_at=occurred_at,
+        )
         if CollaborationOperation.STANDING_PARTICIPATION not in self._host_policy.effective_allowed_operations:
             return
         async with self._store.connection.execute(

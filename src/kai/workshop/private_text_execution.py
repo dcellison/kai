@@ -114,6 +114,7 @@ class WorkshopPrivateTextExecutionService:
             store,
             coordinator.collaboration_authority.host_policy,
         )
+        await standing_participation.synchronize_host_policy()
         service = cls(
             store,
             coordinator,
