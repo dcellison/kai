@@ -25,6 +25,7 @@ from kai.workshop.runtime_assignments import (
     WorkshopRuntimeAssignmentError,
     resolve_channel_runtime_profile,
 )
+from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.store import AppendResult, WorkshopEventStore
 from kai.workshop.wake_policy import resolve_message_wake_targets
 
@@ -107,12 +108,14 @@ class WorkshopConversationCommandService:
         *,
         artifact_storage_root: Path | None = None,
         delivery_policy: WorkshopDeliveryBindingPolicy | None = None,
+        standing_participation: WorkshopStandingParticipationService | None = None,
     ) -> None:
         self._store = store
         self._artifact_storage_root = artifact_storage_root
         effective_policy = delivery_policy or WorkshopDeliveryBindingPolicy.disabled()
         self._delivery_policy = effective_policy
         self._delivery_planner = WorkshopDeliveryPlanner(self._store, effective_policy)
+        self._standing_participation = standing_participation
 
     async def accept(
         self,
@@ -321,6 +324,12 @@ class WorkshopConversationCommandService:
             message_id,
             scope=None,
         )
+        if self._standing_participation is not None:
+            await self._standing_participation.start_from_message_in_transaction(
+                message_id,
+                decision.agent_ids,
+                occurred_at=occurred_at,
+            )
         lifecycle = WorkshopRunLifecycle(self._store)
         accepted: list[RunLifecycleResult] = []
         for agent_id in decision.agent_ids:

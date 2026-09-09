@@ -18,6 +18,7 @@ from kai.workshop.domain import (
 )
 from kai.workshop.human_direct_messages import is_canonical_human_direct_channel
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.standing_participation import end_active_standings_in_transaction
 from kai.workshop.store import AppendResult, WorkshopEventStore
 
 GROUP_AGENT_ENGAGEMENT_WINDOW_SECONDS = 900
@@ -326,6 +327,16 @@ async def dismiss_channel_agent(
         await connection.execute("BEGIN IMMEDIATE")
         result = await store.append_in_transaction(event)
         await store.project_pending_in_transaction(CanonicalConversationProjection())
+        if scope.thread_root_message_id is None:
+            await end_active_standings_in_transaction(
+                store,
+                channel_id=scope.channel_id,
+                agent_id=agent_id,
+                reason="dismissed",
+                occurred_at=occurred_at,
+                cause_event_id=result.event.envelope.event_id,
+                actor_principal_id=principal_id,
+            )
         await connection.commit()
         return result
     except Exception:

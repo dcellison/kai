@@ -69,6 +69,7 @@ from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.runtime_state import WorkshopRuntimeStateWriter
 from kai.workshop.scheduler import WorkshopCanonicalScheduler
 from kai.workshop.settings_workspaces import WorkshopSettingsWorkspaceService
+from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
 
@@ -217,6 +218,7 @@ class KaiCoreServices:
     collaboration_reactions: WorkshopCollaborationReactionService
     collaboration_publications: WorkshopCollaborationPublicationService
     collaboration_policy: WorkshopCollaborationPolicyService
+    standing_participation: WorkshopStandingParticipationService
     delivery_policy: WorkshopDeliveryBindingPolicy
 
 
@@ -418,6 +420,10 @@ class KaiApplicationHost:
                 client_store,
                 private_execution,
             )
+            standing_participation = WorkshopStandingParticipationService(
+                client_store,
+                private_execution.collaboration_authority.host_policy,
+            )
             scheduler = await WorkshopCanonicalScheduler.open_and_start(
                 Path(self._config.session_db_path),
                 private_execution,
@@ -536,6 +542,7 @@ class KaiApplicationHost:
                 collaboration_reactions=collaboration_reactions,
                 collaboration_publications=collaboration_publications,
                 collaboration_policy=collaboration_policy,
+                standing_participation=standing_participation,
                 delivery_policy=delivery_policy,
             )
             self._state = KaiApplicationState.READY

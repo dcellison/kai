@@ -265,7 +265,8 @@ export type WorkshopCollaborationOperation =
   | "progress_publish"
   | "thread_reply"
   | "artifact_publish"
-  | "agent_delegation";
+  | "agent_delegation"
+  | "standing_participation";
 
 export type WorkshopAgentLifecycleState = "draft" | "active" | "archived";
 export type WorkshopAgentEnablementState = "available" | "enabled" | "disabled";

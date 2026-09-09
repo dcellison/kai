@@ -20,6 +20,7 @@ from kai.workshop.domain import (
 )
 from kai.workshop.human_avatars import HumanAvatarDescriptor, human_avatar_descriptors
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.standing_participation import end_active_standings_in_transaction
 from kai.workshop.store import StoredEvent, WorkshopEventStore
 
 
@@ -555,6 +556,15 @@ class WorkshopChannelLifecycleService:
             if not result.inserted:
                 raise WorkshopChannelLifecycleError("New channel lifecycle event unexpectedly already exists")
             await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            if archived:
+                await end_active_standings_in_transaction(
+                    self._store,
+                    channel_id=channel_id,
+                    reason="channel_archived",
+                    occurred_at=now,
+                    cause_event_id=result.event.envelope.event_id,
+                    actor_principal_id=principal_id,
+                )
             await connection.commit()
             return WorkshopChannelLifecycleMutation(channel_id, archived, True, now)
         except WorkshopChannelLifecycleError:
@@ -791,7 +801,7 @@ class WorkshopChannelLifecycleService:
             sponsor_principal_id, runtime_profile_id, detached_at = current
             if detached_at is not None:
                 raise WorkshopChannelLifecycleValidationError("Agent is not attached to this channel")
-            await self._store.append_in_transaction(
+            detached = await self._store.append_in_transaction(
                 self._attachment_event(
                     workshop_id,
                     channel_id,
@@ -805,6 +815,15 @@ class WorkshopChannelLifecycleService:
                 )
             )
             await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            await end_active_standings_in_transaction(
+                self._store,
+                channel_id=channel_id,
+                agent_id=agent_id,
+                reason="detached",
+                occurred_at=detached.event.envelope.occurred_at,
+                cause_event_id=detached.event.envelope.event_id,
+                actor_principal_id=principal_id,
+            )
             await connection.commit()
         except WorkshopChannelLifecycleError:
             await connection.rollback()

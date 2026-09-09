@@ -283,6 +283,15 @@ from kai.workshop.settings_workspaces import (
     WorkshopSettingsWorkspaceValidationError,
     WorkspaceConfigSnapshot,
 )
+from kai.workshop.standing_participation import (
+    ChannelStandingSnapshot,
+    WorkshopStandingParticipationAccessDenied,
+    WorkshopStandingParticipationConflict,
+    WorkshopStandingParticipationError,
+    WorkshopStandingParticipationService,
+    WorkshopStandingParticipationStorageError,
+    WorkshopStandingParticipationValidationError,
+)
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.thread_unread import (
     FollowedThreadSnapshot,
@@ -345,6 +354,7 @@ _COMMAND_SUBMISSION_PATH = "/v1/channels/{channel_id}/commands"
 _AGENT_DISMISSAL_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/dismiss"
 _AGENT_ATTACHMENT_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/attach"
 _AGENT_DETACHMENT_PATH = "/v1/channels/{channel_id}/agents/{agent_id}/detach"
+_CHANNEL_STANDING_PARTICIPATION_PATH = "/v1/channels/{channel_id}/standing-participation"
 _ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/content"
 _ARTIFACT_DOWNLOAD_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/download"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
@@ -1097,6 +1107,105 @@ def _serialize_collaboration_policy(snapshot: CollaborationPolicySnapshot) -> di
             for item in snapshot.operations
         ],
     }
+
+
+def _serialize_standing_participation(snapshot: ChannelStandingSnapshot) -> dict[str, object]:
+    policy = snapshot.policy
+    return {
+        "channel_id": str(policy.channel_id),
+        "policy": {
+            "enabled": policy.enabled,
+            "policy_version": policy.policy_version,
+            "can_manage": policy.can_manage,
+            "host_enabled": policy.host_enabled,
+            "host_policy_version": policy.host_policy_version,
+            "max_agents_per_channel": policy.max_agents_per_channel,
+        },
+        "subscriptions": [
+            {
+                "agent_id": str(item.agent_id),
+                "agent_definition_id": str(item.agent_definition_id),
+                "agent_revision_id": str(item.agent_definition_revision_id),
+                "lifecycle_state": item.lifecycle_state,
+                "started_by_principal_id": str(item.started_by_principal_id),
+                "started_by_message_id": str(item.started_by_message_id),
+                "owner_policy_version": item.owner_policy_version,
+                "channel_policy_version": item.channel_policy_version,
+                "host_policy_version": item.host_policy_version,
+                "quiet_expires_at": item.quiet_expires_at.isoformat() if item.quiet_expires_at else None,
+                "state_version": item.state_version,
+                "end_reason": item.end_reason,
+            }
+            for item in snapshot.subscriptions
+        ],
+    }
+
+
+def _standing_participation_error_response(exc: WorkshopStandingParticipationError) -> web.Response:
+    if isinstance(exc, WorkshopStandingParticipationAccessDenied):
+        return _error_response(status=404, code="channel_not_found", message="Channel not found")
+    if isinstance(exc, WorkshopStandingParticipationValidationError):
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    if isinstance(exc, WorkshopStandingParticipationConflict):
+        return _error_response(status=409, code="standing_participation_conflict", message=str(exc))
+    if isinstance(exc, WorkshopStandingParticipationStorageError):
+        return _error_response(
+            status=503,
+            code="standing_participation_unavailable",
+            message="Standing participation is temporarily unavailable",
+        )
+    return _error_response(status=409, code="standing_participation_conflict", message=str(exc))
+
+
+async def _handle_channel_standing_participation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopStandingParticipationService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        if request.method == "GET":
+            if request.query or request.can_read_body:
+                return _error_response(status=400, code="invalid_request", message="Invalid policy request")
+            snapshot = await service.inspect(principal_id, channel_id)
+            return _json_response(
+                {"version": 1, "standing_participation": _serialize_standing_participation(snapshot)},
+                status=200,
+            )
+        if request.query:
+            return _error_response(status=400, code="invalid_request", message="Invalid policy request")
+        payload = await request.json()
+        if not isinstance(payload, dict) or set(payload) != {
+            "enabled",
+            "expected_policy_version",
+            "client_operation_id",
+        }:
+            return _error_response(status=400, code="invalid_request", message="Invalid policy request")
+        mutation = await service.set_channel_policy(
+            principal_id,
+            channel_id,
+            enabled=payload["enabled"],
+            expected_policy_version=payload["expected_policy_version"],
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid policy request")
+    except WorkshopStandingParticipationError as exc:
+        return _standing_participation_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "standing_participation": _serialize_standing_participation(mutation.snapshot),
+            "changed": mutation.changed,
+            "replayed": mutation.replayed,
+        },
+        status=200,
+    )
 
 
 def _serialize_agent_enablement(snapshot: PrincipalAgentEnablement) -> dict[str, object]:
@@ -7540,6 +7649,7 @@ def register_workshop_read_routes(
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
+    standing_participation: WorkshopStandingParticipationService | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -7971,6 +8081,18 @@ def register_workshop_read_routes(
     app.router.add_post(_CHANNEL_MEMBER_REMOVAL_PATH, handle_channel_member_removal)
     app.router.add_post(_AGENT_ATTACHMENT_PATH, handle_channel_agent_attachment)
     app.router.add_post(_AGENT_DETACHMENT_PATH, handle_channel_agent_detachment)
+    if standing_participation is not None:
+
+        async def handle_channel_standing_participation(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_channel_standing_participation(
+                    request,
+                    authenticator=authenticator,
+                    service=standing_participation,
+                )
+
+        app.router.add_get(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
+        app.router.add_put(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
     app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)
     app.router.add_get(_AGENT_EVENTS_PATH, handle_agent_event_stream)

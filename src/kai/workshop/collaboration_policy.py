@@ -26,6 +26,7 @@ from kai.workshop.domain import (
 )
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.standing_participation import end_active_standings_in_transaction
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 
 _OPERATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -149,7 +150,7 @@ class WorkshopCollaborationPolicyService:
         for operation in CollaborationOperation:
             is_requested = operation.value in requested
             is_allowed = operation.value in allowed
-            host_allowed = operation in self._host_policy.allowed_operations
+            host_allowed = operation in self._host_policy.effective_allowed_operations
             unavailable: str | None = None
             if lifecycle_state != "active":
                 unavailable = "Agent is not active"
@@ -205,7 +206,7 @@ class WorkshopCollaborationPolicyService:
             allowed = validate_collaboration_operations(allowed_operations)
         except ValueError as exc:
             raise WorkshopCollaborationPolicyValidationError(str(exc)) from exc
-        if any(CollaborationOperation(item) not in self._host_policy.allowed_operations for item in allowed):
+        if any(CollaborationOperation(item) not in self._host_policy.effective_allowed_operations for item in allowed):
             raise WorkshopCollaborationPolicyValidationError("Owner policy cannot exceed host policy")
         if (
             not isinstance(expected_policy_version, int)
@@ -268,8 +269,17 @@ class WorkshopCollaborationPolicyService:
                 },
                 metadata={"source": "workshop_client", "request_hash": request_hash},
             )
-            await self._store.append_in_transaction(event)
+            policy_event = await self._store.append_in_transaction(event)
             await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            if "standing_participation" not in allowed:
+                await end_active_standings_in_transaction(
+                    self._store,
+                    definition_id=definition_id,
+                    reason="owner_policy_revoked",
+                    occurred_at=event.occurred_at,
+                    cause_event_id=policy_event.event.envelope.event_id,
+                    actor_principal_id=principal_id,
+                )
             await connection.commit()
         except WorkshopCollaborationPolicyError:
             await connection.rollback()

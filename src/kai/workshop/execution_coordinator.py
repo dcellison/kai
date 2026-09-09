@@ -21,6 +21,7 @@ from kai.workshop.artifacts import ArtifactMessageNotFoundError, build_agent_pro
 from kai.workshop.collaboration_authority import (
     CollaborationAuthorization,
     CollaborationBaseIdentity,
+    CollaborationHostPolicy,
     CollaborationInvocation,
     CollaborationOperation,
     WorkshopCollaborationAuthority,
@@ -161,6 +162,7 @@ class WorkshopCanonicalExecutionCoordinator:
         transcript_projection: CanonicalTranscriptProjection | None = None,
         artifact_storage_root: Path | None = None,
         delivery_policy: WorkshopDeliveryBindingPolicy,
+        collaboration_host_policy: CollaborationHostPolicy | None = None,
     ) -> None:
         if not registered_backend_ids:
             raise ValueError("registered_backend_ids must not be empty")
@@ -179,7 +181,10 @@ class WorkshopCanonicalExecutionCoordinator:
         self._artifact_storage_root = artifact_storage_root
         self._trace_store = WorkshopRunTraceStore(store)
         self._delivery_policy = delivery_policy
-        self._collaboration_authority = WorkshopCollaborationAuthority(store)
+        self._collaboration_authority = WorkshopCollaborationAuthority(
+            store,
+            host_policy=collaboration_host_policy,
+        )
 
     @property
     def collaboration_authority(self) -> WorkshopCollaborationAuthority:

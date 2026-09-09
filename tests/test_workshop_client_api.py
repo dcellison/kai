@@ -50,6 +50,10 @@ from kai.workshop.client_sessions import (
     WorkshopBearerSessionAuthenticator,
     WorkshopClientSessionManager,
 )
+from kai.workshop.collaboration_authority import (
+    CollaborationHostPolicy,
+    StandingParticipationHostPolicy,
+)
 from kai.workshop.collaboration_policy import (
     CollaborationOperationState,
     CollaborationPolicyMutation,
@@ -152,6 +156,7 @@ from kai.workshop.settings_workspaces import (
     WorkspaceConfigSnapshot,
     WorkspaceOption,
 )
+from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.storage_namespaces import (
     WorkshopChannelHistoryRegistry,
     WorkshopPrincipalStorageRegistry,
@@ -893,6 +898,7 @@ async def _open_client(
     agent_enablement=None,
     human_avatars=None,
     collaboration_policy=None,
+    standing_participation=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -917,6 +923,7 @@ async def _open_client(
         agent_enablement=agent_enablement,
         human_avatars=human_avatars,
         collaboration_policy=collaboration_policy,
+        standing_participation=standing_participation,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -984,6 +991,71 @@ async def _read_sse_event(response) -> dict[str, object]:
             event_id = value
         elif field == "data":
             data_lines.append(value)
+
+
+@pytest.mark.asyncio
+async def test_standing_participation_api_is_principal_scoped_versioned_and_replay_safe(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, alice_channel, bob_id, _bob_channel = await _open_store(tmp_path / "kai.db")
+    channel_id = await _create_group_channel(store, alice_id, alice_channel)
+    standing = WorkshopStandingParticipationService(
+        store,
+        CollaborationHostPolicy(
+            standing_participation=StandingParticipationHostPolicy(enabled=True),
+        ),
+    )
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        standing_participation=standing,
+    )
+    path = f"/v1/channels/{channel_id}/standing-participation"
+    headers = {"Authorization": "Bearer alice-token"}
+    request = {
+        "enabled": True,
+        "expected_policy_version": 0,
+        "client_operation_id": "standing-api-enable-1",
+    }
+    try:
+        default = await client.get(path, headers=headers)
+        assert default.status == 200
+        default_body = await default.json()
+        assert default_body["standing_participation"]["policy"] == {
+            "enabled": False,
+            "policy_version": 0,
+            "can_manage": True,
+            "host_enabled": True,
+            "host_policy_version": 2,
+            "max_agents_per_channel": 2,
+        }
+
+        changed = await client.put(path, headers=headers, json=request)
+        assert changed.status == 200
+        changed_body = await changed.json()
+        assert changed_body["changed"] is True
+        assert changed_body["replayed"] is False
+        assert changed_body["standing_participation"]["policy"]["policy_version"] == 1
+
+        replay = await client.put(path, headers=headers, json=request)
+        assert replay.status == 200
+        replay_body = await replay.json()
+        assert replay_body["changed"] is False
+        assert replay_body["replayed"] is True
+
+        stale = await client.put(
+            path,
+            headers=headers,
+            json={**request, "client_operation_id": "standing-api-stale-1"},
+        )
+        assert stale.status == 409
+        denied = await client.get(path, headers={"Authorization": "Bearer bob-token"})
+        assert denied.status == 404
+        invalid = await client.put(path, headers=headers, json={"enabled": True})
+        assert invalid.status == 400
+    finally:
+        await client.close()
+        await store.close()
 
 
 @pytest.mark.asyncio

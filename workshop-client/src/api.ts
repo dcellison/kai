@@ -775,6 +775,7 @@ const COLLABORATION_OPERATIONS = new Set<WorkshopCollaborationOperation>([
   "thread_reply",
   "artifact_publish",
   "agent_delegation",
+  "standing_participation",
 ]);
 
 function parseCollaborationOperations(

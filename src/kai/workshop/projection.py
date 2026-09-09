@@ -1646,7 +1646,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 30
+    version = 31
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1675,6 +1675,8 @@ class CanonicalConversationProjection:
                 "run_attempt_id = NULL, collaboration_grant_id = NULL, collaboration_operation = NULL"
             )
         for table in (
+            "channel_agent_standings",
+            "channel_standing_participation_policies",
             "deliveries",
             "collaboration_publication_receipts",
             "artifacts",
@@ -1716,6 +1718,16 @@ class CanonicalConversationProjection:
         envelope = event.envelope
         payload = envelope.payload
         occurred_at = envelope.occurred_at.isoformat()
+
+        if envelope.event_type in {
+            WorkshopEventType.CHANNEL_STANDING_PARTICIPATION_POLICY_SET,
+            WorkshopEventType.CHANNEL_AGENT_STANDING_STARTED,
+            WorkshopEventType.CHANNEL_AGENT_STANDING_ENDED,
+        }:
+            from kai.workshop.standing_participation import apply_standing_participation_event
+
+            await apply_standing_participation_event(connection, event)
+            return
 
         if envelope.event_type in {
             WorkshopEventType.COLLABORATION_GRANT_ISSUED,
