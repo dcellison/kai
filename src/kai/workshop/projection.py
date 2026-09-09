@@ -40,6 +40,7 @@ from kai.workshop.domain import (
     RunAttemptId,
     RunExecutionOwnerId,
     RunId,
+    RuntimeProfileId,
     ThreadReadPositionId,
     WorkshopEventType,
     WorkshopId,
@@ -211,6 +212,323 @@ async def _message_mentions_json(
     return json.dumps(normalized, separators=(",", ":"), sort_keys=True)
 
 
+async def _apply_standing_observe_run_accepted(
+    connection: aiosqlite.Connection,
+    event: StoredEvent,
+) -> None:
+    envelope = event.envelope
+    payload = envelope.payload
+    keys = {
+        "inbound_message_id",
+        "channel_id",
+        "requested_by_principal_id",
+        "agent_id",
+        "agent_definition_revision_id",
+        "runtime_profile_id",
+        "sponsor_principal_id",
+        "run_kind",
+        "observation_scope_kind",
+        "observation_scope_id",
+        "observed_from_event_position",
+        "observed_through_event_position",
+        "observed_message_ids",
+        "human_anchor_message_id",
+        "standing_subscription_started_event_position",
+    }
+    _require_exact_payload(payload, keys)
+    if payload.get("run_kind") != "observe":
+        raise ValueError("Standing run must declare observe kind")
+    channel_id = ChannelId(_required_text(payload, "channel_id"))
+    await _require_active_channel(connection, channel_id)
+    agent_id = AgentId(_required_text(payload, "agent_id"))
+    revision_id = AgentDefinitionRevisionId(_required_text(payload, "agent_definition_revision_id"))
+    sponsor_id = PrincipalId(_required_text(payload, "sponsor_principal_id"))
+    runtime_profile_id = RuntimeProfileId(_required_text(payload, "runtime_profile_id"))
+    requested_by = PrincipalId(_required_text(payload, "requested_by_principal_id"))
+    inbound_message_id = MessageId(_required_text(payload, "inbound_message_id"))
+    anchor_message_id = MessageId(_required_text(payload, "human_anchor_message_id"))
+    scope_kind = _required_text(payload, "observation_scope_kind")
+    scope_id = _required_text(payload, "observation_scope_id")
+    if scope_kind not in {"channel", "thread"}:
+        raise ValueError("Standing observation scope kind is invalid")
+    from_position = payload.get("observed_from_event_position")
+    through_position = payload.get("observed_through_event_position")
+    subscription_start = payload.get("standing_subscription_started_event_position")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 1
+        for value in (from_position, through_position, subscription_start)
+    ):
+        raise ValueError("Standing observation positions are invalid")
+    assert isinstance(from_position, int)
+    assert isinstance(through_position, int)
+    assert isinstance(subscription_start, int)
+    if from_position > through_position or subscription_start >= from_position:
+        raise ValueError("Standing observation range is invalid")
+    raw_message_ids = payload.get("observed_message_ids")
+    if not isinstance(raw_message_ids, list) or not raw_message_ids:
+        raise ValueError("Standing observation batch must contain messages")
+    message_ids = [MessageId(str(value)) for value in raw_message_ids]
+    if len(set(message_ids)) != len(message_ids) or inbound_message_id != message_ids[-1]:
+        raise ValueError("Standing observation batch identity is invalid")
+    if envelope.actor_principal_id != requested_by:
+        raise ValueError("Standing observation acceptance actor must be its human anchor")
+
+    async with connection.execute(
+        "SELECT c.workshop_id, c.kind, c.archived_at, s.started_event_position, "
+        "s.agent_definition_revision_id, d.owner_principal_id, d.owner_runtime_profile_id, "
+        "ca.sponsor_principal_id, ca.sponsored_runtime_profile_id, ca.detached_at, "
+        "s.lifecycle_state FROM channels c "
+        "JOIN channel_agent_standings s ON s.channel_id = c.id AND s.agent_id = ? "
+        "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = s.agent_id "
+        "JOIN agent_definitions d ON d.id = s.agent_definition_id AND d.agent_id = s.agent_id "
+        "JOIN channel_standing_participation_policies cp ON cp.channel_id = c.id AND cp.enabled = 1 "
+        "AND cp.policy_version = s.channel_policy_version "
+        "JOIN agent_definition_revisions revision ON revision.id = s.agent_definition_revision_id "
+        "AND EXISTS(SELECT 1 FROM json_each(revision.collaboration_operations_json) "
+        "WHERE value = 'standing_participation') "
+        "JOIN agent_collaboration_owner_policies op ON op.agent_definition_id = d.id "
+        "AND op.policy_version = s.owner_policy_version "
+        "AND EXISTS(SELECT 1 FROM json_each(op.allowed_operations_json) "
+        "WHERE value = 'standing_participation') "
+        "WHERE c.id = ? AND (s.quiet_expires_at IS NULL OR s.quiet_expires_at > ?)",
+        (agent_id, channel_id, envelope.occurred_at.isoformat()),
+    ) as cursor:
+        authority = await cursor.fetchone()
+    expected_authority = (
+        envelope.workshop_id,
+        "group",
+        None,
+        subscription_start,
+        revision_id,
+        sponsor_id,
+        str(runtime_profile_id),
+        sponsor_id,
+        str(runtime_profile_id),
+        None,
+        "active",
+    )
+    if authority is None or tuple(authority) != expected_authority:
+        raise ValueError("Standing observation run has stale subscription authority")
+    placeholders = ",".join("?" for _ in message_ids)
+    async with connection.execute(
+        "SELECT m.id, m.created_event_position, m.thread_root_id, m.channel_id, "
+        "p.kind, m.author_principal_id, a.id FROM messages m "
+        "JOIN principals p ON p.id = m.author_principal_id "
+        "LEFT JOIN agents a ON a.principal_id = p.id "
+        f"WHERE m.id IN ({placeholders}) ORDER BY m.created_event_position, m.id",
+        tuple(message_ids),
+    ) as cursor:
+        messages = list(await cursor.fetchall())
+    if [MessageId(str(row[0])) for row in messages] != message_ids:
+        raise ValueError("Standing observation messages are not one ordered canonical batch")
+    if int(messages[0][1]) != from_position or int(messages[-1][1]) != through_position:
+        raise ValueError("Standing observation range does not match its messages")
+    for row in messages:
+        message_scope = str(row[2]) if row[2] is not None else str(row[3])
+        message_scope_kind = "thread" if row[2] is not None else "channel"
+        if (
+            ChannelId(str(row[3])) != channel_id
+            or message_scope != scope_id
+            or message_scope_kind != scope_kind
+            or (row[6] is not None and AgentId(str(row[6])) == agent_id)
+        ):
+            raise ValueError("Standing observation message falls outside its immutable scope")
+    async with connection.execute(
+        "SELECT m.author_principal_id, p.kind, m.created_event_position FROM messages m "
+        "JOIN principals p ON p.id = m.author_principal_id WHERE m.id = ? AND m.channel_id = ?",
+        (anchor_message_id, channel_id),
+    ) as cursor:
+        anchor = await cursor.fetchone()
+    if (
+        anchor is None
+        or PrincipalId(str(anchor[0])) != requested_by
+        or str(anchor[1]) != "human"
+        or int(anchor[2]) > through_position
+    ):
+        raise ValueError("Standing observation human anchor is invalid")
+    await connection.execute(
+        "INSERT INTO runs (id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
+        "inbound_message_id, agent_definition_revision_id, runtime_profile_id, sponsor_principal_id, "
+        "kind, observation_scope_kind, observation_scope_id, observed_from_event_position, "
+        "observed_through_event_position, observed_message_ids_json, human_anchor_message_id, "
+        "standing_subscription_started_event_position, status, accepted_at, last_event_position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'observe', ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)",
+        (
+            envelope.aggregate_id,
+            envelope.workshop_id,
+            channel_id,
+            requested_by,
+            agent_id,
+            inbound_message_id,
+            revision_id,
+            runtime_profile_id,
+            sponsor_id,
+            scope_kind,
+            scope_id,
+            from_position,
+            through_position,
+            json.dumps([str(value) for value in message_ids], separators=(",", ":")),
+            anchor_message_id,
+            subscription_start,
+            envelope.occurred_at.isoformat(),
+            event.position,
+        ),
+    )
+
+
+async def _settle_standing_observation_cursor(
+    connection: aiosqlite.Connection,
+    *,
+    channel_id: ChannelId,
+    agent_id: AgentId,
+    scope_id: str,
+    through_position: int,
+    occurred_at: str,
+) -> None:
+    async with connection.execute(
+        "SELECT pending_through_event_position FROM channel_agent_observation_states "
+        "WHERE channel_id = ? AND agent_id = ? AND scope_id = ?",
+        (channel_id, agent_id, scope_id),
+    ) as cursor:
+        state = await cursor.fetchone()
+    if state is None:
+        raise ValueError("Standing observation completion lost its canonical cursor")
+    pending_through = int(state[0])
+    async with connection.execute(
+        "SELECT COUNT(*), MIN(m.created_event_position) FROM messages m "
+        "WHERE m.channel_id = ? AND m.created_event_position > ? "
+        "AND m.created_event_position <= ? "
+        "AND m.author_principal_id != (SELECT principal_id FROM agents WHERE id = ?) "
+        "AND COALESCE(m.thread_root_id, m.channel_id) = ?",
+        (channel_id, through_position, pending_through, agent_id, scope_id),
+    ) as cursor:
+        remaining_row = await cursor.fetchone()
+    assert remaining_row is not None
+    remaining = int(remaining_row[0])
+    oldest = int(remaining_row[1]) if remaining_row[1] is not None else None
+    await connection.execute(
+        "UPDATE channel_agent_observation_states SET delivered_through_event_position = ?, "
+        "oldest_pending_event_position = ?, pending_message_count = ?, not_before = ?, "
+        "lifecycle_state = ?, state_version = state_version + 1 "
+        "WHERE channel_id = ? AND agent_id = ? AND scope_id = ?",
+        (
+            through_position,
+            oldest,
+            remaining,
+            occurred_at if remaining else None,
+            "pending" if remaining else "idle",
+            channel_id,
+            agent_id,
+            scope_id,
+        ),
+    )
+
+
+async def _apply_standing_observe_run_completed(
+    connection: aiosqlite.Connection,
+    event: StoredEvent,
+    *,
+    run_row: aiosqlite.Row,
+) -> MessageId | None:
+    payload = event.envelope.payload
+    _require_exact_payload(payload, {"attempt_id", "standing_outcome", "result_message_id"})
+    outcome = _required_text(payload, "standing_outcome")
+    if outcome not in {"spoke", "silent", "publication_suppressed"}:
+        raise ValueError("Standing observation outcome is invalid")
+    result_value = payload.get("result_message_id")
+    result_message_id = MessageId(str(result_value)) if result_value is not None else None
+    if (outcome == "spoke") != (result_message_id is not None):
+        raise ValueError("Standing observation result visibility is invalid")
+    run_id = event.envelope.aggregate_id
+    async with connection.execute(
+        "SELECT channel_id, agent_id, observation_scope_id, observed_through_event_position, "
+        "human_anchor_message_id FROM runs WHERE id = ? AND kind = 'observe'",
+        (run_id,),
+    ) as cursor:
+        observation = await cursor.fetchone()
+    if observation is None or any(value is None for value in observation):
+        raise ValueError("Standing observation run metadata is unavailable")
+    channel_id = ChannelId(str(observation[0]))
+    agent_id = AgentId(str(observation[1]))
+    scope_id = str(observation[2])
+    through_position = int(observation[3])
+    anchor_message_id = MessageId(str(observation[4]))
+    if result_message_id is not None:
+        agent_principal = PrincipalId(str(run_row[3]))
+        async with connection.execute(
+            "SELECT created_event_position FROM messages WHERE id = ? AND channel_id = ? AND author_principal_id = ?",
+            (result_message_id, channel_id, agent_principal),
+        ) as cursor:
+            result = await cursor.fetchone()
+        if result is None:
+            raise ValueError("Standing observation publication is unavailable")
+        await connection.execute(
+            "INSERT INTO standing_observation_publications "
+            "(run_id, channel_id, agent_id, scope_id, human_anchor_message_id, result_message_id, "
+            "published_at, published_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                channel_id,
+                agent_id,
+                scope_id,
+                anchor_message_id,
+                result_message_id,
+                event.envelope.occurred_at.isoformat(),
+                int(result[0]),
+            ),
+        )
+    await _settle_standing_observation_cursor(
+        connection,
+        channel_id=channel_id,
+        agent_id=agent_id,
+        scope_id=scope_id,
+        through_position=through_position,
+        occurred_at=event.envelope.occurred_at.isoformat(),
+    )
+    return result_message_id
+
+
+async def _advance_standing_observation_from_response(
+    connection: aiosqlite.Connection,
+    event: StoredEvent,
+) -> None:
+    """Treat an explicit response as catch-up through its human command."""
+    if not await _table_has_column(connection, "runs", "kind"):
+        return
+    async with connection.execute(
+        "SELECT r.channel_id, r.agent_id, m.created_event_position, "
+        "CASE WHEN m.thread_root_id IS NULL THEN 'channel' ELSE 'thread' END, "
+        "COALESCE(m.thread_root_id, m.channel_id) FROM runs r "
+        "JOIN messages m ON m.id = r.inbound_message_id "
+        "WHERE r.id = ? AND r.kind = 'respond'",
+        (event.envelope.aggregate_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return
+    channel_id = ChannelId(str(row[0]))
+    agent_id = AgentId(str(row[1]))
+    through_position = int(row[2])
+    scope_id = str(row[4])
+    async with connection.execute(
+        "SELECT delivered_through_event_position FROM channel_agent_observation_states "
+        "WHERE channel_id = ? AND agent_id = ? AND scope_id = ? AND lifecycle_state = 'pending' "
+        "AND delivered_through_event_position < ?",
+        (channel_id, agent_id, scope_id, through_position),
+    ) as cursor:
+        pending = await cursor.fetchone()
+    if pending is None:
+        return
+    await _settle_standing_observation_cursor(
+        connection,
+        channel_id=channel_id,
+        agent_id=agent_id,
+        scope_id=scope_id,
+        through_position=through_position,
+        occurred_at=event.envelope.occurred_at.isoformat(),
+    )
+
+
 async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent) -> None:
     envelope = event.envelope
     if not isinstance(envelope.aggregate_id, RunId) or envelope.aggregate_type != "run":
@@ -219,6 +537,9 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
     occurred_at = envelope.occurred_at.isoformat()
     payload = envelope.payload
     if envelope.event_type == WorkshopEventType.RUN_ACCEPTED:
+        if envelope.event_version == 5:
+            await _apply_standing_observe_run_accepted(connection, event)
+            return
         if envelope.event_version not in {1, 2, 3, 4}:
             raise ValueError("Unsupported Workshop run acceptance event version")
         keys = {"inbound_message_id", "channel_id", "requested_by_principal_id", "agent_id"}
@@ -498,6 +819,21 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
                 result_row = await cursor.fetchone()
             if result_row is None or int(result_row[0]) != 1:
                 raise ValueError("Workshop completed run must reference its canonical agent result")
+            await _advance_standing_observation_from_response(connection, event)
+        elif envelope.event_version == 3:
+            attempt_transition_at = await _require_run_attempt(
+                connection,
+                RunAttemptId(_required_text(payload, "attempt_id")),
+                envelope.aggregate_id,
+                {"completed"},
+            )
+            if envelope.occurred_at < attempt_transition_at:
+                raise ValueError("Workshop run cannot complete before its execution attempt")
+            result_message_id = await _apply_standing_observe_run_completed(
+                connection,
+                event,
+                run_row=row,
+            )
         else:
             raise ValueError("Unsupported Workshop run.completed event version")
         if (
@@ -507,19 +843,36 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
             or envelope.occurred_at < started_at
         ):
             raise ValueError("Workshop run can complete only from started through its attached agent")
-        await connection.execute(
-            "UPDATE runs SET status = 'completed', terminal_at = ?, result_message_id = ?, "
-            "last_event_position = ? WHERE id = ?",
-            (occurred_at, result_message_id, event.position, envelope.aggregate_id),
-        )
+        if await _table_has_column(connection, "runs", "standing_outcome"):
+            await connection.execute(
+                "UPDATE runs SET status = 'completed', terminal_at = ?, result_message_id = ?, "
+                "standing_outcome = CASE WHEN ? = 3 THEN ? ELSE standing_outcome END, "
+                "last_event_position = ? WHERE id = ?",
+                (
+                    occurred_at,
+                    result_message_id,
+                    envelope.event_version,
+                    payload.get("standing_outcome"),
+                    event.position,
+                    envelope.aggregate_id,
+                ),
+            )
+        else:
+            await connection.execute(
+                "UPDATE runs SET status = 'completed', terminal_at = ?, result_message_id = ?, "
+                "last_event_position = ? WHERE id = ?",
+                (occurred_at, result_message_id, event.position, envelope.aggregate_id),
+            )
         return
 
     if envelope.event_type == WorkshopEventType.RUN_FAILED:
         expected_keys = {"failure_code"} if envelope.event_version == 1 else {"attempt_id", "failure_code"}
-        if envelope.event_version not in {1, 2}:
+        if envelope.event_version == 3:
+            expected_keys.add("retry_not_before")
+        if envelope.event_version not in {1, 2, 3}:
             raise ValueError("Unsupported Workshop run.failed event version")
         _require_exact_payload(payload, expected_keys)
-        if envelope.event_version == 2:
+        if envelope.event_version in {2, 3}:
             attempt_transition_at = await _require_run_attempt(
                 connection,
                 RunAttemptId(_required_text(payload, "attempt_id")),
@@ -538,6 +891,21 @@ async def _apply_run_event(connection: aiosqlite.Connection, event: StoredEvent)
             or envelope.occurred_at < started_at
         ):
             raise ValueError("Workshop run can fail only from started through its attached agent")
+        if envelope.event_version == 3:
+            async with connection.execute(
+                "SELECT kind, channel_id, agent_id, observation_scope_id FROM runs WHERE id = ?",
+                (envelope.aggregate_id,),
+            ) as cursor:
+                observe = await cursor.fetchone()
+            if observe is None or str(observe[0]) != "observe" or observe[3] is None:
+                raise ValueError("Standing retry boundary requires an observe run")
+            retry_not_before = _required_text(payload, "retry_not_before")
+            _parse_projection_timestamp(retry_not_before)
+            await connection.execute(
+                "UPDATE channel_agent_observation_states SET not_before = ?, "
+                "state_version = state_version + 1 WHERE channel_id = ? AND agent_id = ? AND scope_id = ?",
+                (retry_not_before, observe[1], observe[2], observe[3]),
+            )
         await connection.execute(
             "UPDATE runs SET status = 'failed', terminal_at = ?, terminal_code = ?, "
             "last_event_position = ? WHERE id = ?",
@@ -1646,7 +2014,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 32
+    version = 33
 
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
@@ -1675,6 +2043,7 @@ class CanonicalConversationProjection:
                 "run_attempt_id = NULL, collaboration_grant_id = NULL, collaboration_operation = NULL"
             )
         for table in (
+            "standing_observation_publications",
             "channel_agent_observation_states",
             "channel_agent_standings",
             "channel_standing_participation_policies",

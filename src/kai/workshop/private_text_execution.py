@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import AgentDefinitionId, MessageId, RunId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
+    CanonicalExecutionDisposition,
     CanonicalExecutionResult,
     StreamObserver,
     SuccessTransformer,
@@ -36,11 +38,13 @@ from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_lifecycle import WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.standing_observation import WorkshopStandingObservationService
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.transcript_export import CanonicalTranscriptProjection
 
-_RECOVERY_INTERVAL_SECONDS = 5.0
+_RECOVERY_INTERVAL_SECONDS = 1.0
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +69,7 @@ class WorkshopPrivateTextExecutionService:
         runtime_pool: WorkshopRuntimePool,
         routing_policy: WorkshopRoutingPolicyService,
         standing_participation: WorkshopStandingParticipationService,
+        standing_observation: WorkshopStandingObservationService,
     ) -> None:
         self._store = store
         self._coordinator = coordinator
@@ -73,8 +78,10 @@ class WorkshopPrivateTextExecutionService:
         self._runtime_pool = runtime_pool
         self.routing_policy = routing_policy
         self.standing_participation = standing_participation
+        self.standing_observation = standing_observation
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._observation_tasks: dict[RunId, asyncio.Task[None]] = {}
         self._closed = False
 
     @classmethod
@@ -115,6 +122,10 @@ class WorkshopPrivateTextExecutionService:
             coordinator.collaboration_authority.host_policy,
         )
         await standing_participation.synchronize_host_policy()
+        standing_observation = WorkshopStandingObservationService(
+            store,
+            coordinator.collaboration_authority.host_policy,
+        )
         service = cls(
             store,
             coordinator,
@@ -128,6 +139,7 @@ class WorkshopPrivateTextExecutionService:
             runtime_pool,
             routing_policy,
             standing_participation,
+            standing_observation,
         )
         try:
             await coordinator.recover_expired()
@@ -265,6 +277,7 @@ class WorkshopPrivateTextExecutionService:
                 "JOIN channel_agent_runtime_assignments ra "
                 "ON ra.channel_id = r.channel_id AND ra.agent_id = r.agent_id "
                 "WHERE r.status = 'accepted' AND r.cancellation_requested_at IS NULL "
+                "AND r.kind = 'respond' "
                 "AND json_extract(e.metadata_json, '$.source') = 'workshop_client' "
                 "AND NOT EXISTS (SELECT 1 FROM run_attempts a WHERE a.run_id = r.id "
                 "AND a.status IN ('granted', 'started')) "
@@ -350,6 +363,10 @@ class WorkshopPrivateTextExecutionService:
         try:
             if task is not None:
                 await asyncio.shield(task)
+            for run_id in tuple(self._observation_tasks):
+                await self._coordinator.request_cancellation(run_id)
+            if self._observation_tasks:
+                await asyncio.gather(*tuple(self._observation_tasks.values()), return_exceptions=True)
         finally:
             self._closed = True
             self._task = None
@@ -357,8 +374,52 @@ class WorkshopPrivateTextExecutionService:
 
     async def _recovery_loop(self) -> None:
         while True:
+            await self._recover_and_dispatch_observations()
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=_RECOVERY_INTERVAL_SECONDS)
                 return
             except TimeoutError:
                 await self._coordinator.recover_expired()
+
+    async def _recover_and_dispatch_observations(self) -> None:
+        finished = [run_id for run_id, task in self._observation_tasks.items() if task.done()]
+        for run_id in finished:
+            task = self._observation_tasks.pop(run_id)
+            try:
+                task.result()
+            except Exception:
+                # The coordinator durably settles post-dispatch failures. An
+                # unexpected worker failure remains visible in diagnostics and
+                # is retried from the canonical inbox after recovery.
+                log.exception("Standing observation worker failed for %s", run_id)
+        async with (
+            self._database_lock,
+            self._store.connection.execute(
+                "SELECT r.id FROM runs r WHERE r.kind = 'observe' AND r.status = 'accepted' "
+                "AND r.cancellation_requested_at IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM run_attempts a WHERE a.run_id = r.id "
+                "AND a.status IN ('granted', 'started')) ORDER BY r.accepted_at, r.id"
+            ) as cursor,
+        ):
+            recoverable = [RunId(str(row[0])) for row in await cursor.fetchall()]
+        for run_id in recoverable:
+            self._schedule_observation(run_id)
+        while True:
+            async with self._database_lock:
+                accepted = await self.standing_observation.accept_next_ready()
+            if accepted is None:
+                return
+            self._schedule_observation(accepted.run.run_id)
+
+    def _schedule_observation(self, run_id: RunId) -> None:
+        if run_id in self._observation_tasks:
+            return
+        self._observation_tasks[run_id] = asyncio.create_task(
+            self._execute_observation(run_id),
+            name=f"kai-workshop-standing-observe-{run_id}",
+        )
+
+    async def _execute_observation(self, run_id: RunId) -> None:
+        result = await self._coordinator.execute(run_id)
+        if result.disposition == CanonicalExecutionDisposition.PREPARATION_DEFERRED:
+            await asyncio.sleep(_RECOVERY_INTERVAL_SECONDS)

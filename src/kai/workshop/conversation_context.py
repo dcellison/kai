@@ -41,13 +41,27 @@ async def assemble_canonical_conversation_context(
     if inbound is None:
         raise RuntimeError("Canonical inbound message no longer exists")
     inbound_position = int(inbound[0])
+    scope_clause = ""
+    parameters: list[object] = [run.channel_id]
+    if run.kind.value == "observe":
+        if run.observed_from_event_position is None or run.observation_scope_kind is None:
+            raise RuntimeError("Standing observation context is missing its immutable boundary")
+        inbound_position = run.observed_from_event_position
+        if run.observation_scope_kind == "channel":
+            scope_clause = "AND m.thread_root_id IS NULL "
+        elif run.observation_scope_kind == "thread" and run.observation_scope_id is not None:
+            scope_clause = "AND (m.id = ? OR m.thread_root_id = ?) "
+            parameters.extend((run.observation_scope_id, run.observation_scope_id))
+        else:
+            raise RuntimeError("Standing observation context has an invalid scope")
+    parameters.extend((inbound_position, _MAX_CONTEXT_MESSAGES))
 
     async with store.connection.execute(
         "SELECT p.display_name, p.kind, m.body, m.created_event_position "
         "FROM messages m JOIN principals p ON p.id = m.author_principal_id "
-        "WHERE m.channel_id = ? AND m.created_event_position < ? "
+        "WHERE m.channel_id = ? " + scope_clause + "AND m.created_event_position < ? "
         "ORDER BY m.created_event_position DESC LIMIT ?",
-        (run.channel_id, inbound_position, _MAX_CONTEXT_MESSAGES),
+        tuple(parameters),
     ) as cursor:
         rows = list(await cursor.fetchall())
 
