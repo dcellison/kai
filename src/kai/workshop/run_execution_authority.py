@@ -609,6 +609,49 @@ class WorkshopRunExecutionAuthority:
             result_message_id=result_message_id,
         )
 
+    async def complete_observe_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        outcome: str,
+        occurred_at: datetime,
+        result_message_id: MessageId | None = None,
+    ) -> RunExecutionResult:
+        """Complete an observe run, including a proven silent outcome."""
+        if outcome not in {"spoke", "silent", "publication_suppressed"}:
+            raise ValueError("outcome must be a standing observe outcome")
+        if (outcome == "spoke") != (result_message_id is not None):
+            raise ValueError("Only a spoken standing outcome requires a result message")
+        return await self._settle_in_transaction(
+            claim,
+            operation="completed",
+            attempt_type=WorkshopEventType.RUN_ATTEMPT_COMPLETED,
+            run_type=WorkshopEventType.RUN_COMPLETED,
+            occurred_at=occurred_at,
+            terminal_code=None,
+            result_message_id=result_message_id,
+            standing_outcome=outcome,
+        )
+
+    async def fail_observe_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        failure_code: str,
+        retry_not_before: datetime,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Fail an observe attempt without exposing a conversational error."""
+        return await self._settle_in_transaction(
+            claim,
+            operation="failed",
+            attempt_type=WorkshopEventType.RUN_ATTEMPT_FAILED,
+            run_type=WorkshopEventType.RUN_FAILED,
+            occurred_at=occurred_at,
+            terminal_code=_require_code(failure_code, field_name="failure_code"),
+            retry_not_before=_timestamp(retry_not_before, field_name="retry_not_before"),
+        )
+
     async def fail(
         self,
         claim: RunExecutionClaim,
@@ -818,6 +861,82 @@ class WorkshopRunExecutionAuthority:
             changed=True,
         )
 
+    async def interrupt_observe_expired_in_transaction(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        retry_not_before: datetime,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        """Settle an expired observe attempt without publishing an error message."""
+        if not self._store.connection.in_transaction:
+            raise RuntimeError("observe interruption requires an active transaction")
+        occurred_at = _timestamp(occurred_at, field_name="occurred_at")
+        retry_not_before = _timestamp(retry_not_before, field_name="retry_not_before")
+        projection = CanonicalConversationProjection()
+        await self._store.project_pending_in_transaction(projection)
+        run, attempt = await self._current_claim(claim)
+        if run.kind.value != "observe":
+            raise RunExecutionConflictError("Observe interruption requires an observe run")
+        if (
+            attempt.status != RunAttemptStatus.STARTED
+            or attempt.lease_version != claim.lease_version
+            or occurred_at < attempt.lease_expires_at
+        ):
+            raise StaleRunExecutionAuthorityError("Started observe execution is not eligible for recovery")
+        actor = await _agent_principal(self._store, run)
+        first = await self._store.append_in_transaction(
+            self._attempt_terminal_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=WorkshopEventType.RUN_ATTEMPT_INTERRUPTED,
+                operation="interrupted",
+                terminal_code="execution_interrupted",
+                occurred_at=occurred_at,
+            )
+        )
+        second = await self._store.append_in_transaction(
+            self._run_terminal_envelope(
+                run,
+                claim,
+                actor=actor,
+                event_type=WorkshopEventType.RUN_FAILED,
+                operation="failed",
+                terminal_code="execution_interrupted",
+                retry_not_before=retry_not_before,
+                occurred_at=occurred_at,
+            )
+        )
+        await self._store.project_pending_in_transaction(projection)
+        return RunExecutionResult(
+            run=await self._require_run(claim.run_id),
+            attempt=await self._require_attempt(claim.attempt_id),
+            events=(first.event, second.event),
+            changed=True,
+        )
+
+    async def interrupt_observe_expired(
+        self,
+        claim: RunExecutionClaim,
+        *,
+        retry_not_before: datetime,
+        occurred_at: datetime,
+    ) -> RunExecutionResult:
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            result = await self.interrupt_observe_expired_in_transaction(
+                claim,
+                retry_not_before=retry_not_before,
+                occurred_at=occurred_at,
+            )
+            await connection.commit()
+            return result
+        except Exception:
+            await connection.rollback()
+            raise
+
     async def recover_expired(
         self,
         *,
@@ -857,6 +976,8 @@ class WorkshopRunExecutionAuthority:
         occurred_at: datetime,
         terminal_code: str | None,
         result_message_id: MessageId | None = None,
+        standing_outcome: str | None = None,
+        retry_not_before: datetime | None = None,
     ) -> RunExecutionResult:
         occurred_at = _timestamp(occurred_at, field_name="occurred_at")
         connection = self._store.connection
@@ -870,6 +991,8 @@ class WorkshopRunExecutionAuthority:
                 occurred_at=occurred_at,
                 terminal_code=terminal_code,
                 result_message_id=result_message_id,
+                standing_outcome=standing_outcome,
+                retry_not_before=retry_not_before,
             )
             await connection.commit()
             return result
@@ -887,6 +1010,8 @@ class WorkshopRunExecutionAuthority:
         occurred_at: datetime,
         terminal_code: str | None,
         result_message_id: MessageId | None = None,
+        standing_outcome: str | None = None,
+        retry_not_before: datetime | None = None,
     ) -> RunExecutionResult:
         if not self._store.connection.in_transaction:
             raise RuntimeError("run settlement in transaction requires an active transaction")
@@ -910,7 +1035,13 @@ class WorkshopRunExecutionAuthority:
             if terminal_code is not None:
                 expected_attempt_payload["terminal_code"] = terminal_code
             expected_run_payload: dict[str, object] = {"attempt_id": claim.attempt_id}
-            if run_type == WorkshopEventType.RUN_COMPLETED:
+            if standing_outcome is not None:
+                expected_run_payload["standing_outcome"] = standing_outcome
+                expected_run_payload["result_message_id"] = result_message_id
+            elif retry_not_before is not None:
+                expected_run_payload["failure_code"] = terminal_code
+                expected_run_payload["retry_not_before"] = retry_not_before.isoformat()
+            elif run_type == WorkshopEventType.RUN_COMPLETED:
                 expected_run_payload["result_message_id"] = result_message_id
             elif run_type == WorkshopEventType.RUN_FAILED:
                 expected_run_payload["failure_code"] = terminal_code
@@ -981,6 +1112,8 @@ class WorkshopRunExecutionAuthority:
                 operation=operation,
                 terminal_code=terminal_code,
                 result_message_id=result_message_id,
+                standing_outcome=standing_outcome,
+                retry_not_before=retry_not_before,
                 occurred_at=occurred_at,
             )
         first = await self._store.append_in_transaction(attempt_event)
@@ -1107,9 +1240,24 @@ class WorkshopRunExecutionAuthority:
         terminal_code: str | None,
         occurred_at: datetime,
         result_message_id: MessageId | None = None,
+        standing_outcome: str | None = None,
+        retry_not_before: datetime | None = None,
     ) -> EventEnvelope:
         payload: dict[str, object] = {"attempt_id": claim.attempt_id}
-        if event_type == WorkshopEventType.RUN_COMPLETED:
+        event_version = 2
+        if standing_outcome is not None:
+            if event_type != WorkshopEventType.RUN_COMPLETED:
+                raise ValueError("Standing outcome requires completed run")
+            payload["standing_outcome"] = standing_outcome
+            payload["result_message_id"] = result_message_id
+            event_version = 3
+        elif retry_not_before is not None:
+            if event_type != WorkshopEventType.RUN_FAILED or terminal_code is None:
+                raise ValueError("Standing retry boundary requires failed run")
+            payload["failure_code"] = terminal_code
+            payload["retry_not_before"] = retry_not_before.isoformat()
+            event_version = 3
+        elif event_type == WorkshopEventType.RUN_COMPLETED:
             if result_message_id is None:
                 raise ValueError("Completed run requires result_message_id")
             payload["result_message_id"] = result_message_id
@@ -1124,7 +1272,7 @@ class WorkshopRunExecutionAuthority:
         return EventEnvelope.create(
             event_id=EventId.derived(run.run_id, f"v2:{operation}"),
             event_type=event_type,
-            event_version=2,
+            event_version=event_version,
             workshop_id=run.workshop_id,
             aggregate_type="run",
             aggregate_id=run.run_id,

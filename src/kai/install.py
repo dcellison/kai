@@ -98,6 +98,7 @@ from kai.workshop.diagnostics import (
     workshop_operational_state_status,
     workshop_runtime_session_status,
     workshop_standing_observation_status,
+    workshop_standing_observe_execution_status,
     workshop_standing_participation_status,
     workshop_transcript_authority_status,
     workshop_transition_tooling_status,
@@ -9543,6 +9544,7 @@ def _cmd_status() -> None:
     print(workshop_collaboration_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_standing_participation_status(Path(data_dir) / "kai.db"))
     print(workshop_standing_observation_status(Path(data_dir) / "kai.db"))
+    print(workshop_standing_observe_execution_status(Path(data_dir) / "kai.db"))
     print(workshop_human_handle_status(Path(data_dir) / "kai.db"))
     print(workshop_human_avatar_status(Path(data_dir) / "kai.db", Path(data_dir) / "files" / "avatars"))
     print(workshop_human_notification_status(Path(data_dir) / "kai.db"))

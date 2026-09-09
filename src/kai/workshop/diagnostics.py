@@ -153,6 +153,13 @@ _STANDING_OBSERVATION_TABLES = _STANDING_PARTICIPATION_TABLES | {
     "messages",
     "standing_participation_host_policy",
 }
+_STANDING_OBSERVE_EXECUTION_TABLES = _STANDING_OBSERVATION_TABLES | {
+    "runs",
+    "run_attempts",
+    "standing_observation_protocol_anomalies",
+    "standing_observation_publications",
+    "standing_observation_suppressed_outputs",
+}
 _AGENT_HANDLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _TELEGRAM_SUBJECT_PATTERN = re.compile(r"^-?[0-9]+$")
 _SYNTHETIC_ASSISTANT_PATTERN = re.compile(
@@ -1058,6 +1065,80 @@ def workshop_standing_observation_status(db_path: Path) -> str:
         f"(idle={idle}, pending={pending}, paused overflow={paused}), "
         f"pending messages={pending_messages}, unanchored={unanchored}; {limits}; "
         f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; authority=canonical-message"
+    )
+
+
+def workshop_standing_observe_execution_status(db_path: Path) -> str:
+    """Report standing inference, silence, publication, and suppression state."""
+    prefix = "Workshop standing observe execution:"
+    if not db_path.is_file():
+        return f"{prefix} pending; execution schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _STANDING_OBSERVE_EXECUTION_TABLES:
+                return f"{prefix} pending; execution schema unavailable"
+            host = connection.execute(
+                "SELECT enabled, max_observe_runs_per_hour, max_unsolicited_messages_per_hour, "
+                "minimum_unsolicited_interval_seconds FROM standing_participation_host_policy "
+                "WHERE singleton = 1"
+            ).fetchone()
+            counts = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN status IN ('accepted', 'started') THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'completed' AND standing_outcome = 'spoke' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'completed' AND standing_outcome = 'silent' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'completed' AND standing_outcome = 'publication_suppressed' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) FROM runs WHERE kind = 'observe'"
+            ).fetchone()
+            total, nonterminal, spoke, silent, suppressed, failed = tuple(
+                int(value or 0) for value in (counts or (0, 0, 0, 0, 0, 0))
+            )
+            protected = _scalar(connection, "SELECT COUNT(*) FROM standing_observation_suppressed_outputs")
+            anomalies = _scalar(connection, "SELECT COUNT(*) FROM standing_observation_protocol_anomalies")
+            integrity_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM runs r LEFT JOIN standing_observation_publications p ON p.run_id = r.id "
+                "WHERE (r.kind = 'observe' AND (r.observation_scope_kind IS NULL "
+                "OR r.observation_scope_id IS NULL OR r.observed_from_event_position IS NULL "
+                "OR r.observed_through_event_position IS NULL OR r.observed_message_ids_json IS NULL "
+                "OR r.human_anchor_message_id IS NULL "
+                "OR r.standing_subscription_started_event_position IS NULL "
+                "OR (r.status = 'completed' AND r.standing_outcome IS NULL) "
+                "OR (r.standing_outcome = 'spoke' AND (r.result_message_id IS NULL OR p.run_id IS NULL)) "
+                "OR (r.standing_outcome IN ('silent', 'publication_suppressed') "
+                "AND r.result_message_id IS NOT NULL))) "
+                "OR (r.kind = 'respond' AND (r.observation_scope_kind IS NOT NULL "
+                "OR r.observation_scope_id IS NOT NULL OR r.standing_outcome IS NOT NULL))",
+            )
+            replay_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM standing_observation_publications p LEFT JOIN runs r ON r.id = p.run_id "
+                "LEFT JOIN messages m ON m.id = p.result_message_id "
+                "WHERE r.id IS NULL OR r.standing_outcome != 'spoke' OR m.id IS NULL",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return f"{prefix} INCOMPLETE; diagnostics unavailable"
+    host_state = "unknown" if host is None else ("enabled" if bool(host[0]) else "disabled")
+    limits = (
+        "limits=unknown"
+        if host is None
+        else f"inference/hour={int(host[1])}, publication/hour={int(host[2])}, cooldown={int(host[3])}s"
+    )
+    state = "active" if integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; host={host_state}, runs={total} (nonterminal={nonterminal}, "
+        f"spoke={spoke}, silent={silent}, suppressed={suppressed}, failed={failed}), "
+        f"protected outputs={protected}, protocol anomalies={anomalies}; {limits}; "
+        f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; "
+        "authority=canonical/attempt-scoped"
     )
 
 

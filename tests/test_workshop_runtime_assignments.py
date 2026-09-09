@@ -255,7 +255,7 @@ class TestRuntimeAssignmentPolicy:
 
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
 
-            assert checkpoint.version == 32
+            assert checkpoint.version == 33
             assert await resolve_channel_runtime_profile(store, channel_id) == (
                 assigned.agent_id,
                 profile_id(202),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -35,6 +36,11 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class RunKind(StrEnum):
+    RESPOND = "respond"
+    OBSERVE = "observe"
 
 
 class RunLifecycleError(RuntimeError):
@@ -71,6 +77,15 @@ class DurableRun:
     sponsor_principal_id: PrincipalId | None = None
     parent_run_id: RunId | None = None
     delegation_id: AgentDelegationId | None = None
+    kind: RunKind = RunKind.RESPOND
+    observation_scope_kind: str | None = None
+    observation_scope_id: str | None = None
+    observed_from_event_position: int | None = None
+    observed_through_event_position: int | None = None
+    observed_message_ids: tuple[MessageId, ...] = ()
+    human_anchor_message_id: MessageId | None = None
+    standing_subscription_started_event_position: int | None = None
+    standing_outcome: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,10 +124,46 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
     )
     parent_expression = "parent_run_id" if "parent_run_id" in run_columns else "NULL AS parent_run_id"
     delegation_expression = "delegation_id" if "delegation_id" in run_columns else "NULL AS delegation_id"
+    kind_expression = "kind" if "kind" in run_columns else "'respond' AS kind"
+    observation_scope_kind_expression = (
+        "observation_scope_kind" if "observation_scope_kind" in run_columns else "NULL AS observation_scope_kind"
+    )
+    observation_scope_id_expression = (
+        "observation_scope_id" if "observation_scope_id" in run_columns else "NULL AS observation_scope_id"
+    )
+    observed_from_expression = (
+        "observed_from_event_position"
+        if "observed_from_event_position" in run_columns
+        else "NULL AS observed_from_event_position"
+    )
+    observed_through_expression = (
+        "observed_through_event_position"
+        if "observed_through_event_position" in run_columns
+        else "NULL AS observed_through_event_position"
+    )
+    observed_ids_expression = (
+        "observed_message_ids_json"
+        if "observed_message_ids_json" in run_columns
+        else "NULL AS observed_message_ids_json"
+    )
+    anchor_expression = (
+        "human_anchor_message_id" if "human_anchor_message_id" in run_columns else "NULL AS human_anchor_message_id"
+    )
+    subscription_expression = (
+        "standing_subscription_started_event_position"
+        if "standing_subscription_started_event_position" in run_columns
+        else "NULL AS standing_subscription_started_event_position"
+    )
+    standing_outcome_expression = (
+        "standing_outcome" if "standing_outcome" in run_columns else "NULL AS standing_outcome"
+    )
     async with store.connection.execute(
         "SELECT id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
         f"inbound_message_id, {revision_expression}, {runtime_expression}, {sponsor_expression}, "
-        f"{parent_expression}, {delegation_expression}, "
+        f"{parent_expression}, {delegation_expression}, {kind_expression}, "
+        f"{observation_scope_kind_expression}, {observation_scope_id_expression}, "
+        f"{observed_from_expression}, {observed_through_expression}, {observed_ids_expression}, "
+        f"{anchor_expression}, {subscription_expression}, {standing_outcome_expression}, "
         "status, accepted_at, "
         "started_at, terminal_at, terminal_code, "
         "cancellation_requested_at, cancellation_code, result_message_id, "
@@ -134,15 +185,26 @@ async def load_durable_run(store: WorkshopEventStore, run_id: RunId) -> DurableR
         sponsor_principal_id=PrincipalId(str(row[8])) if row[8] is not None else None,
         parent_run_id=RunId(str(row[9])) if row[9] is not None else None,
         delegation_id=AgentDelegationId(str(row[10])) if row[10] is not None else None,
-        status=RunStatus(str(row[11])),
-        accepted_at=_parse_timestamp(row[12]),
-        started_at=_optional_timestamp(row[13]),
-        terminal_at=_optional_timestamp(row[14]),
-        terminal_code=str(row[15]) if row[15] is not None else None,
-        cancellation_requested_at=_optional_timestamp(row[16]),
-        cancellation_code=str(row[17]) if row[17] is not None else None,
-        result_message_id=MessageId(str(row[18])) if row[18] is not None else None,
-        last_event_position=int(row[19]),
+        kind=RunKind(str(row[11])),
+        observation_scope_kind=str(row[12]) if row[12] is not None else None,
+        observation_scope_id=str(row[13]) if row[13] is not None else None,
+        observed_from_event_position=int(row[14]) if row[14] is not None else None,
+        observed_through_event_position=int(row[15]) if row[15] is not None else None,
+        observed_message_ids=(
+            tuple(MessageId(str(item)) for item in json.loads(str(row[16]))) if row[16] is not None else ()
+        ),
+        human_anchor_message_id=MessageId(str(row[17])) if row[17] is not None else None,
+        standing_subscription_started_event_position=int(row[18]) if row[18] is not None else None,
+        standing_outcome=str(row[19]) if row[19] is not None else None,
+        status=RunStatus(str(row[20])),
+        accepted_at=_parse_timestamp(row[21]),
+        started_at=_optional_timestamp(row[22]),
+        terminal_at=_optional_timestamp(row[23]),
+        terminal_code=str(row[24]) if row[24] is not None else None,
+        cancellation_requested_at=_optional_timestamp(row[25]),
+        cancellation_code=str(row[26]) if row[26] is not None else None,
+        result_message_id=MessageId(str(row[27])) if row[27] is not None else None,
+        last_event_position=int(row[28]),
     )
 
 

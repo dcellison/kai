@@ -260,6 +260,91 @@ async def record_outbound_message(
         raise
 
 
+async def record_standing_observation_message_in_transaction(
+    store: WorkshopEventStore,
+    *,
+    run_id: object,
+    channel_id: ChannelId,
+    agent_id: AgentId,
+    scope_kind: str,
+    scope_id: str,
+    body: str,
+    occurred_at: datetime,
+    delivery_policy: WorkshopDeliveryBindingPolicy,
+) -> AppendResult:
+    """Publish one unsolicited standing contribution inside its terminal transaction."""
+    if not store.connection.in_transaction:
+        raise RuntimeError("Standing observation publication requires an active transaction")
+    if scope_kind not in {"channel", "thread"} or not scope_id or not body.strip():
+        raise ValueError("Standing observation publication is malformed")
+    async with store.connection.execute(
+        "SELECT c.workshop_id, c.kind, c.archived_at, a.principal_id FROM channels c "
+        "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.agent_id = ? AND ca.detached_at IS NULL "
+        "JOIN agents a ON a.id = ca.agent_id WHERE c.id = ?",
+        (agent_id, channel_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None or str(row[1]) != "group" or row[2] is not None:
+        raise OutboundMessageNotFoundError("Standing observation channel authority is unavailable")
+    workshop_id = WorkshopId(str(row[0]))
+    agent_principal_id = PrincipalId(str(row[3]))
+    message_id = MessageId.derived(workshop_id, f"standing-observation-result:{run_id}")
+    payload: dict[str, object] = {
+        "channel_id": channel_id,
+        "author_principal_id": agent_principal_id,
+        "body": body.strip(),
+    }
+    if scope_kind == "thread":
+        root_id = MessageId(scope_id)
+        async with store.connection.execute(
+            "SELECT 1 FROM messages WHERE id = ? AND channel_id = ?",
+            (root_id, channel_id),
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                raise OutboundMessageNotFoundError("Standing observation thread is unavailable")
+        payload.update({"reply_to_message_id": root_id, "thread_root_id": root_id})
+    elif scope_id != str(channel_id):
+        raise OutboundMessageNotFoundError("Standing observation channel scope is invalid")
+    key = f"workshop-standing-observation-result:v1:{run_id}"
+    event = EventEnvelope.create(
+        event_id=EventId.derived(message_id, "created"),
+        event_type=WorkshopEventType.MESSAGE_CREATED,
+        event_version=1,
+        workshop_id=workshop_id,
+        aggregate_type="message",
+        aggregate_id=message_id,
+        actor_principal_id=agent_principal_id,
+        occurred_at=occurred_at,
+        idempotency_key=key,
+        payload=payload,
+        metadata={"source": "standing_participation", "run_id": str(run_id)},
+    )
+    existing = await store.event_by_idempotency_key(key)
+    if existing is not None:
+        if (
+            existing.envelope.event_type != event.event_type
+            or existing.envelope.event_version != event.event_version
+            or existing.envelope.workshop_id != event.workshop_id
+            or existing.envelope.aggregate_type != event.aggregate_type
+            or existing.envelope.aggregate_id != event.aggregate_id
+            or existing.envelope.actor_principal_id != event.actor_principal_id
+            or existing.envelope.payload != event.payload
+            or existing.envelope.metadata != event.metadata
+        ):
+            raise IdempotencyConflictError("Standing observation result identity has conflicting content")
+        return AppendResult(existing, False)
+    result = await store.append_in_transaction(event)
+    projection = CanonicalConversationProjection()
+    await store.project_pending_in_transaction(projection)
+    await append_human_notifications_in_transaction(
+        store,
+        result.event,
+        delivery_policy=delivery_policy,
+    )
+    await store.project_pending_in_transaction(projection)
+    return result
+
+
 async def record_outbound_message_with_delivery(
     store: WorkshopEventStore,
     message: OutboundMessage,

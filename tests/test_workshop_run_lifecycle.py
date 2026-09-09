@@ -166,7 +166,7 @@ class TestDurableRunReplay:
             checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
             after = await lifecycle.state(before.run_id)
 
-            assert checkpoint.version == 32
+            assert checkpoint.version == 33
             assert after == before
         finally:
             await store.close()

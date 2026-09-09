@@ -40,9 +40,13 @@ from kai.workshop.run_execution_authority import (
     RunExecutionSelection,
     WorkshopRunExecutionAuthority,
 )
-from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
+from kai.workshop.run_lifecycle import DurableRun, RunKind, RunStatus, WorkshopRunLifecycle
 from kai.workshop.run_traces import WorkshopRunTraceStore
 from kai.workshop.runtime_sessions import RuntimeSessionSettlement
+from kai.workshop.standing_observation import (
+    StandingObserveSettlement,
+    WorkshopStandingObservationService,
+)
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.terminal_transactions import (
     TerminalFailureCode,
@@ -99,7 +103,7 @@ class CanonicalCancellationDisposition(StrEnum):
 class CanonicalExecutionResult:
     disposition: CanonicalExecutionDisposition
     run: DurableRun
-    terminal: TerminalTransactionResult | None = None
+    terminal: TerminalTransactionResult | StandingObserveSettlement | None = None
     session_id: str | None = None
     workspace: str | None = None
     selection: RunExecutionSelection | None = None
@@ -126,6 +130,7 @@ class _ActiveExecution:
     authority: WorkshopRunExecutionAuthority | None = None
     claim: RunExecutionClaim | None = None
     collaboration_invocation: CollaborationInvocation | None = None
+    collaboration_operations: frozenset[CollaborationOperation] = frozenset()
     started: bool = False
     settling: bool = False
 
@@ -185,6 +190,10 @@ class WorkshopCanonicalExecutionCoordinator:
             store,
             host_policy=collaboration_host_policy,
         )
+        self._standing_observation = WorkshopStandingObservationService(
+            store,
+            self._collaboration_authority.host_policy,
+        )
 
     @property
     def collaboration_authority(self) -> WorkshopCollaborationAuthority:
@@ -241,6 +250,17 @@ class WorkshopCanonicalExecutionCoordinator:
             replay = await self._replay_disposition(run)
             if replay is not None:
                 return CanonicalExecutionResult(replay, run)
+            if run.kind == RunKind.OBSERVE:
+                if await self._respond_waiting(run):
+                    return CanonicalExecutionResult(CanonicalExecutionDisposition.PREPARATION_DEFERRED, run)
+                if await self._observe_is_caught_up(run):
+                    async with self._database_lock:
+                        cancelled = await self._probe_authority().cancel_before_dispatch(
+                            run.run_id,
+                            cancellation_code="respond_superseded",
+                            occurred_at=self._now(),
+                        )
+                    return CanonicalExecutionResult(CanonicalExecutionDisposition.CANCELLED, cancelled)
 
             active = _ActiveExecution(run_id)
             async with self._map_lock:
@@ -335,13 +355,21 @@ class WorkshopCanonicalExecutionCoordinator:
                     await authority.expire_grant(claim, occurred_at=now)
                     expired += 1
                 else:
-                    await WorkshopRunTerminalTransactionCoordinator(
-                        authority,
-                        delivery_policy=self._delivery_policy,
-                    ).interrupt_expired(
-                        claim,
-                        occurred_at=now,
-                    )
+                    run = await WorkshopRunLifecycle(self._store).state(attempt.run_id)
+                    if run.kind == RunKind.OBSERVE:
+                        await authority.interrupt_observe_expired(
+                            claim,
+                            retry_not_before=now + timedelta(seconds=60),
+                            occurred_at=now,
+                        )
+                    else:
+                        await WorkshopRunTerminalTransactionCoordinator(
+                            authority,
+                            delivery_policy=self._delivery_policy,
+                        ).interrupt_expired(
+                            claim,
+                            occurred_at=now,
+                        )
                     interrupted += 1
             if await self._collaboration_authority.available():
                 await self._collaboration_authority.reconcile_unbound(
@@ -384,13 +412,39 @@ class WorkshopCanonicalExecutionCoordinator:
             active.started = True
             async with self._database_lock:
                 if await self._collaboration_authority.available():
-                    _grant, active.collaboration_invocation = await self._collaboration_authority.issue(
+                    grant, active.collaboration_invocation = await self._collaboration_authority.issue(
                         started.claim,
                         occurred_at=self._now(),
                     )
+                    active.collaboration_operations = grant.effective_operations
 
             if active.collaboration_invocation is not None:
                 prepared.stage_collaboration_invocation(active.collaboration_invocation)
+
+            if run.kind == RunKind.OBSERVE:
+                async with self._database_lock:
+                    if (
+                        CollaborationOperation.STANDING_PARTICIPATION not in active.collaboration_operations
+                        or not await self._standing_observation.authority_is_current(run, occurred_at=self._now())
+                    ):
+                        active.settling = True
+                        denied = await self._standing_observation.settle_attempt(
+                            authority,
+                            active.claim,
+                            response_text=None,
+                            response_succeeded=False,
+                            failure_code="standing_authority_revoked",
+                            occurred_at=self._now(),
+                            delivery_policy=self._delivery_policy,
+                            grant_operations=active.collaboration_operations,
+                        )
+                        return CanonicalExecutionResult(
+                            CanonicalExecutionDisposition.FAILED,
+                            denied.execution.run,
+                            denied,
+                            workspace=str(prepared.workspace),
+                            selection=prepared.selection,
+                        )
 
             response = await self._consume_with_renewal(active, prepared, stream_observer=stream_observer)
             if active.cancellation_requested:
@@ -402,10 +456,41 @@ class WorkshopCanonicalExecutionCoordinator:
                     if success_transformer is not None
                     else CanonicalSuccessOutcome(response.text)
                 )
-            terminal = WorkshopRunTerminalTransactionCoordinator(
-                authority,
-                delivery_policy=self._delivery_policy,
-            )
+            if run.kind == RunKind.OBSERVE:
+                async with self._database_lock:
+                    active.settling = True
+                    failure = _FAILURE_CODE_BY_KIND.get(
+                        (response.failure_kind if response is not None else None) or AgentFailureKind.UNKNOWN,
+                        TerminalFailureCode.UNKNOWN,
+                    )
+                    standing = await self._standing_observation.settle_attempt(
+                        authority,
+                        active.claim,
+                        response_text=response.text if response is not None else None,
+                        response_succeeded=response is not None and response.success,
+                        failure_code=(
+                            TerminalFailureCode.NO_RESPONSE.value
+                            if response is None or (response.success and not response.text.strip())
+                            else failure.value
+                        ),
+                        occurred_at=self._now(),
+                        delivery_policy=self._delivery_policy,
+                        grant_operations=active.collaboration_operations,
+                    )
+                disposition = (
+                    CanonicalExecutionDisposition.COMPLETED
+                    if standing.execution.run.status == RunStatus.COMPLETED
+                    else CanonicalExecutionDisposition.FAILED
+                )
+                return CanonicalExecutionResult(
+                    disposition,
+                    standing.execution.run,
+                    standing,
+                    session_id=response.session_id if response is not None and response.success else None,
+                    workspace=str(prepared.workspace),
+                    selection=prepared.selection,
+                )
+            terminal = WorkshopRunTerminalTransactionCoordinator(authority, delivery_policy=self._delivery_policy)
             async with self._database_lock:
                 active.settling = True
                 if response is None or (response.success and not response.text.strip()):
@@ -466,15 +551,34 @@ class WorkshopCanonicalExecutionCoordinator:
                 active.claim = started.claim
                 active.started = True
                 active.ready.set()
-                active.settling = True
-                settled = await WorkshopRunTerminalTransactionCoordinator(
-                    authority,
-                    delivery_policy=self._delivery_policy,
-                ).fail(
-                    started.claim,
-                    failure_code=TerminalFailureCode.ROUTING_INELIGIBLE,
-                    occurred_at=self._now(),
-                )
+                if run.kind == RunKind.OBSERVE:
+                    if await self._collaboration_authority.available():
+                        grant, active.collaboration_invocation = await self._collaboration_authority.issue(
+                            started.claim,
+                            occurred_at=self._now(),
+                        )
+                        active.collaboration_operations = grant.effective_operations
+                    active.settling = True
+                    settled = await self._standing_observation.settle_attempt(
+                        authority,
+                        started.claim,
+                        response_text=None,
+                        response_succeeded=False,
+                        failure_code=TerminalFailureCode.ROUTING_INELIGIBLE.value,
+                        occurred_at=self._now(),
+                        delivery_policy=self._delivery_policy,
+                        grant_operations=active.collaboration_operations,
+                    )
+                else:
+                    active.settling = True
+                    settled = await WorkshopRunTerminalTransactionCoordinator(
+                        authority,
+                        delivery_policy=self._delivery_policy,
+                    ).fail(
+                        started.claim,
+                        failure_code=TerminalFailureCode.ROUTING_INELIGIBLE,
+                        occurred_at=self._now(),
+                    )
             return CanonicalExecutionResult(
                 CanonicalExecutionDisposition.FAILED,
                 settled.execution.run,
@@ -494,14 +598,26 @@ class WorkshopCanonicalExecutionCoordinator:
                         pass
                 async with self._database_lock:
                     active.settling = True
-                    settled = await WorkshopRunTerminalTransactionCoordinator(
-                        active.authority,
-                        delivery_policy=self._delivery_policy,
-                    ).fail(
-                        active.claim,
-                        failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
-                        occurred_at=self._now(),
-                    )
+                    if run.kind == RunKind.OBSERVE:
+                        settled = await self._standing_observation.settle_attempt(
+                            active.authority,
+                            active.claim,
+                            response_text=None,
+                            response_succeeded=False,
+                            failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED.value,
+                            occurred_at=self._now(),
+                            delivery_policy=self._delivery_policy,
+                            grant_operations=active.collaboration_operations,
+                        )
+                    else:
+                        settled = await WorkshopRunTerminalTransactionCoordinator(
+                            active.authority,
+                            delivery_policy=self._delivery_policy,
+                        ).fail(
+                            active.claim,
+                            failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
+                            occurred_at=self._now(),
+                        )
                 return CanonicalExecutionResult(
                     CanonicalExecutionDisposition.FAILED,
                     settled.execution.run,
@@ -537,14 +653,27 @@ class WorkshopCanonicalExecutionCoordinator:
             if active.started:
                 async with self._database_lock:
                     active.settling = True
-                    result = await WorkshopRunTerminalTransactionCoordinator(
-                        active.authority,
-                        delivery_policy=self._delivery_policy,
-                    ).fail(
-                        active.claim,
-                        failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
-                        occurred_at=self._now(),
-                    )
+                    run = await WorkshopRunLifecycle(self._store).state(active.run_id)
+                    if run.kind == RunKind.OBSERVE:
+                        result = await self._standing_observation.settle_attempt(
+                            active.authority,
+                            active.claim,
+                            response_text=None,
+                            response_succeeded=False,
+                            failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED.value,
+                            occurred_at=self._now(),
+                            delivery_policy=self._delivery_policy,
+                            grant_operations=active.collaboration_operations,
+                        )
+                    else:
+                        result = await WorkshopRunTerminalTransactionCoordinator(
+                            active.authority,
+                            delivery_policy=self._delivery_policy,
+                        ).fail(
+                            active.claim,
+                            failure_code=TerminalFailureCode.EXECUTION_INTERRUPTED,
+                            occurred_at=self._now(),
+                        )
                 return CanonicalExecutionResult(
                     CanonicalExecutionDisposition.FAILED,
                     result.execution.run,
@@ -558,15 +687,32 @@ class WorkshopCanonicalExecutionCoordinator:
             )
         async with self._database_lock:
             active.settling = True
-            result = await WorkshopRunTerminalTransactionCoordinator(
-                active.authority,
-                delivery_policy=self._delivery_policy,
-            ).confirm_cancellation(
-                active.claim,
-                occurred_at=self._now(),
-            )
+            run = await WorkshopRunLifecycle(self._store).state(active.run_id)
+            if run.kind == RunKind.OBSERVE:
+                result = await self._standing_observation.settle_attempt(
+                    active.authority,
+                    active.claim,
+                    response_text=None,
+                    response_succeeded=False,
+                    failure_code="standing_cancelled",
+                    occurred_at=self._now(),
+                    delivery_policy=self._delivery_policy,
+                    grant_operations=active.collaboration_operations,
+                )
+            else:
+                result = await WorkshopRunTerminalTransactionCoordinator(
+                    active.authority,
+                    delivery_policy=self._delivery_policy,
+                ).confirm_cancellation(
+                    active.claim,
+                    occurred_at=self._now(),
+                )
         return CanonicalExecutionResult(
-            CanonicalExecutionDisposition.CANCELLED,
+            (
+                CanonicalExecutionDisposition.FAILED
+                if run.kind == RunKind.OBSERVE
+                else CanonicalExecutionDisposition.CANCELLED
+            ),
             result.execution.run,
             result,
             workspace=str(active.prepared.workspace) if active.prepared is not None else None,
@@ -580,7 +726,10 @@ class WorkshopCanonicalExecutionCoordinator:
         *,
         stream_observer: StreamObserver | None,
     ) -> AgentResponse | None:
-        prompt = await self._prompt(prepared.run)
+        prompt = await self._prompt(
+            prepared.run,
+            collaboration_operations=active.collaboration_operations,
+        )
         async with self._database_lock:
             context = await assemble_canonical_conversation_context(self._store, prepared.run)
             revision_id = prepared.run.agent_definition_revision_id
@@ -664,7 +813,19 @@ class WorkshopCanonicalExecutionCoordinator:
                     )
                 active.claim = renewed.claim
 
-    async def _prompt(self, run: DurableRun) -> str | list:
+    async def _prompt(
+        self,
+        run: DurableRun,
+        *,
+        collaboration_operations: frozenset[CollaborationOperation],
+    ) -> str | list:
+        if run.kind == RunKind.OBSERVE:
+            async with self._database_lock:
+                return await self._standing_observation.prompt_for_run(
+                    run,
+                    grant_operations=collaboration_operations,
+                    occurred_at=self._now(),
+                )
         if self._artifact_storage_root is not None:
             try:
                 return await build_agent_prompt_for_message(
@@ -689,6 +850,31 @@ class WorkshopCanonicalExecutionCoordinator:
     async def _run(self, run_id: RunId) -> DurableRun:
         async with self._database_lock:
             return await WorkshopRunLifecycle(self._store).state(run_id)
+
+    async def _respond_waiting(self, run: DurableRun) -> bool:
+        async with (
+            self._database_lock,
+            self._store.connection.execute(
+                "SELECT 1 FROM runs waiting JOIN messages source ON source.id = waiting.inbound_message_id "
+                "WHERE waiting.channel_id = ? AND waiting.agent_id = ? AND waiting.kind = 'respond' "
+                "AND waiting.status = 'accepted' AND source.created_event_position >= ? LIMIT 1",
+                (run.channel_id, run.agent_id, run.observed_from_event_position or 0),
+            ) as cursor,
+        ):
+            return await cursor.fetchone() is not None
+
+    async def _observe_is_caught_up(self, run: DurableRun) -> bool:
+        assert run.observation_scope_id is not None and run.observed_through_event_position is not None
+        async with (
+            self._database_lock,
+            self._store.connection.execute(
+                "SELECT delivered_through_event_position FROM channel_agent_observation_states "
+                "WHERE channel_id = ? AND agent_id = ? AND scope_id = ?",
+                (run.channel_id, run.agent_id, run.observation_scope_id),
+            ) as cursor,
+        ):
+            state = await cursor.fetchone()
+        return state is not None and int(state[0]) >= run.observed_through_event_position
 
     async def _replay_disposition(self, run: DurableRun) -> CanonicalExecutionDisposition | None:
         if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:

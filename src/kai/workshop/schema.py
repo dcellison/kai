@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 73
+WORKSHOP_SCHEMA_VERSION = 74
 
 
 @dataclass(frozen=True, slots=True)
@@ -3263,6 +3263,75 @@ _STANDING_OBSERVATION_INBOX_SCHEMA = SchemaMigration(
     ),
 )
 
+_STANDING_OBSERVE_EXECUTION_SCHEMA = SchemaMigration(
+    version=74,
+    name="standing_observe_execution",
+    statements=(
+        "ALTER TABLE standing_participation_host_policy ADD COLUMN max_observe_runs_per_hour "
+        "INTEGER NOT NULL DEFAULT 30 CHECK (max_observe_runs_per_hour > 0)",
+        "ALTER TABLE standing_participation_host_policy ADD COLUMN max_unsolicited_messages_per_hour "
+        "INTEGER NOT NULL DEFAULT 12 CHECK (max_unsolicited_messages_per_hour > 0)",
+        "ALTER TABLE standing_participation_host_policy ADD COLUMN minimum_unsolicited_interval_seconds "
+        "INTEGER NOT NULL DEFAULT 60 CHECK (minimum_unsolicited_interval_seconds > 0)",
+        "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'respond' CHECK (kind IN ('respond', 'observe'))",
+        "ALTER TABLE runs ADD COLUMN observation_scope_kind TEXT "
+        "CHECK (observation_scope_kind IS NULL OR observation_scope_kind IN ('channel', 'thread'))",
+        "ALTER TABLE runs ADD COLUMN observation_scope_id TEXT",
+        "ALTER TABLE runs ADD COLUMN observed_from_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "ALTER TABLE runs ADD COLUMN observed_through_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "ALTER TABLE runs ADD COLUMN observed_message_ids_json TEXT "
+        "CHECK (observed_message_ids_json IS NULL OR (json_valid(observed_message_ids_json) "
+        "AND json_type(observed_message_ids_json) = 'array'))",
+        "ALTER TABLE runs ADD COLUMN human_anchor_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT",
+        "ALTER TABLE runs ADD COLUMN standing_subscription_started_event_position INTEGER "
+        "REFERENCES event_log(position) ON DELETE RESTRICT",
+        "ALTER TABLE runs ADD COLUMN standing_outcome TEXT "
+        "CHECK (standing_outcome IS NULL OR standing_outcome IN "
+        "('spoke', 'silent', 'publication_suppressed'))",
+        "CREATE INDEX runs_kind_status_idx ON runs (kind, status, accepted_at)",
+        "CREATE UNIQUE INDEX runs_observe_batch_idx ON runs "
+        "(channel_id, agent_id, observation_scope_id, observed_from_event_position, "
+        "observed_through_event_position) WHERE kind = 'observe' "
+        "AND status IN ('accepted', 'started')",
+        """
+        CREATE TABLE standing_observation_publications (
+            run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+            scope_id TEXT NOT NULL,
+            human_anchor_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+            result_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE RESTRICT,
+            published_at TEXT NOT NULL,
+            published_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (agent_id, scope_id, human_anchor_message_id)
+        )
+        """,
+        "CREATE INDEX standing_observation_publications_quota_idx ON "
+        "standing_observation_publications (agent_id, channel_id, published_at)",
+        """
+        CREATE TABLE standing_observation_suppressed_outputs (
+            run_id TEXT PRIMARY KEY,
+            body TEXT NOT NULL,
+            protocol_anomaly INTEGER NOT NULL CHECK (protocol_anomaly IN (0, 1)),
+            suppression_reason TEXT NOT NULL CHECK (
+                suppression_reason IN ('anchor_used', 'hourly_quota', 'cooldown', 'authority_revoked')
+            ),
+            created_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE standing_observation_protocol_anomalies (
+            run_id TEXT PRIMARY KEY,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3337,6 +3406,7 @@ _MIGRATIONS = (
     _AGENT_COLLABORATION_OWNER_POLICY_SCHEMA,
     _STANDING_PARTICIPATION_AUTHORITY_SCHEMA,
     _STANDING_OBSERVATION_INBOX_SCHEMA,
+    _STANDING_OBSERVE_EXECUTION_SCHEMA,
 )
 
 
