@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,11 +17,21 @@ from kai.workshop.collaboration_authority import (
 from kai.workshop.collaboration_policy import WorkshopCollaborationPolicyService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.diagnostics import workshop_standing_participation_status
-from kai.workshop.domain import AgentId, ChannelId, PrincipalId
+from kai.workshop.domain import (
+    AgentId,
+    ChannelId,
+    EventEnvelope,
+    EventId,
+    MessageId,
+    PrincipalId,
+    WorkshopEventType,
+    WorkshopId,
+)
 from kai.workshop.inbound import ClientInboundMessage
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.store import WorkshopEventStore
+from kai.workshop.wake_policy import EngagementScope, dismiss_channel_agent
 from tests.workshop_profiles import profile_id
 
 _NOW = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
@@ -134,6 +144,71 @@ def _message(principal_id: PrincipalId, channel_id: ChannelId, identity: str) ->
     )
 
 
+async def _start_without_run(
+    store: WorkshopEventStore,
+    standing: WorkshopStandingParticipationService,
+    human_id: PrincipalId,
+    channel_id: ChannelId,
+    agent_id: AgentId,
+    identity: str,
+    *,
+    occurred_at: datetime = _NOW,
+) -> MessageId:
+    """Start standing from a canonical mention without leaving a respond run."""
+    async with store.connection.execute(
+        "SELECT c.workshop_id, a.principal_id, d.handle FROM channels c "
+        "JOIN agents a ON a.id = ? JOIN agent_definitions d ON d.agent_id = a.id "
+        "WHERE c.id = ?",
+        (agent_id, channel_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    workshop_id = WorkshopId(str(row[0]))
+    agent_principal_id = PrincipalId(str(row[1]))
+    handle = str(row[2])
+    body = f"@{handle} qualify standing lifecycle"
+    message_id = MessageId.derived(channel_id, identity)
+    event = EventEnvelope.create(
+        event_id=EventId.derived(message_id, "created"),
+        event_type=WorkshopEventType.MESSAGE_CREATED,
+        event_version=2,
+        workshop_id=workshop_id,
+        aggregate_type="message",
+        aggregate_id=message_id,
+        actor_principal_id=human_id,
+        occurred_at=occurred_at,
+        idempotency_key=f"standing-qualification:{identity}",
+        payload={
+            "channel_id": channel_id,
+            "author_principal_id": human_id,
+            "body": body,
+            "mentions": [
+                {
+                    "principal_id": agent_principal_id,
+                    "kind": "agent",
+                    "start": 0,
+                    "length": len(handle) + 1,
+                }
+            ],
+        },
+        metadata={"source": "qualification"},
+    )
+    await store.connection.execute("BEGIN IMMEDIATE")
+    try:
+        await store.append_in_transaction(event)
+        await store.project_pending_in_transaction(CanonicalConversationProjection())
+        await standing.start_from_message_in_transaction(
+            message_id,
+            (agent_id,),
+            occurred_at=occurred_at,
+        )
+        await store.connection.commit()
+    except Exception:
+        await store.connection.rollback()
+        raise
+    return message_id
+
+
 async def test_explicit_mention_starts_one_replayable_subscription_without_replacing_response(
     tmp_path: Path,
 ) -> None:
@@ -151,7 +226,7 @@ async def test_explicit_mention_starts_one_replayable_subscription_without_repla
         assert [item.agent_id for item in active] == [agent_id]
         assert active[0].owner_policy_version == 1
         assert active[0].channel_policy_version == 1
-        assert active[0].host_policy_version == 2
+        assert active[0].host_policy_version == 3
         async with store.connection.execute("SELECT COUNT(*) FROM collaboration_grants") as cursor:
             grants = await cursor.fetchone()
         assert grants is not None and int(grants[0]) == 0
@@ -173,7 +248,12 @@ async def test_host_revocation_is_fenced_lazily_and_diagnostics_report_clean_sta
         await WorkshopConversationCommandService(store, standing_participation=standing).accept_client(
             _message(human_id, channel_id, "standing-host-revocation")
         )
-        disabled_host = WorkshopStandingParticipationService(store, CollaborationHostPolicy())
+        disabled_host = WorkshopStandingParticipationService(
+            store,
+            CollaborationHostPolicy(
+                standing_participation=StandingParticipationHostPolicy(enabled=False),
+            ),
+        )
 
         fenced = await disabled_host.inspect(human_id, channel_id)
 
@@ -254,7 +334,12 @@ async def test_channel_policy_disable_ends_subscription_and_rebuild_preserves_te
 async def test_host_rollout_disabled_keeps_mention_response_without_subscription(tmp_path: Path) -> None:
     store, human_id, channel_id, _agent_id = await _base_group_store(tmp_path / "kai.db")
     try:
-        standing = WorkshopStandingParticipationService(store, CollaborationHostPolicy())
+        standing = WorkshopStandingParticipationService(
+            store,
+            CollaborationHostPolicy(
+                standing_participation=StandingParticipationHostPolicy(enabled=False),
+            ),
+        )
         accepted = await WorkshopConversationCommandService(store, standing_participation=standing).accept_client(
             _message(human_id, channel_id, "standing-host-off")
         )
@@ -262,3 +347,157 @@ async def test_host_rollout_disabled_keeps_mention_response_without_subscription
         assert (await standing.inspect(human_id, channel_id)).subscriptions == ()
     finally:
         await store.close()
+
+
+async def test_production_host_policy_enables_standing_by_default() -> None:
+    host = CollaborationHostPolicy()
+
+    assert host.version == 3
+    assert host.standing_participation.enabled is True
+    assert "standing_participation" in host.effective_allowed_operations
+
+
+async def test_channel_dismissal_ends_subscription_immediately_and_replays(tmp_path: Path) -> None:
+    store, human_id, channel_id, agent_id, standing = await _eligible_authority(tmp_path / "dismiss.db")
+    try:
+        await _start_without_run(store, standing, human_id, channel_id, agent_id, "dismiss-start")
+        first = await dismiss_channel_agent(
+            store,
+            principal_id=human_id,
+            scope=EngagementScope(channel_id, None),
+            agent_id=agent_id,
+            client_dismissal_id="standing-dismiss",
+            occurred_at=_NOW + timedelta(seconds=1),
+        )
+        replay = await dismiss_channel_agent(
+            store,
+            principal_id=human_id,
+            scope=EngagementScope(channel_id, None),
+            agent_id=agent_id,
+            client_dismissal_id="standing-dismiss",
+            occurred_at=_NOW + timedelta(seconds=1),
+        )
+
+        snapshot = await standing.inspect(human_id, channel_id)
+        assert first.inserted is True
+        assert replay.inserted is False
+        assert snapshot.subscriptions[0].lifecycle_state == "ended"
+        assert snapshot.subscriptions[0].end_reason == "dismissed"
+    finally:
+        await store.close()
+
+
+async def test_definition_archive_ends_subscription_immediately(tmp_path: Path) -> None:
+    store, human_id, channel_id, agent_id, standing = await _eligible_authority(tmp_path / "definition.db")
+    try:
+        await _start_without_run(store, standing, human_id, channel_id, agent_id, "definition-start")
+        lifecycle = WorkshopAgentLifecycleService(store)
+        definition = next(item for item in await lifecycle.list_visible(human_id) if item.agent_id == agent_id)
+        await lifecycle.archive(
+            human_id,
+            definition.definition_id,
+            idempotency_key="standing-definition-archive",
+            expected_version=definition.state_version,
+        )
+
+        snapshot = await standing.inspect(human_id, channel_id)
+        assert snapshot.subscriptions[0].lifecycle_state == "ended"
+        assert snapshot.subscriptions[0].end_reason == "definition_archived"
+    finally:
+        await store.close()
+
+
+async def test_channel_archive_ends_subscription_immediately(tmp_path: Path) -> None:
+    store, human_id, channel_id, agent_id, standing = await _eligible_authority(tmp_path / "channel.db")
+    try:
+        await _start_without_run(store, standing, human_id, channel_id, agent_id, "channel-start")
+        await WorkshopChannelLifecycleService(store).archive(
+            human_id,
+            channel_id,
+            client_operation_id="standing-channel-archive",
+        )
+
+        async with store.connection.execute(
+            "SELECT lifecycle_state, end_reason FROM channel_agent_standings WHERE channel_id = ?",
+            (channel_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None and tuple(row) == ("ended", "channel_archived")
+    finally:
+        await store.close()
+
+
+async def test_owner_revocation_ends_subscription_immediately(tmp_path: Path) -> None:
+    store, human_id, channel_id, agent_id, standing = await _eligible_authority(tmp_path / "owner.db")
+    try:
+        await _start_without_run(store, standing, human_id, channel_id, agent_id, "owner-start")
+        lifecycle = WorkshopAgentLifecycleService(store)
+        definition = next(item for item in await lifecycle.list_visible(human_id) if item.agent_id == agent_id)
+        policy = WorkshopCollaborationPolicyService(
+            store,
+            cast(Any, _PrivateExecution(WorkshopCollaborationAuthority(store))),
+        )
+        await policy.set_allowed(
+            human_id,
+            definition.definition_id,
+            allowed_operations=[],
+            expected_policy_version=1,
+            client_operation_id="standing-owner-revoke",
+        )
+
+        snapshot = await standing.inspect(human_id, channel_id)
+        assert snapshot.subscriptions[0].lifecycle_state == "ended"
+        assert snapshot.subscriptions[0].end_reason == "owner_policy_revoked"
+    finally:
+        await store.close()
+
+
+async def test_revision_loss_and_quiet_expiry_fail_closed_lazily(tmp_path: Path) -> None:
+    revision_store, human_id, channel_id, agent_id, standing = await _eligible_authority(tmp_path / "revision.db")
+    try:
+        await _start_without_run(revision_store, standing, human_id, channel_id, agent_id, "revision-start")
+        lifecycle = WorkshopAgentLifecycleService(revision_store)
+        definition = next(item for item in await lifecycle.list_visible(human_id) if item.agent_id == agent_id)
+        revised = await lifecycle.add_revision(
+            human_id,
+            definition.definition_id,
+            idempotency_key="standing-nonparticipating-revision",
+            expected_version=definition.state_version,
+            purpose="Respond only when explicitly mentioned.",
+            instructions="Do not participate as a standing agent.",
+            capabilities=["text_generation"],
+            collaboration_operations=[],
+        )
+        await lifecycle.activate_revision(
+            human_id,
+            definition.definition_id,
+            revision_id=revised.revisions[-1].revision_id,
+            idempotency_key="standing-nonparticipating-activate",
+            expected_version=revised.state_version,
+        )
+        snapshot = await standing.inspect(human_id, channel_id)
+        assert snapshot.subscriptions[0].end_reason == "access_removed"
+    finally:
+        await revision_store.close()
+
+    expiry_store, human_id, channel_id, agent_id, _standing = await _eligible_authority(tmp_path / "expiry.db")
+    expiry_policy = CollaborationHostPolicy(
+        standing_participation=StandingParticipationHostPolicy(enabled=True, quiet_expiry_seconds=1),
+    )
+    expiry = WorkshopStandingParticipationService(expiry_store, expiry_policy)
+    try:
+        started_at = datetime.now(UTC) - timedelta(seconds=2)
+        await _start_without_run(
+            expiry_store,
+            expiry,
+            human_id,
+            channel_id,
+            agent_id,
+            "expiry-start",
+            occurred_at=started_at,
+        )
+        snapshot = await expiry.inspect(human_id, channel_id)
+        assert snapshot.subscriptions[0].lifecycle_state == "ended"
+        assert snapshot.subscriptions[0].end_reason == "quiet_expired"
+    finally:
+        await expiry_store.close()

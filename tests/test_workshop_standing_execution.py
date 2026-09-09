@@ -91,6 +91,7 @@ async def test_ready_batch_becomes_immutable_observe_run_and_exact_silence_advan
     status = workshop_standing_observe_execution_status(database)
     assert status.startswith("Workshop standing observe execution: active;")
     assert "runs=1 (nonterminal=0, spoke=0, silent=1, suppressed=0, failed=0)" in status
+    assert "quota ledger=(inferences=1, publications=0)" in status
 
 
 async def test_standing_publication_is_once_per_human_anchor_and_suppressed_text_is_protected(

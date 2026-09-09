@@ -122,7 +122,7 @@ async def test_grant_snapshots_revision_owner_host_context_and_limits(tmp_path: 
         )
         assert grant.effective_operations == frozenset({CollaborationOperation.AGENT_DELEGATION})
         assert grant.owner_policy_version == 7
-        assert grant.host_policy_version == 2
+        assert grant.host_policy_version == 3
         assert grant.quotas[CollaborationOperation.AGENT_DELEGATION] == 12
         assert grant.proof_fingerprint != invocation.token
         assert invocation.token not in repr(invocation)

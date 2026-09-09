@@ -1026,7 +1026,7 @@ async def test_standing_participation_api_is_principal_scoped_versioned_and_repl
             "policy_version": 0,
             "can_manage": True,
             "host_enabled": True,
-            "host_policy_version": 2,
+            "host_policy_version": 3,
             "max_agents_per_channel": 2,
             "coalescing_grace_seconds": 2,
             "max_messages_per_observe_run": 40,
