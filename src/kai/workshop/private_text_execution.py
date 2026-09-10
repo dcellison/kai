@@ -44,6 +44,7 @@ from kai.workshop.store import WorkshopEventStore
 from kai.workshop.transcript_export import CanonicalTranscriptProjection
 
 _RECOVERY_INTERVAL_SECONDS = 1.0
+_RECOVERY_ERROR_INTERVAL_SECONDS = 30.0
 log = logging.getLogger(__name__)
 
 
@@ -126,6 +127,12 @@ class WorkshopPrivateTextExecutionService:
             store,
             coordinator.collaboration_authority.host_policy,
         )
+        repaired_observation_scopes = await standing_observation.reconcile_subscription_boundaries()
+        if repaired_observation_scopes:
+            log.warning(
+                "Rebased %d standing observation scope(s) retained from an ended subscription",
+                repaired_observation_scopes,
+            )
         service = cls(
             store,
             coordinator,
@@ -374,12 +381,33 @@ class WorkshopPrivateTextExecutionService:
 
     async def _recovery_loop(self) -> None:
         while True:
-            await self._recover_and_dispatch_observations()
+            recovery_failed = False
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=_RECOVERY_INTERVAL_SECONDS)
+                await self._recover_and_dispatch_observations()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                recovery_failed = True
+                log.exception("Standing observation recovery failed; the service remains available")
+            delay = _RECOVERY_ERROR_INTERVAL_SECONDS if recovery_failed else _RECOVERY_INTERVAL_SECONDS
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
                 return
             except TimeoutError:
-                await self._coordinator.recover_expired()
+                try:
+                    await self._coordinator.recover_expired()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Canonical execution recovery failed; the service remains available")
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(),
+                            timeout=_RECOVERY_ERROR_INTERVAL_SECONDS,
+                        )
+                        return
+                    except TimeoutError:
+                        pass
 
     async def _recover_and_dispatch_observations(self) -> None:
         finished = [run_id for run_id, task in self._observation_tasks.items() if task.done()]

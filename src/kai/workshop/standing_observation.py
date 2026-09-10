@@ -445,6 +445,45 @@ class WorkshopStandingObservationService:
             await connection.rollback()
             raise
 
+    async def reconcile_subscription_boundaries(self) -> int:
+        """Repair observation cursors retained from an ended subscription."""
+        connection = self._store.connection
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await self._store.project_pending_in_transaction(CanonicalConversationProjection())
+            await synchronize_standing_observation_host_policy_in_transaction(
+                connection,
+                self._host_policy,
+                occurred_at=datetime.now(UTC),
+            )
+            async with connection.execute(
+                "SELECT o.channel_id, o.agent_id, o.scope_id, s.started_event_position "
+                "FROM channel_agent_observation_states o "
+                "JOIN channel_agent_standings s ON s.channel_id = o.channel_id "
+                "AND s.agent_id = o.agent_id AND s.lifecycle_state = 'active' "
+                "WHERE o.delivered_through_event_position < s.started_event_position "
+                "ORDER BY s.started_event_position, o.channel_id, o.agent_id, o.scope_id"
+            ) as cursor:
+                stale = list(await cursor.fetchall())
+            if not stale:
+                await connection.commit()
+                return 0
+            for row in stale:
+                await connection.execute(
+                    "DELETE FROM channel_agent_observation_states "
+                    "WHERE channel_id = ? AND agent_id = ? AND scope_id = ?",
+                    (str(row[0]), str(row[1]), str(row[2])),
+                )
+            earliest_start = min(int(row[3]) for row in stale)
+            for event in await self._store.read_events(after_position=earliest_start):
+                if event.envelope.event_type == WorkshopEventType.MESSAGE_CREATED:
+                    await apply_canonical_message_to_standing_observations(connection, event)
+            await connection.commit()
+            return len(stale)
+        except Exception:
+            await connection.rollback()
+            raise
+
     async def inspect(
         self,
         channel_id: ChannelId,

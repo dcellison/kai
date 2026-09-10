@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import kai.workshop.private_text_execution as private_text_execution_module
 from kai.backend import AgentResponse, StreamEvent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop, bootstrap_human_principal_id
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
@@ -201,6 +202,28 @@ def _message(*, suffix: str = "1") -> InboundMessage:
         body=f"Canonical prompt {suffix}",
         occurred_at=_NOW,
     )
+
+
+async def test_standing_recovery_failure_isolated_from_service_lifecycle(monkeypatch) -> None:
+    service = object.__new__(WorkshopPrivateTextExecutionService)
+    service._stop_event = asyncio.Event()
+    service._coordinator = SimpleNamespace(recover_expired=AsyncMock())
+    attempts = 0
+
+    async def recover() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("malformed standing observation")
+        service._stop_event.set()
+
+    service._recover_and_dispatch_observations = recover  # type: ignore[method-assign]
+    monkeypatch.setattr(private_text_execution_module, "_RECOVERY_ERROR_INTERVAL_SECONDS", 0.001)
+
+    await asyncio.wait_for(service._recovery_loop(), timeout=1)
+
+    assert attempts == 2
+    service._coordinator.recover_expired.assert_awaited_once()
 
 
 async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp_path: Path):

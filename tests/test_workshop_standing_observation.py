@@ -25,7 +25,12 @@ from kai.workshop.standing_observation import WorkshopStandingObservationService
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.store import AppendResult, WorkshopEventStore
 from kai.workshop.wake_policy import EngagementScope, dismiss_channel_agent
-from tests.test_workshop_standing_participation import _NOW, _eligible_authority, _message
+from tests.test_workshop_standing_participation import (
+    _NOW,
+    _eligible_authority,
+    _message,
+    _start_without_run,
+)
 
 
 def _host_policy(**overrides: object) -> CollaborationHostPolicy:
@@ -163,6 +168,103 @@ async def test_every_canonical_message_source_uses_one_coalesced_observation_tri
         assert batches[0].message_ids == tuple(result.event.envelope.aggregate_id for result in results)
         async with store.connection.execute("SELECT COUNT(*) FROM runs") as cursor:
             assert int((await cursor.fetchone())[0]) == initial_runs
+    finally:
+        await store.close()
+
+
+async def test_restarted_subscription_rebases_observation_and_repairs_installed_stale_cursor(
+    tmp_path: Path,
+) -> None:
+    store, human_id, channel_id, agent_id, standing = await _observation_authority(tmp_path / "kai.db")
+    observation = WorkshopStandingObservationService(store, _host_policy())
+    try:
+        await observation.synchronize_host_policy()
+        old_message = await _append_message(
+            store,
+            channel_id,
+            human_id,
+            "before-standing-restart",
+            offset_seconds=1,
+        )
+        disabled = await standing.set_channel_policy(
+            human_id,
+            channel_id,
+            enabled=False,
+            expected_policy_version=1,
+            client_operation_id="observation-restart-disable",
+        )
+        enabled = await standing.set_channel_policy(
+            human_id,
+            channel_id,
+            enabled=True,
+            expected_policy_version=disabled.snapshot.policy.policy_version,
+            client_operation_id="observation-restart-enable",
+        )
+        assert enabled.snapshot.policy.enabled is True
+        await _start_without_run(
+            store,
+            standing,
+            human_id,
+            channel_id,
+            agent_id,
+            "observation-restart-mention",
+            occurred_at=_NOW + timedelta(seconds=2),
+        )
+        after_restart = await _append_message(
+            store,
+            channel_id,
+            human_id,
+            "after-standing-restart",
+            offset_seconds=3,
+        )
+
+        snapshot = await standing.inspect(human_id, channel_id)
+        assert any(item.lifecycle_state == "active" for item in snapshot.subscriptions)
+        async with store.connection.execute(
+            "SELECT started_event_position FROM channel_agent_standings "
+            "WHERE channel_id = ? AND agent_id = ? AND lifecycle_state = 'active'",
+            (channel_id, agent_id),
+        ) as cursor:
+            started_row = await cursor.fetchone()
+        assert started_row is not None
+        started_event_position = int(started_row[0])
+        expected = await observation.inspect(channel_id, agent_id, current_at=_NOW + timedelta(seconds=4))
+        assert len(expected) == 1
+        assert expected[0].delivered_through_event_position == started_event_position
+        assert expected[0].pending_message_count == 1
+        assert (await observation.pending_batches(expected[0]))[0].message_ids == (
+            after_restart.event.envelope.aggregate_id,
+        )
+        assert (
+            old_message.event.envelope.aggregate_id
+            not in (await observation.pending_batches(expected[0]))[0].message_ids
+        )
+
+        await store.connection.execute(
+            "UPDATE channel_agent_observation_states SET delivered_through_event_position = ? "
+            "WHERE channel_id = ? AND agent_id = ?",
+            (started_event_position - 1, channel_id, agent_id),
+        )
+        await store.connection.commit()
+        assert await observation.reconcile_subscription_boundaries() == 1
+        assert (
+            await observation.inspect(
+                channel_id,
+                agent_id,
+                current_at=_NOW + timedelta(seconds=4),
+            )
+            == expected
+        )
+
+        await store.rebuild_projection(CanonicalConversationProjection())
+        assert (
+            await observation.inspect(
+                channel_id,
+                agent_id,
+                current_at=_NOW + timedelta(seconds=4),
+            )
+            == expected
+        )
     finally:
         await store.close()
 
