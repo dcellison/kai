@@ -1,7 +1,7 @@
 # Kai Workshop: Phase 0 Implementation Map
 
-**Status:** Canonical Workshop active; standing participation implemented and pending final installed qualification
-**Date:** 2026-09-09
+**Status:** Canonical Workshop active; standing participation implemented with final qualification governed by #1470
+**Date:** 2026-09-10
 **Scope:** Map and execute the current Kai implementation's migration onto the proposed Kai Workshop architecture.
 
 This document is a chronological implementation map. Earlier sections preserve
@@ -2323,5 +2323,23 @@ authorized run inspection; silent observations remain hidden by default.
 
 Installed diagnostics report subscription lifecycle, observation cursors and
 overflow, run outcomes, quota use, protected-output counts, protocol anomalies,
-and replay or integrity gaps. Final installed qualification under #1470 is the
-closure gate for this section and epic #1465.
+and replay or integrity gaps.
+
+The final qualification contract is intentionally split between deterministic
+automated evidence and installed human observation. The standing-participation,
+observation, execution, and final-qualification suites cover lifecycle
+termination, replay and cursor recovery, overflow, exact silence, output
+suppression, quotas, fresh grants, respond priority, cancellation boundaries,
+crash recovery, scoped prompt secrecy, bounded two-agent quiescence, direct
+channel exclusion, and reuse of one canonical backend instance across turns.
+The shared runtime contract exercises that reuse across all five supported
+backend adapters without requiring five live provider accounts. Existing
+Workshop regression suites remain authoritative for explicit delegation,
+proactive publication, memory, delivery, Telegram, and other adapter behavior.
+
+Issue #1470 is the installed closure record. It must contain a real group-channel
+silent observation, a visible selective contribution, bounded two-agent
+participation, restart continuity, immediate revocation, healthy authority
+diagnostics, and unchanged ordinary Workshop and Telegram responses before the
+epic may close. Installed evidence belongs on the issue rather than as mutable
+host-specific claims in this repository design.
