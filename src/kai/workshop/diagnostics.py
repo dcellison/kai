@@ -1070,7 +1070,7 @@ def workshop_standing_observation_status(db_path: Path) -> str:
         f"{prefix} {state}; host={host_state}, scopes={scopes} "
         f"(idle={idle}, pending={pending}, paused overflow={paused}), "
         f"cursors={scopes} (delivery boundary initialized={delivered_cursors}, "
-        f"backlog beyond boundary={awaiting_cursors}), "
+        f"considered beyond delivery boundary={awaiting_cursors}), "
         f"pending messages={pending_messages}, unanchored={unanchored}; {limits}; "
         f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; authority=canonical-message"
     )

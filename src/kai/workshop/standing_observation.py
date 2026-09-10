@@ -33,6 +33,12 @@ from kai.workshop.run_execution_authority import (
     WorkshopRunExecutionAuthority,
 )
 from kai.workshop.run_lifecycle import DurableRun, load_durable_run
+from kai.workshop.runtime_sessions import (
+    RuntimeSessionSettlement,
+    RuntimeSessionSettlementResult,
+    RuntimeSessionStateConflictError,
+    settle_runtime_session_in_transaction,
+)
 from kai.workshop.store import StoredEvent, WorkshopEventStore
 
 OBSERVATION_PROJECTION_VERSION = 1
@@ -85,6 +91,7 @@ class StandingObserveSettlement:
     published_message_id: MessageId | None
     suppression_reason: str | None
     protocol_anomaly: bool
+    runtime_session: RuntimeSessionSettlementResult | None = None
 
 
 def _parse_timestamp(value: object) -> datetime:
@@ -780,12 +787,15 @@ class WorkshopStandingObservationService:
         occurred_at: datetime,
         delivery_policy: object,
         grant_operations: frozenset[CollaborationOperation],
+        runtime_session: RuntimeSessionSettlement | None = None,
     ) -> StandingObserveSettlement:
         """Settle one observe attempt without exposing failures or suppressed output."""
         from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 
         if not isinstance(delivery_policy, WorkshopDeliveryBindingPolicy):
             raise TypeError("delivery_policy must be a WorkshopDeliveryBindingPolicy")
+        if runtime_session is not None and runtime_session.run_id != claim.run_id:
+            raise ValueError("Standing runtime-session settlement must match the observe run")
         now = occurred_at.astimezone(UTC)
         connection = self._store.connection
         try:
@@ -794,6 +804,12 @@ class WorkshopStandingObservationService:
             run = await load_durable_run(self._store, claim.run_id)
             if run is None or run.kind.value != "observe":
                 raise RuntimeError("Standing settlement requires an observe run")
+            if runtime_session is not None and (
+                runtime_session.channel_id != run.channel_id
+                or runtime_session.agent_id != run.agent_id
+                or runtime_session.runtime_profile_id != run.runtime_profile_id
+            ):
+                raise ValueError("Standing runtime-session settlement does not match canonical run authority")
             body = response_text.strip() if response_text is not None else ""
             protocol_anomaly = "<<silent>>" in body and body != "<<silent>>"
             authority_current = await self._authority_is_current(run, occurred_at=now)
@@ -887,8 +903,35 @@ class WorkshopStandingObservationService:
                 result_message_id=message_id,
                 occurred_at=now,
             )
+            runtime_session_result = None
+            if runtime_session is not None:
+                await connection.execute("SAVEPOINT standing_runtime_session_settlement")
+                try:
+                    runtime_session_result = await settle_runtime_session_in_transaction(
+                        self._store,
+                        runtime_session,
+                        result_message_id=message_id,
+                        context_through_event_position=message.event.position,
+                        occurred_at=now,
+                    )
+                except RuntimeSessionStateConflictError:
+                    # The standing message and fenced run settlement are the
+                    # primary facts. Mirror ordinary terminal settlement: a
+                    # concurrent authority change must remain diagnosable but
+                    # cannot discard output the backend already produced.
+                    await connection.execute("ROLLBACK TO SAVEPOINT standing_runtime_session_settlement")
+                    await connection.execute("RELEASE SAVEPOINT standing_runtime_session_settlement")
+                else:
+                    await connection.execute("RELEASE SAVEPOINT standing_runtime_session_settlement")
             await connection.commit()
-            return StandingObserveSettlement(execution, "spoke", message_id, None, protocol_anomaly)
+            return StandingObserveSettlement(
+                execution,
+                "spoke",
+                message_id,
+                None,
+                protocol_anomaly,
+                runtime_session_result,
+            )
         except Exception:
             await connection.rollback()
             raise
