@@ -5386,14 +5386,17 @@ class TestCmdStatus:
             "aggregate_type TEXT, event_type TEXT, metadata_json TEXT);"
             "INSERT INTO channels VALUES "
             "('chn_active','wsp_one','group','Active',NULL,NULL,NULL),"
-            "('chn_archived','wsp_one','group','Archived','2026-08-30T15:00:00Z',7,NULL);"
+            "('chn_archived','wsp_one','group','Archived','2026-08-30T15:00:00Z',7,NULL),"
+            "('chn_restored','wsp_one','direct','Restored',NULL,8,NULL);"
             "INSERT INTO principals VALUES ('prn_one','human'),('prn_two','human');"
             "INSERT INTO channel_memberships VALUES "
             "('chn_active','prn_one','owner'),('chn_archived','prn_two','owner');"
             "INSERT INTO workshop_memberships VALUES ('wsp_one','prn_one'),('wsp_one','prn_two');"
             "INSERT INTO human_handles VALUES ('wsp_one','prn_one'),('wsp_one','prn_two');"
             "INSERT INTO event_log VALUES "
-            "(7,'chn_archived','channel','channel.archived','{}');"
+            "(7,'chn_archived','channel','channel.archived','{}'),"
+            "(8,'chn_restored','channel','channel.restored','{\"source\":\"human_provisioning_migration\"}');"
+            "INSERT INTO channel_bindings VALUES ('chn_restored');"
         )
         connection.commit()
         connection.close()
@@ -10369,7 +10372,47 @@ backends:
 
         assert status == (
             "Workshop model catalogue: active; contexts=1, active=1, refreshed=1, "
-            "succeeded=1, failed=0, discovered entries=2, operator entries=1; "
+            "succeeded=1, unsupported=0, failed=0, discovered entries=2, operator entries=1; "
+            "diagnostic discovery=disabled"
+        )
+
+    def test_model_catalogue_status_treats_unsupported_discovery_as_expected(self, tmp_path):
+        profile_id = str(kai.install.runtime_profile_id_for_config_id(101))
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "runtime_profiles": {
+                        profile_id: {
+                            "display_name": "Daniel",
+                            "compatibility_runtime_config_id": 101,
+                            "backend": "claude",
+                            "provider": "anthropic",
+                            "model": "sonnet",
+                            "timeout_seconds": 120,
+                            "allowed_services": [],
+                            "home_workspace": None,
+                            "workspace_base": None,
+                            "allowed_workspaces": [],
+                        }
+                    },
+                }
+            )
+        )
+        database = tmp_path / "kai.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE workshop_model_catalogue_refreshes "
+                "(status TEXT, last_successful_refresh_at TEXT, active INTEGER)"
+            )
+            connection.execute("CREATE TABLE workshop_model_catalogue_discovered_entries (status TEXT)")
+            connection.execute("CREATE TABLE workshop_model_catalogue_operator_entries (active INTEGER)")
+            connection.execute("INSERT INTO workshop_model_catalogue_refreshes VALUES ('unsupported', NULL, 1)")
+
+        assert _model_catalogue_status(database, policy) == (
+            "Workshop model catalogue: active; contexts=1, active=1, refreshed=0, "
+            "succeeded=0, unsupported=1, failed=0, discovered entries=0, operator entries=0; "
             "diagnostic discovery=disabled"
         )
 

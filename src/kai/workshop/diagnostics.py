@@ -83,10 +83,23 @@ _EXECUTION_STATE_TABLES = {
     "channel_agent_execution_settings",
     "channel_agent_runtime_assignments",
     "channel_agent_workspace_settings",
+    "channel_memberships",
+    "channels",
+    "principal_agent_enablements",
     "principal_workspace_grants",
     "principal_workspace_history",
+    "principals",
     "workshop_execution_state_migrations",
 }
+_PROTECTED_EXECUTION_STATE_LANES_SQL = (
+    " FROM channel_agent_runtime_assignments a "
+    "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
+    "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
+    "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
+    "LEFT JOIN principal_agent_enablements pae ON pae.direct_channel_id = c.id "
+    "AND pae.agent_id = a.agent_id "
+    "WHERE pae.id IS NULL OR pae.lifecycle_state = 'enabled'"
+)
 _MEMORY_AUTHORITY_TABLES = {
     "channel_agent_runtime_assignments",
     "channel_memberships",
@@ -97,8 +110,12 @@ _MEMORY_AUTHORITY_TABLES = {
 }
 _OPERATIONAL_STATE_TABLES = {
     "channel_agent_runtime_assignments",
+    "channel_memberships",
+    "channels",
     "jobs",
+    "principal_agent_enablements",
     "principal_github_subscriptions",
+    "principals",
     "workshop_execution_state_migrations",
     "workshop_job_owners",
     "workshop_operational_state_migrations",
@@ -1352,23 +1369,22 @@ def workshop_execution_state_status(db_path: Path) -> str:
             }
             if not tables >= _EXECUTION_STATE_TABLES:
                 return f"{prefix} pending; canonical execution-state schema unavailable"
-            profiles = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_runtime_assignments")
-            migrated = _scalar(connection, "SELECT COUNT(*) FROM workshop_execution_state_migrations")
-            missing = _scalar(
+            profiles = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a WHERE NOT EXISTS ("
-                "SELECT 1 FROM workshop_execution_state_migrations m "
-                "WHERE m.runtime_profile_id = a.runtime_profile_id AND m.channel_id = a.channel_id "
-                "AND m.agent_id = a.agent_id)",
+                "SELECT COUNT(DISTINCT a.runtime_profile_id)" + _PROTECTED_EXECUTION_STATE_LANES_SQL,
             )
+            migrated = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_execution_state_migrations m WHERE EXISTS ("
+                "SELECT 1" + _PROTECTED_EXECUTION_STATE_LANES_SQL + " "
+                "AND a.runtime_profile_id = m.runtime_profile_id)",
+            )
+            missing = max(profiles - migrated, 0)
             stale = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM workshop_execution_state_migrations m WHERE NOT EXISTS ("
-                "SELECT 1 FROM channel_agent_runtime_assignments a "
-                "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' "
-                "JOIN channel_memberships cm ON cm.channel_id = c.id AND cm.role = 'owner' "
-                "JOIN principals p ON p.id = cm.principal_id AND p.kind = 'human' "
-                "WHERE a.runtime_profile_id = m.runtime_profile_id "
+                "SELECT 1" + _PROTECTED_EXECUTION_STATE_LANES_SQL + " "
+                "AND a.runtime_profile_id = m.runtime_profile_id "
                 "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id "
                 "AND cm.principal_id = m.principal_id)",
             )
@@ -1522,24 +1538,20 @@ def workshop_operational_state_status(db_path: Path) -> str:
                 return f"{prefix} pending; canonical operational-state schema unavailable"
             profiles = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM channel_agent_runtime_assignments",
+                "SELECT COUNT(DISTINCT a.runtime_profile_id)" + _PROTECTED_EXECUTION_STATE_LANES_SQL,
             )
             migrated = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM workshop_operational_state_migrations",
+                "SELECT COUNT(*) FROM workshop_operational_state_migrations m WHERE EXISTS ("
+                "SELECT 1" + _PROTECTED_EXECUTION_STATE_LANES_SQL + " "
+                "AND a.runtime_profile_id = m.runtime_profile_id)",
             )
-            missing = _scalar(
-                connection,
-                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a WHERE NOT EXISTS ("
-                "SELECT 1 FROM workshop_operational_state_migrations m "
-                "WHERE m.runtime_profile_id = a.runtime_profile_id "
-                "AND m.channel_id = a.channel_id AND m.agent_id = a.agent_id)",
-            )
+            missing = max(profiles - migrated, 0)
             stale = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM workshop_operational_state_migrations m WHERE NOT EXISTS ("
-                "SELECT 1 FROM channel_agent_runtime_assignments a "
-                "WHERE a.runtime_profile_id = m.runtime_profile_id "
+                "SELECT 1" + _PROTECTED_EXECUTION_STATE_LANES_SQL + " "
+                "AND a.runtime_profile_id = m.runtime_profile_id "
                 "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id)",
             )
             jobs = _scalar(connection, "SELECT COUNT(*) FROM workshop_scheduled_jobs")
@@ -1548,18 +1560,18 @@ def workshop_operational_state_status(db_path: Path) -> str:
                 connection,
                 "SELECT COUNT(*) FROM workshop_scheduled_job_migrations",
             )
-            missing_job_migrations = _scalar(
+            covered_job_migrations = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM channel_agent_runtime_assignments a WHERE NOT EXISTS ("
-                "SELECT 1 FROM workshop_scheduled_job_migrations m "
-                "WHERE m.runtime_profile_id = a.runtime_profile_id "
-                "AND m.channel_id = a.channel_id AND m.agent_id = a.agent_id)",
+                "SELECT COUNT(*) FROM workshop_scheduled_job_migrations m WHERE EXISTS ("
+                "SELECT 1" + _PROTECTED_EXECUTION_STATE_LANES_SQL + " "
+                "AND a.runtime_profile_id = m.runtime_profile_id)",
             )
+            missing_job_migrations = max(profiles - covered_job_migrations, 0)
             stale_job_migrations = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM workshop_scheduled_job_migrations m WHERE NOT EXISTS ("
-                "SELECT 1 FROM channel_agent_runtime_assignments a "
-                "WHERE a.runtime_profile_id = m.runtime_profile_id "
+                "SELECT 1" + _PROTECTED_EXECUTION_STATE_LANES_SQL + " "
+                "AND a.runtime_profile_id = m.runtime_profile_id "
                 "AND a.channel_id = m.channel_id AND a.agent_id = m.agent_id)",
             )
             unmigrated_jobs = _scalar(
@@ -1685,13 +1697,16 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
             in {
                 WorkshopEventType.CHANNEL_CREATED,
                 WorkshopEventType.WORKSHOP_MEMBER_ADDED,
-                WorkshopEventType.CHANNEL_MEMBER_ADDED,
                 WorkshopEventType.TRANSPORT_CHANNEL_BOUND,
                 WorkshopEventType.RUNTIME_PROFILE_ASSIGNED,
             }
             and envelope.event_version != 1
         ):
             raise ValueError("Workshop event replay encountered an unsupported event version")
+        if envelope.event_type == WorkshopEventType.CHANNEL_MEMBER_ADDED and envelope.event_version not in {1, 2}:
+            raise ValueError("Workshop event replay encountered an unsupported membership version")
+        if envelope.event_type == WorkshopEventType.CHANNEL_MEMBER_REMOVED and envelope.event_version != 1:
+            raise ValueError("Workshop event replay encountered an unsupported membership version")
         if envelope.event_type == WorkshopEventType.PRINCIPAL_CREATED:
             if envelope.event_version not in {1, 2}:
                 raise ValueError("Workshop event replay encountered an unsupported principal version")
@@ -1742,6 +1757,16 @@ def _replay_state(connection: sqlite3.Connection) -> _ReplayState:
                     _required_payload_text(payload, "role"),
                 ),
             )
+            continue
+        if envelope.event_type == WorkshopEventType.CHANNEL_MEMBER_REMOVED:
+            expected = (
+                _required_payload_text(payload, "channel_id"),
+                _required_payload_text(payload, "principal_id"),
+                _required_payload_text(payload, "role"),
+            )
+            if channel_memberships.get(aggregate_id) != expected:
+                raise ValueError("Workshop membership removal has no matching replayed membership")
+            del channel_memberships[aggregate_id]
             continue
         if envelope.event_type == WorkshopEventType.RUNTIME_PROFILE_ASSIGNED:
             _insert_replayed_fact(

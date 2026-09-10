@@ -9713,12 +9713,13 @@ def _model_catalogue_status(database_path: Path, policy_path: Path) -> str:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
     active = len(rows)
     succeeded = sum(str(row[0]) == "succeeded" for row in rows)
-    failed = sum(str(row[0]) not in {"succeeded", "refreshing"} for row in rows)
+    unsupported = sum(str(row[0]) == "unsupported" for row in rows)
+    failed = sum(str(row[0]) not in {"succeeded", "refreshing", "unsupported"} for row in rows)
     refreshed = sum(row[1] is not None for row in rows)
     state = "active" if active <= expected and failed == 0 else "DEGRADED"
     return (
         f"{prefix} {state}; contexts={expected}, active={active}, refreshed={refreshed}, "
-        f"succeeded={succeeded}, failed={failed}, discovered entries={entries}, "
+        f"succeeded={succeeded}, unsupported={unsupported}, failed={failed}, discovered entries={entries}, "
         f"operator entries={operator_entries}; diagnostic discovery=disabled"
     )
 
@@ -10194,8 +10195,11 @@ def _channel_lifecycle_status(db_path: Path) -> str:
                     "LEFT JOIN event_log e ON e.position = l.position "
                     "WHERE (c.kind != 'group' AND (c.archived_at IS NOT NULL "
                     "OR c.lifecycle_event_position IS NOT NULL) AND NOT ("
-                    "c.kind = 'direct' AND e.event_type = 'channel.archived' "
-                    "AND json_extract(e.metadata_json, '$.source') = 'human_provisioning_migration')) "
+                    "c.kind = 'direct' AND e.event_type IN ('channel.archived', 'channel.restored') "
+                    "AND json_extract(e.metadata_json, '$.source') = 'human_provisioning_migration' "
+                    "AND c.lifecycle_event_position = e.position "
+                    "AND ((c.archived_at IS NOT NULL AND e.event_type = 'channel.archived') "
+                    "OR (c.archived_at IS NULL AND e.event_type = 'channel.restored')))) "
                     "OR (c.kind = 'group' AND c.archived_at IS NOT NULL AND ("
                     "e.event_type IS NULL OR e.event_type != 'channel.archived' "
                     "OR c.lifecycle_event_position != e.position)) "

@@ -61,7 +61,11 @@ from kai.workshop.collaboration_policy import (
     WorkshopCollaborationPolicyAccessDenied,
 )
 from kai.workshop.conversation_commands import ConversationCommandDisposition
-from kai.workshop.diagnostics import workshop_human_avatar_status
+from kai.workshop.diagnostics import (
+    workshop_canonical_message_integrity_status,
+    workshop_human_avatar_status,
+    workshop_legacy_jsonl_archive_status,
+)
 from kai.workshop.domain import (
     AgentDefinitionId,
     AgentId,
@@ -2753,6 +2757,9 @@ class TestWorkshopChannelLifecycleHTTPContract:
             assert retried_payload["changed"] is False
             assert added_payload["state_version"] == retried_payload["state_version"]
             membership_version = added_payload["state_version"]
+            assert workshop_canonical_message_integrity_status(tmp_path / "kai.db").startswith(
+                "Workshop canonical message integrity: clean;"
+            )
 
             bob_members = await client.get(path, headers={"Authorization": "Bearer bob"})
             assert bob_members.status == 200
@@ -2831,6 +2838,38 @@ class TestWorkshopChannelLifecycleHTTPContract:
             replayed = await client.get(path, headers={"Authorization": "Bearer alice"})
             assert replayed.status == 200
             assert [item["display_name"] for item in (await replayed.json())["members"]] == ["Alice"]
+            assert workshop_canonical_message_integrity_status(tmp_path / "kai.db").startswith(
+                "Workshop canonical message integrity: clean;"
+            )
+            assert workshop_legacy_jsonl_archive_status(
+                tmp_path / "kai.db",
+                tmp_path / "history",
+            ).startswith("Workshop legacy JSONL archive: classified;")
+            async with store.connection.execute(
+                "SELECT workshop_id FROM channels WHERE id = ?",
+                (channel_id,),
+            ) as cursor:
+                workshop_row = await cursor.fetchone()
+            assert workshop_row is not None
+            await store.append(
+                EventEnvelope.create(
+                    event_type=WorkshopEventType.CHANNEL_MEMBER_ADDED,
+                    event_version=3,
+                    workshop_id=WorkshopId(str(workshop_row[0])),
+                    aggregate_type="channel_membership",
+                    aggregate_id=ChannelMembershipId.new(),
+                    actor_principal_id=alice_id,
+                    occurred_at=_NOW,
+                    payload={
+                        "channel_id": channel_id,
+                        "principal_id": bob_id,
+                        "role": "participant",
+                    },
+                )
+            )
+            assert workshop_canonical_message_integrity_status(tmp_path / "kai.db").startswith(
+                "Workshop canonical message integrity: NOT VERIFIED"
+            )
         finally:
             await client.close()
             await store.close()
