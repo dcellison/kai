@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from kai.backend import AgentResponse
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.diagnostics import (
@@ -19,6 +21,7 @@ from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.run_lifecycle import RunKind, RunStatus
 from kai.workshop.runtime_sessions import load_runtime_session
 from kai.workshop.standing_observation import StandingObserveSettlement, WorkshopStandingObservationService
+from kai.workshop.store import WorkshopEventStore
 from tests.test_workshop_execution_coordinator import (
     _Preparation,
     _PreparationByRun,
@@ -36,14 +39,14 @@ from tests.test_workshop_standing_participation import _message
 from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 
-def _coordinator(store, prepared, policy):
+def _coordinator(store, prepared, policy, *, offset_seconds: float = 30):
     assert prepared.run.runtime_profile_id is not None
     prepared.runtime_profile_id = prepared.run.runtime_profile_id
     return WorkshopCanonicalExecutionCoordinator(
         store,
         _Preparation(prepared),
         registered_backend_ids=frozenset({"codex"}),
-        clock=lambda: _NOW + timedelta(seconds=30),
+        clock=lambda: _NOW + timedelta(seconds=offset_seconds),
         delivery_policy=TELEGRAM_DELIVERY_POLICY,
         collaboration_host_policy=policy,
     )
@@ -180,6 +183,67 @@ async def test_empty_observe_response_fails_silently_and_defers_retry(tmp_path: 
         assert str(state[1]) == (_NOW + timedelta(seconds=90)).isoformat()
     finally:
         await store.close()
+
+
+async def test_failed_observe_batch_retries_after_run_identity_upgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kai.workshop import schema
+
+    path = tmp_path / "kai.db"
+    policy = _host_policy()
+    with monkeypatch.context() as migration_context:
+        migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 74)
+        migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:74])
+        store, human_id, channel_id, _agent_id, _standing = await _observation_authority(path)
+        observation = WorkshopStandingObservationService(store, policy)
+        try:
+            await observation.synchronize_host_policy()
+            await _append_message(store, channel_id, human_id, "observe-existing", offset_seconds=1)
+            existing = await observation.accept_next_ready(occurred_at=_NOW + timedelta(seconds=4))
+            assert existing is not None
+            spoken = _Prepared(existing.run, response=AgentResponse(success=True, text="Existing output"))
+            result = await _coordinator(store, spoken, policy).execute(existing.run.run_id)
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            existing_result_message_id = result.run.result_message_id
+            assert existing_result_message_id is not None
+
+            await _append_message(store, channel_id, human_id, "observe-retry", offset_seconds=40)
+            failed_acceptance = await observation.accept_next_ready(occurred_at=_NOW + timedelta(seconds=43))
+            assert failed_acceptance is not None
+            failed = _Prepared(failed_acceptance.run, response=AgentResponse(success=True, text=""))
+            result = await _coordinator(store, failed, policy, offset_seconds=60).execute(failed_acceptance.run.run_id)
+            assert result.disposition == CanonicalExecutionDisposition.FAILED
+        finally:
+            await store.close()
+
+    upgraded = await WorkshopEventStore.open(path)
+    observation = WorkshopStandingObservationService(upgraded, policy)
+    try:
+        assert await upgraded.schema_version() == schema.WORKSHOP_SCHEMA_VERSION
+        retry = await observation.accept_next_ready(occurred_at=_NOW + timedelta(seconds=125))
+        assert retry is not None
+        assert retry.run.run_id != failed_acceptance.run.run_id
+        assert retry.run.inbound_message_id == failed_acceptance.run.inbound_message_id
+        silent = _Prepared(retry.run, response=AgentResponse(success=True, text="<<silent>>"))
+        result = await _coordinator(upgraded, silent, policy, offset_seconds=150).execute(retry.run.run_id)
+        assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+        assert result.run.standing_outcome == "silent"
+        async with upgraded.connection.execute(
+            "SELECT COUNT(*) FROM runs WHERE inbound_message_id = ? AND agent_id = ?",
+            (failed_acceptance.run.inbound_message_id, failed_acceptance.run.agent_id),
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == 2
+        async with upgraded.connection.execute(
+            "SELECT COUNT(*) FROM standing_observation_publications WHERE run_id = ? AND result_message_id = ?",
+            (existing.run.run_id, existing_result_message_id),
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == 1
+        async with upgraded.connection.execute("PRAGMA foreign_key_check") as cursor:
+            assert await cursor.fetchall() == []
+    finally:
+        await upgraded.close()
 
 
 async def test_host_disable_after_acceptance_fails_closed_before_backend_dispatch(tmp_path: Path) -> None:

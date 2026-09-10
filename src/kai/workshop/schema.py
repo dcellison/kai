@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 74
+WORKSHOP_SCHEMA_VERSION = 75
 
 
 @dataclass(frozen=True, slots=True)
@@ -3332,6 +3332,13 @@ _STANDING_OBSERVE_EXECUTION_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_RUN_KIND_SCOPED_IDENTITY_SCHEMA = SchemaMigration(
+    version=75,
+    name="run_kind_scoped_identity",
+    statements=(),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3407,7 +3414,136 @@ _MIGRATIONS = (
     _STANDING_PARTICIPATION_AUTHORITY_SCHEMA,
     _STANDING_OBSERVATION_INBOX_SCHEMA,
     _STANDING_OBSERVE_EXECUTION_SCHEMA,
+    _RUN_KIND_SCOPED_IDENTITY_SCHEMA,
 )
+
+
+_RUN_KIND_SCOPED_IDENTITY_STATEMENTS = (
+    "ALTER TABLE runs RENAME TO runs_v74",
+    """
+    CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        requested_by_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+        inbound_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT,
+        status TEXT NOT NULL CHECK (
+            status IN ('accepted', 'started', 'completed', 'failed', 'cancelled')
+        ),
+        accepted_at TEXT NOT NULL,
+        started_at TEXT,
+        terminal_at TEXT,
+        terminal_code TEXT,
+        last_event_position INTEGER NOT NULL UNIQUE
+            REFERENCES event_log(position) ON DELETE RESTRICT,
+        cancellation_requested_at TEXT,
+        cancellation_code TEXT,
+        result_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+        agent_definition_revision_id TEXT
+            REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+        runtime_profile_id TEXT,
+        sponsor_principal_id TEXT REFERENCES principals(id) ON DELETE RESTRICT,
+        parent_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+        delegation_id TEXT,
+        kind TEXT NOT NULL DEFAULT 'respond' CHECK (kind IN ('respond', 'observe')),
+        observation_scope_kind TEXT CHECK (
+            observation_scope_kind IS NULL OR observation_scope_kind IN ('channel', 'thread')
+        ),
+        observation_scope_id TEXT,
+        observed_from_event_position INTEGER REFERENCES event_log(position) ON DELETE RESTRICT,
+        observed_through_event_position INTEGER REFERENCES event_log(position) ON DELETE RESTRICT,
+        observed_message_ids_json TEXT CHECK (
+            observed_message_ids_json IS NULL OR (
+                json_valid(observed_message_ids_json)
+                AND json_type(observed_message_ids_json) = 'array'
+            )
+        ),
+        human_anchor_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+        standing_subscription_started_event_position INTEGER
+            REFERENCES event_log(position) ON DELETE RESTRICT,
+        standing_outcome TEXT CHECK (
+            standing_outcome IS NULL OR standing_outcome IN (
+                'spoke', 'silent', 'publication_suppressed'
+            )
+        ),
+        CHECK (
+            (status = 'accepted' AND started_at IS NULL
+                AND terminal_at IS NULL AND terminal_code IS NULL)
+            OR (status = 'started' AND started_at IS NOT NULL
+                AND terminal_at IS NULL AND terminal_code IS NULL)
+            OR (status = 'completed' AND started_at IS NOT NULL
+                AND terminal_at IS NOT NULL AND terminal_code IS NULL)
+            OR (status = 'failed' AND started_at IS NOT NULL
+                AND terminal_at IS NOT NULL AND terminal_code IS NOT NULL)
+            OR (status = 'cancelled' AND terminal_at IS NOT NULL
+                AND terminal_code IS NOT NULL)
+        )
+    )
+    """,
+    """
+    INSERT INTO runs (
+        id, workshop_id, channel_id, requested_by_principal_id, agent_id,
+        inbound_message_id, status, accepted_at, started_at, terminal_at,
+        terminal_code, last_event_position, cancellation_requested_at,
+        cancellation_code, result_message_id, agent_definition_revision_id,
+        runtime_profile_id, sponsor_principal_id, parent_run_id, delegation_id,
+        kind, observation_scope_kind, observation_scope_id,
+        observed_from_event_position, observed_through_event_position,
+        observed_message_ids_json, human_anchor_message_id,
+        standing_subscription_started_event_position, standing_outcome
+    ) SELECT
+        id, workshop_id, channel_id, requested_by_principal_id, agent_id,
+        inbound_message_id, status, accepted_at, started_at, terminal_at,
+        terminal_code, last_event_position, cancellation_requested_at,
+        cancellation_code, result_message_id, agent_definition_revision_id,
+        runtime_profile_id, sponsor_principal_id, parent_run_id, delegation_id,
+        kind, observation_scope_kind, observation_scope_id,
+        observed_from_event_position, observed_through_event_position,
+        observed_message_ids_json, human_anchor_message_id,
+        standing_subscription_started_event_position, standing_outcome
+    FROM runs_v74
+    """,
+    "DROP TABLE runs_v74",
+    "CREATE INDEX runs_channel_status_idx ON runs (channel_id, status, accepted_at)",
+    "CREATE INDEX runs_agent_status_idx ON runs (agent_id, status, accepted_at)",
+    "CREATE INDEX runs_agent_definition_revision_idx ON runs (agent_definition_revision_id, accepted_at)",
+    "CREATE UNIQUE INDEX runs_delegation_idx ON runs (delegation_id) WHERE delegation_id IS NOT NULL",
+    "CREATE INDEX runs_parent_run_idx ON runs (parent_run_id, accepted_at) WHERE parent_run_id IS NOT NULL",
+    "CREATE INDEX runs_kind_status_idx ON runs (kind, status, accepted_at)",
+    "CREATE UNIQUE INDEX runs_respond_inbound_agent_idx ON runs (inbound_message_id, agent_id) WHERE kind = 'respond'",
+    "CREATE UNIQUE INDEX runs_observe_batch_idx ON runs "
+    "(channel_id, agent_id, observation_scope_id, observed_from_event_position, "
+    "observed_through_event_position) WHERE kind = 'observe' "
+    "AND status IN ('accepted', 'started')",
+)
+
+
+async def _migrate_run_kind_scoped_identity(connection: aiosqlite.Connection) -> None:
+    """Replace the legacy all-run input constraint outside foreign-key mode."""
+    if connection.in_transaction:
+        raise RuntimeError("Run identity migration requires no active transaction")
+    await connection.execute("PRAGMA foreign_keys=OFF")
+    await connection.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        await connection.execute("BEGIN IMMEDIATE")
+        for statement in _RUN_KIND_SCOPED_IDENTITY_STATEMENTS:
+            await connection.execute(statement)
+        async with connection.execute("PRAGMA foreign_key_check") as cursor:
+            foreign_key_gaps = list(await cursor.fetchall())
+        if foreign_key_gaps:
+            raise RuntimeError("Run identity migration created foreign-key gaps")
+        await connection.execute(
+            "INSERT INTO workshop_schema_migrations (version, name) VALUES (?, ?)",
+            (_RUN_KIND_SCOPED_IDENTITY_SCHEMA.version, _RUN_KIND_SCOPED_IDENTITY_SCHEMA.name),
+        )
+        await connection.commit()
+    except Exception:
+        await connection.rollback()
+        raise
+    finally:
+        await connection.execute("PRAGMA legacy_alter_table=OFF")
+        await connection.execute("PRAGMA foreign_keys=ON")
 
 
 async def migrate_workshop_schema(
@@ -3438,6 +3574,13 @@ async def migrate_workshop_schema(
 
         for migration in _MIGRATIONS:
             if migration.version in applied:
+                continue
+            if migration == _RUN_KIND_SCOPED_IDENTITY_SCHEMA:
+                if not manage_transaction:
+                    raise RuntimeError("Run identity migration requires managed transactions")
+                await connection.commit()
+                await _migrate_run_kind_scoped_identity(connection)
+                applied.add(migration.version)
                 continue
             for statement in migration.statements:
                 await connection.execute(statement)

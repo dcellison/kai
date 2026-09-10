@@ -185,10 +185,10 @@ async def init_db(db_path: Path) -> None:
     Called once at startup from main.py. Uses aiosqlite.Row as the row
     factory so query results can be accessed by column name.
 
-    All DDL (CREATE TABLE, ALTER TABLE, migrations) runs inside a single
-    explicit transaction. On failure, ROLLBACK undoes everything - the
-    database is either fully initialized or completely unchanged. SQLite
-    supports transactional DDL (as does PostgreSQL; MySQL does not).
+    Workshop schema migrations run first in their own managed transactions so
+    foreign-key-sensitive table rebuilds can safely change SQLite enforcement
+    between migrations. Legacy session DDL then runs in one explicit
+    transaction and remains all-or-nothing.
 
     Args:
         db_path: Path to the SQLite database file (created if missing).
@@ -213,6 +213,7 @@ async def init_db(db_path: Path) -> None:
     _restrict_sqlite_files(db_path)
 
     try:
+        await migrate_workshop_schema(_get_db())
         # BEGIN IMMEDIATE acquires the write lock up front rather than on
         # the first write statement, preventing a deadlock if another
         # connection holds a read lock during our init sequence.
@@ -348,10 +349,6 @@ async def init_db(db_path: Path) -> None:
             await _get_db().execute("DROP TABLE workspace_history")
             await _get_db().execute("ALTER TABLE workspace_history_new RENAME TO workspace_history")
 
-        # Additive Workshop schema only. Canonical bootstrap records are
-        # created separately after the protected user configuration has
-        # loaded; no message path reads these tables yet.
-        await migrate_workshop_schema(_get_db(), manage_transaction=False)
         await _get_db().commit()
         _restrict_sqlite_files(db_path)
     except Exception:
