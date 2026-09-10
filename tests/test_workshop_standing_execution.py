@@ -7,14 +7,18 @@ from pathlib import Path
 
 from kai.backend import AgentResponse
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
-from kai.workshop.diagnostics import workshop_standing_observe_execution_status
+from kai.workshop.diagnostics import (
+    workshop_runtime_session_status,
+    workshop_standing_observe_execution_status,
+)
 from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
     WorkshopCanonicalExecutionCoordinator,
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.run_lifecycle import RunKind, RunStatus
-from kai.workshop.standing_observation import WorkshopStandingObservationService
+from kai.workshop.runtime_sessions import load_runtime_session
+from kai.workshop.standing_observation import StandingObserveSettlement, WorkshopStandingObservationService
 from tests.test_workshop_execution_coordinator import (
     _Preparation,
     _PreparationByRun,
@@ -33,6 +37,8 @@ from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
 
 def _coordinator(store, prepared, policy):
+    assert prepared.run.runtime_profile_id is not None
+    prepared.runtime_profile_id = prepared.run.runtime_profile_id
     return WorkshopCanonicalExecutionCoordinator(
         store,
         _Preparation(prepared),
@@ -105,9 +111,26 @@ async def test_standing_publication_is_once_per_human_anchor_and_suppressed_text
         await _append_message(store, channel_id, human_id, "observe-anchor", offset_seconds=1)
         first = await observation.accept_next_ready(occurred_at=_NOW + timedelta(seconds=4))
         assert first is not None
-        spoken = _Prepared(first.run, response=AgentResponse(success=True, text="Useful contribution"))
+        spoken = _Prepared(
+            first.run,
+            response=AgentResponse(
+                success=True,
+                text="Useful contribution",
+                session_id="standing-provider-session",
+            ),
+        )
         first_result = await _coordinator(store, spoken, policy).execute(first.run.run_id)
         assert first_result.run.standing_outcome == "spoke"
+        assert isinstance(first_result.terminal, StandingObserveSettlement)
+        assert first_result.terminal.runtime_session is not None
+        session = await load_runtime_session(store, channel_id, first.run.agent_id)
+        assert session is not None
+        assert session.last_run_id == first.run.run_id
+        assert session.last_result_message_id == first_result.run.result_message_id
+        assert session.provider_session_id == "standing-provider-session"
+        assert workshop_runtime_session_status(tmp_path / "kai.db").startswith(
+            "Workshop conversation continuity: active; successful lanes=1, sessions=1"
+        )
 
         peer = await _other_agent_principal(store, human_id)
         await _append_message(store, channel_id, peer, "observe-peer-followup", offset_seconds=12)
@@ -128,6 +151,7 @@ async def test_standing_publication_is_once_per_human_anchor_and_suppressed_text
             "ORDER BY created_event_position"
         ) as cursor:
             assert [str(row[0]) for row in await cursor.fetchall()] == ["Useful contribution"]
+        assert "missing=0, stale=0" in workshop_runtime_session_status(tmp_path / "kai.db")
     finally:
         await store.close()
 

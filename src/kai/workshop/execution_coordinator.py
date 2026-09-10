@@ -476,6 +476,24 @@ class WorkshopCanonicalExecutionCoordinator:
                         occurred_at=self._now(),
                         delivery_policy=self._delivery_policy,
                         grant_operations=active.collaboration_operations,
+                        runtime_session=(
+                            RuntimeSessionSettlement(
+                                channel_id=prepared.run.channel_id,
+                                agent_id=prepared.run.agent_id,
+                                runtime_profile_id=prepared.runtime_profile_id,
+                                selection=prepared.selection,
+                                workspace=str(prepared.workspace),
+                                provider_session_id=response.session_id,
+                                run_id=prepared.run.run_id,
+                            )
+                            if (
+                                response is not None
+                                and response.success
+                                and response.text.strip()
+                                and response.text.strip() != "<<silent>>"
+                            )
+                            else None
+                        ),
                     )
                 disposition = (
                     CanonicalExecutionDisposition.COMPLETED
