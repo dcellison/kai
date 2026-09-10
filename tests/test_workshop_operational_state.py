@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,12 +10,14 @@ import pytest
 
 from kai import sessions
 from kai.workshop.bootstrap import BootstrapHuman
-from kai.workshop.diagnostics import workshop_operational_state_status
+from kai.workshop.diagnostics import workshop_execution_state_status, workshop_operational_state_status
+from kai.workshop.domain import ChannelAgentId, ChannelId, EventEnvelope, RuntimeAssignmentId, WorkshopId
 from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
 )
 from kai.workshop.operational_state import WorkshopOperationalStateError
+from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -390,6 +393,56 @@ class TestCanonicalOperationalStateWrites:
 
 
 class TestCanonicalOperationalStateDiagnostic:
+    async def test_additional_group_lane_does_not_require_protected_migration_receipts(self, database: Path):
+        registry = await _bootstrap(101)
+        await sessions.initialize_workshop_operational_state(registry, _config(101))
+        namespace = registry.namespaces[0]
+        connection = sessions._get_db()
+        async with connection.execute(
+            "SELECT workshop_id FROM channels WHERE id = ?", (namespace.channel_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        workshop_id = WorkshopId(str(row[0]))
+        group_id = ChannelId.new()
+        event = await WorkshopEventStore.from_initialized_connection(connection).append(
+            EventEnvelope.create(
+                event_type="qualification.runtime_assigned",
+                event_version=1,
+                workshop_id=workshop_id,
+                aggregate_type="channel",
+                aggregate_id=group_id,
+                occurred_at=datetime.now(UTC),
+                payload={},
+            )
+        )
+        created_at = event.event.envelope.occurred_at.isoformat()
+        await connection.execute(
+            "INSERT INTO channels (id, workshop_id, kind, name, created_at) VALUES (?, ?, 'group', ?, ?)",
+            (group_id, workshop_id, "Additional lane", created_at),
+        )
+        await connection.execute(
+            "INSERT INTO channel_agents (id, channel_id, agent_id, created_at) VALUES (?, ?, ?, ?)",
+            (ChannelAgentId.new(), group_id, namespace.agent_id, created_at),
+        )
+        await connection.execute(
+            "INSERT INTO channel_agent_runtime_assignments "
+            "(id, channel_id, agent_id, runtime_profile_id, created_at, created_event_position) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                RuntimeAssignmentId.new(),
+                group_id,
+                namespace.agent_id,
+                namespace.runtime_profile_id,
+                created_at,
+                event.event.position,
+            ),
+        )
+        await connection.commit()
+
+        assert "active; profiles=1, migrated=1, missing=0, stale=0" in workshop_execution_state_status(database)
+        assert "active; profiles=1, migrated=1, missing=0, stale=0" in workshop_operational_state_status(database)
+
     async def test_reports_clean_authority_and_detects_unowned_job(self, database: Path):
         registry = await _bootstrap(101)
         await sessions.initialize_workshop_operational_state(registry, _config(101))
