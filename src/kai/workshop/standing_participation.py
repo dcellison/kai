@@ -316,6 +316,13 @@ async def apply_standing_participation_event(
             or "standing_participation" not in validate_collaboration_operations(json.loads(str(owner_policy[1])))
         ):
             raise ValueError("Standing owner-policy evidence is not current")
+        # Observation cursors belong to one standing-subscription generation.
+        # A renewed subscription must never inherit pending work, anchors, or
+        # delivery boundaries from the generation that just ended.
+        await connection.execute(
+            "DELETE FROM channel_agent_observation_states WHERE channel_id = ? AND agent_id = ?",
+            (channel_id, agent_id),
+        )
         await connection.execute(
             "INSERT INTO channel_agent_standings "
             "(channel_id, agent_id, agent_definition_id, agent_definition_revision_id, "
