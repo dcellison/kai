@@ -264,6 +264,7 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
                 profile_id(101),
                 sponsor_principal_id=accepted.run.sponsor_principal_id,
                 settings_channel_id=accepted.run.channel_id,
+                workspace_runtime_profile_id=profile_id(101),
             ),
             "codex:openai",
             "gpt-5.6-sol",

@@ -2835,7 +2835,6 @@ function WorkshopView({
   onLoadHumanPeers,
   onLoadRun,
   onLoadRunTrace,
-  onLoadSettingsWorkspace,
   onLoadEffectiveAgentRuntime,
   onLoadThread,
   onLoadThreadUnread,
@@ -2925,7 +2924,6 @@ function WorkshopView({
   onLoadHumanPeers: () => Promise<WorkshopHumanPeer[]>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
-  onLoadSettingsWorkspace: () => Promise<WorkshopSettingsWorkspace>;
   onLoadEffectiveAgentRuntime: () => Promise<WorkshopEffectiveAgentRuntime>;
   onLoadThread: (
     rootMessageId: string,
@@ -3031,8 +3029,6 @@ function WorkshopView({
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [contextWidth, setContextWidth] = useState(restoreContextWidth);
   const [resizingContext, setResizingContext] = useState(false);
-  const [settingsWorkspace, setSettingsWorkspace] =
-    useState<WorkshopSettingsWorkspace | null>(null);
   const [settingsWorkspaceError, setSettingsWorkspaceError] =
     useState<string | null>(null);
   const [effectiveAgentRuntime, setEffectiveAgentRuntime] =
@@ -3792,7 +3788,6 @@ function WorkshopView({
 
   useEffect(() => {
     let cancelled = false;
-    setSettingsWorkspace(null);
     setEffectiveAgentRuntime(null);
     setSettingsWorkspaceError(null);
     const directAgent = channel.kind === "direct" && channel.agents.length === 1;
@@ -3802,18 +3797,11 @@ function WorkshopView({
       };
     }
     void onLoadEffectiveAgentRuntime()
-      .then(async (runtime) => {
+      .then((runtime) => {
         if (cancelled) {
           return;
         }
         setEffectiveAgentRuntime(runtime);
-        if (!runtime.canManage) {
-          return;
-        }
-        const snapshot = await onLoadSettingsWorkspace();
-        if (!cancelled) {
-          setSettingsWorkspace(snapshot);
-        }
       })
       .catch((caught) => {
         if (!cancelled) {
@@ -3834,11 +3822,10 @@ function WorkshopView({
     channelId,
     humanDirect,
     onLoadEffectiveAgentRuntime,
-    onLoadSettingsWorkspace,
   ]);
 
   const selectWorkspace = async (path: string): Promise<void> => {
-    if (!settingsWorkspace || path === settingsWorkspace.workspace) {
+    if (!effectiveAgentRuntime || path === effectiveAgentRuntime.workspace) {
       return;
     }
     setSettingsWorkspaceError(null);
@@ -3846,11 +3833,17 @@ function WorkshopView({
     try {
       const snapshot = await onSwitchWorkspace(
         path,
-        settingsWorkspace.revision,
+        effectiveAgentRuntime.workspaceRevision,
       );
-      setSettingsWorkspace(snapshot);
       setEffectiveAgentRuntime((current) =>
-        current === null ? null : { ...current, workspace: snapshot.workspace },
+        current === null
+          ? null
+          : {
+              ...current,
+              workspace: snapshot.workspace,
+              workspaceRevision: snapshot.revision,
+              workspaces: snapshot.workspaces,
+            },
       );
       setActiveRun(null);
     } catch (caught) {
@@ -5436,6 +5429,7 @@ function WorkshopView({
             <h3>Runtime and workspace</h3>
             {effectiveAgentRuntime ? (
               <div className="runtime-settings">
+                <p className="settings-source">Agent runtime</p>
                 <p>
                   <strong>{effectiveAgentRuntime.backend}</strong>
                   {effectiveAgentRuntime.provider
@@ -5447,26 +5441,7 @@ function WorkshopView({
                   <br />
                   Timeout: {effectiveAgentRuntime.timeoutSeconds.value}s
                 </p>
-                {effectiveAgentRuntime.canManage && settingsWorkspace ? (
-                  <>
-                    <label htmlFor={`workspace-${channelId}`}>Workspace</label>
-                    <select
-                      id={`workspace-${channelId}`}
-                      value={settingsWorkspace.workspace}
-                      disabled={switchingWorkspace || isRunActive(activeRun)}
-                      onChange={(event) => void selectWorkspace(event.target.value)}
-                    >
-                      {settingsWorkspace.workspaces.map((workspaceOption) => (
-                        <option key={workspaceOption.path} value={workspaceOption.path}>
-                          {workspaceOption.name}
-                        </option>
-                      ))}
-                    </select>
-                  </>
-                ) : (
-                  <p>Workspace: <code>{effectiveAgentRuntime.workspace}</code></p>
-                )}
-                {!effectiveAgentRuntime.canManage && (
+                {!effectiveAgentRuntime.canManageRuntime && (
                   <p className="settings-source">
                     Sponsored by {effectiveAgentRuntime.sponsorDisplayName}
                   </p>
@@ -5475,6 +5450,19 @@ function WorkshopView({
                   Model: {effectiveAgentRuntime.model.source}; timeout:{" "}
                   {effectiveAgentRuntime.timeoutSeconds.source}
                 </p>
+                <label htmlFor={`workspace-${channelId}`}>Your workspace</label>
+                <select
+                  id={`workspace-${channelId}`}
+                  value={effectiveAgentRuntime.workspace}
+                  disabled={switchingWorkspace || isRunActive(activeRun)}
+                  onChange={(event) => void selectWorkspace(event.target.value)}
+                >
+                  {effectiveAgentRuntime.workspaces.map((workspaceOption) => (
+                    <option key={workspaceOption.path} value={workspaceOption.path}>
+                      {workspaceOption.name}
+                    </option>
+                  ))}
+                </select>
               </div>
             ) : settingsWorkspaceError ? (
               <p className="settings-error">{settingsWorkspaceError}</p>
@@ -6019,16 +6007,6 @@ function ActiveWorkshopClient({
       throw caught;
     }
   }, [onAuthenticationFailure, session]);
-  const loadConversationSettingsWorkspace = useCallback(async () => {
-    try {
-      return await loadSettingsWorkspace(session);
-    } catch (caught) {
-      if (caught instanceof AuthenticationError) {
-        onAuthenticationFailure(caught.message);
-      }
-      throw caught;
-    }
-  }, [onAuthenticationFailure, session]);
   const switchConversationWorkspace = useCallback(
     (path: string, revision: string) =>
       withAccessHandling(() => switchWorkspace(session, path, revision)),
@@ -6160,7 +6138,6 @@ function ActiveWorkshopClient({
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadEffectiveAgentRuntime={loadConversationEffectiveRuntime}
-      onLoadSettingsWorkspace={loadConversationSettingsWorkspace}
       onLoadThread={loadSelectedThread}
       onLoadThreadUnread={loadSelectedThreadUnread}
       onAdvanceThreadRead={advanceSelectedThreadRead}

@@ -89,6 +89,12 @@ class _RuntimePool:
     def is_in_flight(self, _profile_id) -> bool:
         return self.in_flight
 
+    def requester_workspace_is_in_flight(self, _context) -> bool:
+        return False
+
+    async def invalidate_requester_workspace_lanes(self, _context) -> None:
+        return None
+
     async def select_backend(self, _profile_id, selector: str, *, commit_selection=None) -> bool:
         if self.reject_switch:
             return False

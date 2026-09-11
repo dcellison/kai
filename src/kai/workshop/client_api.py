@@ -3372,11 +3372,16 @@ async def _handle_effective_agent_runtime(
         agent_id = AgentId(str(row[0]))
         sponsor_principal_id = PrincipalId(str(row[3]))
         runtime_profile_id = RuntimeProfileId(str(row[4]))
-        authority = service.authority_for_principal_profile(
+        runtime_authority = service.authority_for_principal_profile(
             sponsor_principal_id,
             runtime_profile_id,
         )
-        snapshot = await service.inspect(authority)
+        workspace_authority = service.authority_for_principal_channel(
+            principal_id,
+            channel_id,
+        )
+        runtime_snapshot = await service.inspect(runtime_authority)
+        workspace_snapshot = await service.inspect(workspace_authority)
     except (TypeError, ValueError, WorkshopSettingsWorkspaceAccessDenied):
         return _error_response(
             status=409,
@@ -3392,18 +3397,28 @@ async def _handle_effective_agent_runtime(
             "agent_handle": str(row[2]),
             "sponsor_principal_id": str(sponsor_principal_id),
             "sponsor_display_name": str(row[5]),
-            "can_manage": principal_id == sponsor_principal_id,
-            "backend": snapshot.backend,
-            "provider": snapshot.provider,
+            "can_manage_runtime": principal_id == sponsor_principal_id,
+            "backend": runtime_snapshot.backend,
+            "provider": runtime_snapshot.provider,
             "model": {
-                "value": snapshot.model.value,
-                "source": snapshot.model.source,
+                "value": runtime_snapshot.model.value,
+                "source": runtime_snapshot.model.source,
             },
             "timeout_seconds": {
-                "value": snapshot.timeout_seconds.value,
-                "source": snapshot.timeout_seconds.source,
+                "value": runtime_snapshot.timeout_seconds.value,
+                "source": runtime_snapshot.timeout_seconds.source,
             },
-            "workspace": snapshot.workspace,
+            "workspace": workspace_snapshot.workspace,
+            "workspace_revision": workspace_snapshot.revision,
+            "workspaces": [
+                {
+                    "path": option.path,
+                    "name": option.name,
+                    "current": option.current,
+                    "home": option.home,
+                }
+                for option in workspace_snapshot.workspaces
+            ],
         },
         status=200,
     )

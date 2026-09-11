@@ -628,7 +628,12 @@ class WorkshopSettingsWorkspaceService:
                 raise WorkshopSettingsWorkspaceAccessDenied("Workspace is outside this runtime profile's grants")
             current = await self._inspect_locked(authority)
             self._check_revision(current.revision, expected_revision)
-            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
+            runtime_authority = self._runtime_authority(authority)
+            if self._runtime_pool.requester_workspace_is_in_flight(runtime_authority):
+                raise WorkshopSettingsWorkspaceBusy(
+                    "The workspace cannot be changed while this conversation has an active run"
+                )
+            was_running = self._runtime_pool.is_running(runtime_authority)
             namespace = self._namespace(authority)
             prior_settings = await sessions.get_canonical_execution_settings(namespace)
             prior_workspace = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
@@ -651,6 +656,9 @@ class WorkshopSettingsWorkspaceService:
             await sessions.replace_canonical_settings_state(namespace, desired_settings)
             try:
                 await self._apply_runtime_state(authority, requested)
+                await self._runtime_pool.invalidate_requester_workspace_lanes(
+                    runtime_authority,
+                )
                 if requested != home:
                     await sessions.upsert_canonical_workspace_history(
                         namespace,

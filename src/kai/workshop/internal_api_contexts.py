@@ -25,6 +25,7 @@ class WorkshopInternalAPIExecutionContext:
     private_context: bool = True
     sponsor_principal_id: PrincipalId | None = None
     settings_channel_id: ChannelId | None = None
+    workspace_runtime_profile_id: RuntimeProfileId | None = None
 
     @property
     def runtime_owner_principal_id(self) -> PrincipalId:
@@ -33,6 +34,11 @@ class WorkshopInternalAPIExecutionContext:
     @property
     def effective_settings_channel_id(self) -> ChannelId:
         return self.settings_channel_id or self.channel_id
+
+    @property
+    def effective_workspace_runtime_profile_id(self) -> RuntimeProfileId:
+        """Return the requester's workspace policy without changing sponsorship."""
+        return self.workspace_runtime_profile_id or self.runtime_profile_id
 
     @classmethod
     def for_unprotected_runtime(

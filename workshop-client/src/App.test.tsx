@@ -641,7 +641,7 @@ const effectiveAgentRuntime: WorkshopEffectiveAgentRuntime = {
   agentId: "agt_00000000000000000000000000000002",
   agentName: "Kai",
   backend: settingsWorkspace.backend,
-  canManage: true,
+  canManageRuntime: true,
   channelId,
   model: {
     source: settingsWorkspace.model.source,
@@ -655,6 +655,8 @@ const effectiveAgentRuntime: WorkshopEffectiveAgentRuntime = {
     value: settingsWorkspace.timeoutSeconds.value,
   },
   workspace: settingsWorkspace.workspace,
+  workspaceRevision: settingsWorkspace.revision,
+  workspaces: settingsWorkspace.workspaces,
 };
 
 const standingParticipation: WorkshopStandingParticipation = {
@@ -1841,7 +1843,7 @@ describe("Workshop React client", () => {
     render(<App />);
 
     expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
-    const selector = screen.getByLabelText("Workspace");
+    const selector = screen.getByLabelText("Your workspace");
     expect(selector).toHaveValue("/Users/kai/Projects/kai");
     expect(screen.getByRole("option", { name: "Home" })).toHaveValue(
       "/var/lib/kai/home/principal",
@@ -1857,7 +1859,7 @@ describe("Workshop React client", () => {
       "sws_current",
     );
     await waitFor(() =>
-      expect(screen.getByLabelText("Workspace")).toHaveValue(
+      expect(screen.getByLabelText("Your workspace")).toHaveValue(
         "/var/lib/kai/home/principal",
       ),
     );
@@ -1878,7 +1880,16 @@ describe("Workshop React client", () => {
     });
     vi.mocked(loadEffectiveAgentRuntime).mockResolvedValue({
       ...effectiveAgentRuntime,
-      canManage: false,
+      canManageRuntime: false,
+      workspace: "/var/lib/kai/home/scott",
+      workspaces: [
+        {
+          current: true,
+          home: true,
+          name: "Home",
+          path: "/var/lib/kai/home/scott",
+        },
+      ],
     });
 
     render(<App />);
@@ -1886,8 +1897,10 @@ describe("Workshop React client", () => {
     expect(await screen.findByText("Sponsored by Daniel")).toBeVisible();
     expect(screen.getByText("codex")).toBeVisible();
     expect(screen.getByText("· openai")).toBeVisible();
-    expect(screen.getByText("/Users/kai/Projects/kai")).toBeVisible();
-    expect(screen.queryByLabelText("Workspace")).toBeNull();
+    expect(screen.queryByText("/Users/kai/Projects/kai")).toBeNull();
+    expect(screen.getByLabelText("Your workspace")).toHaveValue(
+      "/var/lib/kai/home/scott",
+    );
     expect(loadSettingsWorkspace).not.toHaveBeenCalled();
     expect(switchWorkspace).not.toHaveBeenCalled();
   });

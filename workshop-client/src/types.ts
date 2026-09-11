@@ -594,7 +594,7 @@ export interface WorkshopEffectiveAgentRuntime {
   agentId: string;
   agentName: string;
   backend: string;
-  canManage: boolean;
+  canManageRuntime: boolean;
   channelId: string;
   model: { source: string; value: string };
   provider: string;
@@ -602,6 +602,8 @@ export interface WorkshopEffectiveAgentRuntime {
   sponsorPrincipalId: string;
   timeoutSeconds: { source: string; value: number };
   workspace: string;
+  workspaceRevision: string;
+  workspaces: WorkshopWorkspaceOption[];
 }
 
 export type WorkshopRoutingTaskClass = "conversation" | "coding" | "vision";

@@ -67,6 +67,18 @@ class WorkshopRuntimePool:
     async def suspend_canonical_lane(self, context: WorkshopInternalAPIExecutionContext) -> None:
         await self._pool.suspend_canonical_lane(context)
 
+    def requester_workspace_is_in_flight(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+    ) -> bool:
+        return self._pool.requester_workspace_is_in_flight(context)
+
+    async def invalidate_requester_workspace_lanes(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+    ) -> None:
+        await self._pool.invalidate_requester_workspace_lanes(context)
+
     def legacy_runtime_key(self, runtime_profile_id: str | RuntimeProfileId) -> int | None:
         """Return migration-only state for the temporary cutover coordinator."""
         return self._profiles.legacy_runtime_key(runtime_profile_id)

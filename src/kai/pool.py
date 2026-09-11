@@ -19,7 +19,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -476,6 +476,7 @@ class SubprocessPool:
             existing.runtime_owner_principal_id != context.runtime_owner_principal_id
             or existing.private_context != context.private_context
             or existing.effective_settings_channel_id != context.effective_settings_channel_id
+            or existing.effective_workspace_runtime_profile_id != context.effective_workspace_runtime_profile_id
         ):
             raise RuntimeError("Canonical runtime lane conflicts with existing context")
         self._contexts_by_runtime.setdefault(lane_key, context)
@@ -516,6 +517,53 @@ class SubprocessPool:
         # cannot extend a disabled lane's access if termination is delayed.
         self._internal_api_auth.revoke_agent_context(context)
         await self.force_kill(context)
+
+    def _sponsored_workspace_lane_keys(
+        self,
+        requester: WorkshopInternalAPIExecutionContext,
+    ) -> tuple[_CanonicalRuntimeLaneKey, ...]:
+        """Find sponsored private runtimes that consume one requester's workspace."""
+        return tuple(
+            key
+            for key, context in self._contexts_by_runtime.items()
+            if isinstance(key, _CanonicalRuntimeLaneKey)
+            and context.private_context
+            and context.principal_id == requester.principal_id
+            and context.channel_id == requester.channel_id
+            and context.agent_id == requester.agent_id
+            and context.runtime_profile_id != requester.runtime_profile_id
+            and context.effective_workspace_runtime_profile_id == requester.runtime_profile_id
+        )
+
+    def requester_workspace_is_in_flight(
+        self,
+        requester: WorkshopInternalAPIExecutionContext,
+    ) -> bool:
+        """Return whether a sponsored runtime currently owns this workspace lane."""
+        return any(self._profile_has_in_flight(key) for key in self._sponsored_workspace_lane_keys(requester))
+
+    async def invalidate_requester_workspace_lanes(
+        self,
+        requester: WorkshopInternalAPIExecutionContext,
+    ) -> None:
+        """Discard idle sponsored processes after their requester changes workspace."""
+        for key in self._sponsored_workspace_lane_keys(requester):
+            instance_keys = tuple(
+                instance_key
+                for instance_key in self._pool
+                if instance_key == key
+                or (isinstance(instance_key, _RoutedRuntimeKey) and instance_key.runtime_key == key)
+            )
+            for instance_key in instance_keys:
+                instance = self._pool.get(instance_key)
+                if instance is not None:
+                    await self._shutdown_instance(
+                        instance_key,
+                        instance,
+                        reason="requester workspace changed",
+                    )
+            self._pending_workspace_restore.discard(key)
+            self._pending_settings_restore.discard(key)
 
     def _protected_profile(self, runtime: RuntimeSelector):
         """Resolve protected policy while preserving the negative-group bridge."""
@@ -562,6 +610,60 @@ class SubprocessPool:
             sponsor_principal_id=context.runtime_owner_principal_id,
             settings_channel_id=context.effective_settings_channel_id,
         )
+
+    def _canonical_workspace_namespace(
+        self,
+        runtime: RuntimeSelector,
+    ) -> WorkshopExecutionStateNamespace | None:
+        """Keep private workspace state on the requester's conversation lane."""
+        from kai.workshop.execution_state import WorkshopExecutionStateNamespace
+
+        namespace = self._canonical_namespace(runtime)
+        if namespace is None:
+            return None
+        runtime_key, _legacy_key, _profile = self._resolve_runtime(runtime)
+        context = self._runtime_identity(runtime, runtime_key)
+        if context is None or not context.private_context:
+            return namespace
+        return WorkshopExecutionStateNamespace(
+            principal_id=context.principal_id,
+            channel_id=context.channel_id,
+            agent_id=context.agent_id,
+            runtime_profile_id=context.effective_workspace_runtime_profile_id,
+            legacy_runtime_key=None,
+            sponsor_principal_id=context.principal_id,
+            settings_channel_id=context.channel_id,
+        )
+
+    def _workspace_profile(self, runtime: RuntimeSelector):
+        """Resolve filesystem policy independently from the sponsored backend."""
+        runtime_key, _legacy_key, profile = self._resolve_runtime(runtime)
+        if profile is None or self._runtime_profiles is None:
+            return profile
+        context = self._runtime_identity(runtime, runtime_key)
+        if context is None or not context.private_context:
+            return profile
+        return self._runtime_profiles.resolve(
+            context.effective_workspace_runtime_profile_id,
+        )
+
+    def _workspace_config_for_runtime(
+        self,
+        runtime: RuntimeSelector,
+        workspace_config: WorkspaceConfig | None,
+    ) -> WorkspaceConfig | None:
+        """Prevent a requester's workspace from replacing sponsored runtime policy."""
+        if workspace_config is None:
+            return None
+        runtime_key, _legacy_key, _profile = self._resolve_runtime(runtime)
+        context = self._runtime_identity(runtime, runtime_key)
+        if (
+            context is None
+            or not context.private_context
+            or context.effective_workspace_runtime_profile_id == context.runtime_profile_id
+        ):
+            return workspace_config
+        return replace(workspace_config, model=None, timeout=None)
 
     def get_runtime_profile(self, runtime: RuntimeSelector) -> ProtectedRuntimeProfile | None:
         """Return protected policy for one runtime, when that boundary applies."""
@@ -652,13 +754,15 @@ class SubprocessPool:
         """Resolve home through protected profile policy when available."""
         _, runtime_config_id, profile = self._resolve_runtime(runtime)
         if profile is not None:
-            if profile.home_workspace is not None:
-                if not profile.home_workspace.is_dir():
+            workspace_profile = self._workspace_profile(runtime)
+            assert workspace_profile is not None
+            if workspace_profile.home_workspace is not None:
+                if not workspace_profile.home_workspace.is_dir():
                     raise RuntimeError(
-                        f"Protected runtime {profile.profile_id} home workspace is unavailable: "
-                        f"{profile.home_workspace}. Mount or create it, or update the protected runtime profile."
+                        f"Protected runtime {workspace_profile.profile_id} home workspace is unavailable: "
+                        f"{workspace_profile.home_workspace}. Mount or create it, or update the protected runtime profile."
                     )
-                return profile.home_workspace
+                return workspace_profile.home_workspace
             runtime_key, _, _ = self._resolve_runtime(runtime)
             context = self._runtime_identity(runtime, runtime_key) or self._contexts_by_runtime.get(profile.profile_id)
             if context is None:
@@ -682,7 +786,9 @@ class SubprocessPool:
         """Return per-runtime base/list policy and whether it is protected."""
         _, runtime_config_id, profile = self._resolve_runtime(runtime)
         if profile is not None:
-            return profile.workspace_base, profile.allowed_workspaces, True
+            workspace_profile = self._workspace_profile(runtime)
+            assert workspace_profile is not None
+            return workspace_profile.workspace_base, workspace_profile.allowed_workspaces, True
         assert runtime_config_id is not None
         user = self._config.get_user_config(runtime_config_id)
         if user is None:
@@ -694,7 +800,7 @@ class SubprocessPool:
         _, runtime_config_id, profile = self._resolve_runtime(runtime)
         base, allowed, protected = self.get_static_workspace_policy(runtime)
         if profile is not None:
-            namespace = self._canonical_namespace(runtime)
+            namespace = self._canonical_workspace_namespace(runtime)
             assert namespace is not None
             return await sessions.resolve_canonical_workspace_access(
                 namespace,
@@ -767,7 +873,10 @@ class SubprocessPool:
         # it pointed every unconfigured user at a shared directory.
         workspace = self.get_home_workspace(runtime)
 
-        ws_config = self._config.get_workspace_config(workspace)
+        ws_config = self._workspace_config_for_runtime(
+            runtime,
+            self._config.get_workspace_config(workspace),
+        )
 
         # Per-user backend and provider, falling back to global config.
         # Routed through the canonical get_user_backend_and_provider
@@ -1071,12 +1180,16 @@ class SubprocessPool:
                     model_override=model,
                 )
                 if instance.workspace.resolve() != workspace.resolve():
-                    namespace = self._canonical_namespace(runtime)
+                    namespace = self._canonical_workspace_namespace(runtime)
                     assert namespace is not None
                     workspace_config = await sessions.build_canonical_workspace_config(
                         self._config.get_workspace_config(workspace),
                         workspace,
                         namespace,
+                    )
+                    workspace_config = self._workspace_config_for_runtime(
+                        runtime,
+                        workspace_config,
                     )
                     await instance.change_workspace(workspace, workspace_config=workspace_config)
                 # The durable route decision owns the exact model. A workspace
@@ -1225,7 +1338,7 @@ class SubprocessPool:
         otherwise the user's home workspace).
         """
         runtime_key, chat_id, profile = self._resolve_runtime(runtime)
-        namespace = self._canonical_namespace(runtime)
+        namespace = self._canonical_workspace_namespace(runtime)
         if profile is not None:
             assert namespace is not None
             saved = (await sessions.get_canonical_execution_settings(namespace)).get("workspace")
@@ -1269,6 +1382,10 @@ class SubprocessPool:
                         await sessions.build_canonical_workspace_config(yaml_config, ws_path, namespace)
                         if namespace is not None
                         else await sessions.build_workspace_config(yaml_config, ws_path, _required_legacy_key(chat_id))
+                    )
+                    ws_config = self._workspace_config_for_runtime(
+                        runtime,
+                        ws_config,
                     )
                     await instance.change_workspace(ws_path, workspace_config=ws_config)
                     log.info("Restored workspace for runtime %s: %s", runtime_key, ws_path)
@@ -1510,7 +1627,13 @@ class SubprocessPool:
         # about user-level model or timeout preferences, and pre-split
         # behavior accidentally suppressed the DB-settings job here.
         self._pending_workspace_restore.discard(runtime_key)
-        await instance.change_workspace(new_workspace, workspace_config=workspace_config)
+        await instance.change_workspace(
+            new_workspace,
+            workspace_config=self._workspace_config_for_runtime(
+                runtime,
+                workspace_config,
+            ),
+        )
 
     async def restart(self, runtime: RuntimeSelector) -> None:
         """Restart a specific user's subprocess."""
@@ -1609,7 +1732,7 @@ class SubprocessPool:
         already finalized the workspace half.
         """
         runtime_key, chat_id, _profile = self._resolve_runtime(runtime)
-        namespace = self._canonical_namespace(runtime)
+        namespace = self._canonical_workspace_namespace(runtime)
         instance = self._pool.get(runtime_key)
         if instance is not None and runtime_key not in self._pending_workspace_restore:
             return instance.workspace

@@ -495,12 +495,21 @@ function effectiveAgentRuntimePayload(): Record<string, unknown> {
     agent_handle: "kai",
     sponsor_principal_id: "prn_00000000000000000000000000000001",
     sponsor_display_name: "Daniel",
-    can_manage: false,
+    can_manage_runtime: false,
     backend: "codex",
     provider: "openai",
     model: { value: "gpt-5.6-sol", source: "runtime policy" },
     timeout_seconds: { value: 1800, source: "runtime policy" },
-    workspace: "/Users/kai/Projects/kai",
+    workspace: "/var/lib/kai/home/scott",
+    workspace_revision: "sws_scott",
+    workspaces: [
+      {
+        current: true,
+        home: true,
+        name: "Home",
+        path: "/var/lib/kai/home/scott",
+      },
+    ],
   };
 }
 
@@ -1205,14 +1214,23 @@ describe("Workshop client API", () => {
       agentId,
       agentName: "Kai",
       backend: "codex",
-      canManage: false,
+      canManageRuntime: false,
       channelId,
       model: { value: "gpt-5.6-sol", source: "runtime policy" },
       provider: "openai",
       sponsorDisplayName: "Daniel",
       sponsorPrincipalId: "prn_00000000000000000000000000000001",
       timeoutSeconds: { value: 1800, source: "runtime policy" },
-      workspace: "/Users/kai/Projects/kai",
+      workspace: "/var/lib/kai/home/scott",
+      workspaceRevision: "sws_scott",
+      workspaces: [
+        {
+          current: true,
+          home: true,
+          name: "Home",
+          path: "/var/lib/kai/home/scott",
+        },
+      ],
     });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       `/v1/channels/${channelId}/effective-agent-runtime`,

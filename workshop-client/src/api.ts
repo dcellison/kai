@@ -4086,7 +4086,7 @@ export async function loadEffectiveAgentRuntime(
     typeof payload.sponsor_principal_id !== "string" ||
     !PRINCIPAL_PATTERN.test(payload.sponsor_principal_id) ||
     typeof payload.sponsor_display_name !== "string" ||
-    typeof payload.can_manage !== "boolean" ||
+    typeof payload.can_manage_runtime !== "boolean" ||
     typeof payload.backend !== "string" ||
     typeof payload.provider !== "string" ||
     !isRecord(payload.model) ||
@@ -4095,16 +4095,35 @@ export async function loadEffectiveAgentRuntime(
     !isRecord(payload.timeout_seconds) ||
     !Number.isSafeInteger(payload.timeout_seconds.value) ||
     typeof payload.timeout_seconds.source !== "string" ||
-    typeof payload.workspace !== "string"
+    typeof payload.workspace !== "string" ||
+    typeof payload.workspace_revision !== "string" ||
+    !Array.isArray(payload.workspaces)
   ) {
     throw new Error("Kai returned an unsupported effective agent runtime.");
   }
+  const workspaces = payload.workspaces.map((rawWorkspace) => {
+    if (
+      !isRecord(rawWorkspace) ||
+      typeof rawWorkspace.path !== "string" ||
+      typeof rawWorkspace.name !== "string" ||
+      typeof rawWorkspace.current !== "boolean" ||
+      typeof rawWorkspace.home !== "boolean"
+    ) {
+      throw new Error("Kai returned unsupported effective workspace choices.");
+    }
+    return {
+      current: rawWorkspace.current,
+      home: rawWorkspace.home,
+      name: rawWorkspace.name,
+      path: rawWorkspace.path,
+    };
+  });
   return {
     agentHandle: payload.agent_handle,
     agentId: payload.agent_id,
     agentName: payload.agent_name,
     backend: payload.backend,
-    canManage: payload.can_manage,
+    canManageRuntime: payload.can_manage_runtime,
     channelId: payload.channel_id,
     model: { source: payload.model.source, value: payload.model.value },
     provider: payload.provider,
@@ -4115,6 +4134,8 @@ export async function loadEffectiveAgentRuntime(
       value: payload.timeout_seconds.value as number,
     },
     workspace: payload.workspace,
+    workspaceRevision: payload.workspace_revision,
+    workspaces,
   };
 }
 
