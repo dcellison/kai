@@ -2016,6 +2016,40 @@ class CanonicalConversationProjection:
     # Agent ownership and runtime sponsorship project from explicit authority events.
     version = 33
 
+    async def prepare_rebuild(self, connection: aiosqlite.Connection) -> None:
+        """Preserve durable coordination rows that reference this projection."""
+        async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
+            existing_tables = {str(row[0]) for row in await cursor.fetchall()}
+        if "agent_provisioning_operations" not in existing_tables:
+            return
+        await connection.execute("DROP TABLE IF EXISTS temp.canonical_rebuild_agent_provisioning_receipts")
+        await connection.execute("DROP TABLE IF EXISTS temp.canonical_rebuild_agent_provisioning_operations")
+        await connection.execute(
+            "CREATE TEMP TABLE canonical_rebuild_agent_provisioning_operations AS "
+            "SELECT * FROM agent_provisioning_operations"
+        )
+        await connection.execute(
+            "CREATE TEMP TABLE canonical_rebuild_agent_provisioning_receipts AS "
+            "SELECT * FROM agent_provisioning_stage_receipts"
+        )
+        await connection.execute("DELETE FROM agent_provisioning_stage_receipts")
+        await connection.execute("DELETE FROM agent_provisioning_operations")
+
+    async def finish_rebuild(self, connection: aiosqlite.Connection) -> None:
+        """Restore durable coordination rows after their references are replayed."""
+        async with connection.execute("SELECT name FROM sqlite_temp_master WHERE type = 'table'") as cursor:
+            temporary_tables = {str(row[0]) for row in await cursor.fetchall()}
+        if "canonical_rebuild_agent_provisioning_operations" not in temporary_tables:
+            return
+        await connection.execute(
+            "INSERT INTO agent_provisioning_operations SELECT * FROM canonical_rebuild_agent_provisioning_operations"
+        )
+        await connection.execute(
+            "INSERT INTO agent_provisioning_stage_receipts SELECT * FROM canonical_rebuild_agent_provisioning_receipts"
+        )
+        await connection.execute("DROP TABLE canonical_rebuild_agent_provisioning_receipts")
+        await connection.execute("DROP TABLE canonical_rebuild_agent_provisioning_operations")
+
     async def reset(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
             existing_tables = {str(row[0]) for row in await cursor.fetchall()}

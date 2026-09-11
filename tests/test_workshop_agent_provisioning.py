@@ -30,6 +30,7 @@ from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
     WorkshopInternalAPIExecutionContext,
 )
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -372,6 +373,46 @@ async def test_committed_enablement_recovers_registration_after_store_reopen(
         assert runtime_pool.registered[0].channel_id == result.direct_channel_id
     finally:
         await reopened.close()
+
+
+async def test_completed_provisioning_survives_canonical_projection_rebuild(
+    tmp_path: Path,
+) -> None:
+    store, principal_id, dependencies, _runtime_pool, _settings = await _services(tmp_path)
+    request = _request()
+    request["runtime"] = {**request["runtime"], "workspace": str(tmp_path.resolve())}  # type: ignore[dict-item]
+    service = WorkshopAgentProvisioningService(*dependencies)  # type: ignore[arg-type]
+    try:
+        completed = await service.provision(principal_id, **request)
+        assert completed.status == "ready"
+
+        await store.rebuild_projection(CanonicalConversationProjection())
+
+        replayed = await service.provision(principal_id, **request)
+        assert replayed.status == "ready"
+        assert replayed.replayed is True
+        assert replayed.definition_id == completed.definition_id
+        assert replayed.revision_id == completed.revision_id
+        assert replayed.enablement_id == completed.enablement_id
+        assert replayed.direct_channel_id == completed.direct_channel_id
+        async with store.connection.execute(
+            "SELECT status, definition_id, revision_id, enablement_id, direct_channel_id, "
+            "(SELECT COUNT(*) FROM agent_provisioning_stage_receipts WHERE operation_id = ?) "
+            "FROM agent_provisioning_operations WHERE id = ?",
+            (completed.operation_id, completed.operation_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert tuple(row) == (
+            "ready",
+            str(completed.definition_id),
+            str(completed.revision_id),
+            str(completed.enablement_id),
+            str(completed.direct_channel_id),
+            10,
+        )
+    finally:
+        await store.close()
 
 
 async def test_late_failure_is_bounded_and_resumable(tmp_path: Path) -> None:
