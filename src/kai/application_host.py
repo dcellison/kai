@@ -19,6 +19,7 @@ from kai.backend_registry import (
 )
 from kai.config import Config, models_for_backend_policy
 from kai.pool import SubprocessPool
+from kai.workshop.agent_creation_options import WorkshopAgentCreationOptionsService
 from kai.workshop.agent_delegation import WorkshopAgentDelegationService
 from kai.workshop.agent_enablement import WorkshopAgentEnablementService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
@@ -209,6 +210,7 @@ class KaiCoreServices:
     client_preferences: WorkshopClientPreferenceService
     appearance_preferences: WorkshopAppearancePreferenceService
     human_avatars: WorkshopHumanAvatarService
+    agent_creation_options: WorkshopAgentCreationOptionsService
     agent_enablement: WorkshopAgentEnablementService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
@@ -480,6 +482,11 @@ class KaiApplicationHost:
                 self._internal_api_contexts,
                 runtime_pool,
             )
+            agent_creation_options = WorkshopAgentCreationOptionsService(
+                model_discovery_inventory,
+                model_catalogue,
+                runtime_pool,
+            )
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -538,6 +545,7 @@ class KaiApplicationHost:
                 channel_notification_policy=channel_notification_policy,
                 client_preferences=client_preferences,
                 appearance_preferences=appearance_preferences,
+                agent_creation_options=agent_creation_options,
                 agent_enablement=agent_enablement,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,

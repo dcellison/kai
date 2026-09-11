@@ -28,6 +28,7 @@ import {
   loadChannelMembers,
   loadChannelUnread,
   loadAgentDefinitions,
+  loadAgentCreationOptions,
   loadAgentEnablements,
   loadAgentCollaborationPolicy,
   loadAppearancePreferences,
@@ -273,6 +274,57 @@ function agentEnablementPayload(): Record<string, unknown> {
     conversation_started: false,
     owner_principal_id: "prn_00000000000000000000000000000001",
     owner_runtime_profile_id: runtimeProfileId,
+  };
+}
+
+function agentCreationOptionsPayload(): Record<string, unknown> {
+  return {
+    blockers: [],
+    principal_id: "prn_00000000000000000000000000000001",
+    ready: true,
+    runtimes: [
+      {
+        backends: [
+          {
+            backend: "claude",
+            blockers: [],
+            catalogue_stale: true,
+            catalogue_status: "unsupported",
+            current: true,
+            default_model: "claude-sonnet-4-5",
+            models: [
+              {
+                display_name: "Claude Sonnet 4.5",
+                model_id: "claude-sonnet-4-5",
+                retained: true,
+                selectable: false,
+                status: "not_advertised",
+              },
+            ],
+            option_id: "claude:anthropic",
+            provider: "anthropic",
+            readiness: "unverified",
+          },
+        ],
+        blockers: [],
+        current_backend_option_id: "claude:anthropic",
+        default_timeout_seconds: 300,
+        default_workspace: "/srv/workspaces/home",
+        display_name: "Daniel's runtime",
+        maximum_timeout_seconds: 1800,
+        minimum_timeout_seconds: 1,
+        ready: true,
+        runtime_profile_id: runtimeProfileId,
+        workspaces: [
+          {
+            available: true,
+            default: true,
+            name: "Home",
+            path: "/srv/workspaces/home",
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -2714,6 +2766,52 @@ describe("Workshop client API", () => {
       2,
       "/v1/client/agent-enablement",
       expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
+  it("loads strict principal-scoped agent creation options", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      creation_options: agentCreationOptionsPayload(),
+      version: 1,
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const options = await loadAgentCreationOptions("session-secret");
+
+    expect(options).toEqual(expect.objectContaining({
+      principalId: "prn_00000000000000000000000000000001",
+      ready: true,
+      runtimes: [expect.objectContaining({
+        currentBackendOptionId: "claude:anthropic",
+        defaultWorkspace: "/srv/workspaces/home",
+        runtimeProfileId,
+      })],
+    }));
+    expect(options.runtimes[0]?.backends[0]).toEqual(expect.objectContaining({
+      catalogueStatus: "unsupported",
+      defaultModel: "claude-sonnet-4-5",
+      readiness: "unverified",
+    }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/client/agents/creation-options",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
+  it("rejects malformed agent creation options", async () => {
+    const malformed = agentCreationOptionsPayload();
+    const runtimes = malformed.runtimes as Record<string, unknown>[];
+    const backends = runtimes[0]?.backends as Record<string, unknown>[];
+    if (backends[0]) {
+      backends[0].readiness = "maybe";
+    }
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      creation_options: malformed,
+      version: 1,
+    }), { status: 200 })));
+
+    await expect(loadAgentCreationOptions("session-secret")).rejects.toThrow(
+      "Kai returned unsupported agent creation options.",
     );
   });
 

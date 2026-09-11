@@ -67,6 +67,7 @@ from kai.config import (
 )
 from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
+from kai.workshop.agent_creation_options import WorkshopAgentCreationOptionsService
 from kai.workshop.agent_delegation import (
     AgentDelegationConflict,
     AgentDelegationDenied,
@@ -2180,6 +2181,7 @@ async def _register_workshop_client_api(
     channel_notification_policy: WorkshopChannelNotificationPolicyService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
+    agent_creation_options: WorkshopAgentCreationOptionsService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
@@ -2226,6 +2228,7 @@ async def _register_workshop_client_api(
             channel_notification_policy=channel_notification_policy,
             client_preferences=client_preferences,
             appearance_preferences=appearance_preferences,
+            agent_creation_options=agent_creation_options,
             agent_enablement=agent_enablement,
             human_avatars=human_avatars,
             collaboration_policy=collaboration_policy,
@@ -2317,6 +2320,7 @@ async def start(
             channel_notification_policy=getattr(core_services, "channel_notification_policy", None),
             client_preferences=getattr(core_services, "client_preferences", None),
             appearance_preferences=getattr(core_services, "appearance_preferences", None),
+            agent_creation_options=getattr(core_services, "agent_creation_options", None),
             agent_enablement=getattr(core_services, "agent_enablement", None),
             human_avatars=getattr(core_services, "human_avatars", None),
             collaboration_policy=getattr(core_services, "collaboration_policy", None),
