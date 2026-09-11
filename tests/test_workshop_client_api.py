@@ -170,6 +170,7 @@ from kai.workshop.settings_workspaces import (
     WorkshopSettingsWorkspaceConflict,
     WorkspaceConfigSnapshot,
     WorkspaceCreationResult,
+    WorkspaceDeletionResult,
     WorkspaceOption,
 )
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
@@ -304,6 +305,7 @@ class _SettingsWorkspaces:
     secondary_channel_id: ChannelId | None = None
     switched: list[str] = field(default_factory=list)
     created_workspaces: list[str] = field(default_factory=list)
+    deleted_workspaces: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
     runtime_changes: list[tuple[str, object]] = field(default_factory=list)
     catalogue_calls: list[tuple[str, str | None]] = field(default_factory=list)
@@ -409,6 +411,24 @@ class _SettingsWorkspaces:
             git_ready=True,
             memory_project_registered=True,
             memory_project_note=(f"Registered memory project '{name.lower().replace(' ', '-')}' for this workspace."),
+        )
+
+    async def delete_workspace(
+        self,
+        _authority,
+        name: str,
+        confirmation: str,
+        *,
+        expected_revision=None,
+    ):
+        self._check_revision(expected_revision, "sws_current")
+        assert confirmation == name
+        self.deleted_workspaces.append(name)
+        return WorkspaceDeletionResult(
+            snapshot=self._snapshot(),
+            path=f"/srv/home/workspaces/{name}",
+            directory_deleted=True,
+            memory_project_unregistered=name.lower(),
         )
 
     async def set_model(
@@ -4341,6 +4361,43 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert (await malformed.json())["error"]["code"] == "invalid_request"
             assert foreign.status == 403
             assert service.created_workspaces == ["Research Notes"]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_owner_deletes_workspace_with_exact_confirmation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            settings_workspaces=service,
+        )
+        try:
+            response = await client.delete(
+                f"/v1/channels/{alice_channel}/workspaces",
+                headers={
+                    "Authorization": "Bearer alice-token",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "name": "qualification-1520",
+                    "confirmation": "qualification-1520",
+                    "revision": "sws_current",
+                },
+            )
+
+            assert response.status == 200
+            payload = await response.json()
+            assert payload["deletion"] == {
+                "path": "/srv/home/workspaces/qualification-1520",
+                "directory_deleted": True,
+                "memory_project_unregistered": "qualification-1520",
+            }
+            assert service.deleted_workspaces == ["qualification-1520"]
         finally:
             await client.close()
             await store.close()

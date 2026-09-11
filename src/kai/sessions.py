@@ -1977,6 +1977,46 @@ async def delete_canonical_workspace_history(
     await _get_db().commit()
 
 
+async def canonical_workspace_active_references(principal_id: str, path: str) -> int:
+    """Count the principal-owned runtime lanes currently selecting a workspace."""
+    async with _get_db().execute(
+        "SELECT COUNT(*) AS count FROM channel_agent_execution_settings s "
+        "JOIN runtime_profile_owners o ON o.runtime_profile_id = s.runtime_profile_id "
+        "WHERE o.principal_id = ? AND s.field = 'workspace' AND s.value = ?",
+        (principal_id, path),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return int(row["count"]) if row is not None else 0
+
+
+async def delete_canonical_workspace_state(
+    namespace: WorkshopExecutionStateNamespace,
+    path: str,
+) -> None:
+    """Remove one principal's grant, history, and owned-lane overrides."""
+    db = _get_db()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        await db.execute(
+            "DELETE FROM channel_agent_workspace_settings WHERE workspace_path = ? "
+            "AND runtime_profile_id IN (SELECT runtime_profile_id FROM runtime_profile_owners "
+            "WHERE principal_id = ?)",
+            (path, namespace.principal_id),
+        )
+        await db.execute(
+            "DELETE FROM principal_workspace_history WHERE principal_id = ? AND path = ?",
+            (namespace.principal_id, path),
+        )
+        await db.execute(
+            "DELETE FROM principal_workspace_grants WHERE principal_id = ? AND path = ?",
+            (namespace.principal_id, path),
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
 # ── Memory project registry (DB layer) ─────────────────────────────
 # User-registered memory projects. The in-memory merge with the
 # operator-pinned YAML registry lives in kai.memory_projects; these

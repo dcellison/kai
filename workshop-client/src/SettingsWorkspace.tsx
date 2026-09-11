@@ -12,6 +12,7 @@ import {
   AuthenticationError,
   ChannelAccessError,
   createWorkspace,
+  deleteWorkspace,
   deactivateOperatorModel,
   clearHumanAvatar,
   loadAppearancePreferences,
@@ -111,6 +112,14 @@ function WorkspaceAddIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24">
       <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
+function WorkspaceDeleteIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path d="M5 7h14M9 7V4h6v3m2 0-1 13H8L7 7m3 4v5m4-5v5" />
     </svg>
   );
 }
@@ -319,6 +328,11 @@ function SettingsWorkspaceContent({
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspaceCreationBusy, setWorkspaceCreationBusy] = useState(false);
   const [workspaceCreationError, setWorkspaceCreationError] = useState<string | null>(null);
+  const [workspaceDeletionOpen, setWorkspaceDeletionOpen] = useState(false);
+  const [workspaceDeletionName, setWorkspaceDeletionName] = useState("");
+  const [workspaceDeletionConfirmation, setWorkspaceDeletionConfirmation] = useState("");
+  const [workspaceDeletionBusy, setWorkspaceDeletionBusy] = useState(false);
+  const [workspaceDeletionError, setWorkspaceDeletionError] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -1257,6 +1271,49 @@ function SettingsWorkspaceContent({
     }
   };
 
+  const removeWorkspace = async (): Promise<void> => {
+    if (
+      !runtime ||
+      workspaceDeletionBusy ||
+      !workspaceDeletionName ||
+      workspaceDeletionConfirmation !== workspaceDeletionName
+    ) {
+      return;
+    }
+    setWorkspaceDeletionBusy(true);
+    setWorkspaceDeletionError(null);
+    setRuntimeError(null);
+    setRuntimeNotice(null);
+    try {
+      const deleted = await deleteWorkspace(
+        session,
+        workspaceDeletionName,
+        workspaceDeletionConfirmation,
+        runtime.revision,
+      );
+      adoptRuntime(deleted.settings);
+      setRuntimeNotice(
+        deleted.directoryDeleted
+          ? `Workspace ${workspaceDeletionName} was permanently deleted.`
+          : `Workspace ${workspaceDeletionName} was already absent; its Kai records were cleaned.`,
+      );
+      setWorkspaceDeletionOpen(false);
+      setWorkspaceDeletionName("");
+      setWorkspaceDeletionConfirmation("");
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshRuntime();
+        setWorkspaceDeletionError(
+          "Workspace settings changed elsewhere. The latest state has been reloaded.",
+        );
+      } else if (!handleAccessFailure(caught)) {
+        setWorkspaceDeletionError(errorText(caught, "Could not delete workspace."));
+      }
+    } finally {
+      setWorkspaceDeletionBusy(false);
+    }
+  };
+
   const runtimeBackendCapability = runtime
     ? capability(runtime.capabilities, "backend")
     : null;
@@ -1857,6 +1914,24 @@ function SettingsWorkspaceContent({
               >
                 <WorkspaceAddIcon />
               </button>
+              {runtime.workspaces.some((item) => item.deletable) && (
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label="Delete workspace"
+                  title="Delete workspace"
+                  disabled={runtimeBusy}
+                  onClick={() => {
+                    const first = runtime.workspaces.find((item) => item.deletable);
+                    setWorkspaceDeletionName(first?.name ?? "");
+                    setWorkspaceDeletionConfirmation("");
+                    setWorkspaceDeletionError(null);
+                    setWorkspaceDeletionOpen(true);
+                  }}
+                >
+                  <WorkspaceDeleteIcon />
+                </button>
+              )}
             </div>
             <div className="settings-card-stack workspace-overrides">
               <div className="settings-card-columns">
@@ -1942,6 +2017,81 @@ function SettingsWorkspaceContent({
                     disabled={workspaceCreationBusy || !workspaceName.trim()}
                   >
                     {workspaceCreationBusy ? "Creating…" : "Create workspace"}
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
+        {workspaceDeletionOpen && runtime && (
+          <div className="modal-backdrop" role="presentation">
+            <section
+              className="channel-creation-dialog workspace-creation-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="delete-workspace-title"
+            >
+              <header className="workspace-creation-header">
+                <div>
+                  <p className="overline">Permanent deletion</p>
+                  <h2 id="delete-workspace-title">Delete workspace</h2>
+                </div>
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label="Close workspace deletion"
+                  title="Close workspace deletion"
+                  disabled={workspaceDeletionBusy}
+                  onClick={() => {
+                    setWorkspaceDeletionOpen(false);
+                    setWorkspaceDeletionError(null);
+                    setWorkspaceDeletionConfirmation("");
+                  }}
+                >
+                  <span aria-hidden="true">×</span>
+                </button>
+              </header>
+              <p>This permanently deletes the workspace directory and removes it from Kai.</p>
+              <form onSubmit={(event) => { event.preventDefault(); void removeWorkspace(); }}>
+                <label htmlFor="workspace-delete-name">Workspace</label>
+                <select
+                  id="workspace-delete-name"
+                  value={workspaceDeletionName}
+                  disabled={workspaceDeletionBusy}
+                  onChange={(event) => {
+                    setWorkspaceDeletionName(event.target.value);
+                    setWorkspaceDeletionConfirmation("");
+                  }}
+                >
+                  {runtime.workspaces.filter((item) => item.deletable).map((item) => (
+                    <option key={item.path} value={item.name}>{item.name}</option>
+                  ))}
+                </select>
+                <label htmlFor="workspace-delete-confirmation">
+                  Type <strong>{workspaceDeletionName}</strong> to confirm
+                </label>
+                <input
+                  id="workspace-delete-confirmation"
+                  type="text"
+                  autoFocus
+                  value={workspaceDeletionConfirmation}
+                  disabled={workspaceDeletionBusy}
+                  onChange={(event) => setWorkspaceDeletionConfirmation(event.target.value)}
+                />
+                {workspaceDeletionError && (
+                  <p className="form-error" role="alert">{workspaceDeletionError}</p>
+                )}
+                <div className="form-actions">
+                  <button
+                    className="danger-button"
+                    type="submit"
+                    disabled={
+                      workspaceDeletionBusy ||
+                      !workspaceDeletionName ||
+                      workspaceDeletionConfirmation !== workspaceDeletionName
+                    }
+                  >
+                    {workspaceDeletionBusy ? "Deleting…" : "Delete permanently"}
                   </button>
                 </div>
               </form>

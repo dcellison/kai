@@ -16,6 +16,7 @@ import {
   advanceThreadReadPosition,
   createChannel,
   createWorkspace,
+  deleteWorkspace,
   createAgentDefinition,
   provisionAgent,
   createMemoryFact,
@@ -1259,6 +1260,38 @@ describe("Workshop client API", () => {
     );
     expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
       name: "Research Notes",
+      revision: "sws_current",
+    });
+  });
+
+  it("deletes a workspace only with its exact confirmation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        ...settingsPayload(),
+        deletion: {
+          path: "/srv/home/workspaces/qualification-1520",
+          directory_deleted: true,
+          memory_project_unregistered: "qualification-1520",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      deleteWorkspace(
+        session,
+        "qualification-1520",
+        "qualification-1520",
+        "sws_current",
+      ),
+    ).resolves.toMatchObject({
+      directoryDeleted: true,
+      memoryProjectUnregistered: "qualification-1520",
+    });
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "DELETE" });
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      name: "qualification-1520",
+      confirmation: "qualification-1520",
       revision: "sws_current",
     });
   });

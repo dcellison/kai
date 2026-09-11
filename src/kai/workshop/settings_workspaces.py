@@ -33,6 +33,8 @@ from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workshop.workspace_provisioning import (
     WorkspaceProvisioningError,
+    delete_via_helper,
+    delete_workspace,
     provision_via_helper,
     provision_workspace,
 )
@@ -145,6 +147,7 @@ class WorkspaceOption:
     name: str
     current: bool
     home: bool
+    deletable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +178,14 @@ class WorkspaceCreationResult:
     git_ready: bool
     memory_project_registered: bool
     memory_project_note: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceDeletionResult:
+    snapshot: SettingsWorkspaceSnapshot
+    path: str
+    directory_deleted: bool
+    memory_project_unregistered: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +413,14 @@ class WorkshopSettingsWorkspaceService:
         home_resolved = home.resolve()
         base, allowed = await self._runtime_pool.resolve_workspace_access(runtime)
         history = await sessions.get_canonical_workspace_history(namespace)
+        try:
+            grants = set(await sessions.get_canonical_workspace_grants(namespace))
+        except RuntimeError as exc:
+            # Isolated service tests use an injected runtime pool without
+            # initializing the process-global sessions database.
+            if "Database not initialized" not in str(exc):
+                raise
+            grants = set()
         candidates: list[Path] = [home, workspace, *allowed]
         candidates.extend(Path(str(item["path"])) for item in history)
         seen: set[Path] = set()
@@ -423,6 +442,13 @@ class WorkshopSettingsWorkspaceService:
                     name=self._workspace_name(resolved, base, home_resolved),
                     current=resolved == workspace.resolve(),
                     home=resolved == home_resolved,
+                    deletable=(
+                        base is not None
+                        and resolved.parent == base.resolve()
+                        and resolved in {item.resolve() for item in grants}
+                        and resolved != workspace.resolve()
+                        and resolved != home_resolved
+                    ),
                 )
             )
 
@@ -821,6 +847,94 @@ class WorkshopSettingsWorkspaceService:
                 git_ready=git_ready,
                 memory_project_registered=memory_project_registered,
                 memory_project_note=memory_project_note,
+            )
+
+    async def delete_workspace(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        name: str,
+        confirmation: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> WorkspaceDeletionResult:
+        workspace_name = self._validate_workspace_name(name)
+        if confirmation != workspace_name:
+            raise WorkshopSettingsWorkspaceValidationError("Type the exact workspace name to confirm deletion")
+        async with self._lock(authority):
+            current = await self._inspect_locked(authority)
+            self._check_revision(current.revision, expected_revision)
+            runtime_authority = self._runtime_authority(authority)
+            if self._runtime_pool.requester_workspace_is_in_flight(runtime_authority):
+                raise WorkshopSettingsWorkspaceBusy(
+                    "A workspace cannot be deleted while this conversation has an active run"
+                )
+            workspace_base, _allowed = await self._runtime_pool.resolve_workspace_access(runtime_authority)
+            if workspace_base is None:
+                raise WorkshopSettingsWorkspaceValidationError("No workspace base is configured for this runtime")
+            base = workspace_base.resolve()
+            target = base / workspace_name
+            if target.parent != base:
+                raise WorkshopSettingsWorkspaceValidationError("Invalid workspace name")
+            target_resolved = target.resolve(strict=False)
+            if target_resolved != target or target.is_symlink():
+                raise WorkshopSettingsWorkspaceValidationError("The workspace target is invalid")
+            home = self._runtime_pool.get_home_workspace(runtime_authority).resolve()
+            active = Path(current.workspace).resolve()
+            if target_resolved in {home, active}:
+                raise WorkshopSettingsWorkspaceValidationError("The active or home workspace cannot be deleted")
+            namespace = self._namespace(authority)
+            grants = {item.resolve() for item in await sessions.get_canonical_workspace_grants(namespace)}
+            if target.exists() and target_resolved not in grants:
+                raise WorkshopSettingsWorkspaceAccessDenied(
+                    "Only a principal-owned workspace created or added through Kai can be deleted"
+                )
+            if await sessions.canonical_workspace_active_references(str(authority.principal_id), str(target_resolved)):
+                raise WorkshopSettingsWorkspaceBusy("Another agent runtime is currently using this workspace")
+            profile = self._runtime_pool.runtime_profile(runtime_authority)
+            try:
+                if self._config.protected_install and profile.os_user is not None:
+                    deleted = await asyncio.to_thread(
+                        delete_via_helper,
+                        authority.runtime_profile_id,
+                        workspace_name,
+                    )
+                else:
+                    deleted = await asyncio.to_thread(
+                        delete_workspace,
+                        base,
+                        workspace_name,
+                        os_user=profile.os_user,
+                    )
+            except WorkspaceProvisioningError as exc:
+                raise WorkshopSettingsWorkspaceValidationError(str(exc)) from exc
+            if Path(deleted.path) != target_resolved:
+                raise WorkshopSettingsWorkspaceConsistencyError(
+                    "Workspace deletion returned a path outside the configured workspace base"
+                )
+            await sessions.delete_canonical_workspace_state(namespace, str(target_resolved))
+            creator_runtime_key = self._runtime_pool.legacy_runtime_key(authority.runtime_profile_id)
+            memory_project_unregistered = None
+            if creator_runtime_key is not None:
+                from kai.memory_projects import unregister_workspace_memory_project
+
+                memory_project_unregistered = await unregister_workspace_memory_project(
+                    target_resolved,
+                    creator_runtime_key,
+                )
+            snapshot = await self._inspect_locked(
+                authority,
+                mutation=SettingsMutationOutcome(
+                    operation="delete_workspace",
+                    changed=deleted.directory_deleted,
+                    runtime_action="unchanged",
+                    provider_session_invalidated=False,
+                ),
+            )
+            return WorkspaceDeletionResult(
+                snapshot=snapshot,
+                path=str(target_resolved),
+                directory_deleted=deleted.directory_deleted,
+                memory_project_unregistered=memory_project_unregistered,
             )
 
     async def workspace_config(

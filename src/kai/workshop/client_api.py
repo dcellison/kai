@@ -441,6 +441,7 @@ _MODEL_CATALOGUE_REFRESH_FIELDS = frozenset({"option_id"})
 _MODEL_CATALOGUE_OPERATOR_FIELDS = frozenset({"option_id", "model_id", "display_label"})
 _WORKSPACE_REQUEST_FIELDS = frozenset({"path", "revision"})
 _WORKSPACE_CREATION_REQUEST_FIELDS = frozenset({"name", "revision"})
+_WORKSPACE_DELETION_REQUEST_FIELDS = frozenset({"name", "confirmation", "revision"})
 _MAX_WORKSPACE_CREATION_BODY_BYTES = 2_048
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
@@ -600,6 +601,7 @@ def _serialize_settings_workspace(
                 "name": option.name,
                 "current": option.current,
                 "home": option.home,
+                "deletable": option.deletable,
             }
             for option in snapshot.workspaces
         ],
@@ -3880,6 +3882,63 @@ async def _handle_workspace_creation(
         "memory_project_note": result.memory_project_note,
     }
     return _json_response(response_payload, status=201 if result.directory_created else 200)
+
+
+async def _handle_workspace_deletion(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace deletion request")
+    if request.content_length is not None and request.content_length > _MAX_WORKSPACE_CREATION_BODY_BYTES:
+        return _error_response(status=400, code="invalid_request", message="Workspace deletion request is too large")
+    raw = await request.content.read(_MAX_WORKSPACE_CREATION_BODY_BYTES + 1)
+    try:
+        payload = json.loads(raw) if len(raw) <= _MAX_WORKSPACE_CREATION_BODY_BYTES else None
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _WORKSPACE_DELETION_REQUEST_FIELDS
+        or not isinstance(payload.get("name"), str)
+        or not isinstance(payload.get("confirmation"), str)
+        or not isinstance(payload.get("revision"), str)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace deletion request")
+    try:
+        result = await service.delete_workspace(
+            authority,
+            payload["name"],
+            payload["confirmation"],
+            expected_revision=payload["revision"],
+        )
+    except WorkshopSettingsWorkspaceBusy as exc:
+        return _error_response(status=409, code="runtime_busy", message=str(exc))
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_workspace", message=str(exc))
+    response_payload = _serialize_settings_workspace(result.snapshot)
+    response_payload["deletion"] = {
+        "path": result.path,
+        "directory_deleted": result.directory_deleted,
+        "memory_project_unregistered": result.memory_project_unregistered,
+    }
+    return _json_response(response_payload, status=200)
 
 
 async def _handle_workspace_config(
@@ -9045,6 +9104,14 @@ def register_workshop_read_routes(
                     service=settings_workspaces,
                 )
 
+        async def handle_workspace_deletion(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_workspace_deletion(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
         async def handle_workspace_config(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_workspace_config(
@@ -9082,6 +9149,7 @@ def register_workshop_read_routes(
         )
         app.router.add_post(_ACTIVE_WORKSPACE_PATH, handle_active_workspace_update)
         app.router.add_post(_WORKSPACE_COLLECTION_PATH, handle_workspace_creation)
+        app.router.add_delete(_WORKSPACE_COLLECTION_PATH, handle_workspace_deletion)
         app.router.add_get(_WORKSPACE_CONFIG_PATH, handle_workspace_config)
         app.router.add_patch(
             _WORKSPACE_CONFIG_PATH,

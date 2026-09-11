@@ -107,6 +107,7 @@ from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
     SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceBusy,
     WorkshopSettingsWorkspaceConflict,
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
@@ -2792,6 +2793,7 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         /workspace home           - switch to home workspace
         /workspace <name>         - switch by name (workspace_base, then allowed list)
         /workspace new <name>     - create a new workspace with git init
+        /workspace delete <name> confirm <name> - permanently delete a workspace
         /workspace allow <path>   - add an allowed workspace path
         /workspace deny <path>    - remove an allowed workspace path
         /workspace allowed        - list all allowed workspaces with sources
@@ -2836,6 +2838,39 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     if target_lower == "allowed":
         await _handle_workspace_allowed(update, context)
+        return
+
+    if target_lower == "delete" or target_lower.startswith("delete "):
+        parts = target.split()
+        if len(parts) != 4 or parts[2].lower() != "confirm" or parts[1] != parts[3]:
+            await update.message.reply_text(
+                "Usage: /workspace delete <name> confirm <name>\n"
+                "Repeat the exact workspace name after 'confirm'. This permanently deletes its files."
+            )
+            return
+        authority = _canonical_settings_authority(context, chat_id)
+        if authority is None:
+            await update.message.reply_text("Workspace deletion requires canonical runtime authority.")
+            return
+        try:
+            result = await _get_core_services(context).settings_workspaces.delete_workspace(
+                authority,
+                parts[1],
+                parts[3],
+            )
+        except WorkshopSettingsWorkspaceBusy as exc:
+            await update.message.reply_text(str(exc))
+            return
+        except WorkshopSettingsWorkspaceAccessDenied:
+            await update.message.reply_text("Only a workspace you created or added through Kai can be deleted.")
+            return
+        except WorkshopSettingsWorkspaceValidationError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        if result.directory_deleted:
+            await update.message.reply_text(f"Workspace permanently deleted:\n{result.path}")
+        else:
+            await update.message.reply_text(f"Workspace was already absent; Kai records were cleaned:\n{result.path}")
         return
 
     # Reject absolute paths and ~ expansion for security
@@ -4341,6 +4376,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/workspace <name> - Switch by name\n"
         "/workspace home - Return to default\n"
         "/workspace new <name> - Create + git init + switch\n"
+        "/workspace delete <name> confirm <name> - Permanently delete a workspace\n"
         "/project - List memory projects\n"
         "/project register [name] - Register current workspace as a memory project\n"
         "/project unregister <name> - Remove a chat-registered project\n"
