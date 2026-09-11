@@ -73,6 +73,7 @@ from kai.workshop.agent_delegation import (
     AgentDelegationDenied,
 )
 from kai.workshop.agent_enablement import WorkshopAgentEnablementService
+from kai.workshop.agent_provisioning import WorkshopAgentProvisioningService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import MAX_ARTIFACT_BYTES, WorkshopArtifactService
 from kai.workshop.channel_notification_policy import WorkshopChannelNotificationPolicyService
@@ -2182,6 +2183,7 @@ async def _register_workshop_client_api(
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_creation_options: WorkshopAgentCreationOptionsService | None = None,
+    agent_provisioning: WorkshopAgentProvisioningService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
@@ -2229,6 +2231,7 @@ async def _register_workshop_client_api(
             client_preferences=client_preferences,
             appearance_preferences=appearance_preferences,
             agent_creation_options=agent_creation_options,
+            agent_provisioning=agent_provisioning,
             agent_enablement=agent_enablement,
             human_avatars=human_avatars,
             collaboration_policy=collaboration_policy,
@@ -2321,6 +2324,7 @@ async def start(
             client_preferences=getattr(core_services, "client_preferences", None),
             appearance_preferences=getattr(core_services, "appearance_preferences", None),
             agent_creation_options=getattr(core_services, "agent_creation_options", None),
+            agent_provisioning=getattr(core_services, "agent_provisioning", None),
             agent_enablement=getattr(core_services, "agent_enablement", None),
             human_avatars=getattr(core_services, "human_avatars", None),
             collaboration_policy=getattr(core_services, "collaboration_policy", None),

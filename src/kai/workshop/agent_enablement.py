@@ -650,6 +650,44 @@ class WorkshopAgentEnablementService:
             await connection.rollback()
             raise WorkshopAgentEnablementStorageError("Agent conversation could not be started") from exc
 
+    async def ensure_runtime_registered(
+        self,
+        principal_id: PrincipalId,
+        definition_id: AgentDefinitionId,
+    ) -> PrincipalAgentEnablement:
+        """Reconcile one committed enablement with the live runtime registries.
+
+        Enablement persistence deliberately commits before process-local runtime
+        registration.  A provisioning retry after interruption must therefore
+        be able to reconstruct the exact canonical lane without emitting new
+        lifecycle events or starting a conversation.
+        """
+        current = await self._snapshot(principal_id, definition_id)
+        if (
+            current.enablement_id is None
+            or current.lifecycle_state != "enabled"
+            or current.direct_channel_id is None
+            or current.runtime_profile_id is None
+        ):
+            raise WorkshopAgentEnablementConflict("Agent runtime lane is not enabled")
+        context = WorkshopInternalAPIExecutionContext(
+            principal_id,
+            current.direct_channel_id,
+            current.agent_id,
+            current.runtime_profile_id,
+        )
+        namespace = WorkshopExecutionStateNamespace(
+            context.principal_id,
+            context.channel_id,
+            context.agent_id,
+            context.runtime_profile_id,
+            None,
+        )
+        self._execution_state.register_lane(namespace)
+        self._internal_api_contexts.register_context(context)
+        self._runtime_pool.register_canonical_lane(context)
+        return current
+
     async def suspend_archived_definition(
         self,
         principal_id: PrincipalId,

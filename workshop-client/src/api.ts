@@ -63,6 +63,7 @@ import type {
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
   WorkshopAgentCreationOptions,
+  WorkshopAgentProvisioning,
   WorkshopCollaborationOperation,
   WorkshopCollaborationPolicy,
   WorkshopStandingParticipation,
@@ -97,6 +98,7 @@ import { isWorkshopThemeId } from "./theme";
 import {
   AGENT_PATTERN,
   AGENT_DEFINITION_PATTERN,
+  AGENT_PROVISIONING_PATTERN,
   AGENT_ENABLEMENT_PATTERN,
   AGENT_REVISION_PATTERN,
   ARTIFACT_PATTERN,
@@ -1164,6 +1166,75 @@ function parseAgentCreationOptions(value: unknown): WorkshopAgentCreationOptions
   };
 }
 
+function parseAgentProvisioning(value: unknown): WorkshopAgentProvisioning | null {
+  const statuses = ["draft", "needs_attention", "ready"];
+  const stages = [
+    "definition_created",
+    "revision_activated",
+    "enablement_created",
+    "runtime_registered",
+    "backend_selected",
+    "model_selected",
+    "workspace_selected",
+    "timeout_selected",
+    "collaboration_policy_set",
+    "ready",
+  ];
+  if (
+    !isRecord(value) ||
+    typeof value.operation_id !== "string" ||
+    !AGENT_PROVISIONING_PATTERN.test(value.operation_id) ||
+    typeof value.client_operation_id !== "string" ||
+    value.client_operation_id.length === 0 ||
+    typeof value.status !== "string" ||
+    !statuses.includes(value.status) ||
+    typeof value.replayed !== "boolean" ||
+    (value.definition_id !== null &&
+      (typeof value.definition_id !== "string" ||
+        !AGENT_DEFINITION_PATTERN.test(value.definition_id))) ||
+    (value.revision_id !== null &&
+      (typeof value.revision_id !== "string" ||
+        !AGENT_REVISION_PATTERN.test(value.revision_id))) ||
+    (value.agent_id !== null &&
+      (typeof value.agent_id !== "string" || !AGENT_PATTERN.test(value.agent_id))) ||
+    (value.enablement_id !== null &&
+      (typeof value.enablement_id !== "string" ||
+        !AGENT_ENABLEMENT_PATTERN.test(value.enablement_id))) ||
+    (value.direct_channel_id !== null &&
+      (typeof value.direct_channel_id !== "string" ||
+        !CHANNEL_PATTERN.test(value.direct_channel_id))) ||
+    typeof value.runtime_profile_id !== "string" ||
+    !RUNTIME_PROFILE_PATTERN.test(value.runtime_profile_id) ||
+    !Array.isArray(value.completed_stages) ||
+    value.completed_stages.some(
+      (stage) => typeof stage !== "string" || !stages.includes(stage),
+    ) ||
+    (value.next_stage !== null &&
+      (typeof value.next_stage !== "string" || !stages.includes(value.next_stage)))
+  ) {
+    return null;
+  }
+  const blockers = parseAgentCreationBlockers(value.blockers);
+  if (!blockers) {
+    return null;
+  }
+  return {
+    agentId: value.agent_id,
+    blockers,
+    clientOperationId: value.client_operation_id,
+    completedStages: value.completed_stages as string[],
+    definitionId: value.definition_id,
+    directChannelId: value.direct_channel_id,
+    enablementId: value.enablement_id,
+    nextStage: value.next_stage,
+    operationId: value.operation_id,
+    replayed: value.replayed,
+    revisionId: value.revision_id,
+    runtimeProfileId: value.runtime_profile_id,
+    status: value.status as WorkshopAgentProvisioning["status"],
+  };
+}
+
 async function agentMutation(
   token: string,
   path: string,
@@ -1250,6 +1321,74 @@ export async function loadAgentCreationOptions(
     throw new Error("Kai returned unsupported agent creation options.");
   }
   return options;
+}
+
+export interface AgentProvisioningInput {
+  allowedCollaborationOperations: WorkshopCollaborationOperation[];
+  avatar: string;
+  backendOptionId: string;
+  capabilities: WorkshopAgentCapability[];
+  clientOperationId: string;
+  collaborationOperations: WorkshopCollaborationOperation[];
+  description: string;
+  displayName: string;
+  handle: string;
+  instructions: string;
+  model: string;
+  purpose: string;
+  runtimeProfileId: string;
+  timeoutSeconds: number;
+  workspace: string;
+}
+
+export async function provisionAgent(
+  token: string,
+  input: AgentProvisioningInput,
+): Promise<WorkshopAgentProvisioning> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/agents/provision",
+    {
+      body: JSON.stringify({
+        client_operation_id: input.clientOperationId,
+        collaboration_policy: {
+          allowed_operations: input.allowedCollaborationOperations,
+        },
+        definition: {
+          description: input.description,
+          display_name: input.displayName,
+          handle: input.handle,
+          presentation: input.avatar.trim() ? { avatar: input.avatar.trim() } : {},
+        },
+        revision: {
+          capabilities: input.capabilities,
+          collaboration_operations: input.collaborationOperations,
+          instructions: input.instructions,
+          purpose: input.purpose,
+        },
+        runtime: {
+          backend_option_id: input.backendOptionId,
+          model: input.model,
+          runtime_profile_id: input.runtimeProfileId,
+          timeout_seconds: input.timeoutSeconds,
+          workspace: input.workspace,
+        },
+      }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not provision this agent."));
+  }
+  const provisioning = isRecord(payload) && payload.version === 1
+    ? parseAgentProvisioning(payload.provisioning)
+    : null;
+  if (!provisioning) {
+    throw new Error("Kai returned unsupported agent provisioning state.");
+  }
+  return provisioning;
 }
 
 export async function loadAgentEnablements(

@@ -42,6 +42,15 @@ from kai.workshop.agent_lifecycle import (
     WorkshopAgentLifecycleStorageError,
     WorkshopAgentLifecycleValidationError,
 )
+from kai.workshop.agent_provisioning import (
+    AgentProvisioningResult,
+    WorkshopAgentProvisioningAccessDenied,
+    WorkshopAgentProvisioningConflict,
+    WorkshopAgentProvisioningError,
+    WorkshopAgentProvisioningService,
+    WorkshopAgentProvisioningStorageError,
+    WorkshopAgentProvisioningValidationError,
+)
 from kai.workshop.appearance_preferences import (
     AppearancePreferenceAuthority,
     AppearancePreferenceSnapshot,
@@ -345,6 +354,7 @@ _WORKSHOP_HUMANS_PATH = "/v1/workshops/{workshop_id}/humans"
 _HUMAN_CONVERSATION_PATH = "/v1/workshops/{workshop_id}/humans/{principal_id}/conversation"
 _AGENT_DEFINITIONS_PATH = "/v1/client/agents"
 _AGENT_CREATION_OPTIONS_PATH = "/v1/client/agents/creation-options"
+_AGENT_PROVISIONING_PATH = "/v1/client/agents/provision"
 _AGENT_EVENTS_PATH = "/v1/client/agents/events"
 _AGENT_DEFINITION_PATH = "/v1/client/agents/{definition_id}"
 _AGENT_REVISIONS_PATH = "/v1/client/agents/{definition_id}/revisions"
@@ -483,6 +493,9 @@ _AGENT_ACTIVATION_FIELDS = frozenset({"idempotency_key", "expected_version", "re
 _AGENT_ARCHIVAL_FIELDS = frozenset({"idempotency_key", "expected_version"})
 _AGENT_COLLABORATION_POLICY_FIELDS = frozenset({"allowed_operations", "expected_policy_version", "client_operation_id"})
 _AGENT_COLLABORATION_REVOKE_FIELDS = frozenset({"client_operation_id"})
+_AGENT_PROVISIONING_FIELDS = frozenset(
+    {"client_operation_id", "definition", "revision", "runtime", "collaboration_policy"}
+)
 _MAX_AGENT_LIFECYCLE_BODY_BYTES = 32_768
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 _CLIENT_MESSAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -1149,6 +1162,24 @@ def _serialize_agent_creation_options(snapshot: AgentCreationOptions) -> dict[st
             }
             for runtime in snapshot.runtimes
         ],
+    }
+
+
+def _serialize_agent_provisioning(result: AgentProvisioningResult) -> dict[str, object]:
+    return {
+        "operation_id": str(result.operation_id),
+        "client_operation_id": result.client_operation_id,
+        "status": result.status,
+        "replayed": result.replayed,
+        "definition_id": str(result.definition_id) if result.definition_id is not None else None,
+        "revision_id": str(result.revision_id) if result.revision_id is not None else None,
+        "agent_id": str(result.agent_id) if result.agent_id is not None else None,
+        "enablement_id": str(result.enablement_id) if result.enablement_id is not None else None,
+        "direct_channel_id": (str(result.direct_channel_id) if result.direct_channel_id is not None else None),
+        "runtime_profile_id": str(result.runtime_profile_id),
+        "completed_stages": list(result.completed_stages),
+        "next_stage": result.next_stage,
+        "blockers": [{"code": blocker.code, "detail": blocker.detail} for blocker in result.blockers],
     }
 
 
@@ -5139,6 +5170,54 @@ async def _handle_agent_creation_options(
     )
 
 
+async def _handle_agent_provisioning(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentProvisioningService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    payload, error = await _read_agent_lifecycle_payload(
+        request,
+        _AGENT_PROVISIONING_FIELDS,
+    )
+    if error is not None:
+        return error
+    assert payload is not None
+    try:
+        result = await service.provision(principal_id, **payload)
+    except WorkshopAgentProvisioningAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopAgentProvisioningValidationError as exc:
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    except WorkshopAgentProvisioningConflict as exc:
+        return _error_response(
+            status=409,
+            code="agent_provisioning_conflict",
+            message=str(exc),
+        )
+    except WorkshopAgentProvisioningStorageError:
+        return _error_response(
+            status=503,
+            code="agent_provisioning_unavailable",
+            message="Agent provisioning is temporarily unavailable",
+        )
+    except WorkshopAgentProvisioningError:
+        return _error_response(
+            status=409,
+            code="agent_provisioning_conflict",
+            message="Agent provisioning conflicted with current state",
+        )
+    status = 201 if result.status == "ready" and not result.replayed else 200
+    return _json_response(
+        {"version": 1, "provisioning": _serialize_agent_provisioning(result)},
+        status=status,
+    )
+
+
 async def _handle_agent_definition_detail(
     request: web.Request,
     *,
@@ -7849,6 +7928,7 @@ def register_workshop_read_routes(
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
     agent_creation_options: WorkshopAgentCreationOptionsService | None = None,
+    agent_provisioning: WorkshopAgentProvisioningService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
@@ -8025,6 +8105,15 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=agent_creation_options,
+            )
+
+    async def handle_agent_provisioning(request: web.Request) -> web.Response:
+        assert agent_provisioning is not None
+        async with request_lock:
+            return await _handle_agent_provisioning(
+                request,
+                authenticator=authenticator,
+                service=agent_provisioning,
             )
 
     async def handle_agent_definition_detail(request: web.Request) -> web.Response:
@@ -8316,6 +8405,8 @@ def register_workshop_read_routes(
         app.router.add_post(_CHANNEL_STANDING_OBSERVATION_RESUME_PATH, handle_standing_observation_resume)
     if agent_creation_options is not None:
         app.router.add_get(_AGENT_CREATION_OPTIONS_PATH, handle_agent_creation_options)
+    if agent_provisioning is not None:
+        app.router.add_post(_AGENT_PROVISIONING_PATH, handle_agent_provisioning)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
     app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)
     app.router.add_get(_AGENT_EVENTS_PATH, handle_agent_event_stream)

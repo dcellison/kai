@@ -179,6 +179,10 @@ class AgentEnablementId(OpaqueId):
     prefix = "aen"
 
 
+class AgentProvisioningId(OpaqueId):
+    prefix = "apv"
+
+
 class RuntimeProfileId(OpaqueId):
     prefix = "rtp"
 

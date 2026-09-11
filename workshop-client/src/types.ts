@@ -1,6 +1,7 @@
 export const CHANNEL_PATTERN = /^chn_[0-9a-f]{32}$/;
 export const AGENT_PATTERN = /^agt_[0-9a-f]{32}$/;
 export const AGENT_DEFINITION_PATTERN = /^adf_[0-9a-f]{32}$/;
+export const AGENT_PROVISIONING_PATTERN = /^apv_[0-9a-f]{32}$/;
 export const AGENT_REVISION_PATTERN = /^adr_[0-9a-f]{32}$/;
 export const AGENT_ENABLEMENT_PATTERN = /^aen_[0-9a-f]{32}$/;
 export const PRINCIPAL_PATTERN = /^prn_[0-9a-f]{32}$/;
@@ -484,6 +485,22 @@ export interface WorkshopAgentCreationOptions {
   principalId: string;
   ready: boolean;
   runtimes: WorkshopAgentCreationRuntimeOption[];
+}
+
+export interface WorkshopAgentProvisioning {
+  agentId: string | null;
+  blockers: WorkshopAgentCreationBlocker[];
+  clientOperationId: string;
+  completedStages: string[];
+  definitionId: string | null;
+  directChannelId: string | null;
+  enablementId: string | null;
+  nextStage: string | null;
+  operationId: string;
+  replayed: boolean;
+  revisionId: string | null;
+  runtimeProfileId: string;
+  status: "draft" | "needs_attention" | "ready";
 }
 
 export interface WorkshopAgentChangeSignal {

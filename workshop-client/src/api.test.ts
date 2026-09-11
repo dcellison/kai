@@ -16,6 +16,7 @@ import {
   advanceThreadReadPosition,
   createChannel,
   createAgentDefinition,
+  provisionAgent,
   createMemoryFact,
   deleteMemories,
   deleteMemory,
@@ -325,6 +326,38 @@ function agentCreationOptionsPayload(): Record<string, unknown> {
         ],
       },
     ],
+  };
+}
+
+function agentProvisioningPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    agent_id: agentId,
+    blockers: [],
+    client_operation_id: "provision-builder-1",
+    completed_stages: [
+      "definition_created",
+      "revision_activated",
+      "enablement_created",
+      "runtime_registered",
+      "backend_selected",
+      "model_selected",
+      "workspace_selected",
+      "timeout_selected",
+      "collaboration_policy_set",
+      "ready",
+    ],
+    definition_id: agentDefinitionId,
+    direct_channel_id: channelId,
+    enablement_id: agentEnablementId,
+    next_stage: null,
+    operation_id: "apv_00000000000000000000000000000001",
+    replayed: false,
+    revision_id: agentRevisionId,
+    runtime_profile_id: runtimeProfileId,
+    status: "ready",
+    ...overrides,
   };
 }
 
@@ -2813,6 +2846,90 @@ describe("Workshop client API", () => {
     await expect(loadAgentCreationOptions("session-secret")).rejects.toThrow(
       "Kai returned unsupported agent creation options.",
     );
+  });
+
+  it("provisions an agent through the strict replay-safe contract", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      provisioning: agentProvisioningPayload(),
+      version: 1,
+    }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await provisionAgent("session-secret", {
+      allowedCollaborationOperations: ["context_read"],
+      avatar: "B",
+      backendOptionId: "claude:anthropic",
+      capabilities: ["text_generation"],
+      clientOperationId: "provision-builder-1",
+      collaborationOperations: ["context_read"],
+      description: "Builds things.",
+      displayName: "Builder",
+      handle: "builder",
+      instructions: "Work carefully.",
+      model: "claude-sonnet-4-5",
+      purpose: "Build bounded changes.",
+      runtimeProfileId,
+      timeoutSeconds: 300,
+      workspace: "/srv/workspaces/home",
+    });
+
+    expect(result).toEqual(expect.objectContaining({
+      definitionId: agentDefinitionId,
+      operationId: "apv_00000000000000000000000000000001",
+      status: "ready",
+    }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/client/agents/provision",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
+      client_operation_id: "provision-builder-1",
+      collaboration_policy: { allowed_operations: ["context_read"] },
+      definition: {
+        description: "Builds things.",
+        display_name: "Builder",
+        handle: "builder",
+        presentation: { avatar: "B" },
+      },
+      revision: {
+        capabilities: ["text_generation"],
+        collaboration_operations: ["context_read"],
+        instructions: "Work carefully.",
+        purpose: "Build bounded changes.",
+      },
+      runtime: {
+        backend_option_id: "claude:anthropic",
+        model: "claude-sonnet-4-5",
+        runtime_profile_id: runtimeProfileId,
+        timeout_seconds: 300,
+        workspace: "/srv/workspaces/home",
+      },
+    });
+  });
+
+  it("rejects unsupported agent provisioning state", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      provisioning: agentProvisioningPayload({ completed_stages: ["unknown"] }),
+      version: 1,
+    }), { status: 200 })));
+
+    await expect(provisionAgent("session-secret", {
+      allowedCollaborationOperations: [],
+      avatar: "",
+      backendOptionId: "claude:anthropic",
+      capabilities: ["text_generation"],
+      clientOperationId: "provision-builder-1",
+      collaborationOperations: [],
+      description: "Builds things.",
+      displayName: "Builder",
+      handle: "builder",
+      instructions: "Work carefully.",
+      model: "claude-sonnet-4-5",
+      purpose: "Build bounded changes.",
+      runtimeProfileId,
+      timeoutSeconds: 300,
+      workspace: "/srv/workspaces/home",
+    })).rejects.toThrow("Kai returned unsupported agent provisioning state.");
   });
 
   it("uses versioned agent lifecycle and enablement mutation contracts", async () => {

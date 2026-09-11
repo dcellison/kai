@@ -22,6 +22,7 @@ from kai.workshop.agent_creation_options import (
     AgentCreationWorkspaceOption,
 )
 from kai.workshop.agent_enablement import EligibleAgentRuntime, PrincipalAgentEnablement
+from kai.workshop.agent_provisioning import AgentProvisioningResult
 from kai.workshop.appearance_preferences import (
     WORKSHOP_APPEARANCE_THEMES,
     WorkshopAppearancePreferenceService,
@@ -74,7 +75,10 @@ from kai.workshop.diagnostics import (
 )
 from kai.workshop.domain import (
     AgentDefinitionId,
+    AgentDefinitionRevisionId,
+    AgentEnablementId,
     AgentId,
+    AgentProvisioningId,
     ChannelId,
     ChannelMembershipId,
     EventEnvelope,
@@ -175,6 +179,18 @@ from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
+_AGENT_PROVISIONING_STAGES_FOR_TEST = (
+    "definition_created",
+    "revision_activated",
+    "enablement_created",
+    "runtime_registered",
+    "backend_selected",
+    "model_selected",
+    "workspace_selected",
+    "timeout_selected",
+    "collaboration_policy_set",
+    "ready",
+)
 
 
 @dataclass
@@ -822,6 +838,31 @@ class _AgentCreationOptions:
         )
 
 
+@dataclass
+class _AgentProvisioning:
+    principal_id: PrincipalId
+    calls: list[tuple[PrincipalId, dict[str, object]]] = field(default_factory=list)
+
+    async def provision(self, principal_id: PrincipalId, **payload) -> AgentProvisioningResult:
+        assert principal_id == self.principal_id
+        self.calls.append((principal_id, payload))
+        return AgentProvisioningResult(
+            AgentProvisioningId("apv_" + "1" * 32),
+            str(payload["client_operation_id"]),
+            "ready",
+            False,
+            AgentDefinitionId("adf_" + "2" * 32),
+            AgentDefinitionRevisionId("adr_" + "3" * 32),
+            AgentId("agt_" + "4" * 32),
+            AgentEnablementId("aen_" + "5" * 32),
+            ChannelId("chn_" + "6" * 32),
+            profile_id(101),
+            _AGENT_PROVISIONING_STAGES_FOR_TEST,
+            None,
+            (),
+        )
+
+
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
         "SELECT e.principal_id, b.channel_id FROM external_identities e "
@@ -949,6 +990,7 @@ async def _open_client(
     client_preferences=None,
     appearance_preferences=None,
     agent_creation_options=None,
+    agent_provisioning=None,
     agent_enablement=None,
     human_avatars=None,
     collaboration_policy=None,
@@ -975,6 +1017,7 @@ async def _open_client(
         client_preferences=client_preferences,
         appearance_preferences=appearance_preferences,
         agent_creation_options=agent_creation_options,
+        agent_provisioning=agent_provisioning,
         agent_enablement=agent_enablement,
         human_avatars=human_avatars,
         collaboration_policy=collaboration_policy,
@@ -2658,6 +2701,77 @@ class TestWorkshopAgentEnablementHTTPContract:
             )
             assert selector.status == 400
             assert service.calls == [alice_id]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_provisioning_is_authenticated_and_uses_one_strict_operation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _AgentProvisioning(alice_id)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id}),
+            agent_provisioning=service,
+        )
+        payload = {
+            "client_operation_id": "provision-builder-1",
+            "definition": {
+                "handle": "builder",
+                "display_name": "Builder",
+                "description": "Builds things.",
+                "presentation": {"avatar": "B"},
+            },
+            "revision": {
+                "purpose": "Build bounded changes.",
+                "instructions": "Work carefully.",
+                "capabilities": ["text_generation"],
+                "collaboration_operations": [],
+            },
+            "runtime": {
+                "runtime_profile_id": str(profile_id(101)),
+                "backend_option_id": "claude:anthropic",
+                "model": "claude-sonnet-4-5",
+                "workspace": "/srv/daniel",
+                "timeout_seconds": 300,
+            },
+            "collaboration_policy": {"allowed_operations": []},
+        }
+        try:
+            unauthenticated = await client.post("/v1/client/agents/provision", json=payload)
+            assert unauthenticated.status == 401
+            invalid = await client.post(
+                "/v1/client/agents/provision",
+                headers={"Authorization": "Bearer alice"},
+                json={**payload, "principal_id": str(alice_id)},
+            )
+            assert invalid.status == 400
+
+            response = await client.post(
+                "/v1/client/agents/provision",
+                headers={"Authorization": "Bearer alice"},
+                json=payload,
+            )
+            assert response.status == 201
+            body = await response.json()
+            assert body["provisioning"] == {
+                "operation_id": "apv_" + "1" * 32,
+                "client_operation_id": "provision-builder-1",
+                "status": "ready",
+                "replayed": False,
+                "definition_id": "adf_" + "2" * 32,
+                "revision_id": "adr_" + "3" * 32,
+                "agent_id": "agt_" + "4" * 32,
+                "enablement_id": "aen_" + "5" * 32,
+                "direct_channel_id": "chn_" + "6" * 32,
+                "runtime_profile_id": str(profile_id(101)),
+                "completed_stages": list(_AGENT_PROVISIONING_STAGES_FOR_TEST),
+                "next_stage": None,
+                "blockers": [],
+            }
+            assert service.calls == [(alice_id, payload)]
         finally:
             await client.close()
             await store.close()

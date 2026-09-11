@@ -103,6 +103,25 @@ class WorkshopCollaborationPolicyService:
         self._private_execution = private_execution
         self._host_policy: CollaborationHostPolicy = private_execution.collaboration_authority.host_policy
 
+    def validate_initial_allowed_operations(
+        self,
+        requested_operations: object,
+        allowed_operations: object,
+    ) -> tuple[str, ...]:
+        """Validate creation-time owner policy without requiring a definition."""
+        try:
+            requested = validate_collaboration_operations(requested_operations)
+            allowed = validate_collaboration_operations(allowed_operations)
+        except ValueError as exc:
+            raise WorkshopCollaborationPolicyValidationError(str(exc)) from exc
+        if not set(allowed).issubset(requested):
+            raise WorkshopCollaborationPolicyValidationError(
+                "Owner policy cannot allow operations not requested by Revision 1"
+            )
+        if any(CollaborationOperation(item) not in self._host_policy.effective_allowed_operations for item in allowed):
+            raise WorkshopCollaborationPolicyValidationError("Owner policy cannot exceed host policy")
+        return allowed
+
     async def inspect(
         self,
         principal_id: PrincipalId,

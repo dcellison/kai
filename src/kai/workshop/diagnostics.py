@@ -137,6 +137,25 @@ _AGENT_AUTHORITY_TABLES = {
     "runs",
     "workshop_memberships",
 }
+_AGENT_PROVISIONING_TABLES = {
+    "agent_provisioning_operations",
+    "agent_provisioning_stage_receipts",
+    "agent_definitions",
+    "agent_definition_revisions",
+    "principal_agent_enablements",
+}
+_AGENT_PROVISIONING_STAGES = (
+    "definition_created",
+    "revision_activated",
+    "enablement_created",
+    "runtime_registered",
+    "backend_selected",
+    "model_selected",
+    "workspace_selected",
+    "timeout_selected",
+    "collaboration_policy_set",
+    "ready",
+)
 _COLLABORATION_AUTHORITY_TABLES = {
     "agent_definition_revisions",
     "agent_definitions",
@@ -659,6 +678,153 @@ def workshop_agent_authority_status(db_path: Path) -> str:
         f"enablements={invalid_enablements}, "
         f"runtime bindings={unauthorized_runtime_bindings}, namespaces={namespace_conflicts}, "
         f"attachments={dangling_attachments}, delegations={delegation_gaps}); authority=canonical"
+    )
+
+
+def workshop_agent_provisioning_status(db_path: Path) -> str:
+    """Report replay-safe provisioning outcomes and receipt integrity."""
+    prefix = "Workshop agent provisioning:"
+    if not db_path.is_file():
+        return f"{prefix} pending; replay-safe schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _AGENT_PROVISIONING_TABLES:
+                return f"{prefix} pending; replay-safe schema unavailable"
+            operations = list(
+                connection.execute("SELECT * FROM agent_provisioning_operations ORDER BY created_at, id").fetchall()
+            )
+            receipts = list(
+                connection.execute(
+                    "SELECT operation_id, stage, details_json FROM agent_provisioning_stage_receipts"
+                ).fetchall()
+            )
+            intentional_drafts = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM agent_definitions d WHERE d.lifecycle_state = 'draft' "
+                "AND NOT EXISTS (SELECT 1 FROM agent_provisioning_operations operation "
+                "WHERE operation.definition_id = d.id)",
+            )
+            status_counts = {
+                status: sum(str(row["status"]) == status for row in operations)
+                for status in ("provisioning", "draft", "needs_attention", "ready")
+            }
+            receipt_map: dict[str, dict[str, str]] = {}
+            integrity_gaps = 0
+            for receipt in receipts:
+                stage = str(receipt["stage"])
+                try:
+                    details = json.loads(str(receipt["details_json"]))
+                except (TypeError, ValueError):
+                    details = None
+                if stage not in _AGENT_PROVISIONING_STAGES or not isinstance(details, dict):
+                    integrity_gaps += 1
+                receipt_map.setdefault(str(receipt["operation_id"]), {})[stage] = str(receipt["details_json"])
+            for operation in operations:
+                operation_id = str(operation["id"])
+                completed = set(receipt_map.get(operation_id, {}))
+                prefix_length = 0
+                for stage in _AGENT_PROVISIONING_STAGES:
+                    if stage not in completed:
+                        break
+                    prefix_length += 1
+                if completed != set(_AGENT_PROVISIONING_STAGES[:prefix_length]):
+                    integrity_gaps += 1
+                expected_next = (
+                    _AGENT_PROVISIONING_STAGES[prefix_length]
+                    if prefix_length < len(_AGENT_PROVISIONING_STAGES)
+                    else None
+                )
+                status = str(operation["status"])
+                if status == "ready":
+                    if expected_next is not None or operation["next_stage"] is not None:
+                        integrity_gaps += 1
+                    if operation["failure_code"] is not None or operation["failure_detail"] is not None:
+                        integrity_gaps += 1
+                else:
+                    if operation["next_stage"] != expected_next:
+                        integrity_gaps += 1
+                    has_failure = operation["failure_code"] is not None and operation["failure_detail"] is not None
+                    if (status in {"draft", "needs_attention"}) != has_failure:
+                        integrity_gaps += 1
+                request_json = str(operation["request_json"])
+                try:
+                    request = json.loads(request_json)
+                except (TypeError, ValueError):
+                    request = None
+                if (
+                    not isinstance(request, dict)
+                    or hashlib.sha256(request_json.encode()).hexdigest() != operation["request_hash"]
+                ):
+                    integrity_gaps += 1
+                if "definition_created" in completed:
+                    relationship = connection.execute(
+                        "SELECT COUNT(*) FROM agent_definitions d "
+                        "JOIN agent_definition_revisions r ON r.id = ? AND r.agent_definition_id = d.id "
+                        "WHERE d.id = ? AND d.agent_id = ? AND d.workshop_id = ? "
+                        "AND d.owner_principal_id = ?",
+                        (
+                            operation["revision_id"],
+                            operation["definition_id"],
+                            operation["agent_id"],
+                            operation["workshop_id"],
+                            operation["principal_id"],
+                        ),
+                    ).fetchone()
+                    if relationship is None or int(relationship[0]) != 1:
+                        integrity_gaps += 1
+                if "enablement_created" in completed:
+                    relationship = connection.execute(
+                        "SELECT COUNT(*) FROM principal_agent_enablements e "
+                        "WHERE e.id = ? AND e.agent_definition_id = ? AND e.agent_id = ? "
+                        "AND e.principal_id = ? AND e.runtime_profile_id = ? "
+                        "AND e.direct_channel_id = ?",
+                        (
+                            operation["enablement_id"],
+                            operation["definition_id"],
+                            operation["agent_id"],
+                            operation["principal_id"],
+                            operation["runtime_profile_id"],
+                            operation["direct_channel_id"],
+                        ),
+                    ).fetchone()
+                    if relationship is None or int(relationship[0]) != 1:
+                        integrity_gaps += 1
+                if status == "ready":
+                    relationship = connection.execute(
+                        "SELECT COUNT(*) FROM agent_definitions d "
+                        "JOIN principal_agent_enablements e ON e.id = ? "
+                        "AND e.agent_definition_id = d.id WHERE d.id = ? "
+                        "AND d.lifecycle_state = 'active' AND d.active_revision_id = ? "
+                        "AND e.lifecycle_state = 'enabled' "
+                        "AND d.owner_runtime_profile_id = e.runtime_profile_id "
+                        "AND d.owner_direct_channel_id = e.direct_channel_id",
+                        (
+                            operation["enablement_id"],
+                            operation["definition_id"],
+                            operation["revision_id"],
+                        ),
+                    ).fetchone()
+                    if relationship is None or int(relationship[0]) != 1:
+                        integrity_gaps += 1
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if integrity_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; operations={len(operations)} "
+        f"(ready={status_counts['ready']}, provisioning={status_counts['provisioning']}, "
+        f"draft={status_counts['draft']}, needs attention={status_counts['needs_attention']}), "
+        f"intentional drafts={intentional_drafts}, receipts={len(receipts)}, "
+        f"integrity gaps={integrity_gaps}; authority=canonical/replay-safe"
     )
 
 
