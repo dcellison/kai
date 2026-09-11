@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 75
+WORKSHOP_SCHEMA_VERSION = 76
 
 
 @dataclass(frozen=True, slots=True)
@@ -3339,6 +3339,76 @@ _RUN_KIND_SCOPED_IDENTITY_SCHEMA = SchemaMigration(
     statements=(),
 )
 
+
+_REPLAY_SAFE_AGENT_PROVISIONING_SCHEMA = SchemaMigration(
+    version=76,
+    name="replay_safe_agent_provisioning",
+    statements=(
+        """
+        CREATE TABLE agent_provisioning_operations (
+            id TEXT PRIMARY KEY,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            client_operation_id TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            request_json TEXT NOT NULL CHECK (
+                json_valid(request_json) AND json_type(request_json) = 'object'
+            ),
+            status TEXT NOT NULL CHECK (
+                status IN ('provisioning', 'draft', 'needs_attention', 'ready')
+            ),
+            next_stage TEXT,
+            failure_code TEXT,
+            failure_detail TEXT,
+            definition_id TEXT REFERENCES agent_definitions(id) ON DELETE RESTRICT,
+            revision_id TEXT REFERENCES agent_definition_revisions(id) ON DELETE RESTRICT,
+            definition_initial_version INTEGER CHECK (
+                definition_initial_version IS NULL OR definition_initial_version > 0
+            ),
+            agent_id TEXT REFERENCES agents(id) ON DELETE RESTRICT,
+            enablement_id TEXT REFERENCES principal_agent_enablements(id) ON DELETE RESTRICT,
+            direct_channel_id TEXT REFERENCES channels(id) ON DELETE RESTRICT,
+            runtime_profile_id TEXT NOT NULL,
+            backend_option_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            timeout_seconds INTEGER NOT NULL CHECK (timeout_seconds > 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (workshop_id, principal_id, client_operation_id),
+            CHECK (
+                (failure_code IS NULL AND failure_detail IS NULL)
+                OR (failure_code IS NOT NULL AND failure_detail IS NOT NULL)
+            )
+        )
+        """,
+        "CREATE INDEX agent_provisioning_operations_status_idx ON agent_provisioning_operations (status, updated_at)",
+        """
+        CREATE TABLE agent_provisioning_stage_receipts (
+            operation_id TEXT NOT NULL
+                REFERENCES agent_provisioning_operations(id) ON DELETE CASCADE,
+            stage TEXT NOT NULL CHECK (stage IN (
+                'definition_created',
+                'revision_activated',
+                'enablement_created',
+                'runtime_registered',
+                'backend_selected',
+                'model_selected',
+                'workspace_selected',
+                'timeout_selected',
+                'collaboration_policy_set',
+                'ready'
+            )),
+            details_json TEXT NOT NULL CHECK (
+                json_valid(details_json) AND json_type(details_json) = 'object'
+            ),
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (operation_id, stage)
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3415,6 +3485,7 @@ _MIGRATIONS = (
     _STANDING_OBSERVATION_INBOX_SCHEMA,
     _STANDING_OBSERVE_EXECUTION_SCHEMA,
     _RUN_KIND_SCOPED_IDENTITY_SCHEMA,
+    _REPLAY_SAFE_AGENT_PROVISIONING_SCHEMA,
 )
 
 

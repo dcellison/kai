@@ -22,6 +22,8 @@ from kai.pool import SubprocessPool
 from kai.workshop.agent_creation_options import WorkshopAgentCreationOptionsService
 from kai.workshop.agent_delegation import WorkshopAgentDelegationService
 from kai.workshop.agent_enablement import WorkshopAgentEnablementService
+from kai.workshop.agent_lifecycle import WorkshopAgentLifecycleService
+from kai.workshop.agent_provisioning import WorkshopAgentProvisioningService
 from kai.workshop.appearance_preferences import WorkshopAppearancePreferenceService
 from kai.workshop.artifacts import WorkshopArtifactService
 from kai.workshop.channel_notification_policy import WorkshopChannelNotificationPolicyService
@@ -212,6 +214,7 @@ class KaiCoreServices:
     human_avatars: WorkshopHumanAvatarService
     agent_creation_options: WorkshopAgentCreationOptionsService
     agent_enablement: WorkshopAgentEnablementService
+    agent_provisioning: WorkshopAgentProvisioningService
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
@@ -487,6 +490,14 @@ class KaiApplicationHost:
                 model_catalogue,
                 runtime_pool,
             )
+            agent_provisioning = WorkshopAgentProvisioningService(
+                client_store,
+                agent_creation_options,
+                WorkshopAgentLifecycleService(client_store),
+                agent_enablement,
+                settings_workspaces,
+                collaboration_policy,
+            )
             proactive_publication = WorkshopProactivePublicationService(
                 client_store,
                 artifacts,
@@ -547,6 +558,7 @@ class KaiApplicationHost:
                 appearance_preferences=appearance_preferences,
                 agent_creation_options=agent_creation_options,
                 agent_enablement=agent_enablement,
+                agent_provisioning=agent_provisioning,
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,

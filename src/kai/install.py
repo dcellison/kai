@@ -81,6 +81,7 @@ from kai.workshop.agent_enablement import initial_kai_enablement_ids
 from kai.workshop.bootstrap import bootstrap_human_principal_id
 from kai.workshop.diagnostics import (
     workshop_agent_authority_status,
+    workshop_agent_provisioning_status,
     workshop_appearance_preference_status,
     workshop_bootstrap_status,
     workshop_canonical_message_integrity_status,
@@ -9541,6 +9542,7 @@ def _cmd_status() -> None:
     )
     print(workshop_human_provisioning_status(Path(data_dir) / "kai.db"))
     print(workshop_agent_authority_status(Path(data_dir) / "kai.db"))
+    print(workshop_agent_provisioning_status(Path(data_dir) / "kai.db"))
     print(workshop_collaboration_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_standing_participation_status(Path(data_dir) / "kai.db"))
     print(workshop_standing_observation_status(Path(data_dir) / "kai.db"))
