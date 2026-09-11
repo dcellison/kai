@@ -195,7 +195,35 @@ class TestProtectedExecutionPreparation:
             assert runtime_pool.context.channel_id == scott_channel_id
             assert runtime_pool.context.runtime_owner_principal_id == daniel_id
             assert runtime_pool.context.runtime_profile_id == profile_id(101)
+            assert runtime_pool.context.effective_workspace_runtime_profile_id == profile_id(202)
             assert runtime_pool.context.effective_settings_channel_id == daniel_channel_id
+
+            await store.connection.execute(
+                "DELETE FROM channel_agent_runtime_assignments WHERE channel_id = ? AND agent_id = ?",
+                (scott_channel_id, prepared.run.agent_id),
+            )
+            await store.connection.commit()
+            missing_workspace_authority = await WorkshopConversationCommandService(store).accept(
+                InboundMessage(
+                    transport="telegram",
+                    update_id="shared-agent-scott-missing-workspace",
+                    message_id="shared-agent-scott-missing-workspace-message",
+                    sender_subject="202",
+                    channel_subject="202",
+                    body="Do not fall back to Daniel's workspace.",
+                    occurred_at=_NOW,
+                )
+            )
+            with pytest.raises(
+                ProtectedExecutionPreparationError,
+                match="no requester workspace authority",
+            ):
+                await WorkshopProtectedExecutionPreparationService(
+                    store,
+                    runtime_pool,  # type: ignore[arg-type]
+                    _RoutingPolicy(),  # type: ignore[arg-type]
+                    registered_backend_ids=frozenset({"codex"}),
+                ).prepare(missing_workspace_authority.run.run_id)
         finally:
             await store.close()
 

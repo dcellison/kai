@@ -1204,6 +1204,114 @@ class TestShutdown:
 
 class TestWorkspaceRestoration:
     @pytest.mark.asyncio
+    async def test_sponsored_private_runtime_uses_requester_workspace_policy(self, tmp_path):
+        owner_home = tmp_path / "owner-home"
+        owner_repo = tmp_path / "owner-repo"
+        requester_home = tmp_path / "requester-home"
+        requester_repo = tmp_path / "requester-repo"
+        for path in (owner_home, owner_repo, requester_home, requester_repo):
+            path.mkdir()
+        owner_profile_id = profile_id(111)
+        requester_profile_id = profile_id(222)
+        owner_context = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+            111,
+            owner_profile_id,
+        )
+        requester_principal_id = PrincipalId("prn_" + "2" * 32)
+        requester_channel_id = ChannelId("chn_" + "3" * 32)
+        context = WorkshopInternalAPIExecutionContext(
+            principal_id=requester_principal_id,
+            channel_id=requester_channel_id,
+            agent_id=AgentId("agt_" + "4" * 32),
+            runtime_profile_id=owner_profile_id,
+            private_context=True,
+            sponsor_principal_id=owner_context.principal_id,
+            settings_channel_id=owner_context.channel_id,
+            workspace_runtime_profile_id=requester_profile_id,
+        )
+        requester_authority = WorkshopInternalAPIExecutionContext(
+            principal_id=requester_principal_id,
+            channel_id=requester_channel_id,
+            agent_id=context.agent_id,
+            runtime_profile_id=requester_profile_id,
+        )
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=owner_profile_id,
+                    display_name="owner",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=owner_home,
+                    workspace_base=None,
+                    allowed_workspaces=(owner_repo,),
+                ),
+                ProtectedRuntimeProfile(
+                    profile_id=requester_profile_id,
+                    display_name="requester",
+                    os_user=None,
+                    backend="claude",
+                    provider="anthropic",
+                    model="sonnet",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=requester_home,
+                    workspace_base=None,
+                    allowed_workspaces=(requester_repo,),
+                ),
+            ),
+            legacy_runtime_keys={owner_profile_id: 111, requester_profile_id: 222},
+        )
+        pool = SubprocessPool(
+            config=_make_config(
+                workspace_configs={
+                    requester_home.resolve(): WorkspaceConfig(
+                        path=requester_home.resolve(),
+                        model="sonnet",
+                        timeout=7,
+                    ),
+                },
+            ),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry(
+                (owner_context, requester_authority),
+            ),
+        )
+
+        with patch(
+            "kai.pool.sessions.resolve_canonical_workspace_access",
+            new_callable=AsyncMock,
+            return_value=(None, [requester_repo]),
+        ) as resolve_access:
+            _, allowed = await pool.resolve_workspace_access(context)
+
+        assert pool.get_backend_provider(context) == ("codex", "openai")
+        assert pool.get_home_workspace(context) == requester_home
+        assert allowed == [requester_repo]
+        assert owner_repo not in allowed
+        namespace = resolve_access.await_args.args[0]
+        assert namespace.principal_id == requester_principal_id
+        assert namespace.channel_id == requester_channel_id
+        assert namespace.runtime_profile_id == requester_profile_id
+        assert resolve_access.await_args.kwargs["static_allowed_workspaces"] == (requester_repo,)
+
+        sponsored_instance = pool.get(context)
+        assert sponsored_instance.model == "gpt-5.6-sol"
+        assert sponsored_instance.timeout_seconds == 120
+        assert sponsored_instance.workspace_config is not None
+        assert sponsored_instance.workspace_config.model is None
+        assert sponsored_instance.workspace_config.timeout is None
+        sponsored_instance.shutdown = AsyncMock()
+        await pool.invalidate_requester_workspace_lanes(requester_authority)
+        sponsored_instance.shutdown.assert_awaited_once()
+        assert pool.get_if_exists(context) is None
+
+    @pytest.mark.asyncio
     async def test_restore_saved_workspace(self, tmp_path):
         """First send() restores saved workspace from database."""
         ws = tmp_path / "saved_ws"

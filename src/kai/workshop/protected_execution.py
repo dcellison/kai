@@ -115,17 +115,25 @@ class WorkshopProtectedExecutionPreparationService:
             raise ProtectedExecutionPreparationError("Canonical run channel is unavailable")
         private_context = str(channel_row[0]) == "direct"
         async with self._store.connection.execute(
-            "SELECT owner_direct_channel_id FROM agent_definitions "
-            "WHERE agent_id = ? AND owner_principal_id = ? "
-            "AND owner_runtime_profile_id = ? AND lifecycle_state = 'active'",
-            (run.agent_id, run.sponsor_principal_id, run.runtime_profile_id),
+            "SELECT d.owner_direct_channel_id, ra.runtime_profile_id "
+            "FROM agent_definitions d "
+            "LEFT JOIN channel_agent_runtime_assignments ra "
+            "ON ra.channel_id = ? AND ra.agent_id = d.agent_id "
+            "WHERE d.agent_id = ? AND d.owner_principal_id = ? "
+            "AND d.owner_runtime_profile_id = ? AND d.lifecycle_state = 'active'",
+            (
+                run.channel_id,
+                run.agent_id,
+                run.sponsor_principal_id,
+                run.runtime_profile_id,
+            ),
         ) as cursor:
             authority_row = await cursor.fetchone()
-        settings_channel_id = (
-            ChannelId(str(authority_row[0]))
-            if authority_row is not None and authority_row[0] is not None
-            else run.channel_id
-        )
+        if authority_row is None:
+            raise ProtectedExecutionPreparationError("Canonical agent runtime sponsorship is unavailable")
+        if private_context and authority_row[1] is None:
+            raise ProtectedExecutionPreparationError("Private conversation has no requester workspace authority")
+        settings_channel_id = ChannelId(str(authority_row[0])) if authority_row[0] is not None else run.channel_id
 
         decision = await self._routing_policy.decide_for_run(
             run,
@@ -141,6 +149,7 @@ class WorkshopProtectedExecutionPreparationService:
             private_context=private_context,
             sponsor_principal_id=run.sponsor_principal_id,
             settings_channel_id=settings_channel_id,
+            workspace_runtime_profile_id=(RuntimeProfileId(str(authority_row[1])) if private_context else None),
         )
         runtime = await self._pool.prepare_routed_execution(
             runtime_authority,

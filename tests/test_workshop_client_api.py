@@ -298,27 +298,55 @@ class _AllowChannelRead:
 class _SettingsWorkspaces:
     principal_id: PrincipalId
     channel_id: ChannelId
+    secondary_principal_id: PrincipalId | None = None
+    secondary_channel_id: ChannelId | None = None
     switched: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
     runtime_changes: list[tuple[str, object]] = field(default_factory=list)
     catalogue_calls: list[tuple[str, str | None]] = field(default_factory=list)
 
     def authority_for_principal_channel(self, principal_id, channel_id):
-        if principal_id != self.principal_id or channel_id != self.channel_id:
-            raise WorkshopSettingsWorkspaceAccessDenied("denied")
-        return SimpleNamespace(principal_id=principal_id, channel_id=channel_id)
+        if principal_id == self.principal_id and channel_id == self.channel_id:
+            return SimpleNamespace(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                runtime_profile_id=profile_id(101),
+            )
+        if principal_id == self.secondary_principal_id and channel_id == self.secondary_channel_id:
+            return SimpleNamespace(
+                principal_id=principal_id,
+                channel_id=channel_id,
+                runtime_profile_id=profile_id(202),
+            )
+        raise WorkshopSettingsWorkspaceAccessDenied("denied")
 
     def authority_for_principal_profile(self, principal_id, runtime_profile_id):
         if principal_id != self.principal_id or runtime_profile_id != profile_id(101):
             raise WorkshopSettingsWorkspaceAccessDenied("denied")
-        return SimpleNamespace(principal_id=principal_id, channel_id=self.channel_id)
+        return SimpleNamespace(
+            principal_id=principal_id,
+            channel_id=self.channel_id,
+            runtime_profile_id=runtime_profile_id,
+        )
 
     @staticmethod
     def _check_revision(expected, current: str) -> None:
         if expected != current:
             raise WorkshopSettingsWorkspaceConflict("stale settings")
 
-    async def inspect(self, _authority):
+    async def inspect(self, authority):
+        if authority.principal_id == self.secondary_principal_id:
+            assert self.secondary_channel_id is not None
+            return self._snapshot(
+                principal_id=authority.principal_id,
+                channel_id=self.secondary_channel_id,
+                runtime_profile_id=profile_id(202),
+                workspace="/srv/home/scott",
+                workspaces=(
+                    WorkspaceOption("/srv/home/scott", "Home", True, True),
+                    WorkspaceOption("/srv/scott/sandbox", "sandbox", False, False),
+                ),
+            )
         return self._snapshot()
 
     async def inspect_model_catalogue(self, _authority, option_id=None):
@@ -414,11 +442,19 @@ class _SettingsWorkspaces:
     async def reset_self_service_workspace_config(self, *args, **kwargs):
         return await self.reset_workspace_config(*args, **kwargs)
 
-    def _snapshot(self, *, workspace: str = "/srv/kai"):
+    def _snapshot(
+        self,
+        *,
+        principal_id: PrincipalId | None = None,
+        channel_id: ChannelId | None = None,
+        runtime_profile_id=None,
+        workspace: str = "/srv/kai",
+        workspaces: tuple[WorkspaceOption, ...] | None = None,
+    ):
         return SettingsWorkspaceSnapshot(
-            principal_id=self.principal_id,
-            channel_id=self.channel_id,
-            runtime_profile_id=profile_id(101),
+            principal_id=principal_id or self.principal_id,
+            channel_id=channel_id or self.channel_id,
+            runtime_profile_id=runtime_profile_id or profile_id(101),
             backend_option_id="codex:openai",
             backend="codex",
             provider="openai",
@@ -430,7 +466,7 @@ class _SettingsWorkspaces:
             timeout_seconds=EffectiveValue(120, "runtime policy", 120),
             workspace=workspace,
             model_options=(ModelOption("gpt-5.6-sol", "GPT-5.6 Sol"),),
-            workspaces=(WorkspaceOption(workspace, "kai", True, False),),
+            workspaces=workspaces or (WorkspaceOption(workspace, "kai", True, False),),
             revision="sws_current",
             capabilities=(EditableCapability("model", "runtime", "model_id", True),),
         )
@@ -3931,7 +3967,12 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
         tmp_path: Path,
     ) -> None:
         store, alice_id, alice_channel, bob_id, bob_channel = await _open_store(tmp_path / "kai.db")
-        service = _SettingsWorkspaces(alice_id, alice_channel)
+        service = _SettingsWorkspaces(
+            alice_id,
+            alice_channel,
+            secondary_principal_id=bob_id,
+            secondary_channel_id=bob_channel,
+        )
         client = await _open_client(
             store,
             _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
@@ -3974,22 +4015,37 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
                 "agent_handle": "kai",
                 "sponsor_principal_id": str(alice_id),
                 "sponsor_display_name": "Alice",
-                "can_manage": False,
+                "can_manage_runtime": False,
                 "backend": "codex",
                 "provider": "openai",
                 "model": {"value": "gpt-5.6-sol", "source": "runtime policy"},
                 "timeout_seconds": {"value": 120, "source": "runtime policy"},
-                "workspace": "/srv/kai",
+                "workspace": "/srv/home/scott",
+                "workspace_revision": "sws_current",
+                "workspaces": [
+                    {
+                        "path": "/srv/home/scott",
+                        "name": "Home",
+                        "current": True,
+                        "home": True,
+                    },
+                    {
+                        "path": "/srv/scott/sandbox",
+                        "name": "sandbox",
+                        "current": False,
+                        "home": False,
+                    },
+                ],
             }
             assert "capabilities" not in payload
-            assert "workspaces" not in payload
-            assert "revision" not in payload
+            assert "/srv/kai" not in json.dumps(payload)
             owner_payload = await owner_effective.json()
             assert owner_effective.status == 200
-            assert owner_payload["can_manage"] is True
+            assert owner_payload["can_manage_runtime"] is True
             assert owner_payload["sponsor_principal_id"] == str(alice_id)
-            for field in ("agent_id", "backend", "provider", "model", "timeout_seconds", "workspace"):
+            for field in ("agent_id", "backend", "provider", "model", "timeout_seconds"):
                 assert owner_payload[field] == payload[field]
+            assert owner_payload["workspace"] == "/srv/kai"
             assert cross_principal.status == 403
             assert await cross_principal.json() == {"error": {"code": "access_denied", "message": "Access denied"}}
             assert owner_mutation.status == 403
