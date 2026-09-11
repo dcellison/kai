@@ -3088,6 +3088,20 @@ function WorkshopView({
   // Viewport captured when "load earlier" is clicked, so the prepended
   // page can be offset out of view instead of shoving the reader down.
   const earlierAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const setTimelineElement = useCallback((element: HTMLDivElement | null): void => {
+    const previous = timelineRef.current;
+    if (previous === element) {
+      return;
+    }
+    if (previous && timelineInitializedRef.current) {
+      storeTimelineViewport(channelId, {
+        follow: timelineFollowRef.current,
+        scrollTop: previous.scrollTop,
+      });
+    }
+    timelineRef.current = element;
+    timelineInitializedRef.current = false;
+  }, [channelId]);
   const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
@@ -4051,6 +4065,10 @@ function WorkshopView({
       timelineFollowRef.current = unreadAnchor
         ? isNearTimelineBottom(timeline)
         : restoredViewport?.follow ?? true;
+      storeTimelineViewport(channelId, {
+        follow: timelineFollowRef.current,
+        scrollTop: timeline.scrollTop,
+      });
       // Derived from the clamped position, not the stored flag: the
       // restored window is the latest page only, so a position saved
       // with earlier pages loaded can clamp to (or land near) the
@@ -4075,6 +4093,10 @@ function WorkshopView({
     ) {
       earlierAnchorRef.current = null;
       timeline.scrollTop = anchor.scrollTop + (timeline.scrollHeight - anchor.scrollHeight);
+      storeTimelineViewport(channelId, {
+        follow: timelineFollowRef.current,
+        scrollTop: timeline.scrollTop,
+      });
     }
     earliestMessagePositionRef.current = earliestPosition;
 
@@ -4090,11 +4112,15 @@ function WorkshopView({
     }
     if (timelineFollowRef.current) {
       timeline.scrollTop = timeline.scrollHeight;
+      storeTimelineViewport(channelId, {
+        follow: true,
+        scrollTop: timeline.scrollTop,
+      });
       setUnseenMessageCount(0);
     } else {
       setUnseenMessageCount((count) => count + addedMessages);
     }
-  }, [channelId, messages, unreadBoundaryMessageId]);
+  }, [auxiliaryWorkspaceOpen, channelId, messages, unreadBoundaryMessageId]);
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -4146,6 +4172,10 @@ function WorkshopView({
     timelineFollowRef.current = true;
     if (later.available) {
       onJumpLatest();
+      storeTimelineViewport(channelId, {
+        follow: true,
+        scrollTop: timeline.scrollTop,
+      });
       setUnseenMessageCount(0);
       setAwayFromBottom(false);
       return;
@@ -4705,7 +4735,7 @@ function WorkshopView({
         </header>
 
         <div
-          ref={timelineRef}
+          ref={setTimelineElement}
           className="timeline-wrap"
           aria-label="Conversation timeline"
           onScroll={handleTimelineScroll}
