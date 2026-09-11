@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import shutil
 import stat
 import subprocess
 import sys
@@ -30,6 +31,14 @@ class WorkspaceProvisioningResult:
     path: str
     directory_created: bool
     git_ready: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceDeletionResult:
+    """Filesystem facts returned after bounded workspace deletion."""
+
+    path: str
+    directory_deleted: bool
 
 
 def _validate_flat_name(name: str) -> str:
@@ -139,10 +148,45 @@ def provision_workspace(
     return WorkspaceProvisioningResult(str(target), created, git_ready)
 
 
+def delete_workspace(
+    workspace_base: Path,
+    name: str,
+    *,
+    os_user: str | None = None,
+) -> WorkspaceDeletionResult:
+    """Delete one direct, runtime-owned child of an authorized workspace base."""
+    checked_name = _validate_flat_name(name)
+    if not workspace_base.is_absolute() or workspace_base.is_symlink() or not workspace_base.is_dir():
+        raise WorkspaceProvisioningError("The configured workspace base is unavailable or invalid")
+    try:
+        base = workspace_base.resolve(strict=True)
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise WorkspaceProvisioningError("The configured workspace base is unavailable or invalid") from exc
+
+    identity = _target_identity(os_user)
+    try:
+        try:
+            info = os.stat(checked_name, dir_fd=base_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return WorkspaceDeletionResult(str(base / checked_name), False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise WorkspaceProvisioningError("The workspace target is not a directory")
+        if identity is not None and info.st_uid != identity[0]:
+            raise WorkspaceProvisioningError("The workspace is owned by a different OS identity")
+        try:
+            shutil.rmtree(checked_name, dir_fd=base_fd)
+        except OSError as exc:
+            raise WorkspaceProvisioningError("The workspace directory could not be deleted") from exc
+    finally:
+        os.close(base_fd)
+    return WorkspaceDeletionResult(str(base / checked_name), True)
+
+
 def provision_via_helper(profile_id: RuntimeProfileId, name: str) -> WorkspaceProvisioningResult:
     """Invoke the fixed root helper without giving the daemon a path argument."""
     completed = subprocess.run(
-        ["sudo", "-n", str(WORKSPACE_PROVISIONER), str(profile_id), name],
+        ["sudo", "-n", str(WORKSPACE_PROVISIONER), "create", str(profile_id), name],
         capture_output=True,
         text=True,
         check=False,
@@ -167,23 +211,58 @@ def provision_via_helper(profile_id: RuntimeProfileId, name: str) -> WorkspacePr
     return WorkspaceProvisioningResult(path, directory_created, git_ready)
 
 
+def delete_via_helper(profile_id: RuntimeProfileId, name: str) -> WorkspaceDeletionResult:
+    """Invoke the fixed root helper for one bounded workspace deletion."""
+    completed = subprocess.run(
+        ["sudo", "-n", str(WORKSPACE_PROVISIONER), "delete", str(profile_id), name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise WorkspaceProvisioningError("Protected workspace deletion failed") from exc
+    if completed.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
+        message = payload.get("error") if isinstance(payload, dict) else None
+        raise WorkspaceProvisioningError(
+            str(message) if isinstance(message, str) and message else "Protected workspace deletion failed"
+        )
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise WorkspaceProvisioningError("Protected workspace deletion returned an invalid result")
+    path = result.get("path")
+    directory_deleted = result.get("directory_deleted")
+    if not isinstance(path, str) or not isinstance(directory_deleted, bool):
+        raise WorkspaceProvisioningError("Protected workspace deletion returned an invalid result")
+    return WorkspaceDeletionResult(path, directory_deleted)
+
+
 def _helper_main(argv: list[str]) -> int:
-    if len(argv) != 2 or os.geteuid() != 0:
+    if len(argv) != 3 or argv[0] not in {"create", "delete"} or os.geteuid() != 0:
         print(json.dumps({"ok": False, "error": "Invalid workspace provisioning request"}))
         return 64
     try:
-        profile_id = RuntimeProfileId(argv[0])
+        operation = argv[0]
+        profile_id = RuntimeProfileId(argv[1])
         content = RUNTIME_PROFILES_POLICY.read_text(encoding="utf-8")
         profile = WorkshopRuntimeProfileRegistry.from_yaml(content).resolve(profile_id)
         if profile.workspace_base is None:
             raise WorkspaceProvisioningError("No workspace base is configured for this runtime")
         if profile.os_user is None:
             raise WorkspaceProvisioningError("The protected runtime has no OS identity")
-        result = provision_workspace(
-            profile.workspace_base,
-            argv[1],
-            os_user=profile.os_user,
-        )
+        if operation == "create":
+            result = provision_workspace(
+                profile.workspace_base,
+                argv[2],
+                os_user=profile.os_user,
+            )
+        else:
+            result = delete_workspace(
+                profile.workspace_base,
+                argv[2],
+                os_user=profile.os_user,
+            )
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}))
         return 1

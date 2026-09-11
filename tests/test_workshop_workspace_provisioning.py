@@ -10,9 +10,12 @@ import pytest
 
 from kai.workshop.domain import RuntimeProfileId
 from kai.workshop.workspace_provisioning import (
+    WorkspaceDeletionResult,
     WorkspaceProvisioningError,
     WorkspaceProvisioningResult,
     _helper_main,
+    delete_via_helper,
+    delete_workspace,
     provision_via_helper,
     provision_workspace,
 )
@@ -51,6 +54,29 @@ def test_local_provisioning_rejects_symlinked_base_and_target(tmp_path: Path) ->
         provision_workspace(linked_base, "project")
     with pytest.raises(WorkspaceProvisioningError, match="symbolic link"):
         provision_workspace(real_base, "linked-target")
+
+
+def test_local_deletion_removes_only_named_direct_child(tmp_path: Path) -> None:
+    base = tmp_path / "configured-projects"
+    target = base / "research"
+    target.mkdir(parents=True)
+    (target / "notes.md").write_text("private")
+
+    assert delete_workspace(base, "research") == WorkspaceDeletionResult(str(target), True)
+    assert not target.exists()
+    assert delete_workspace(base, "research") == WorkspaceDeletionResult(str(target), False)
+
+
+def test_local_deletion_rejects_symlink_target(tmp_path: Path) -> None:
+    base = tmp_path / "configured-projects"
+    outside = tmp_path / "outside"
+    base.mkdir()
+    outside.mkdir()
+    (base / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(WorkspaceProvisioningError, match="not a directory"):
+        delete_workspace(base, "linked")
+    assert outside.is_dir()
 
 
 def test_git_identity_drop_clears_supplementary_groups(
@@ -124,6 +150,34 @@ def test_helper_invocation_surfaces_bounded_error(monkeypatch) -> None:
         provision_via_helper(profile_id, "research")
 
 
+def test_deletion_helper_invocation_accepts_only_bounded_json_result(monkeypatch) -> None:
+    profile_id = RuntimeProfileId("rtp_" + "1" * 32)
+    recorded: list[str] = []
+
+    def run(argv, **_kwargs):
+        recorded.extend(argv)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "result": {
+                        "path": "/configured/projects/research",
+                        "directory_deleted": True,
+                    },
+                }
+            ),
+        )
+
+    monkeypatch.setattr("kai.workshop.workspace_provisioning.subprocess.run", run)
+
+    assert delete_via_helper(profile_id, "research") == WorkspaceDeletionResult(
+        "/configured/projects/research",
+        True,
+    )
+    assert recorded[-3:] == ["delete", str(profile_id), "research"]
+
+
 def test_root_helper_derives_base_and_owner_from_runtime_profile(
     tmp_path: Path,
     monkeypatch,
@@ -151,7 +205,7 @@ def test_root_helper_derives_base_and_owner_from_runtime_profile(
     )
     monkeypatch.setattr("kai.workshop.workspace_provisioning.provision_workspace", provisioner)
 
-    assert _helper_main([str(profile_id), "research"]) == 0
+    assert _helper_main(["create", str(profile_id), "research"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
         "ok": True,

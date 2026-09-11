@@ -139,7 +139,8 @@ _DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 # Root-owned helper the nightly memory backup invokes via sudo to read
 # per-principal MEMORY.md files the service user cannot read directly
 # (protected installs keep those directories 0700 per-owner). The
-# script validates its single argument, so the sudoers grant cannot be
+# script validates its operation, runtime profile, and flat workspace name, so
+# the sudoers grant cannot be
 # steered outside DATA_DIR/memory/<name>/MEMORY.md. memory_backup.py
 # hardcodes the same path; keep them in sync.
 PRINCIPAL_MEMORY_READER = Path("/etc/kai/read-principal-memory")

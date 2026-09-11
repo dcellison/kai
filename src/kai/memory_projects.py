@@ -303,6 +303,43 @@ def db_registry_creator(project_id: str) -> int | None:
     return _db_creators.get(project_id)
 
 
+async def unregister_workspace_memory_project(
+    root: Path,
+    creator_runtime_key: int,
+) -> str | None:
+    """Remove the caller-created memory project rooted exactly at a deleted workspace."""
+    resolved_root = root.expanduser().resolve()
+    async with registry_mutation_lock():
+        project_id = next(
+            (
+                candidate
+                for candidate, config in _db_registry.items()
+                if resolved_root in config.workspace_roots
+                and len(config.workspace_roots) == 1
+                and _db_creators.get(candidate) == creator_runtime_key
+            ),
+            None,
+        )
+        if project_id is None:
+            return None
+        if not await sessions.unregister_memory_project(project_id):
+            return None
+        db_registry_remove(project_id)
+    log.info(
+        "memory.project.registry %s",
+        json.dumps(
+            {
+                "action": "unregister_deleted_workspace",
+                "project_id": project_id,
+                "root": str(resolved_root),
+                "by": creator_runtime_key,
+            },
+            separators=(",", ":"),
+        ),
+    )
+    return project_id
+
+
 async def register_workspace_memory_project(
     config: Config,
     creator_runtime_key: int,

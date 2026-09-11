@@ -480,6 +480,92 @@ async def test_workspace_creation_uses_configured_base_and_is_idempotent(
     assert pool.events == [f"workspace-config:{path}"]
 
 
+async def test_workspace_deletion_removes_files_and_canonical_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+    target = pool.allowed.parent / "qualification-1520"
+    target.mkdir()
+    (target / "result.txt").write_text("disposable")
+    monkeypatch.setattr(
+        pool,
+        "resolve_workspace_access",
+        AsyncMock(return_value=(pool.allowed.parent, [pool.allowed, target])),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "get_canonical_workspace_grants",
+        AsyncMock(return_value=[target]),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "canonical_workspace_active_references",
+        AsyncMock(return_value=0),
+    )
+    delete_state = AsyncMock()
+    monkeypatch.setattr(sessions, "delete_canonical_workspace_state", delete_state)
+    unregister = AsyncMock(return_value="qualification-1520")
+    monkeypatch.setattr(
+        "kai.memory_projects.unregister_workspace_memory_project",
+        unregister,
+    )
+
+    revision = (await service.inspect(authority)).revision
+    result = await service.delete_workspace(
+        authority,
+        "qualification-1520",
+        "qualification-1520",
+        expected_revision=revision,
+    )
+
+    assert result.directory_deleted is True
+    assert result.memory_project_unregistered == "qualification-1520"
+    assert not target.exists()
+    delete_state.assert_awaited_once()
+    unregister.assert_awaited_once()
+
+
+async def test_workspace_deletion_requires_exact_confirmation_and_nonactive_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="exact workspace name"):
+        await service.delete_workspace(authority, "qualification", "wrong")
+    pool.workspace = pool.allowed.parent / "qualification"
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="active or home"):
+        await service.delete_workspace(authority, "qualification", "qualification")
+
+
+async def test_workspace_deletion_rejects_ungranted_existing_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+    target = pool.allowed.parent / "operator-project"
+    target.mkdir()
+    monkeypatch.setattr(
+        pool,
+        "resolve_workspace_access",
+        AsyncMock(return_value=(pool.allowed.parent, [target])),
+    )
+    monkeypatch.setattr(
+        sessions,
+        "get_canonical_workspace_grants",
+        AsyncMock(return_value=[]),
+    )
+
+    with pytest.raises(WorkshopSettingsWorkspaceAccessDenied, match="created or added"):
+        await service.delete_workspace(authority, "operator-project", "operator-project")
+
+    assert target.is_dir()
+
+
 @pytest.mark.parametrize(
     "name",
     ["", " ", " leading", "trailing ", ".", "..", "../escape", "nested/name", "nested\\name", "bad\x00name"],

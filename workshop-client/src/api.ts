@@ -20,6 +20,7 @@ import type {
   WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceCreation,
+  WorkshopWorkspaceDeletion,
   WorkshopRoutingEligibility,
   WorkshopRoutingPolicy,
   WorkshopRunRoutingDecision,
@@ -2618,12 +2619,14 @@ function parseSettingsWorkspace(
       typeof rawWorkspace.path !== "string" ||
       typeof rawWorkspace.name !== "string" ||
       typeof rawWorkspace.current !== "boolean" ||
-      typeof rawWorkspace.home !== "boolean"
+      typeof rawWorkspace.home !== "boolean" ||
+      (rawWorkspace.deletable !== undefined && typeof rawWorkspace.deletable !== "boolean")
     ) {
       throw new Error("Kai returned unsupported workspace state.");
     }
     return {
       current: rawWorkspace.current,
+      deletable: rawWorkspace.deletable === true,
       home: rawWorkspace.home,
       name: rawWorkspace.name,
       path: rawWorkspace.path,
@@ -4857,6 +4860,48 @@ export async function createWorkspace(
     memoryProjectNote: payload.creation.memory_project_note,
     memoryProjectRegistered: payload.creation.memory_project_registered,
     path: payload.creation.path,
+    settings: parseSettingsWorkspace(payload, session.channelId),
+  };
+}
+
+export async function deleteWorkspace(
+  session: WorkshopSession,
+  name: string,
+  confirmation: string,
+  revision: string,
+): Promise<WorkshopWorkspaceDeletion> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspaces`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, confirmation, revision }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Settings changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not delete workspace."));
+  }
+  if (
+    !isRecord(payload) ||
+    !isRecord(payload.deletion) ||
+    typeof payload.deletion.path !== "string" ||
+    typeof payload.deletion.directory_deleted !== "boolean" ||
+    (payload.deletion.memory_project_unregistered !== null &&
+      typeof payload.deletion.memory_project_unregistered !== "string")
+  ) {
+    throw new Error("Kai returned an unsupported workspace deletion result.");
+  }
+  return {
+    directoryDeleted: payload.deletion.directory_deleted,
+    memoryProjectUnregistered: payload.deletion.memory_project_unregistered,
+    path: payload.deletion.path,
     settings: parseSettingsWorkspace(payload, session.channelId),
   };
 }

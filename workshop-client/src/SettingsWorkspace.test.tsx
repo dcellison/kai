@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChannelAccessError,
   createWorkspace,
+  deleteWorkspace,
   deactivateOperatorModel,
   loadAppearancePreferences,
   loadGitHubSettings,
@@ -71,6 +72,7 @@ vi.mock("./api", async (importOriginal) => {
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     createWorkspace: vi.fn(),
+    deleteWorkspace: vi.fn(),
     restorePreferenceRevision: vi.fn(),
     refreshAllModelCatalogues: vi.fn(),
     refreshModelCatalogue: vi.fn(),
@@ -538,6 +540,12 @@ describe("Settings workspace", () => {
           },
         ],
       },
+    });
+    vi.mocked(deleteWorkspace).mockResolvedValue({
+      directoryDeleted: true,
+      memoryProjectUnregistered: "qualification-1520",
+      path: "/srv/home/workspaces/qualification-1520",
+      settings: runtime,
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
@@ -1013,6 +1021,42 @@ describe("Settings workspace", () => {
     expect(screen.getByLabelText("Active workspace")).toHaveValue("2");
     expect(screen.getByRole("option", { name: "Research Notes" })).toBeVisible();
     expect(switchWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("requires the exact workspace name before permanent deletion", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadSettingsWorkspace).mockResolvedValueOnce({
+      ...runtime,
+      workspaces: [
+        ...runtime.workspaces,
+        {
+          current: false,
+          deletable: true,
+          home: false,
+          name: "qualification-1520",
+          path: "/srv/home/workspaces/qualification-1520",
+        },
+      ],
+    });
+    renderAgentRuntime();
+
+    await user.click(await screen.findByRole("button", { name: "Delete workspace" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete workspace" });
+    const submit = within(dialog).getByRole("button", { name: "Delete permanently" });
+    expect(submit).toBeDisabled();
+    await user.type(
+      within(dialog).getByLabelText(/Type qualification-1520 to confirm/),
+      "qualification-1520",
+    );
+    await user.click(submit);
+
+    await waitFor(() => expect(deleteWorkspace).toHaveBeenCalledWith(
+      session,
+      "qualification-1520",
+      "qualification-1520",
+      "sws_current",
+    ));
+    expect(await screen.findByText("Workspace qualification-1520 was permanently deleted.")).toBeVisible();
   });
 
   it("switches only the authenticated principal's backend after confirmation", async () => {

@@ -5792,6 +5792,43 @@ class TestHandleProject:
 
 
 class TestWorkspaceNewAutoRegister:
+    async def test_workspace_delete_uses_canonical_service_with_exact_confirmation(self, tmp_path):
+        from kai.bot import handle_workspace
+
+        update = _make_update("/workspace delete qualification-1520 confirm qualification-1520")
+        ctx = _make_context(args=["delete", "qualification-1520", "confirm", "qualification-1520"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.delete_workspace = AsyncMock(
+            return_value=SimpleNamespace(
+                directory_deleted=True,
+                path=str(tmp_path / "qualification-1520"),
+            )
+        )
+        ctx.application.core_services.settings_workspaces = service
+
+        with _mock_resolve(base=tmp_path):
+            await handle_workspace(update, ctx)
+
+        service.delete_workspace.assert_awaited_once_with(
+            authority,
+            "qualification-1520",
+            "qualification-1520",
+        )
+        assert "Workspace permanently deleted" in update.message.reply_text.call_args.args[0]
+
+    async def test_workspace_delete_rejects_mismatched_confirmation(self, tmp_path):
+        from kai.bot import handle_workspace
+
+        update = _make_update("/workspace delete qualification confirm wrong")
+        ctx = _make_context(args=["delete", "qualification", "confirm", "wrong"])
+
+        with _mock_resolve(base=tmp_path):
+            await handle_workspace(update, ctx)
+
+        assert "Repeat the exact workspace name" in update.message.reply_text.call_args.args[0]
+
     async def test_workspace_new_uses_canonical_creation_service(self, tmp_path):
         """Telegram and Workshop share one protected workspace operation."""
         from kai.bot import handle_workspace

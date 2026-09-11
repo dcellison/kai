@@ -540,6 +540,7 @@ export interface WorkshopModelCatalogue {
 
 export interface WorkshopWorkspaceOption {
   current: boolean;
+  deletable?: boolean;
   home: boolean;
   name: string;
   path: string;
@@ -594,6 +595,13 @@ export interface WorkshopWorkspaceCreation {
   gitReady: boolean;
   memoryProjectNote: string;
   memoryProjectRegistered: boolean;
+  path: string;
+  settings: WorkshopSettingsWorkspace;
+}
+
+export interface WorkshopWorkspaceDeletion {
+  directoryDeleted: boolean;
+  memoryProjectUnregistered: string | null;
   path: string;
   settings: WorkshopSettingsWorkspace;
 }
