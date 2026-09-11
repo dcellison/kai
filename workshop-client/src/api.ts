@@ -1167,7 +1167,7 @@ function parseAgentCreationOptions(value: unknown): WorkshopAgentCreationOptions
 }
 
 function parseAgentProvisioning(value: unknown): WorkshopAgentProvisioning | null {
-  const statuses = ["draft", "needs_attention", "ready"];
+  const statuses = ["draft", "needs_attention", "provisioning", "ready"];
   const stages = [
     "definition_created",
     "revision_activated",
@@ -1332,6 +1332,7 @@ export interface AgentProvisioningInput {
   collaborationOperations: WorkshopCollaborationOperation[];
   description: string;
   displayName: string;
+  existingDefinitionId?: string;
   handle: string;
   instructions: string;
   model: string;
@@ -1339,6 +1340,94 @@ export interface AgentProvisioningInput {
   runtimeProfileId: string;
   timeoutSeconds: number;
   workspace: string;
+}
+
+export interface AgentProvisioningSetup {
+  input: AgentProvisioningInput;
+  provisioning: WorkshopAgentProvisioning;
+}
+
+function parseAgentProvisioningInput(value: unknown): AgentProvisioningInput | null {
+  if (!isRecord(value) ||
+      typeof value.client_operation_id !== "string" ||
+      !isRecord(value.definition) ||
+      !isRecord(value.revision) ||
+      !isRecord(value.runtime) ||
+      !isRecord(value.collaboration_policy)) return null;
+  const definition = value.definition;
+  const revision = value.revision;
+  const runtime = value.runtime;
+  const policy = value.collaboration_policy;
+  const presentation = definition.presentation;
+  const existingDefinitionId = definition.existing_definition_id;
+  if (
+    typeof definition.handle !== "string" ||
+    typeof definition.display_name !== "string" ||
+    typeof definition.description !== "string" ||
+    !isRecord(presentation) ||
+    (presentation.avatar !== undefined && typeof presentation.avatar !== "string") ||
+    (existingDefinitionId !== undefined &&
+      (typeof existingDefinitionId !== "string" || !AGENT_DEFINITION_PATTERN.test(existingDefinitionId))) ||
+    typeof revision.purpose !== "string" ||
+    typeof revision.instructions !== "string" ||
+    !Array.isArray(revision.capabilities) ||
+    revision.capabilities.some((item) => typeof item !== "string") ||
+    !Array.isArray(revision.collaboration_operations) ||
+    revision.collaboration_operations.some((item) => typeof item !== "string") ||
+    !Array.isArray(policy.allowed_operations) ||
+    policy.allowed_operations.some((item) => typeof item !== "string") ||
+    typeof runtime.runtime_profile_id !== "string" ||
+    typeof runtime.backend_option_id !== "string" ||
+    typeof runtime.model !== "string" ||
+    typeof runtime.workspace !== "string" ||
+    typeof runtime.timeout_seconds !== "number"
+  ) return null;
+  return {
+    allowedCollaborationOperations:
+      policy.allowed_operations as WorkshopCollaborationOperation[],
+    avatar: typeof presentation.avatar === "string" ? presentation.avatar : "",
+    backendOptionId: runtime.backend_option_id,
+    capabilities: revision.capabilities as WorkshopAgentCapability[],
+    clientOperationId: value.client_operation_id,
+    collaborationOperations:
+      revision.collaboration_operations as WorkshopCollaborationOperation[],
+    description: definition.description,
+    displayName: definition.display_name,
+    ...(typeof existingDefinitionId === "string" ? { existingDefinitionId } : {}),
+    handle: definition.handle,
+    instructions: revision.instructions,
+    model: runtime.model,
+    purpose: revision.purpose,
+    runtimeProfileId: runtime.runtime_profile_id,
+    timeoutSeconds: runtime.timeout_seconds,
+    workspace: runtime.workspace,
+  };
+}
+
+export async function loadAgentProvisioningSetups(
+  token: string,
+): Promise<AgentProvisioningSetup[]> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/agents/provision",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load saved agent setup."));
+  }
+  if (!isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.setups)) {
+    throw new Error("Kai returned unsupported saved agent setup state.");
+  }
+  const setups = payload.setups.map((value): AgentProvisioningSetup | null => {
+    if (!isRecord(value)) return null;
+    const provisioning = parseAgentProvisioning(value.provisioning);
+    const input = parseAgentProvisioningInput(value.request);
+    return provisioning && input ? { input, provisioning } : null;
+  });
+  if (setups.some((setup) => setup === null)) {
+    throw new Error("Kai returned unsupported saved agent setup state.");
+  }
+  return setups as AgentProvisioningSetup[];
 }
 
 export async function provisionAgent(
@@ -1359,6 +1448,9 @@ export async function provisionAgent(
           display_name: input.displayName,
           handle: input.handle,
           presentation: input.avatar.trim() ? { avatar: input.avatar.trim() } : {},
+          ...(input.existingDefinitionId
+            ? { existing_definition_id: input.existingDefinitionId }
+            : {}),
         },
         revision: {
           capabilities: input.capabilities,

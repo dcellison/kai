@@ -22,7 +22,7 @@ from kai.workshop.agent_creation_options import (
     AgentCreationWorkspaceOption,
 )
 from kai.workshop.agent_enablement import EligibleAgentRuntime, PrincipalAgentEnablement
-from kai.workshop.agent_provisioning import AgentProvisioningResult
+from kai.workshop.agent_provisioning import AgentProvisioningResult, AgentProvisioningSetup
 from kai.workshop.appearance_preferences import (
     WORKSHOP_APPEARANCE_THEMES,
     WorkshopAppearancePreferenceService,
@@ -842,6 +842,10 @@ class _AgentCreationOptions:
 class _AgentProvisioning:
     principal_id: PrincipalId
     calls: list[tuple[PrincipalId, dict[str, object]]] = field(default_factory=list)
+
+    async def list_incomplete(self, principal_id: PrincipalId) -> tuple[AgentProvisioningSetup, ...]:
+        assert principal_id == self.principal_id
+        return ()
 
     async def provision(self, principal_id: PrincipalId, **payload) -> AgentProvisioningResult:
         assert principal_id == self.principal_id
@@ -2740,6 +2744,12 @@ class TestWorkshopAgentEnablementHTTPContract:
             "collaboration_policy": {"allowed_operations": []},
         }
         try:
+            listing = await client.get(
+                "/v1/client/agents/provision",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert listing.status == 200
+            assert await listing.json() == {"version": 1, "setups": []}
             unauthenticated = await client.post("/v1/client/agents/provision", json=payload)
             assert unauthenticated.status == 401
             invalid = await client.post(

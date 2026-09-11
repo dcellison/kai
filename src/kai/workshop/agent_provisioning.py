@@ -33,6 +33,7 @@ from kai.workshop.agent_enablement import (
     WorkshopAgentEnablementService,
 )
 from kai.workshop.agent_lifecycle import (
+    AgentDefinitionSnapshot,
     WorkshopAgentLifecycleAccessDenied,
     WorkshopAgentLifecycleConflict,
     WorkshopAgentLifecycleError,
@@ -125,8 +126,17 @@ class AgentProvisioningResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentProvisioningSetup:
+    """A principal-owned, incomplete provisioning operation and its saved input."""
+
+    provisioning: AgentProvisioningResult
+    request: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class _NormalizedProvisioningRequest:
     client_operation_id: str
+    existing_definition_id: AgentDefinitionId | None
     handle: str
     display_name: str
     description: str
@@ -143,14 +153,17 @@ class _NormalizedProvisioningRequest:
     allowed_collaboration_operations: tuple[str, ...]
 
     def payload(self) -> dict[str, object]:
+        definition: dict[str, object] = {
+            "handle": self.handle,
+            "display_name": self.display_name,
+            "description": self.description,
+            "presentation": self.presentation,
+        }
+        if self.existing_definition_id is not None:
+            definition["existing_definition_id"] = str(self.existing_definition_id)
         return {
             "client_operation_id": self.client_operation_id,
-            "definition": {
-                "handle": self.handle,
-                "display_name": self.display_name,
-                "description": self.description,
-                "presentation": self.presentation,
-            },
+            "definition": definition,
             "revision": {
                 "purpose": self.purpose,
                 "instructions": self.instructions,
@@ -210,6 +223,35 @@ class WorkshopAgentProvisioningService:
         self._collaboration_policy = collaboration_policy
         self._locks: dict[tuple[PrincipalId, str], asyncio.Lock] = {}
 
+    async def list_incomplete(
+        self,
+        principal_id: PrincipalId,
+    ) -> tuple[AgentProvisioningSetup, ...]:
+        """Return only the caller's durable, unfinished setup operations."""
+        authority = await self._lifecycle.authority_for(principal_id)
+        async with self._store.connection.execute(
+            "SELECT id, request_json FROM agent_provisioning_operations "
+            "WHERE workshop_id = ? AND principal_id = ? AND status != 'ready' "
+            "ORDER BY updated_at DESC, id DESC",
+            (authority.workshop_id, principal_id),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        setups: list[AgentProvisioningSetup] = []
+        for row in rows:
+            try:
+                request = json.loads(str(row["request_json"]))
+            except (TypeError, ValueError) as exc:
+                raise WorkshopAgentProvisioningStorageError("Saved provisioning input is unavailable") from exc
+            if not isinstance(request, dict):
+                raise WorkshopAgentProvisioningStorageError("Saved provisioning input is unavailable")
+            setups.append(
+                AgentProvisioningSetup(
+                    await self._result(AgentProvisioningId(str(row["id"])), replayed=True),
+                    request,
+                )
+            )
+        return tuple(setups)
+
     async def provision(
         self,
         principal_id: PrincipalId,
@@ -245,6 +287,8 @@ class WorkshopAgentProvisioningService:
                 if existing.status == "ready":
                     return await self._result(existing.operation_id, replayed=True)
 
+            if existing is None and request.existing_definition_id is not None:
+                await self._existing_draft(principal_id, request)
             await self._validate_authority(principal_id, request)
             operation = existing or await self._create_operation(
                 authority.workshop_id,
@@ -270,18 +314,21 @@ class WorkshopAgentProvisioningService:
         try:
             operation = await self._require_operation(operation_id)
             if "definition_created" not in completed:
-                draft = await self._lifecycle.create_draft(
-                    principal_id,
-                    idempotency_key=self._stage_key(operation_id, "definition"),
-                    handle=request.handle,
-                    display_name=request.display_name,
-                    description=request.description,
-                    presentation=request.presentation,
-                    purpose=request.purpose,
-                    instructions=request.instructions,
-                    capabilities=list(request.capabilities),
-                    collaboration_operations=list(request.collaboration_operations),
-                )
+                if request.existing_definition_id is not None:
+                    draft = await self._existing_draft(principal_id, request)
+                else:
+                    draft = await self._lifecycle.create_draft(
+                        principal_id,
+                        idempotency_key=self._stage_key(operation_id, "definition"),
+                        handle=request.handle,
+                        display_name=request.display_name,
+                        description=request.description,
+                        presentation=request.presentation,
+                        purpose=request.purpose,
+                        instructions=request.instructions,
+                        capabilities=list(request.capabilities),
+                        collaboration_operations=list(request.collaboration_operations),
+                    )
                 revision = draft.revisions[0]
                 await self._record_stage(
                     operation_id,
@@ -468,11 +515,12 @@ class WorkshopAgentProvisioningService:
             raise WorkshopAgentProvisioningValidationError(
                 "client_operation_id must be 1-128 letters, digits, dots, underscores, colons, or hyphens"
             )
-        definition_map = self._exact_object(
-            definition,
-            "definition",
+        if not isinstance(definition, dict) or set(definition) not in (
             {"handle", "display_name", "description", "presentation"},
-        )
+            {"handle", "display_name", "description", "presentation", "existing_definition_id"},
+        ):
+            raise WorkshopAgentProvisioningValidationError("definition contains unsupported fields")
+        definition_map = definition
         revision_map = self._exact_object(
             revision,
             "revision",
@@ -500,6 +548,10 @@ class WorkshopAgentProvisioningService:
             {"allowed_operations"},
         )
         try:
+            raw_existing_definition_id = definition_map.get("existing_definition_id")
+            existing_definition_id = (
+                AgentDefinitionId(str(raw_existing_definition_id)) if raw_existing_definition_id is not None else None
+            )
             handle = normalize_agent_handle(definition_map["handle"])
             display_name = validate_agent_text(
                 definition_map["display_name"],
@@ -551,6 +603,7 @@ class WorkshopAgentProvisioningService:
             raise WorkshopAgentProvisioningValidationError(str(exc)) from exc
         return _NormalizedProvisioningRequest(
             client_operation_id,
+            existing_definition_id,
             handle,
             display_name,
             description,
@@ -566,6 +619,36 @@ class WorkshopAgentProvisioningService:
             timeout,
             allowed,
         )
+
+    async def _existing_draft(
+        self,
+        principal_id: PrincipalId,
+        request: _NormalizedProvisioningRequest,
+    ) -> AgentDefinitionSnapshot:
+        definition_id = request.existing_definition_id
+        if definition_id is None:
+            raise WorkshopAgentProvisioningValidationError("Existing draft is unavailable")
+        try:
+            snapshot = await self._lifecycle.get_visible(principal_id, definition_id)
+        except WorkshopAgentLifecycleAccessDenied as exc:
+            raise WorkshopAgentProvisioningAccessDenied("Access denied") from exc
+        if snapshot.owner_principal_id != principal_id:
+            raise WorkshopAgentProvisioningAccessDenied("Access denied")
+        if snapshot.lifecycle_state != "draft" or len(snapshot.revisions) != 1:
+            raise WorkshopAgentProvisioningConflict("Only an unchanged Revision 1 draft can continue setup")
+        revision = snapshot.revisions[0]
+        if (
+            snapshot.handle != request.handle
+            or snapshot.display_name != request.display_name
+            or snapshot.description != request.description
+            or snapshot.presentation != request.presentation
+            or revision.purpose != request.purpose
+            or revision.instructions != request.instructions
+            or revision.capabilities != request.capabilities
+            or revision.collaboration_operations != request.collaboration_operations
+        ):
+            raise WorkshopAgentProvisioningConflict("Saved draft content changed before setup could continue")
+        return snapshot
 
     @staticmethod
     def _exact_object(value: object, field: str, keys: set[str]) -> dict[str, object]:

@@ -13,6 +13,7 @@ import {
 } from "react";
 
 import {
+  type AgentProvisioningSetup,
   AuthenticationError,
   advanceThreadReadPosition,
   archiveChannel,
@@ -29,6 +30,7 @@ import {
   loadChannelMessage,
   loadAgentDefinitions,
   loadAgentEnablements,
+  loadAgentProvisioningSetups,
   loadWorkshopHumans,
   loadNavigation,
   loadNotificationPreferences,
@@ -85,7 +87,12 @@ import type {
   WorkshopReaction,
   WorkshopReactionReactors,
 } from "./types";
-import { AGENT_DEFINITION_PATTERN, CHANNEL_PATTERN, MESSAGE_PATTERN } from "./types";
+import {
+  AGENT_DEFINITION_PATTERN,
+  AGENT_PROVISIONING_PATTERN,
+  CHANNEL_PATTERN,
+  MESSAGE_PATTERN,
+} from "./types";
 import { RunTraceCard } from "./RunTraceCard";
 import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
@@ -174,6 +181,7 @@ type WorkshopDestination =
       kind: "agents";
       creating: boolean;
       definitionId: string | null;
+      setupId: string | null;
       section: "runtime" | null;
     }
   | { kind: "memory"; memoryId: string | null }
@@ -204,6 +212,7 @@ function destinationFromLocation(): WorkshopDestination {
         definitionId: agentDefinitionId,
         kind: "agents",
         section: "runtime",
+        setupId: null,
       };
     }
     return {
@@ -224,6 +233,10 @@ function destinationFromLocation(): WorkshopDestination {
           ? definitionId
           : null,
       section: parameters.get("section") === "runtime" ? "runtime" : null,
+      setupId:
+        parameters.get("setup") && AGENT_PROVISIONING_PATTERN.test(parameters.get("setup")!)
+          ? parameters.get("setup")
+          : null,
     };
   }
   if (parameters.get("view") !== "memory") {
@@ -253,6 +266,7 @@ function writeDestination(
   url.searchParams.delete("runtime");
   url.searchParams.delete("new");
   url.searchParams.delete("section");
+  url.searchParams.delete("setup");
   url.searchParams.delete("message");
   url.searchParams.delete("thread");
   if (destination.kind === "memory") {
@@ -275,6 +289,9 @@ function writeDestination(
     }
     if (destination.section) {
       url.searchParams.set("section", destination.section);
+    }
+    if (destination.setupId) {
+      url.searchParams.set("setup", destination.setupId);
     }
   } else if (destination.kind === "mentions") {
     url.searchParams.set("view", "mentions");
@@ -2036,25 +2053,75 @@ function ArchivedDirectMessagesDialog({
 }
 
 interface InactiveAgentEntry {
-  agentId: string;
+  entryId: string;
   conversationChannelId: string | null;
   definitionId: string | null;
   displayName: string;
   handle: string;
-  lifecycleState: WorkshopAgentDefinition["lifecycleState"];
+  state: "Archived" | "Draft" | "Needs attention";
+  setupId: string | null;
 }
 
 function InactiveAgentsDialog({
   agents,
   onClose,
   onOpenConversation,
+  onContinue,
   onView,
 }: {
   agents: InactiveAgentEntry[];
   onClose: () => void;
   onOpenConversation: (channelId: string) => void;
+  onContinue: (definitionId: string | null, setupId: string | null) => void;
   onView: (definitionId: string) => void;
 }): React.JSX.Element {
+  const drafts = agents.filter((agent) => agent.state !== "Archived");
+  const archived = agents.filter((agent) => agent.state === "Archived");
+  const renderAgents = (entries: InactiveAgentEntry[]): React.JSX.Element => (
+    <ul className="channel-archive-list">
+      {entries.map((agent) => (
+        <li key={agent.entryId}>
+          <span>
+            <strong>{agent.displayName}</strong>
+            <small>@{agent.handle} · {agent.state}</small>
+          </span>
+          <span className="channel-archive-actions">
+            {agent.state !== "Archived" && (
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => onContinue(agent.definitionId, agent.setupId)}
+              >
+                Continue setup
+              </button>
+            )}
+            {agent.conversationChannelId && (
+              <button
+                className="panel-icon-button"
+                type="button"
+                aria-label={`Open archived conversation with ${agent.displayName}`}
+                title="Open archived conversation"
+                onClick={() => onOpenConversation(agent.conversationChannelId!)}
+              >
+                <ReplyIcon />
+              </button>
+            )}
+            {agent.definitionId && agent.state === "Archived" && (
+              <button
+                className="panel-icon-button"
+                type="button"
+                aria-label={`View archived agent ${agent.displayName}`}
+                title="View archived agent"
+                onClick={() => onView(agent.definitionId!)}
+              >
+                <ViewIcon />
+              </button>
+            )}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
   return (
     <div className="modal-backdrop" role="presentation">
       <section
@@ -2081,42 +2148,10 @@ function InactiveAgentsDialog({
         {agents.length === 0 ? (
           <p className="channel-archive-empty">No draft or archived agents.</p>
         ) : (
-          <ul className="channel-archive-list">
-            {agents.map((agent) => (
-              <li key={agent.agentId}>
-                <span>
-                  <strong>{agent.displayName}</strong>
-                  <small>@{agent.handle} · {agent.lifecycleState}</small>
-                </span>
-                <span className="channel-archive-actions">
-                  {agent.conversationChannelId && (
-                    <button
-                      className="panel-icon-button"
-                      type="button"
-                      aria-label={`Open archived conversation with ${agent.displayName}`}
-                      title="Open archived conversation"
-                      onClick={() => onOpenConversation(agent.conversationChannelId!)}
-                    >
-                      <ReplyIcon />
-                    </button>
-                  )}
-                  {agent.definitionId && (
-                    <button
-                      className="panel-icon-button"
-                      type="button"
-                      aria-label={
-                        `View ${agent.lifecycleState} agent ${agent.displayName}`
-                      }
-                      title={`View ${agent.lifecycleState} agent`}
-                      onClick={() => onView(agent.definitionId!)}
-                    >
-                      <ViewIcon />
-                    </button>
-                  )}
-                </span>
-              </li>
-            ))}
-          </ul>
+          <div className="inactive-agent-sections">
+            {drafts.length > 0 && <section><h3>Drafts</h3>{renderAgents(drafts)}</section>}
+            {archived.length > 0 && <section><h3>Archived agents</h3>{renderAgents(archived)}</section>}
+          </div>
         )}
       </section>
     </div>
@@ -2813,6 +2848,7 @@ function WorkshopView({
   onOpenHumanNotification,
   onCreateAgent,
   onOpenAgentDefinition,
+  onOpenAgentSetup,
   onOpenAgentChannel,
   onOpenSettings,
   onRestoreChannel,
@@ -2830,6 +2866,7 @@ function WorkshopView({
   agentDestination: {
     creating: boolean;
     definitionId: string | null;
+    setupId: string | null;
     section: "runtime" | null;
   } | null;
   agentToken: string;
@@ -2925,6 +2962,7 @@ function WorkshopView({
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onCreateAgent: () => void;
   onOpenAgentDefinition: (definitionId: string) => Promise<void>;
+  onOpenAgentSetup: (definitionId: string | null, setupId: string | null) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenSettings: () => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
@@ -3008,6 +3046,8 @@ function WorkshopView({
   const [directMessageArchiveBusy, setDirectMessageArchiveBusy] = useState<string | null>(null);
   const [agentCatalogue, setAgentCatalogue] = useState<WorkshopAgentEnablement[]>([]);
   const [agentDefinitions, setAgentDefinitions] = useState<WorkshopAgentDefinition[]>([]);
+  const [agentProvisioningSetups, setAgentProvisioningSetups] =
+    useState<AgentProvisioningSetup[]>([]);
   const [agentManagement, setAgentManagement] = useState<WorkshopAgentEnablement[] | null>(null);
   const [agentManagementLoading, setAgentManagementLoading] = useState(false);
   const [memberManagement, setMemberManagement] = useState<WorkshopHumanMembership | null>(null);
@@ -3139,10 +3179,17 @@ function WorkshopView({
     );
   }, [workshop.channels]);
   const visibleAgents = useMemo(
-    () => [...agentCatalogue].sort((left, right) =>
-      left.displayName.localeCompare(right.displayName)
-    ),
-    [agentCatalogue],
+    () => {
+      const incompleteDefinitionIds = new Set(
+        agentProvisioningSetups
+          .map((setup) => setup.provisioning.definitionId)
+          .filter((definitionId): definitionId is string => definitionId !== null),
+      );
+      return agentCatalogue
+        .filter((agent) => !incompleteDefinitionIds.has(agent.definitionId))
+        .sort((left, right) => left.displayName.localeCompare(right.displayName));
+    },
+    [agentCatalogue, agentProvisioningSetups],
   );
   const inactiveAgentEntries = useMemo(() => {
     const entries = new Map<string, InactiveAgentEntry>();
@@ -3154,12 +3201,27 @@ function WorkshopView({
         continue;
       }
       entries.set(agent.agentId, {
-        agentId: agent.agentId,
+        entryId: agent.agentId,
         conversationChannelId: null,
         definitionId: agent.definitionId,
         displayName: agent.displayName,
         handle: agent.handle,
-        lifecycleState: agent.lifecycleState,
+        setupId: null,
+        state: agent.lifecycleState === "archived" ? "Archived" : "Draft",
+      });
+    }
+    for (const setup of agentProvisioningSetups) {
+      const definition = agentDefinitions.find(
+        (agent) => agent.definitionId === setup.provisioning.definitionId,
+      );
+      entries.set(setup.provisioning.agentId ?? setup.provisioning.operationId, {
+        entryId: setup.provisioning.operationId,
+        conversationChannelId: null,
+        definitionId: setup.provisioning.definitionId,
+        displayName: definition?.displayName ?? setup.input.displayName,
+        handle: definition?.handle ?? setup.input.handle,
+        setupId: setup.provisioning.operationId,
+        state: "Needs attention",
       });
     }
     for (const channel of workshop.channels) {
@@ -3172,19 +3234,20 @@ function WorkshopView({
         }
         const existing = entries.get(agent.agentId);
         entries.set(agent.agentId, {
-          agentId: agent.agentId,
+          entryId: agent.agentId,
           conversationChannelId: channel.channelId,
           definitionId: existing?.definitionId ?? null,
           displayName: existing?.displayName ?? agent.name,
           handle: existing?.handle ?? agent.handle,
-          lifecycleState: existing?.lifecycleState ?? "archived",
+          setupId: existing?.setupId ?? null,
+          state: "Archived",
         });
       }
     }
     return Array.from(entries.values()).sort((left, right) =>
       left.displayName.localeCompare(right.displayName),
     );
-  }, [agentDefinitions, navigation.principal.principalId, workshop.channels]);
+  }, [agentDefinitions, agentProvisioningSetups, navigation.principal.principalId, workshop.channels]);
   const visibleDirectChannels = useMemo(
     () => workshop.channels.filter(
       (availableChannel) =>
@@ -3469,12 +3532,14 @@ function WorkshopView({
 
   const refreshAgentCatalogue = useCallback(async (): Promise<void> => {
     try {
-      const [definitions, enablements] = await Promise.all([
+      const [definitions, enablements, setups] = await Promise.all([
         loadAgentDefinitions(agentToken),
         loadAgentEnablements(agentToken),
+        loadAgentProvisioningSetups(agentToken),
       ]);
       setAgentDefinitions(definitions);
       setAgentCatalogue(enablements);
+      setAgentProvisioningSetups(setups);
     } catch (caught) {
       if (caught instanceof AuthenticationError) {
         onMemoryAuthenticationFailure(caught.message);
@@ -4555,6 +4620,7 @@ function WorkshopView({
           activeChannelId={channelId}
           initialCreating={agentDestination.creating}
           initialDefinitionId={agentDestination.definitionId}
+          initialSetupId={agentDestination.setupId}
           initialSection={agentDestination.section}
           isAdministrator={workshop.role === "admin"}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
@@ -5454,6 +5520,10 @@ function WorkshopView({
             setArchivedAgentsOpen(false);
             void onOpenAgentChannel(archivedChannelId);
           }}
+          onContinue={(definitionId, setupId) => {
+            setArchivedAgentsOpen(false);
+            void onOpenAgentSetup(definitionId, setupId);
+          }}
           onView={(definitionId) => {
             setArchivedAgentsOpen(false);
             void onOpenAgentDefinition(definitionId);
@@ -5543,6 +5613,7 @@ function ActiveWorkshopClient({
   onAgentNavigationChanged,
   onCreateAgent,
   onOpenAgentDefinition,
+  onOpenAgentSetup,
   onOpenAgentChannel,
   onOpenMemory,
   onOpenMentions,
@@ -5574,6 +5645,7 @@ function ActiveWorkshopClient({
   onAgentNavigationChanged: () => Promise<void>;
   onCreateAgent: () => void;
   onOpenAgentDefinition: (definitionId: string) => Promise<void>;
+  onOpenAgentSetup: (definitionId: string | null, setupId: string | null) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
@@ -6010,6 +6082,7 @@ function ActiveWorkshopClient({
       onMemoryAuthenticationFailure={onAuthenticationFailure}
       onOpenAgentChannel={onOpenAgentChannel}
       onOpenAgentDefinition={onOpenAgentDefinition}
+      onOpenAgentSetup={onOpenAgentSetup}
       onOpenMemory={onOpenMemory}
       onOpenMentions={onOpenMentions}
       onOpenFollowing={onOpenFollowing}
@@ -6335,6 +6408,7 @@ function WorkshopApp(): React.JSX.Element {
     definitionId: string | null = null,
     creating = false,
     section: "runtime" | null = null,
+    setupId: string | null = null,
   ): Promise<void> => {
     if (
       destination.kind === "settings" &&
@@ -6348,6 +6422,7 @@ function WorkshopApp(): React.JSX.Element {
       definitionId,
       kind: "agents",
       section,
+      setupId,
     };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");
@@ -6377,6 +6452,7 @@ function WorkshopApp(): React.JSX.Element {
       definitionId,
       kind: "agents",
       section,
+      setupId: null,
     };
     setDestination(nextDestination);
     writeDestination(nextDestination, "replace");
@@ -6384,6 +6460,13 @@ function WorkshopApp(): React.JSX.Element {
 
   const openAgentDefinition = async (definitionId: string): Promise<void> => {
     await openAgents(definitionId);
+  };
+
+  const openAgentSetup = async (
+    definitionId: string | null,
+    setupId: string | null,
+  ): Promise<void> => {
+    await openAgents(definitionId, true, null, setupId);
   };
 
   const refreshAgentNavigation = useCallback(async (): Promise<void> => {
@@ -6608,6 +6691,7 @@ function WorkshopApp(): React.JSX.Element {
         onCreateAgent={() => void openAgents(null, true)}
         onOpenAgentChannel={openAgentChannel}
         onOpenAgentDefinition={openAgentDefinition}
+        onOpenAgentSetup={openAgentSetup}
         onOpenMemory={() => void openMemory()}
         onOpenMentions={() => void openMentions()}
         onOpenFollowing={() => void openFollowing()}

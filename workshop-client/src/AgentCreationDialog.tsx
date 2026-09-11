@@ -97,6 +97,22 @@ function preferredWorkspace(runtime: WorkshopAgentCreationRuntimeOption): string
   return configured?.path ?? runtime.workspaces.find((workspace) => workspace.available)?.path ?? "";
 }
 
+function setupStageLabel(stage: string | null): string {
+  const labels: Record<string, string> = {
+    backend_selected: "apply the backend",
+    collaboration_policy_set: "apply collaboration limits",
+    definition_created: "save the definition",
+    enablement_created: "authorize its runtime",
+    model_selected: "apply the model",
+    ready: "finish setup",
+    revision_activated: "activate Revision 1",
+    runtime_registered: "connect the runtime",
+    timeout_selected: "apply the response timeout",
+    workspace_selected: "apply the workspace",
+  };
+  return stage ? labels[stage] ?? "continue setup" : "finish setup";
+}
+
 function choiceList({
   disabled,
   kind,
@@ -148,6 +164,9 @@ export function AgentCreationDialog({
   options,
   optionsError,
   optionsLoading,
+  resumeDraft,
+  resumeInput,
+  resumeProvisioning,
   onCancel,
   onCreateReady,
   onSaveDraft,
@@ -157,25 +176,46 @@ export function AgentCreationDialog({
   options: WorkshopAgentCreationOptions | null;
   optionsError: string | null;
   optionsLoading: boolean;
+  resumeDraft: (AgentDefinitionFormState & { definitionId: string }) | null;
+  resumeInput: AgentProvisioningInput | null;
+  resumeProvisioning: WorkshopAgentProvisioning | null;
   onCancel: () => void;
   onCreateReady: (input: AgentProvisioningInput) => Promise<WorkshopAgentProvisioning>;
   onSaveDraft: (form: AgentDefinitionFormState) => Promise<void>;
 }): React.JSX.Element {
   const confirm = useConfirmation();
-  const [form, setForm] = useState(EMPTY_AGENT_DEFINITION);
-  const [stage, setStage] = useState<CreationStage>("Identity");
+  const initialForm = resumeInput ? {
+    avatar: resumeInput.avatar,
+    capabilities: resumeInput.capabilities,
+    collaborationOperations: resumeInput.collaborationOperations,
+    description: resumeInput.description,
+    displayName: resumeInput.displayName,
+    handle: resumeInput.handle,
+    instructions: resumeInput.instructions,
+    purpose: resumeInput.purpose,
+  } : resumeDraft ?? EMPTY_AGENT_DEFINITION;
+  const [form, setForm] = useState(initialForm);
+  const [stage, setStage] = useState<CreationStage>(
+    resumeInput ? "Review" : resumeDraft ? "Runtime" : "Identity",
+  );
   const [dirty, setDirty] = useState(false);
   const [handleAutomatic, setHandleAutomatic] = useState(true);
-  const [runtimeProfileId, setRuntimeProfileId] = useState("");
-  const [backendOptionId, setBackendOptionId] = useState("");
-  const [model, setModel] = useState("");
+  const [runtimeProfileId, setRuntimeProfileId] = useState(
+    resumeInput?.runtimeProfileId ?? "",
+  );
+  const [backendOptionId, setBackendOptionId] = useState(
+    resumeInput?.backendOptionId ?? "",
+  );
+  const [model, setModel] = useState(resumeInput?.model ?? "");
   const [modelSelections, setModelSelections] = useState<Record<string, string>>({});
-  const [workspace, setWorkspace] = useState("");
+  const [workspace, setWorkspace] = useState(resumeInput?.workspace ?? "");
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [submittedInput, setSubmittedInput] = useState<AgentProvisioningInput | null>(null);
-  const [provisioning, setProvisioning] = useState<WorkshopAgentProvisioning | null>(null);
-  const [clientOperationId] = useState(creationOperationKey);
+  const [submittedInput, setSubmittedInput] = useState<AgentProvisioningInput | null>(resumeInput);
+  const [provisioning, setProvisioning] = useState<WorkshopAgentProvisioning | null>(resumeProvisioning);
+  const [clientOperationId] = useState(
+    resumeInput?.clientOperationId ?? creationOperationKey,
+  );
 
   const selectedRuntime = options?.runtimes.find(
     (runtime) => runtime.runtimeProfileId === runtimeProfileId,
@@ -257,7 +297,11 @@ export function AgentCreationDialog({
     if (!/^[a-z][a-z0-9_]{0,31}$/.test(form.handle)) {
       return "Use a handle beginning with a lowercase letter and containing only lowercase letters, numbers, and underscores.";
     }
-    if (existingHandles.includes(form.handle)) {
+    if (
+      existingHandles.includes(form.handle) &&
+      form.handle !== resumeInput?.handle &&
+      form.handle !== resumeDraft?.handle
+    ) {
       return `@${form.handle} is already in use. Choose another handle.`;
     }
     return null;
@@ -372,6 +416,7 @@ export function AgentCreationDialog({
       collaborationOperations: form.collaborationOperations,
       description: form.description,
       displayName: form.displayName,
+      ...(resumeDraft ? { existingDefinitionId: resumeDraft.definitionId } : {}),
       handle: form.handle,
       instructions: form.instructions,
       model,
@@ -417,8 +462,12 @@ export function AgentCreationDialog({
         <form className="agent-editor" onSubmit={submit}>
           <div className="agent-creation-header">
             <div>
-              <p className="overline">New software participant</p>
-              <h2 id="create-agent-title">Create agent</h2>
+              <p className="overline">
+                {resumeInput ? "Saved agent setup" : resumeDraft ? "Draft agent" : "New software participant"}
+              </p>
+              <h2 id="create-agent-title">
+                {resumeInput || resumeDraft ? `Continue ${form.displayName}` : "Create agent"}
+              </h2>
             </div>
             <button
               className="panel-icon-button"
@@ -707,9 +756,20 @@ export function AgentCreationDialog({
               )}
               {busy && <p className="agent-creation-loading" role="status">Creating the agent and applying its runtime settings…</p>}
               {provisioning && provisioning.status !== "ready" && (
-                <p className="agent-creation-recovery">
-                  Setup progress is stored durably. Retry to continue the same operation without creating a duplicate.
-                </p>
+                <section className="agent-creation-recovery">
+                  <strong>Setup needs attention</strong>
+                  <p>
+                    Your choices and completed work are saved. The next step is to {setupStageLabel(provisioning.nextStage)}.
+                  </p>
+                  <p>Retry continues this exact setup without creating a duplicate agent.</p>
+                  <details>
+                    <summary>Setup diagnostics</summary>
+                    <code>{provisioning.operationId}</code>
+                    <small>
+                      {provisioning.completedStages.length} completed stages · next: {provisioning.nextStage ?? "finish"}
+                    </small>
+                  </details>
+                </section>
               )}
             </section>
           )}
@@ -733,20 +793,20 @@ export function AgentCreationDialog({
             <span className="agent-creation-primary-actions">
               {stage === "Review" ? (
                 <>
-                  <button
+                  {!resumeDraft && !resumeInput && <button
                     className="quiet-button"
                     type="button"
                     disabled={busy || locked}
                     onClick={() => void saveDraft()}
                   >
                     Save as draft
-                  </button>
+                  </button>}
                   <button
                     className="primary-button"
                     type="submit"
                     disabled={busy || readinessBlockers.length > 0}
                   >
-                    {busy ? "Creating agent…" : locked ? "Retry setup" : "Create agent"}
+                    {busy ? "Completing setup…" : locked ? "Retry setup" : resumeDraft ? "Complete setup" : "Create agent"}
                   </button>
                 </>
               ) : (

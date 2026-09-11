@@ -2343,3 +2343,36 @@ participation, restart continuity, immediate revocation, healthy authority
 diagnostics, and unchanged ordinary Workshop and Telegram responses before the
 epic may close. Installed evidence belongs on the issue rather than as mutable
 host-specific claims in this repository design.
+
+## 50. Guided and resumable principal-owned agent creation
+
+**Implementation date:** 2026-09-11
+
+Workshop creates a ready principal-owned agent through one guided operation
+that composes the existing canonical definition, Revision 1 activation,
+enablement, runtime registration, backend, model, workspace, timeout, and
+collaboration-policy authorities. Creation choices come only from the
+principal's authorized runtime readiness contract. Completing setup does not
+start a direct conversation or attach the agent to a channel.
+
+Each stage has a durable receipt. Retrying the same client operation continues
+from the first unfinished stage, while changed input conflicts instead of
+silently producing a different agent. Workshop reloads unfinished operations
+with their exact saved choices and presents them as **Needs attention** with a
+plain-language next action. Raw operation identifiers and stage names remain
+available under setup diagnostics rather than serving as the primary user
+language.
+
+An intentional, unchanged Revision 1 draft can enter the same guided flow at
+runtime selection. Its existing definition and revision are adopted rather
+than copied, so continuation cannot create a duplicate agent. Drafts and
+archived agents remain separate in the inactive-agent browser: drafts have a
+primary **Continue setup** action, while archived definitions retain their
+historical inspection and conversation behavior. Ready, Draft, Needs
+attention, and Archived are the user-facing lifecycle states.
+
+Provisioning recovery and listing are scoped to the authenticated principal.
+Reload, process restart, or interruption after any durable stage preserves the
+operation identity and completed prefix. Existing conversations, principal
+defaults, and already-ready agents remain unchanged throughout creation and
+recovery.

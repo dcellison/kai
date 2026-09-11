@@ -149,9 +149,10 @@ class _InterruptingProvisioningService(WorkshopAgentProvisioningService):
             raise _Crash(stage)
 
 
-async def _principal(store: WorkshopEventStore) -> PrincipalId:
+async def _principal(store: WorkshopEventStore, subject: str = "101") -> PrincipalId:
     async with store.connection.execute(
-        "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = '101'",
+        "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = ?",
+        (subject,),
     ) as cursor:
         row = await cursor.fetchone()
     assert row is not None
@@ -387,6 +388,124 @@ async def test_late_failure_is_bounded_and_resumable(tmp_path: Path) -> None:
 
         completed = await service.provision(principal_id, **request)
         assert completed.status == "ready"
+    finally:
+        await store.close()
+
+
+async def test_incomplete_setup_is_principal_scoped_and_exposes_saved_input(
+    tmp_path: Path,
+) -> None:
+    store, principal_id, dependencies, _runtime_pool, settings = await _services(tmp_path)
+    request = _request()
+    request["runtime"] = {**request["runtime"], "workspace": str(tmp_path.resolve())}  # type: ignore[dict-item]
+    settings.fail_model_once = True
+    service = WorkshopAgentProvisioningService(*dependencies)  # type: ignore[arg-type]
+    try:
+        blocked = await service.provision(principal_id, **request)
+        setups = await service.list_incomplete(principal_id)
+
+        assert len(setups) == 1
+        assert setups[0].provisioning.operation_id == blocked.operation_id
+        assert setups[0].provisioning.status == "needs_attention"
+        assert setups[0].request == request
+
+        completed = await service.provision(principal_id, **request)
+        assert completed.status == "ready"
+        assert await service.list_incomplete(principal_id) == ()
+    finally:
+        await store.close()
+
+
+async def test_revision_one_draft_continues_without_duplicate_definition(
+    tmp_path: Path,
+) -> None:
+    store, principal_id, dependencies, _runtime_pool, settings = await _services(tmp_path)
+    lifecycle = dependencies[2]
+    draft = await lifecycle.create_draft(
+        principal_id,
+        idempotency_key="q1490-intentional-draft",
+        handle="builder",
+        display_name="Builder",
+        description="A bounded builder.",
+        presentation={"avatar": "B"},
+        purpose="Build carefully.",
+        instructions="Use the authorized workspace.",
+        capabilities=["text_generation"],
+        collaboration_operations=[],
+    )
+    request = _request()
+    request["definition"] = {
+        **request["definition"],  # type: ignore[dict-item]
+        "existing_definition_id": str(draft.definition_id),
+    }
+    request["runtime"] = {**request["runtime"], "workspace": str(tmp_path.resolve())}  # type: ignore[dict-item]
+    service = WorkshopAgentProvisioningService(*dependencies)  # type: ignore[arg-type]
+    try:
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM event_log WHERE event_type = 'principal_agent.conversation_started'",
+        ) as cursor:
+            initial_conversation_starts = int((await cursor.fetchone())[0])
+        settings.fail_model_once = True
+        blocked = await service.provision(principal_id, **request)
+        assert blocked.status == "needs_attention"
+        assert blocked.definition_id == draft.definition_id
+
+        completed = await WorkshopAgentProvisioningService(*dependencies).provision(  # type: ignore[arg-type]
+            principal_id,
+            **request,
+        )
+
+        assert completed.status == "ready"
+        assert completed.definition_id == draft.definition_id
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM agent_definitions WHERE handle = 'builder'",
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == 1
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM event_log WHERE event_type = 'principal_agent.conversation_started'",
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == initial_conversation_starts
+    finally:
+        await store.close()
+
+
+async def test_another_principal_cannot_continue_an_owned_draft(tmp_path: Path) -> None:
+    store, principal_id, dependencies, _runtime_pool, _settings = await _services(tmp_path)
+    lifecycle = dependencies[2]
+    draft = await lifecycle.create_draft(
+        principal_id,
+        idempotency_key="q1490-private-draft",
+        handle="builder",
+        display_name="Builder",
+        description="A bounded builder.",
+        presentation={"avatar": "B"},
+        purpose="Build carefully.",
+        instructions="Use the authorized workspace.",
+        capabilities=["text_generation"],
+        collaboration_operations=[],
+    )
+    await bootstrap_default_workshop(
+        store,
+        (
+            BootstrapHuman("Daniel", "admin", "telegram", "101", "101", profile_id(101)),
+            BootstrapHuman("Scott", "member", "telegram", "202", "202", profile_id(202)),
+        ),
+    )
+    other_principal_id = await _principal(store, "202")
+    request = _request()
+    request["definition"] = {
+        **request["definition"],  # type: ignore[dict-item]
+        "existing_definition_id": str(draft.definition_id),
+    }
+    request["runtime"] = {**request["runtime"], "workspace": str(tmp_path.resolve())}  # type: ignore[dict-item]
+    service = WorkshopAgentProvisioningService(*dependencies)  # type: ignore[arg-type]
+    try:
+        with pytest.raises(WorkshopAgentProvisioningAccessDenied, match="Access denied"):
+            await service.provision(other_principal_id, **request)
+        async with store.connection.execute(
+            "SELECT COUNT(*) FROM agent_provisioning_operations",
+        ) as cursor:
+            assert int((await cursor.fetchone())[0]) == 0
     finally:
         await store.close()
 
