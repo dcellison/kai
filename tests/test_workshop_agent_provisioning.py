@@ -119,6 +119,8 @@ class _CollaborationPolicy:
     values: tuple[str, ...] = ()
 
     def validate_initial_allowed_operations(self, requested, allowed):
+        assert isinstance(requested, list)
+        assert isinstance(allowed, list)
         assert set(allowed).issubset(requested)
         return tuple(allowed)
 
