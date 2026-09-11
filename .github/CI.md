@@ -20,7 +20,7 @@ Unknown or empty change input fails closed to complete validation.
 
 - `core`: general application, adapter, configuration, installation, and integration tests;
 - `memory`: `test_memory*` and `test_eval_*` modules;
-- `workshop`: `test_workshop_*` modules.
+- `workshop-1`, `workshop-2`, and `workshop-3`: `test_workshop_*` modules distributed by a frozen consistent hash. Existing paths remain in the same sub-shard, and new modules are assigned automatically.
 
 The shards run concurrently with fail-fast disabled, so failures remain independently visible. Unit coverage proves that their sets are exhaustive and disjoint. The required `check` job succeeds only after the quality job and every selected shard succeed.
 
@@ -31,5 +31,7 @@ Run a shard locally with:
 ```bash
 python scripts/ci_test_shard.py core
 python scripts/ci_test_shard.py memory
-python scripts/ci_test_shard.py workshop
+python scripts/ci_test_shard.py workshop-1
+python scripts/ci_test_shard.py workshop-2
+python scripts/ci_test_shard.py workshop-3
 ```

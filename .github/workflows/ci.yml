@@ -93,7 +93,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [core, memory, workshop]
+        shard: [core, memory, workshop-1, workshop-2, workshop-3]
     steps:
       - uses: actions/checkout@v7
 
