@@ -423,6 +423,69 @@ export interface WorkshopAgentEnablement {
   ownerRuntimeProfileId: string | null;
 }
 
+export interface WorkshopAgentCreationBlocker {
+  code: string;
+  detail: string;
+}
+
+export interface WorkshopAgentCreationModelOption {
+  displayName: string;
+  modelId: string;
+  retained: boolean;
+  selectable: boolean;
+  status: "available" | "not_advertised" | "unavailable" | "unknown";
+}
+
+export interface WorkshopAgentCreationBackendOption {
+  backend: string;
+  blockers: WorkshopAgentCreationBlocker[];
+  catalogueStale: boolean;
+  catalogueStatus:
+    | "refreshing"
+    | "succeeded"
+    | "failed"
+    | "unsupported"
+    | "malformed"
+    | "timed_out"
+    | "invalidated"
+    | "superseded"
+    | null;
+  current: boolean;
+  defaultModel: string;
+  models: WorkshopAgentCreationModelOption[];
+  optionId: string;
+  provider: string;
+  readiness: "ready" | "unverified" | "unavailable" | "misconfigured";
+}
+
+export interface WorkshopAgentCreationWorkspaceOption {
+  available: boolean;
+  default: boolean;
+  name: string;
+  path: string;
+}
+
+export interface WorkshopAgentCreationRuntimeOption {
+  backends: WorkshopAgentCreationBackendOption[];
+  blockers: WorkshopAgentCreationBlocker[];
+  currentBackendOptionId: string;
+  defaultTimeoutSeconds: number;
+  defaultWorkspace: string | null;
+  displayName: string;
+  maximumTimeoutSeconds: number;
+  minimumTimeoutSeconds: number;
+  ready: boolean;
+  runtimeProfileId: string;
+  workspaces: WorkshopAgentCreationWorkspaceOption[];
+}
+
+export interface WorkshopAgentCreationOptions {
+  blockers: WorkshopAgentCreationBlocker[];
+  principalId: string;
+  ready: boolean;
+  runtimes: WorkshopAgentCreationRuntimeOption[];
+}
+
 export interface WorkshopAgentChangeSignal {
   definitionId: string | null;
   eventPosition: number;

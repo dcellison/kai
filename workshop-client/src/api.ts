@@ -62,6 +62,7 @@ import type {
   WorkshopAgentChangeSignal,
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
+  WorkshopAgentCreationOptions,
   WorkshopCollaborationOperation,
   WorkshopCollaborationPolicy,
   WorkshopStandingParticipation,
@@ -974,6 +975,195 @@ function parseAgentEnablement(value: unknown): WorkshopAgentEnablement | null {
   };
 }
 
+function parseAgentCreationBlockers(
+  value: unknown,
+): WorkshopAgentCreationOptions["blockers"] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const blockers = value.map((item) => {
+    if (
+      !isRecord(item) ||
+      typeof item.code !== "string" ||
+      item.code.length === 0 ||
+      typeof item.detail !== "string" ||
+      item.detail.length === 0
+    ) {
+      return null;
+    }
+    return { code: item.code, detail: item.detail };
+  });
+  return blockers.some((item) => item === null)
+    ? null
+    : blockers as WorkshopAgentCreationOptions["blockers"];
+}
+
+function parseAgentCreationOptions(value: unknown): WorkshopAgentCreationOptions | null {
+  if (
+    !isRecord(value) ||
+    typeof value.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(value.principal_id) ||
+    typeof value.ready !== "boolean" ||
+    !Array.isArray(value.runtimes)
+  ) {
+    return null;
+  }
+  const blockers = parseAgentCreationBlockers(value.blockers);
+  if (!blockers) {
+    return null;
+  }
+  const refreshStatuses = [
+    "refreshing",
+    "succeeded",
+    "failed",
+    "unsupported",
+    "malformed",
+    "timed_out",
+    "invalidated",
+    "superseded",
+  ];
+  const modelStatuses = ["available", "not_advertised", "unavailable", "unknown"];
+  const readinessStates = ["ready", "unverified", "unavailable", "misconfigured"];
+  const runtimes = value.runtimes.map((runtime) => {
+    if (
+      !isRecord(runtime) ||
+      typeof runtime.runtime_profile_id !== "string" ||
+      !RUNTIME_PROFILE_PATTERN.test(runtime.runtime_profile_id) ||
+      typeof runtime.display_name !== "string" ||
+      runtime.display_name.length === 0 ||
+      typeof runtime.current_backend_option_id !== "string" ||
+      runtime.current_backend_option_id.length === 0 ||
+      (runtime.default_workspace !== null && typeof runtime.default_workspace !== "string") ||
+      !Number.isSafeInteger(runtime.default_timeout_seconds) ||
+      (runtime.default_timeout_seconds as number) < 1 ||
+      !Number.isSafeInteger(runtime.minimum_timeout_seconds) ||
+      (runtime.minimum_timeout_seconds as number) < 1 ||
+      !Number.isSafeInteger(runtime.maximum_timeout_seconds) ||
+      (runtime.maximum_timeout_seconds as number) < (runtime.minimum_timeout_seconds as number) ||
+      typeof runtime.ready !== "boolean" ||
+      !Array.isArray(runtime.backends) ||
+      !Array.isArray(runtime.workspaces)
+    ) {
+      return null;
+    }
+    const runtimeBlockers = parseAgentCreationBlockers(runtime.blockers);
+    if (!runtimeBlockers) {
+      return null;
+    }
+    const backends = runtime.backends.map((backend) => {
+      if (
+        !isRecord(backend) ||
+        typeof backend.option_id !== "string" ||
+        backend.option_id.length === 0 ||
+        typeof backend.backend !== "string" ||
+        backend.backend.length === 0 ||
+        typeof backend.provider !== "string" ||
+        backend.provider.length === 0 ||
+        typeof backend.current !== "boolean" ||
+        typeof backend.readiness !== "string" ||
+        !readinessStates.includes(backend.readiness) ||
+        typeof backend.default_model !== "string" ||
+        backend.default_model.length === 0 ||
+        (backend.catalogue_status !== null &&
+          (typeof backend.catalogue_status !== "string" ||
+            !refreshStatuses.includes(backend.catalogue_status))) ||
+        typeof backend.catalogue_stale !== "boolean" ||
+        !Array.isArray(backend.models)
+      ) {
+        return null;
+      }
+      const backendBlockers = parseAgentCreationBlockers(backend.blockers);
+      if (!backendBlockers) {
+        return null;
+      }
+      const models = backend.models.map((model) => {
+        if (
+          !isRecord(model) ||
+          typeof model.model_id !== "string" ||
+          model.model_id.length === 0 ||
+          typeof model.display_name !== "string" ||
+          model.display_name.length === 0 ||
+          typeof model.status !== "string" ||
+          !modelStatuses.includes(model.status) ||
+          typeof model.selectable !== "boolean" ||
+          typeof model.retained !== "boolean"
+        ) {
+          return null;
+        }
+        return {
+          displayName: model.display_name,
+          modelId: model.model_id,
+          retained: model.retained,
+          selectable: model.selectable,
+          status: model.status,
+        };
+      });
+      if (models.some((model) => model === null)) {
+        return null;
+      }
+      return {
+        backend: backend.backend,
+        blockers: backendBlockers,
+        catalogueStale: backend.catalogue_stale,
+        catalogueStatus: backend.catalogue_status,
+        current: backend.current,
+        defaultModel: backend.default_model,
+        models,
+        optionId: backend.option_id,
+        provider: backend.provider,
+        readiness: backend.readiness,
+      };
+    });
+    const workspaces = runtime.workspaces.map((workspace) => {
+      if (
+        !isRecord(workspace) ||
+        typeof workspace.path !== "string" ||
+        workspace.path.length === 0 ||
+        typeof workspace.name !== "string" ||
+        workspace.name.length === 0 ||
+        typeof workspace.default !== "boolean" ||
+        typeof workspace.available !== "boolean"
+      ) {
+        return null;
+      }
+      return {
+        available: workspace.available,
+        default: workspace.default,
+        name: workspace.name,
+        path: workspace.path,
+      };
+    });
+    if (
+      backends.some((backend) => backend === null) ||
+      workspaces.some((workspace) => workspace === null)
+    ) {
+      return null;
+    }
+    return {
+      backends,
+      blockers: runtimeBlockers,
+      currentBackendOptionId: runtime.current_backend_option_id,
+      defaultTimeoutSeconds: runtime.default_timeout_seconds as number,
+      defaultWorkspace: runtime.default_workspace,
+      displayName: runtime.display_name,
+      maximumTimeoutSeconds: runtime.maximum_timeout_seconds as number,
+      minimumTimeoutSeconds: runtime.minimum_timeout_seconds as number,
+      ready: runtime.ready,
+      runtimeProfileId: runtime.runtime_profile_id,
+      workspaces,
+    };
+  });
+  if (runtimes.some((runtime) => runtime === null)) {
+    return null;
+  }
+  return {
+    blockers,
+    principalId: value.principal_id,
+    ready: value.ready,
+    runtimes: runtimes as WorkshopAgentCreationOptions["runtimes"],
+  };
+}
+
 async function agentMutation(
   token: string,
   path: string,
@@ -1040,6 +1230,26 @@ export async function loadAgentDefinitions(
     throw new Error("Kai returned unsupported agent definitions.");
   }
   return agents as WorkshopAgentDefinition[];
+}
+
+export async function loadAgentCreationOptions(
+  token: string,
+): Promise<WorkshopAgentCreationOptions> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    "/v1/client/agents/creation-options",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load agent creation options."));
+  }
+  const options = isRecord(payload) && payload.version === 1
+    ? parseAgentCreationOptions(payload.creation_options)
+    : null;
+  if (!options) {
+    throw new Error("Kai returned unsupported agent creation options.");
+  }
+  return options;
 }
 
 export async function loadAgentEnablements(

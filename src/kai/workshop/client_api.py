@@ -19,6 +19,11 @@ from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
 
+from kai.workshop.agent_creation_options import (
+    AgentCreationBlocker,
+    AgentCreationOptions,
+    WorkshopAgentCreationOptionsService,
+)
 from kai.workshop.agent_enablement import (
     PrincipalAgentEnablement,
     WorkshopAgentEnablementAccessDenied,
@@ -339,6 +344,7 @@ _CHANNEL_MEMBER_REMOVAL_PATH = "/v1/channels/{channel_id}/members/{principal_id}
 _WORKSHOP_HUMANS_PATH = "/v1/workshops/{workshop_id}/humans"
 _HUMAN_CONVERSATION_PATH = "/v1/workshops/{workshop_id}/humans/{principal_id}/conversation"
 _AGENT_DEFINITIONS_PATH = "/v1/client/agents"
+_AGENT_CREATION_OPTIONS_PATH = "/v1/client/agents/creation-options"
 _AGENT_EVENTS_PATH = "/v1/client/agents/events"
 _AGENT_DEFINITION_PATH = "/v1/client/agents/{definition_id}"
 _AGENT_REVISIONS_PATH = "/v1/client/agents/{definition_id}/revisions"
@@ -1084,6 +1090,64 @@ def _serialize_agent_definition(snapshot: AgentDefinitionSnapshot) -> dict[str, 
                 "event_position": revision.event_position,
             }
             for revision in snapshot.revisions
+        ],
+    }
+
+
+def _serialize_agent_creation_options(snapshot: AgentCreationOptions) -> dict[str, object]:
+    def blocker(item: AgentCreationBlocker) -> dict[str, str]:
+        return {"code": item.code, "detail": item.detail}
+
+    return {
+        "principal_id": str(snapshot.principal_id),
+        "ready": snapshot.ready,
+        "blockers": [blocker(item) for item in snapshot.blockers],
+        "runtimes": [
+            {
+                "runtime_profile_id": str(runtime.runtime_profile_id),
+                "display_name": runtime.display_name,
+                "current_backend_option_id": runtime.current_backend_option_id,
+                "default_workspace": runtime.default_workspace,
+                "default_timeout_seconds": runtime.default_timeout_seconds,
+                "minimum_timeout_seconds": runtime.minimum_timeout_seconds,
+                "maximum_timeout_seconds": runtime.maximum_timeout_seconds,
+                "ready": runtime.ready,
+                "blockers": [blocker(item) for item in runtime.blockers],
+                "backends": [
+                    {
+                        "option_id": backend.option_id,
+                        "backend": backend.backend,
+                        "provider": backend.provider,
+                        "current": backend.current,
+                        "readiness": backend.readiness,
+                        "default_model": backend.default_model,
+                        "catalogue_status": backend.catalogue_status,
+                        "catalogue_stale": backend.catalogue_stale,
+                        "blockers": [blocker(item) for item in backend.blockers],
+                        "models": [
+                            {
+                                "model_id": model.model_id,
+                                "display_name": model.display_name,
+                                "status": model.status,
+                                "selectable": model.selectable,
+                                "retained": model.retained,
+                            }
+                            for model in backend.models
+                        ],
+                    }
+                    for backend in runtime.backends
+                ],
+                "workspaces": [
+                    {
+                        "path": workspace.path,
+                        "name": workspace.name,
+                        "default": workspace.default,
+                        "available": workspace.available,
+                    }
+                    for workspace in runtime.workspaces
+                ],
+            }
+            for runtime in snapshot.runtimes
         ],
     }
 
@@ -5049,6 +5113,32 @@ async def _handle_agent_definition_list(
     )
 
 
+async def _handle_agent_creation_options(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentCreationOptionsService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent creation-options request")
+    try:
+        snapshot = await service.inspect(principal_id)
+    except Exception:
+        return _error_response(
+            status=503,
+            code="agent_creation_options_unavailable",
+            message="Agent creation options are temporarily unavailable",
+        )
+    return _json_response(
+        {"version": 1, "creation_options": _serialize_agent_creation_options(snapshot)},
+        status=200,
+    )
+
+
 async def _handle_agent_definition_detail(
     request: web.Request,
     *,
@@ -7758,6 +7848,7 @@ def register_workshop_read_routes(
     channel_notification_policy: WorkshopChannelNotificationPolicyService | None = None,
     client_preferences: WorkshopClientPreferenceService | None = None,
     appearance_preferences: WorkshopAppearancePreferenceService | None = None,
+    agent_creation_options: WorkshopAgentCreationOptionsService | None = None,
     agent_enablement: WorkshopAgentEnablementService | None = None,
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
@@ -7925,6 +8016,15 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=agent_lifecycle,
+            )
+
+    async def handle_agent_creation_options(request: web.Request) -> web.Response:
+        assert agent_creation_options is not None
+        async with request_lock:
+            return await _handle_agent_creation_options(
+                request,
+                authenticator=authenticator,
+                service=agent_creation_options,
             )
 
     async def handle_agent_definition_detail(request: web.Request) -> web.Response:
@@ -8214,6 +8314,8 @@ def register_workshop_read_routes(
         app.router.add_get(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
         app.router.add_put(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
         app.router.add_post(_CHANNEL_STANDING_OBSERVATION_RESUME_PATH, handle_standing_observation_resume)
+    if agent_creation_options is not None:
+        app.router.add_get(_AGENT_CREATION_OPTIONS_PATH, handle_agent_creation_options)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
     app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)
     app.router.add_get(_AGENT_EVENTS_PATH, handle_agent_event_stream)

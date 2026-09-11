@@ -15,6 +15,12 @@ from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 
+from kai.workshop.agent_creation_options import (
+    AgentCreationBackendOption,
+    AgentCreationOptions,
+    AgentCreationRuntimeOption,
+    AgentCreationWorkspaceOption,
+)
 from kai.workshop.agent_enablement import EligibleAgentRuntime, PrincipalAgentEnablement
 from kai.workshop.appearance_preferences import (
     WORKSHOP_APPEARANCE_THEMES,
@@ -773,6 +779,49 @@ class _AgentEnablement:
         return replace(self._snapshot("enabled"), conversation_started=True)
 
 
+@dataclass
+class _AgentCreationOptions:
+    principal_id: PrincipalId
+    calls: list[PrincipalId] = field(default_factory=list)
+
+    async def inspect(self, principal_id: PrincipalId) -> AgentCreationOptions:
+        assert principal_id == self.principal_id
+        self.calls.append(principal_id)
+        return AgentCreationOptions(
+            principal_id,
+            True,
+            (
+                AgentCreationRuntimeOption(
+                    profile_id(101),
+                    "Daniel",
+                    "claude:anthropic",
+                    "/srv/daniel",
+                    300,
+                    1,
+                    1800,
+                    (
+                        AgentCreationBackendOption(
+                            "claude:anthropic",
+                            "claude",
+                            "anthropic",
+                            True,
+                            "unverified",
+                            "claude-sonnet-4-5",
+                            (),
+                            "unsupported",
+                            True,
+                            (),
+                        ),
+                    ),
+                    (AgentCreationWorkspaceOption("/srv/daniel", "Home", True, True),),
+                    True,
+                    (),
+                ),
+            ),
+            (),
+        )
+
+
 async def _identity_for(store: WorkshopEventStore, subject: str) -> tuple[PrincipalId, ChannelId]:
     async with store.connection.execute(
         "SELECT e.principal_id, b.channel_id FROM external_identities e "
@@ -899,6 +948,7 @@ async def _open_client(
     notification_preferences=None,
     client_preferences=None,
     appearance_preferences=None,
+    agent_creation_options=None,
     agent_enablement=None,
     human_avatars=None,
     collaboration_policy=None,
@@ -924,6 +974,7 @@ async def _open_client(
         notification_preferences=notification_preferences,
         client_preferences=client_preferences,
         appearance_preferences=appearance_preferences,
+        agent_creation_options=agent_creation_options,
         agent_enablement=agent_enablement,
         human_avatars=human_avatars,
         collaboration_policy=collaboration_policy,
@@ -2536,6 +2587,81 @@ class TestWorkshopAgentLifecycleHTTPContract:
 
 
 class TestWorkshopAgentEnablementHTTPContract:
+    async def test_creation_options_are_authenticated_principal_scoped_and_read_only(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        service = _AgentCreationOptions(alice_id)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+            agent_creation_options=service,
+        )
+        try:
+            unauthenticated = await client.get("/v1/client/agents/creation-options")
+            assert unauthenticated.status == 401
+            selected = await client.get(
+                "/v1/client/agents/creation-options",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert selected.status == 200
+            payload = await selected.json()
+            assert payload == {
+                "version": 1,
+                "creation_options": {
+                    "principal_id": str(alice_id),
+                    "ready": True,
+                    "blockers": [],
+                    "runtimes": [
+                        {
+                            "runtime_profile_id": str(profile_id(101)),
+                            "display_name": "Daniel",
+                            "current_backend_option_id": "claude:anthropic",
+                            "default_workspace": "/srv/daniel",
+                            "default_timeout_seconds": 300,
+                            "minimum_timeout_seconds": 1,
+                            "maximum_timeout_seconds": 1800,
+                            "ready": True,
+                            "blockers": [],
+                            "backends": [
+                                {
+                                    "option_id": "claude:anthropic",
+                                    "backend": "claude",
+                                    "provider": "anthropic",
+                                    "current": True,
+                                    "readiness": "unverified",
+                                    "default_model": "claude-sonnet-4-5",
+                                    "catalogue_status": "unsupported",
+                                    "catalogue_stale": True,
+                                    "blockers": [],
+                                    "models": [],
+                                }
+                            ],
+                            "workspaces": [
+                                {
+                                    "path": "/srv/daniel",
+                                    "name": "Home",
+                                    "default": True,
+                                    "available": True,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+            assert service.calls == [alice_id]
+
+            selector = await client.get(
+                f"/v1/client/agents/creation-options?principal_id={bob_id}",
+                headers={"Authorization": "Bearer alice"},
+            )
+            assert selector.status == 400
+            assert service.calls == [alice_id]
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_authenticated_principal_lists_and_enables_agent(self, tmp_path: Path) -> None:
         store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
         service = _AgentEnablement(alice_id)
