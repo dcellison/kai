@@ -1400,12 +1400,12 @@ function channelIsHumanDirect(channel: WorkshopChannelSummary): boolean {
 
 function workshopRoleLabel(role: string): string {
   if (role === "admin") {
-    return "Workshop administrator";
+    return "Administrator";
   }
   if (role === "member") {
-    return "Workshop member";
+    return "Member";
   }
-  return `Workshop ${role}`;
+  return role.charAt(0).toUpperCase() + role.slice(1);
 }
 
 interface ChannelCreationRequest {
@@ -4767,7 +4767,7 @@ function WorkshopView({
                   ? "Authenticated GitHub activity appears here live and is delivered to every configured client."
                   : humanDirect
                     ? `Messages here are private to you and ${channelName}.`
-                    : "Messages below come from Kai’s durable conversation history across every connected client."}
+                    : `Messages below come from ${channelName}’s durable conversation history across every connected client.`}
               </p>
               {channel.kind === "notification" && notificationPreferences && (
                 <p className="notification-routing-summary">
