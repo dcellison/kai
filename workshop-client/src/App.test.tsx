@@ -1042,7 +1042,7 @@ describe("Workshop React client", () => {
     expect(navigationPanel.querySelector(".sidebar-header")).not.toHaveTextContent(
       "admin",
     );
-    expect(screen.getByText("Workshop administrator")).toBeVisible();
+    expect(screen.getByText("Administrator")).toBeVisible();
     expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
     expect(redeemEnrollment).toHaveBeenCalledWith(
       "one-time-token",
@@ -1706,7 +1706,7 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("menuitem", { name: /Settings/ }));
 
     expect(await screen.findByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
-    expect(screen.getByText("Workshop administrator")).toBeVisible();
+    expect(screen.getByText("Administrator")).toBeVisible();
     expect(screen.queryByLabelText("Backend")).toBeNull();
     expect(screen.queryByRole("heading", { name: "Runtime settings" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Workspace settings" })).toBeNull();
@@ -3489,6 +3489,28 @@ describe("Workshop React client", () => {
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "existing-session" }),
     );
+    const guidedAgentName = "Guided qualification";
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      workshops: navigation.workshops.map((workshop) => ({
+        ...workshop,
+        channels: workshop.channels.map((availableChannel) =>
+          availableChannel.channelId === channelId
+            ? {
+                ...availableChannel,
+                agents: availableChannel.agents.map((agent) => ({
+                  ...agent,
+                  name: guidedAgentName,
+                })),
+                participants: availableChannel.participants.map((participant) => ({
+                  ...participant,
+                  displayName: guidedAgentName,
+                })),
+              }
+            : availableChannel
+        ),
+      })),
+    });
     vi.mocked(loadTimeline).mockImplementation(async (selectedSession) => ({
       messages: [
         {
@@ -3503,11 +3525,19 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(screen.getByText("Direct messages")).toBeVisible();
-    const kaiDirectMessage = screen.getByRole("button", { name: "Kai" });
-    expect(kaiDirectMessage).toBeVisible();
-    expect(within(kaiDirectMessage).getByText("K")).toHaveClass("channel-agent-avatar");
+    const agentDirectMessage = screen.getByRole("button", { name: guidedAgentName });
+    expect(agentDirectMessage).toBeVisible();
+    expect(within(agentDirectMessage).getByText("G")).toHaveClass("channel-agent-avatar");
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Welcome to Kai" })).toBeVisible();
+    expect(
+      screen.getByRole("heading", { name: `Welcome to ${guidedAgentName}` }),
+    ).toBeVisible();
+    expect(screen.getByText(
+      `Messages below come from ${guidedAgentName}’s durable conversation history across every connected client.`,
+    )).toBeVisible();
+    expect(screen.queryByText(
+      "Messages below come from Kai’s durable conversation history across every connected client.",
+    )).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Scott" }));
 
