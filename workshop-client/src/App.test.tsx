@@ -29,6 +29,7 @@ import {
   loadChannelMembers,
   loadChannelMessage,
   loadChannelUnread,
+  loadEffectiveAgentRuntime,
   loadHumanNotificationCounts,
   loadHumanNotifications,
   loadWorkshopHumans,
@@ -81,6 +82,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopHumanNotification,
   WorkshopChannelUnreadState,
+  WorkshopEffectiveAgentRuntime,
   WorkshopThreadUnreadState,
   WorkshopFollowedThread,
   WorkshopStandingParticipation,
@@ -107,6 +109,7 @@ vi.mock("./api", async (importOriginal) => {
     loadChannelMembers: vi.fn(),
     loadChannelMessage: vi.fn(),
     loadChannelUnread: vi.fn(),
+    loadEffectiveAgentRuntime: vi.fn(),
     loadHumanNotificationCounts: vi.fn(),
     loadHumanNotifications: vi.fn(),
     loadWorkshopHumans: vi.fn(),
@@ -633,6 +636,26 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
     },
   ],
 };
+const effectiveAgentRuntime: WorkshopEffectiveAgentRuntime = {
+  agentHandle: "kai",
+  agentId: "agt_00000000000000000000000000000002",
+  agentName: "Kai",
+  backend: settingsWorkspace.backend,
+  canManage: true,
+  channelId,
+  model: {
+    source: settingsWorkspace.model.source,
+    value: settingsWorkspace.model.value,
+  },
+  provider: settingsWorkspace.provider,
+  sponsorDisplayName: "Daniel",
+  sponsorPrincipalId: "prn_00000000000000000000000000000001",
+  timeoutSeconds: {
+    source: settingsWorkspace.timeoutSeconds.source,
+    value: settingsWorkspace.timeoutSeconds.value,
+  },
+  workspace: settingsWorkspace.workspace,
+};
 
 const standingParticipation: WorkshopStandingParticipation = {
   canInspectSilent: true,
@@ -877,6 +900,7 @@ describe("Workshop React client", () => {
     vi.mocked(markHumanNotificationsRead).mockResolvedValue([]);
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ collaborationActivity: [], entries: [], hasMore: false });
+    vi.mocked(loadEffectiveAgentRuntime).mockResolvedValue(effectiveAgentRuntime);
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
     vi.mocked(loadStandingParticipation).mockResolvedValue(standingParticipation);
     vi.mocked(updateStandingParticipation).mockResolvedValue(standingParticipation);
@@ -1839,6 +1863,35 @@ describe("Workshop React client", () => {
     );
   });
 
+  it("shows a non-owner the agent owner's effective runtime without edit controls", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "scott-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue({
+      ...navigation,
+      principal: {
+        displayName: "Scott",
+        handle: "scott",
+        principalId: "prn_00000000000000000000000000000003",
+      },
+    });
+    vi.mocked(loadEffectiveAgentRuntime).mockResolvedValue({
+      ...effectiveAgentRuntime,
+      canManage: false,
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Sponsored by Daniel")).toBeVisible();
+    expect(screen.getByText("codex")).toBeVisible();
+    expect(screen.getByText("· openai")).toBeVisible();
+    expect(screen.getByText("/Users/kai/Projects/kai")).toBeVisible();
+    expect(screen.queryByLabelText("Workspace")).toBeNull();
+    expect(loadSettingsWorkspace).not.toHaveBeenCalled();
+    expect(switchWorkspace).not.toHaveBeenCalled();
+  });
+
   it("fetches the run trace incrementally on trace doorbells", async () => {
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -2690,7 +2743,7 @@ describe("Workshop React client", () => {
     expect(redeemEnrollment).not.toHaveBeenCalled();
   });
 
-  it("uses the principal's direct runtime settings from a group channel", async () => {
+  it("does not claim one effective runtime for a multi-agent channel", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -2731,20 +2784,14 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${secondChannelId}`),
     ).toBeVisible();
-    expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
-    expect(loadSettingsWorkspace).toHaveBeenLastCalledWith({
-      channelId,
+    expect(await screen.findByText(
+      "Runtime is selected per agent when that agent participates.",
+    )).toBeVisible();
+    expect(screen.queryByLabelText("Workspace")).toBeNull();
+    expect(loadEffectiveAgentRuntime).not.toHaveBeenCalledWith({
+      channelId: secondChannelId,
       token: "existing-session",
     });
-    await user.selectOptions(
-      screen.getByLabelText("Workspace"),
-      "/var/lib/kai/home/principal",
-    );
-    expect(switchWorkspace).toHaveBeenCalledWith(
-      { channelId, token: "existing-session" },
-      "/var/lib/kai/home/principal",
-      "sws_current",
-    );
     await waitFor(() => expect(loadNavigation).toHaveBeenCalledTimes(1));
     expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
 

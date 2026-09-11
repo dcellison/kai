@@ -589,6 +589,21 @@ export interface WorkshopSettingsWorkspace {
   workspaces: WorkshopWorkspaceOption[];
 }
 
+export interface WorkshopEffectiveAgentRuntime {
+  agentHandle: string;
+  agentId: string;
+  agentName: string;
+  backend: string;
+  canManage: boolean;
+  channelId: string;
+  model: { source: string; value: string };
+  provider: string;
+  sponsorDisplayName: string;
+  sponsorPrincipalId: string;
+  timeoutSeconds: { source: string; value: number };
+  workspace: string;
+}
+
 export type WorkshopRoutingTaskClass = "conversation" | "coding" | "vision";
 
 export interface WorkshopRoutingEligibility {
