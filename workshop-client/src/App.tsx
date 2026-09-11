@@ -4426,6 +4426,9 @@ function WorkshopView({
                   const humanPeer = availableChannel.agents.length === 0
                     ? availableChannel.participants.find((participant) => participant.kind === "human")
                     : undefined;
+                  const agentPeer = !humanPeer && availableChannel.agents.length === 1
+                    ? availableChannel.agents[0]
+                    : undefined;
                   return (
                   <button
                     className={`channel-link ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
@@ -4442,6 +4445,10 @@ function WorkshopView({
                         displayName={humanPeer.displayName}
                         principalId={humanPeer.principalId}
                       />
+                    ) : agentPeer ? (
+                      <span className="channel-agent-avatar" aria-hidden="true">
+                        {agentPeer.name.slice(0, 1).toUpperCase()}
+                      </span>
                     ) : (
                       <span>{channelSymbol(availableChannel)}</span>
                     )}

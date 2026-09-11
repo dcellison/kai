@@ -3421,7 +3421,9 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(screen.getByText("Direct messages")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
+    const kaiDirectMessage = screen.getByRole("button", { name: "Kai" });
+    expect(kaiDirectMessage).toBeVisible();
+    expect(within(kaiDirectMessage).getByText("K")).toHaveClass("channel-agent-avatar");
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Welcome to Kai" })).toBeVisible();
 

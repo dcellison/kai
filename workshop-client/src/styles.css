@@ -687,8 +687,8 @@ button:disabled {
 }
 
 .agent-link {
-  grid-template-columns: 1.85rem minmax(0, 1fr) auto;
-  gap: 0.55rem;
+  grid-template-columns: 1.35rem minmax(0, 1fr) auto;
+  gap: 0.42rem;
   padding: 0.25rem 0.6rem;
 }
 
@@ -705,13 +705,13 @@ button:disabled {
 .mini-avatar {
   display: inline-grid;
   place-items: center;
-  width: 1.7rem;
-  height: 1.7rem;
-  border-radius: 0.35rem;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 0.28rem;
   background: color-mix(in srgb, var(--color-success) 15%, transparent);
   color: var(--color-success);
   font-family: var(--serif);
-  font-size: 0.8rem;
+  font-size: 0.6rem;
   font-weight: 720;
 }
 
@@ -734,6 +734,7 @@ button:disabled {
 }
 
 .channel-human-avatar,
+.channel-agent-avatar,
 .context-person-avatar,
 .human-picker-avatar {
   display: inline-grid;
@@ -747,9 +748,18 @@ button:disabled {
 }
 
 .channel-human-avatar {
-  width: 1.35rem;
-  height: 1.35rem;
-  font-size: 0.64rem;
+  width: 1.05rem;
+  height: 1.05rem;
+  font-size: 0.52rem;
+}
+
+.channel-agent-avatar {
+  width: 1.05rem;
+  height: 1.05rem;
+  background: color-mix(in srgb, var(--color-success) 15%, transparent);
+  color: var(--color-success);
+  font-family: var(--serif);
+  font-size: 0.56rem;
 }
 
 .agent-link strong,
@@ -783,8 +793,8 @@ button:disabled {
 
 .profile-trigger {
   display: grid;
-  grid-template-columns: 1.85rem minmax(0, 1fr) auto;
-  gap: 0.55rem;
+  grid-template-columns: 1.35rem minmax(0, 1fr) auto;
+  gap: 0.42rem;
   align-items: center;
   width: 100%;
   border: 0;
