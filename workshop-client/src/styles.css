@@ -3310,6 +3310,7 @@ button:disabled {
 }
 
 .agent-authority-note,
+.agent-ready-summary,
 .agent-enablement-card,
 .agent-active-revision,
 .agent-admin-controls,
@@ -3323,6 +3324,16 @@ button:disabled {
 
 .agent-authority-note {
   border-left: 3px solid var(--color-special);
+}
+
+.agent-ready-summary {
+  border-left: 3px solid var(--color-success);
+}
+
+.agent-ready-summary p {
+  margin: 0.3rem 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
 }
 
 .agent-authority-note p,
@@ -3461,8 +3472,214 @@ button:disabled {
   overflow-y: auto;
 }
 
+.agent-creation-wizard {
+  width: min(54rem, 100%);
+}
+
+.agent-creation-progress {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  margin: 0 0 1.15rem;
+  padding: 0;
+  color: var(--color-text-muted);
+  list-style: none;
+}
+
+.agent-creation-progress li {
+  display: flex;
+  position: relative;
+  align-items: center;
+  gap: 0.4rem;
+  border-bottom: 2px solid var(--color-border);
+  padding: 0.55rem 0.35rem;
+  font-size: 0.64rem;
+}
+
+.agent-creation-progress li > span {
+  display: grid;
+  width: 1.25rem;
+  height: 1.25rem;
+  place-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 50%;
+  font-size: 0.58rem;
+}
+
+.agent-creation-progress li.active {
+  border-color: var(--color-accent);
+  color: var(--color-text-strong);
+}
+
+.agent-creation-progress li[aria-current="step"] > span {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  color: var(--color-accent);
+}
+
+.agent-creation-stage {
+  min-height: 20rem;
+}
+
+.agent-creation-stage-heading {
+  margin-bottom: 1rem;
+}
+
+.agent-creation-stage-heading h3,
+.agent-creation-stage-heading p {
+  margin: 0;
+}
+
+.agent-creation-stage-heading p,
+.agent-runtime-notice,
+.agent-conversation-notice,
+.agent-creation-recovery {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.agent-creation-stage-heading p {
+  margin-top: 0.25rem;
+}
+
+.agent-creation-advanced {
+  margin-top: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.45rem;
+  padding: 0.75rem;
+  background: var(--color-panel);
+}
+
+.agent-creation-advanced > summary {
+  color: var(--color-text-strong);
+  cursor: pointer;
+  font-size: 0.68rem;
+  font-weight: 680;
+}
+
+.agent-runtime-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.agent-runtime-choice-grid > label,
+.agent-runtime-profile-choice label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--color-text-strong);
+  font-size: 0.68rem;
+  font-weight: 680;
+}
+
+.agent-runtime-profile-choice {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.agent-runtime-profile-choice label {
+  margin-top: 0.75rem;
+}
+
+.agent-editor select {
+  width: 100%;
+  min-height: 2.35rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.55rem 0.65rem;
+  background: var(--color-canvas-inset);
+  color: var(--color-text-strong);
+  font: inherit;
+}
+
+.agent-editor select:focus-visible {
+  border-color: var(--color-accent);
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 30%, transparent);
+  outline-offset: 1px;
+}
+
+.agent-runtime-notice {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.agent-creation-blockers {
+  margin-top: 1rem;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 55%, var(--color-border));
+  border-radius: 0.45rem;
+  padding: 0.8rem;
+  background: color-mix(in srgb, var(--color-warning) 7%, var(--color-panel));
+}
+
+.agent-creation-blockers strong,
+.agent-creation-blockers p,
+.agent-creation-blockers li {
+  font-size: 0.66rem;
+}
+
+.agent-creation-blockers ul {
+  margin: 0.55rem 0;
+  padding-left: 1.1rem;
+}
+
+.agent-creation-blockers p {
+  margin: 0;
+  color: var(--color-text-muted);
+}
+
+.agent-creation-review {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin: 0;
+}
+
+.agent-creation-review > div {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.7rem;
+  background: var(--color-canvas-inset);
+}
+
+.agent-creation-review dt,
+.agent-creation-review dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-creation-review dt {
+  color: var(--color-text-muted);
+  font-size: 0.6rem;
+}
+
+.agent-creation-review dd {
+  margin-top: 0.25rem;
+  color: var(--color-text-strong);
+  font-size: 0.68rem;
+}
+
+.agent-conversation-notice,
+.agent-creation-recovery,
+.agent-creation-loading {
+  margin: 1rem 0 0;
+}
+
+.agent-creation-error {
+  margin: 0.8rem 0 0;
+}
+
 .agent-creation-dialog .form-actions {
   margin-top: 1rem;
+}
+
+.agent-creation-dialog .agent-creation-actions {
+  justify-content: space-between;
+}
+
+.agent-creation-primary-actions {
+  display: flex;
+  gap: 0.55rem;
 }
 
 .agent-execution-profile-card > summary {
@@ -4494,6 +4711,8 @@ button:disabled {
   }
 
   .agent-editor-grid,
+  .agent-runtime-choice-grid,
+  .agent-creation-review,
   .agent-capability-choices {
     grid-template-columns: 1fr;
   }

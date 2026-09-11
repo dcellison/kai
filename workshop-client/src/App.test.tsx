@@ -13,11 +13,13 @@ import {
   cancelRun,
   changeChannelMember,
   ChannelAccessError,
+  createAgentDefinition,
   createChannel,
   detachChannelAgent,
   dismissChannelAgent,
   enableAgentDefinition,
   loadAppearancePreferences,
+  loadAgentCreationOptions,
   loadAgentDefinitions,
   loadAgentEnablements,
   loadEarlierTimeline,
@@ -46,6 +48,7 @@ import {
   loadThreadTimeline,
   loadThreadUnread,
   loadWorkspaceConfig,
+  provisionAgent,
   redeemEnrollment,
   restoreChannel,
   restoreDirectMessage,
@@ -64,9 +67,11 @@ import {
   updateStandingParticipation,
 } from "./api";
 import type {
-  WorkshopMemoryRecord,
+  WorkshopAgentCreationOptions,
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
+  WorkshopAgentProvisioning,
+  WorkshopMemoryRecord,
   TimelineMessage,
   TimelineSnapshot,
   WorkshopNavigation,
@@ -90,6 +95,7 @@ vi.mock("./api", async (importOriginal) => {
     advanceThreadReadPosition: vi.fn(),
     cancelRun: vi.fn(),
     changeChannelMember: vi.fn(),
+    createAgentDefinition: vi.fn(),
     createChannel: vi.fn(),
     detachChannelAgent: vi.fn(),
     dismissChannelAgent: vi.fn(),
@@ -104,6 +110,7 @@ vi.mock("./api", async (importOriginal) => {
     loadWorkshopHumans: vi.fn(),
     loadFollowedThreads: vi.fn(),
     loadAppearancePreferences: vi.fn(),
+    loadAgentCreationOptions: vi.fn(),
     loadAgentDefinitions: vi.fn(),
     loadAgentEnablements: vi.fn(),
     loadNavigation: vi.fn(),
@@ -123,6 +130,7 @@ vi.mock("./api", async (importOriginal) => {
     loadSettingsWorkspace: vi.fn(),
     loadStandingParticipation: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
+    provisionAgent: vi.fn(),
     redeemEnrollment: vi.fn(),
     restoreChannel: vi.fn(),
     restoreDirectMessage: vi.fn(),
@@ -422,6 +430,97 @@ const agentEnablement: WorkshopAgentEnablement = {
   ownerPrincipalId: "prn_00000000000000000000000000000001",
   ownerRuntimeProfileId: runtimeProfileId,
 };
+
+const agentCreationOptions: WorkshopAgentCreationOptions = {
+  blockers: [],
+  principalId: navigation.principal.principalId,
+  ready: true,
+  runtimes: [
+    {
+      backends: [
+        {
+          backend: "claude",
+          blockers: [],
+          catalogueStale: false,
+          catalogueStatus: "unsupported",
+          current: true,
+          defaultModel: "claude-sonnet-4-5",
+          models: [
+            {
+              displayName: "Claude Sonnet 4.5",
+              modelId: "claude-sonnet-4-5",
+              retained: true,
+              selectable: true,
+              status: "available",
+            },
+          ],
+          optionId: "claude:anthropic",
+          provider: "anthropic",
+          readiness: "unverified",
+        },
+        {
+          backend: "codex",
+          blockers: [],
+          catalogueStale: false,
+          catalogueStatus: "succeeded",
+          current: false,
+          defaultModel: "gpt-5.6-sol",
+          models: [
+            {
+              displayName: "GPT-5.6 Sol",
+              modelId: "gpt-5.6-sol",
+              retained: true,
+              selectable: true,
+              status: "available",
+            },
+          ],
+          optionId: "codex:openai",
+          provider: "openai",
+          readiness: "ready",
+        },
+      ],
+      blockers: [],
+      currentBackendOptionId: "claude:anthropic",
+      defaultTimeoutSeconds: 300,
+      defaultWorkspace: "/srv/workspaces/home",
+      displayName: "Daniel's runtime",
+      maximumTimeoutSeconds: 1800,
+      minimumTimeoutSeconds: 1,
+      ready: true,
+      runtimeProfileId,
+      workspaces: [
+        {
+          available: true,
+          default: true,
+          name: "Home",
+          path: "/srv/workspaces/home",
+        },
+        {
+          available: true,
+          default: false,
+          name: "kai",
+          path: "/srv/workspaces/kai",
+        },
+      ],
+    },
+  ],
+};
+
+const agentProvisioning: WorkshopAgentProvisioning = {
+  agentId: "agt_44444444444444444444444444444444",
+  blockers: [],
+  clientOperationId: "workshop-agent-provision-test",
+  completedStages: ["ready"],
+  definitionId: "adf_44444444444444444444444444444444",
+  directChannelId: "chn_44444444444444444444444444444444",
+  enablementId: "aen_44444444444444444444444444444444",
+  nextStage: null,
+  operationId: "apv_44444444444444444444444444444444",
+  replayed: false,
+  revisionId: "adr_44444444444444444444444444444444",
+  runtimeProfileId,
+  status: "ready",
+};
 const memoryRecord: WorkshopMemoryRecord = {
   confidence: 1,
   createdAt: "2026-08-24T10:00:00Z",
@@ -674,8 +773,11 @@ describe("Workshop React client", () => {
         },
       ],
     });
+    vi.mocked(loadAgentCreationOptions).mockResolvedValue(agentCreationOptions);
     vi.mocked(loadAgentDefinitions).mockResolvedValue([agentDefinition]);
     vi.mocked(loadAgentEnablements).mockResolvedValue([agentEnablement]);
+    vi.mocked(provisionAgent).mockResolvedValue(agentProvisioning);
+    vi.mocked(createAgentDefinition).mockResolvedValue(agentDefinition);
     vi.mocked(enableAgentDefinition).mockResolvedValue(agentEnablement);
     vi.mocked(startAgentConversation).mockResolvedValue({
       ...agentEnablement,
@@ -3544,9 +3646,10 @@ describe("Workshop React client", () => {
     expect(closeCreation).toHaveAttribute("title", "Close agent creation");
     expect(closeCreation.querySelector("span")).toHaveAttribute("aria-hidden", "true");
     expect(within(creationDialog).queryByRole("button", { name: "Cancel" })).toBeNull();
-    expect(
-      within(creationDialog).getByLabelText(/Display name/).previousElementSibling,
-    ).toHaveClass("agent-field-hint-placeholder");
+    expect(within(creationDialog).getByRole("heading", { name: "Identity" })).toBeVisible();
+    expect(within(creationDialog).getByLabelText("Agent creation progress")).toHaveTextContent(
+      "1Identity2Role3Runtime4Review",
+    );
     await user.click(closeCreation);
     expect(screen.queryByRole("dialog", { name: "Create agent" })).toBeNull();
     expect(window.location.search).toBe("?view=agents");
@@ -3680,7 +3783,7 @@ describe("Workshop React client", () => {
 
     await user.click(createAgent);
     const creationDialog = await screen.findByRole("dialog", { name: "Create agent" });
-    await user.type(within(creationDialog).getByLabelText(/Stable handle/), "draft_agent");
+    await user.type(within(creationDialog).getByLabelText(/Handle/), "draft_agent");
     await user.click(within(creationDialog).getByRole("button", {
       name: "Close agent creation",
     }));
@@ -3697,6 +3800,232 @@ describe("Workshop React client", () => {
     ));
     expect(screen.queryByRole("dialog", { name: "Create agent" })).toBeNull();
     expect(window.location.search).toBe("?view=agents");
+  });
+
+  it("guides creation from the sidebar through reviewed runtime choices to a ready agent", async () => {
+    const user = userEvent.setup();
+    vi.mocked(provisionAgent).mockRejectedValueOnce(
+      new Error("Provisioning paused safely."),
+    );
+    const readyDefinition: WorkshopAgentDefinition = {
+      ...agentDefinition,
+      activeRevisionId: agentProvisioning.revisionId,
+      agentId: agentProvisioning.agentId as string,
+      definitionId: agentProvisioning.definitionId as string,
+      description: "Builds carefully.",
+      displayName: "Build helper",
+      handle: "build_helper",
+      presentation: { avatar: "B" },
+      revisions: [
+        {
+          ...agentDefinition.revisions[0],
+          instructions: "Make bounded, tested changes.",
+          purpose: "Build reviewed changes.",
+          revisionId: agentProvisioning.revisionId as string,
+        },
+      ],
+    };
+    const readyEnablement: WorkshopAgentEnablement = {
+      ...agentEnablement,
+      agentId: readyDefinition.agentId,
+      definitionId: readyDefinition.definitionId,
+      directChannelId: agentProvisioning.directChannelId,
+      displayName: readyDefinition.displayName,
+      enablementId: agentProvisioning.enablementId,
+      handle: readyDefinition.handle,
+      conversationStarted: false,
+    };
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Create agent" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Create agent" });
+    expect(loadAgentCreationOptions).toHaveBeenCalledWith("existing-session");
+    await user.type(within(dialog).getByLabelText("Display name"), "Build helper");
+    expect(within(dialog).getByLabelText(/Handle/)).toHaveValue("build_helper");
+    await user.type(within(dialog).getByLabelText(/Description/), "Builds carefully.");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    expect(within(dialog).getByRole("heading", { name: "Role" })).toBeVisible();
+    await user.type(
+      within(dialog).getByLabelText("What should this agent do?"),
+      "Build reviewed changes.",
+    );
+    await user.type(
+      within(dialog).getByLabelText(/How should it behave/),
+      "Make bounded, tested changes.",
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    expect(await within(dialog).findByRole("heading", { name: "Runtime" })).toBeVisible();
+    expect(within(dialog).queryByLabelText("Execution profile")).toBeNull();
+    await user.selectOptions(within(dialog).getByLabelText("Backend"), "codex:openai");
+    expect(within(dialog).getByLabelText("Model")).toHaveValue("gpt-5.6-sol");
+    expect(within(dialog).getByText(/protected default for codex · openai/)).toBeVisible();
+    await user.selectOptions(within(dialog).getByLabelText("Workspace"), "/srv/workspaces/kai");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    expect(within(dialog).getByRole("heading", { name: "Review" })).toBeVisible();
+    expect(within(dialog).getByText("codex · openai")).toBeVisible();
+    expect(within(dialog).getByText("GPT-5.6 Sol")).toBeVisible();
+    expect(within(dialog).getByText("kai")).toBeVisible();
+    expect(within(dialog).getByText(/will not start a direct conversation/)).toBeVisible();
+    await user.click(within(dialog).getByRole("button", { name: "Back to Runtime" }));
+    expect(within(dialog).getByLabelText("Backend")).toHaveValue("codex:openai");
+    expect(within(dialog).getByLabelText("Model")).toHaveValue("gpt-5.6-sol");
+    expect(within(dialog).getByLabelText("Workspace")).toHaveValue("/srv/workspaces/kai");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+    await user.click(within(dialog).getByRole("button", { name: "Create agent" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Provisioning paused safely.",
+    );
+    const firstProvisioningInput = vi.mocked(provisionAgent).mock.calls[0]?.[1];
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([agentDefinition, readyDefinition]);
+    vi.mocked(loadAgentEnablements).mockResolvedValue([agentEnablement, readyEnablement]);
+    await user.click(within(dialog).getByRole("button", { name: "Retry setup" }));
+
+    expect(await screen.findByText("Agent ready")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Build helper", level: 2 })).toBeVisible();
+    expect(window.location.search).toBe(
+      `?view=agents&agent=${readyDefinition.definitionId}`,
+    );
+    expect(provisionAgent).toHaveBeenCalledWith(
+      "existing-session",
+      expect.objectContaining({
+        allowedCollaborationOperations: [],
+        backendOptionId: "codex:openai",
+        capabilities: ["text_generation"],
+        collaborationOperations: [],
+        description: "Builds carefully.",
+        displayName: "Build helper",
+        handle: "build_helper",
+        instructions: "Make bounded, tested changes.",
+        model: "gpt-5.6-sol",
+        purpose: "Build reviewed changes.",
+        runtimeProfileId,
+        timeoutSeconds: 300,
+        workspace: "/srv/workspaces/kai",
+      }),
+    );
+    expect(createAgentDefinition).not.toHaveBeenCalled();
+    expect(startAgentConversation).not.toHaveBeenCalled();
+    expect(provisionAgent).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(provisionAgent).mock.calls[1]?.[1]).toEqual(firstProvisioningInput);
+  });
+
+  it("keeps multiple creation runtimes behind an advanced disclosure", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadAgentCreationOptions).mockResolvedValue({
+      ...agentCreationOptions,
+      runtimes: [
+        ...agentCreationOptions.runtimes,
+        {
+          ...agentCreationOptions.runtimes[0],
+          backends: agentCreationOptions.runtimes[0].backends.map((backend) => ({
+            ...backend,
+            current: backend.optionId === "codex:openai",
+          })),
+          currentBackendOptionId: "codex:openai",
+          displayName: "Daniel's alternate runtime",
+          runtimeProfileId: "rtp_22222222222222222222222222222222",
+        },
+      ],
+    });
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Create agent" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create agent" });
+    await user.type(within(dialog).getByLabelText("Display name"), "Runtime helper");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+    await user.type(
+      within(dialog).getByLabelText("What should this agent do?"),
+      "Exercise the runtime selector.",
+    );
+    await user.type(
+      within(dialog).getByLabelText(/How should it behave/),
+      "Use the chosen execution profile.",
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    const disclosure = await within(dialog).findByText("Advanced runtime");
+    expect(disclosure.closest("details")).not.toHaveAttribute("open");
+    await user.click(disclosure);
+    expect(disclosure.closest("details")).toHaveAttribute("open");
+    expect(within(dialog).getByLabelText("Execution profile")).toHaveValue(runtimeProfileId);
+    expect(within(dialog).getByRole("option", { name: "Daniel's runtime" })).toBeVisible();
+    expect(
+      within(dialog).getByRole("option", { name: "Daniel's alternate runtime" }),
+    ).toBeVisible();
+  });
+
+  it("keeps ready creation blocked while preserving explicit draft saving", async () => {
+    const user = userEvent.setup();
+    const blockedOptions: WorkshopAgentCreationOptions = {
+      ...agentCreationOptions,
+      blockers: [{ code: "runtime_unavailable", detail: "Runtime authentication needs attention." }],
+      ready: false,
+    };
+    const draftDefinition: WorkshopAgentDefinition = {
+      ...agentDefinition,
+      activeRevisionId: null,
+      agentId: "agt_55555555555555555555555555555555",
+      definitionId: "adf_55555555555555555555555555555555",
+      displayName: "Draft helper",
+      handle: "draft_helper",
+      lifecycleState: "draft",
+    };
+    vi.mocked(loadAgentCreationOptions).mockResolvedValue(blockedOptions);
+    vi.mocked(createAgentDefinition).mockResolvedValue(draftDefinition);
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    await screen.findByText("Canonical history is ready.");
+    await user.click(screen.getByRole("button", { name: "Create agent" }));
+    const dialog = await screen.findByRole("dialog", { name: "Create agent" });
+    await user.type(within(dialog).getByLabelText("Display name"), "Draft helper");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+    await user.type(
+      within(dialog).getByLabelText("What should this agent do?"),
+      "Remain an intentional draft.",
+    );
+    await user.type(
+      within(dialog).getByLabelText(/How should it behave/),
+      "Wait for runtime access.",
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    expect(await within(dialog).findByText("Runtime authentication needs attention.")).toBeVisible();
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+    expect(within(dialog).getByRole("button", { name: "Create agent" })).toBeDisabled();
+    vi.mocked(loadAgentDefinitions).mockResolvedValue([agentDefinition, draftDefinition]);
+    await user.click(within(dialog).getByRole("button", { name: "Save as draft" }));
+
+    expect(await screen.findByRole("heading", { name: "Draft helper", level: 2 })).toBeVisible();
+    expect(createAgentDefinition).toHaveBeenCalledWith(
+      "existing-session",
+      expect.objectContaining({
+        displayName: "Draft helper",
+        handle: "draft_helper",
+        instructions: "Wait for runtime access.",
+        purpose: "Remain an intentional draft.",
+      }),
+    );
+    expect(provisionAgent).not.toHaveBeenCalled();
+    expect(startAgentConversation).not.toHaveBeenCalled();
   });
 
   it("keeps active agents in the sidebar and owner drafts in the inactive browser", async () => {
