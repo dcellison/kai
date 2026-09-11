@@ -901,6 +901,7 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/effective-agent-runtime",
                 "/v1/channels/{channel_id}/models",
                 "/v1/channels/{channel_id}/workspace",
+                "/v1/channels/{channel_id}/workspaces",
                 "/v1/channels/{channel_id}/workspace-config",
                 "/v1/settings/model-catalogue/refresh-all",
                 "/v1/preferences",

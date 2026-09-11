@@ -3970,7 +3970,11 @@ button:disabled {
   }
 
   .agent-runtime-controls .workspace-settings-heading {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .agent-runtime-controls .workspace-settings-heading > label {
+    grid-column: 1 / -1;
   }
 
   .agent-runtime-controls .model-catalogue-card > summary {
@@ -4647,13 +4651,40 @@ button:disabled {
 
 .workspace-settings-heading {
   display: grid;
-  grid-template-columns: minmax(10rem, 0.35fr) minmax(14rem, 1fr);
+  grid-template-columns: minmax(10rem, 0.35fr) minmax(14rem, 1fr) auto;
   align-items: center;
   gap: 1rem;
 }
 
 .workspace-settings-heading > label {
   margin: 0;
+}
+
+.workspace-settings-heading .panel-icon-button svg,
+.workspace-creation-header .panel-icon-button svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.8;
+}
+
+.workspace-creation-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.workspace-creation-header .overline,
+.workspace-creation-header h2 {
+  margin-block-start: 0;
+}
+
+.workspace-creation-dialog > p {
+  color: var(--color-text-muted);
+  font-size: 0.72rem;
 }
 
 .workspace-overrides,
@@ -5871,7 +5902,11 @@ button:disabled {
 
   .preference-compare,
   .workspace-settings-heading {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .workspace-settings-heading > label {
+    grid-column: 1 / -1;
   }
 
   .model-catalogue-card > summary {

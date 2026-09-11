@@ -5792,6 +5792,38 @@ class TestHandleProject:
 
 
 class TestWorkspaceNewAutoRegister:
+    async def test_workspace_new_uses_canonical_creation_service(self, tmp_path):
+        """Telegram and Workshop share one protected workspace operation."""
+        from kai.bot import handle_workspace
+
+        update = _make_update("/workspace new myproj")
+        ctx = _make_context(args=["new", "myproj"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.create_workspace = AsyncMock(
+            return_value=SimpleNamespace(
+                directory_created=True,
+                git_ready=True,
+                memory_project_note="Registered memory project 'myproj' for this workspace.",
+                memory_project_registered=True,
+                path=str(tmp_path / "home" / "workspaces" / "myproj"),
+            )
+        )
+        ctx.application.core_services.settings_workspaces = service
+
+        with (
+            _mock_resolve(base=tmp_path),
+            patch("kai.bot.asyncio.create_subprocess_exec", new_callable=AsyncMock) as legacy_git_init,
+        ):
+            await handle_workspace(update, ctx)
+
+        service.create_workspace.assert_awaited_once_with(authority, "myproj")
+        legacy_git_init.assert_not_awaited()
+        replies = [call.args[0] for call in update.message.reply_text.call_args_list]
+        assert any("Workspace created and selected" in reply for reply in replies)
+        assert replies[-1] == "Registered memory project 'myproj' for this workspace."
+
     async def test_workspace_new_registers_project(self, tmp_path):
         """/workspace new is the strong project signal: the created
         directory is registered automatically and the user is told."""

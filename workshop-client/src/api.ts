@@ -19,6 +19,7 @@ import type {
   WorkshopSettingsMutation,
   WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
+  WorkshopWorkspaceCreation,
   WorkshopRoutingEligibility,
   WorkshopRoutingPolicy,
   WorkshopRunRoutingDecision,
@@ -4814,6 +4815,50 @@ export async function switchWorkspace(
     throw new Error(safeErrorMessage(payload, "Could not switch workspace."));
   }
   return parseSettingsWorkspace(payload, session.channelId);
+}
+
+export async function createWorkspace(
+  session: WorkshopSession,
+  name: string,
+  revision: string,
+): Promise<WorkshopWorkspaceCreation> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspaces`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, revision }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Settings changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not create workspace."));
+  }
+  if (
+    !isRecord(payload) ||
+    !isRecord(payload.creation) ||
+    typeof payload.creation.path !== "string" ||
+    typeof payload.creation.directory_created !== "boolean" ||
+    typeof payload.creation.git_ready !== "boolean" ||
+    typeof payload.creation.memory_project_registered !== "boolean" ||
+    typeof payload.creation.memory_project_note !== "string"
+  ) {
+    throw new Error("Kai returned an unsupported workspace creation result.");
+  }
+  return {
+    directoryCreated: payload.creation.directory_created,
+    gitReady: payload.creation.git_ready,
+    memoryProjectNote: payload.creation.memory_project_note,
+    memoryProjectRegistered: payload.creation.memory_project_registered,
+    path: payload.creation.path,
+    settings: parseSettingsWorkspace(payload, session.channelId),
+  };
 }
 
 export async function submitCommand(

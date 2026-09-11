@@ -589,6 +589,15 @@ export interface WorkshopSettingsWorkspace {
   workspaces: WorkshopWorkspaceOption[];
 }
 
+export interface WorkshopWorkspaceCreation {
+  directoryCreated: boolean;
+  gitReady: boolean;
+  memoryProjectNote: string;
+  memoryProjectRegistered: boolean;
+  path: string;
+  settings: WorkshopSettingsWorkspace;
+}
+
 export interface WorkshopEffectiveAgentRuntime {
   agentHandle: string;
   agentId: string;

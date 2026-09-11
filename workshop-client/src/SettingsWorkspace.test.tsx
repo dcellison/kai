@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ChannelAccessError,
+  createWorkspace,
   deactivateOperatorModel,
   loadAppearancePreferences,
   loadGitHubSettings,
@@ -69,6 +70,7 @@ vi.mock("./api", async (importOriginal) => {
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
+    createWorkspace: vi.fn(),
     restorePreferenceRevision: vi.fn(),
     refreshAllModelCatalogues: vi.fn(),
     refreshModelCatalogue: vi.fn(),
@@ -510,6 +512,32 @@ describe("Settings workspace", () => {
         ...item,
         current: item.home,
       })),
+    });
+    vi.mocked(createWorkspace).mockResolvedValue({
+      directoryCreated: true,
+      gitReady: true,
+      memoryProjectNote: "Registered memory project 'research-notes' for this workspace.",
+      memoryProjectRegistered: true,
+      path: "/srv/home/workspaces/Research Notes",
+      settings: {
+        ...runtime,
+        mutation: {
+          changed: true,
+          operation: "create_workspace",
+          providerSessionInvalidated: true,
+          runtimeAction: "restarted",
+        },
+        workspace: "/srv/home/workspaces/Research Notes",
+        workspaces: [
+          ...runtime.workspaces.map((item) => ({ ...item, current: false })),
+          {
+            current: true,
+            home: false,
+            name: "Research Notes",
+            path: "/srv/home/workspaces/Research Notes",
+          },
+        ],
+      },
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
@@ -962,6 +990,29 @@ describe("Settings workspace", () => {
       "sws_workspace",
       { field: "prompt", value: "Use the project conventions." },
     );
+  });
+
+  it("creates, initializes, registers, and selects a private workspace", async () => {
+    const user = userEvent.setup();
+    renderAgentRuntime();
+
+    await user.click(await screen.findByRole("button", { name: "Create workspace" }));
+    const dialog = screen.getByRole("dialog", { name: "Create workspace" });
+    expect(within(dialog).getByText("This creates a private directory inside your Kai home.")).toBeVisible();
+    await user.type(within(dialog).getByLabelText("Workspace name"), "Research Notes");
+    await user.click(within(dialog).getByRole("button", { name: "Create workspace" }));
+
+    await waitFor(() => expect(createWorkspace).toHaveBeenCalledWith(
+      session,
+      "Research Notes",
+      "sws_current",
+    ));
+    expect(
+      await screen.findByText("Workspace created and selected. The conversation session was cleared."),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Active workspace")).toHaveValue("2");
+    expect(screen.getByRole("option", { name: "Research Notes" })).toBeVisible();
+    expect(switchWorkspace).not.toHaveBeenCalled();
   });
 
   it("switches only the authenticated principal's backend after confirmation", async () => {

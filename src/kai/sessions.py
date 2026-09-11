@@ -2199,12 +2199,13 @@ async def get_allowed_workspaces(chat_id: int) -> list[Path]:
 async def add_canonical_workspace_grant(
     namespace: WorkshopExecutionStateNamespace,
     path: str,
-) -> None:
-    await _get_db().execute(
+) -> bool:
+    cursor = await _get_db().execute(
         "INSERT OR IGNORE INTO principal_workspace_grants (principal_id, path) VALUES (?, ?)",
         (namespace.principal_id, path),
     )
     await _get_db().commit()
+    return cursor.rowcount > 0
 
 
 async def remove_canonical_workspace_grant(

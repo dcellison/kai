@@ -116,6 +116,9 @@ class _RuntimePool:
     def get_home_workspace(self, _profile_id) -> Path:
         return self.home
 
+    def legacy_runtime_key(self, _profile_id) -> int:
+        return 12345
+
     async def resolve_workspace_access(self, _profile_id):
         return self.allowed.parent, [self.allowed]
 
@@ -401,6 +404,140 @@ async def test_workspace_switch_rejects_paths_outside_runtime_grants(
         await service.switch_workspace(authority, str(outside))
 
     assert pool.events == []
+
+
+async def test_workspace_creation_is_private_registered_and_idempotent(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, principal_id, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+    grants: list[Path] = []
+    registered_for: list[PrincipalId] = []
+    history: list[str] = []
+
+    async def resolve_workspace_access(_runtime):
+        return pool.allowed.parent, [pool.allowed, *grants]
+
+    async def add_grant(namespace, path: str) -> bool:
+        registered_for.append(namespace.principal_id)
+        candidate = Path(path)
+        if candidate in grants:
+            return False
+        grants.append(candidate)
+        return True
+
+    monkeypatch.setattr(pool, "resolve_workspace_access", resolve_workspace_access)
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
+    monkeypatch.setattr(
+        sessions,
+        "upsert_canonical_workspace_history",
+        AsyncMock(side_effect=lambda _namespace, path: history.append(path)),
+    )
+    register_project = AsyncMock(
+        side_effect=[
+            (True, True, "Registered memory project 'research-notes' for this workspace."),
+            (True, False, "Memory project 'research-notes' was already registered for this workspace."),
+        ]
+    )
+    monkeypatch.setattr(
+        "kai.workshop.settings_workspaces._register_workspace_memory_project",
+        register_project,
+    )
+    revision = (await service.inspect(authority)).revision
+
+    created = await service.create_workspace(
+        authority,
+        "research-notes",
+        expected_revision=revision,
+    )
+    retried = await service.create_workspace(
+        authority,
+        "research-notes",
+        expected_revision=created.snapshot.revision,
+    )
+
+    path = pool.home / "workspaces" / "research-notes"
+    assert path.is_dir()
+    assert (path / ".git").is_dir()
+    assert path.stat().st_mode & 0o777 == 0o700
+    assert created.directory_created is True
+    assert created.git_ready is True
+    assert created.memory_project_registered is True
+    assert created.snapshot.workspace == str(path)
+    assert created.snapshot.mutation is not None and created.snapshot.mutation.changed is True
+    assert created.snapshot.mutation.provider_session_invalidated is True
+    assert retried.directory_created is False
+    assert retried.snapshot.mutation is not None and retried.snapshot.mutation.changed is False
+    assert [(item.name, item.path) for item in created.snapshot.workspaces if item.path == str(path)] == [
+        ("research-notes", str(path))
+    ]
+    assert registered_for == [principal_id, principal_id]
+    assert history == [str(path)]
+    assert pool.events == [f"workspace-config:{path}"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", " ", " leading", "trailing ", ".", "..", "../escape", "nested/name", "nested\\name", "bad\x00name"],
+)
+async def test_workspace_creation_rejects_unsafe_names(
+    tmp_path: Path,
+    monkeypatch,
+    name: str,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+    add_grant = AsyncMock()
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
+
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError):
+        await service.create_workspace(authority, name)
+
+    assert not (pool.home / "workspaces").exists()
+    add_grant.assert_not_awaited()
+
+
+async def test_workspace_creation_rejects_symlink_and_file_collisions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+    workspace_root = pool.home / "workspaces"
+    workspace_root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace_root / "linked").symlink_to(outside, target_is_directory=True)
+    (workspace_root / "occupied").write_text("not a directory")
+    add_grant = AsyncMock()
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
+
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="symbolic link"):
+        await service.create_workspace(authority, "linked")
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="non-directory"):
+        await service.create_workspace(authority, "occupied")
+
+    add_grant.assert_not_awaited()
+
+
+async def test_workspace_creation_rejects_symlinked_private_workspace_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (pool.home / "workspaces").symlink_to(outside, target_is_directory=True)
+    add_grant = AsyncMock()
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
+
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="private workspace directory"):
+        await service.create_workspace(authority, "Research")
+
+    assert not (outside / "Research").exists()
+    add_grant.assert_not_awaited()
 
 
 async def test_timeout_validation_precedes_persistence(tmp_path: Path) -> None:

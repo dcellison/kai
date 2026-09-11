@@ -11,6 +11,7 @@ import {
 import {
   AuthenticationError,
   ChannelAccessError,
+  createWorkspace,
   deactivateOperatorModel,
   clearHumanAvatar,
   loadAppearancePreferences,
@@ -102,6 +103,14 @@ function AvatarClearIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24">
       <path d="M5 7h14M9 7V4h6v3m2 0-1 13H8L7 7m3 4v5m4-5v5" />
+    </svg>
+  );
+}
+
+function WorkspaceAddIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path d="M12 5v14M5 12h14" />
     </svg>
   );
 }
@@ -306,6 +315,10 @@ function SettingsWorkspaceContent({
   const [workspaceModel, setWorkspaceModel] = useState("");
   const [workspaceTimeout, setWorkspaceTimeout] = useState("");
   const [workspacePrompt, setWorkspacePrompt] = useState("");
+  const [workspaceCreationOpen, setWorkspaceCreationOpen] = useState(false);
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [workspaceCreationBusy, setWorkspaceCreationBusy] = useState(false);
+  const [workspaceCreationError, setWorkspaceCreationError] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -1201,6 +1214,49 @@ function SettingsWorkspaceContent({
     }
   };
 
+  const addWorkspace = async (): Promise<void> => {
+    if (!runtime || workspaceCreationBusy || !workspaceName.trim()) {
+      return;
+    }
+    setWorkspaceCreationBusy(true);
+    setWorkspaceCreationError(null);
+    setRuntimeError(null);
+    setRuntimeNotice(null);
+    try {
+      const created = await createWorkspace(
+        session,
+        workspaceName,
+        runtime.revision,
+      );
+      adoptRuntime(created.settings);
+      const notices = [
+        created.directoryCreated
+          ? "Workspace created and selected. The conversation session was cleared."
+          : "That workspace already existed and is now selected.",
+      ];
+      if (!created.gitReady) {
+        notices.push("Git initialization failed; the workspace is still usable.");
+      }
+      if (!created.memoryProjectRegistered) {
+        notices.push(created.memoryProjectNote);
+      }
+      setRuntimeNotice(notices.join(" "));
+      setWorkspaceName("");
+      setWorkspaceCreationOpen(false);
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshRuntime();
+        setWorkspaceCreationError(
+          "Workspace settings changed elsewhere. The latest state has been reloaded.",
+        );
+      } else if (!handleAccessFailure(caught)) {
+        setWorkspaceCreationError(errorText(caught, "Could not create workspace."));
+      }
+    } finally {
+      setWorkspaceCreationBusy(false);
+    }
+  };
+
   const runtimeBackendCapability = runtime
     ? capability(runtime.capabilities, "backend")
     : null;
@@ -1769,7 +1825,7 @@ function SettingsWorkspaceContent({
           <section className="settings-section" id="settings-section-workspace">
             <div>
               <h2>Workspace settings</h2>
-              <p>Choose an existing authorized workspace and manage overrides that apply only within it.</p>
+              <p>Choose or create an authorized workspace and manage overrides that apply only within it.</p>
             </div>
             <div className="workspace-settings-heading">
               <label htmlFor="settings-workspace">Active workspace</label>
@@ -1788,6 +1844,19 @@ function SettingsWorkspaceContent({
                   <option key={item.path} value={String(index)}>{item.name}</option>
                 ))}
               </select>
+              <button
+                className="panel-icon-button"
+                type="button"
+                aria-label="Create workspace"
+                title="Create workspace"
+                disabled={runtimeBusy}
+                onClick={() => {
+                  setWorkspaceCreationError(null);
+                  setWorkspaceCreationOpen(true);
+                }}
+              >
+                <WorkspaceAddIcon />
+              </button>
             </div>
             <div className="settings-card-stack workspace-overrides">
               <div className="settings-card-columns">
@@ -1822,6 +1891,62 @@ function SettingsWorkspaceContent({
               </div>
             </div>
           </section>
+        )}
+        {workspaceCreationOpen && runtime && (
+          <div className="modal-backdrop" role="presentation">
+            <section
+              className="channel-creation-dialog workspace-creation-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="create-workspace-title"
+            >
+              <header className="workspace-creation-header">
+                <div>
+                  <p className="overline">Private workspace</p>
+                  <h2 id="create-workspace-title">Create workspace</h2>
+                </div>
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label="Close workspace creation"
+                  title="Close workspace creation"
+                  disabled={workspaceCreationBusy}
+                  onClick={() => {
+                    setWorkspaceCreationOpen(false);
+                    setWorkspaceCreationError(null);
+                    setWorkspaceName("");
+                  }}
+                >
+                  <span aria-hidden="true">×</span>
+                </button>
+              </header>
+              <p>This creates a private directory inside your Kai home.</p>
+              <form onSubmit={(event) => { event.preventDefault(); void addWorkspace(); }}>
+                <label htmlFor="workspace-name">Workspace name</label>
+                <input
+                  id="workspace-name"
+                  type="text"
+                  autoFocus
+                  maxLength={64}
+                  value={workspaceName}
+                  disabled={workspaceCreationBusy}
+                  onChange={(event) => setWorkspaceName(event.target.value)}
+                />
+                {workspaceCreationError && (
+                  <p className="form-error" role="alert">{workspaceCreationError}</p>
+                )}
+                <div className="form-actions">
+                  <button
+                    className="primary-button"
+                    type="submit"
+                    disabled={workspaceCreationBusy || !workspaceName.trim()}
+                  >
+                    {workspaceCreationBusy ? "Creating…" : "Create workspace"}
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
         )}
         {agentRuntime && runtime && !workspaceConfig && !runtimeLoading && (
           <section className="settings-section" id="settings-section-workspace">

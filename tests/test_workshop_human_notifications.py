@@ -136,13 +136,14 @@ async def _open_client(
     authenticator: _Authenticator,
     *,
     channel_notification_policy: WorkshopChannelNotificationPolicyService | None = None,
+    request_lock: asyncio.Lock | None = None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
         app,
         store=store,
         authenticator=authenticator,
-        request_lock=asyncio.Lock(),
+        request_lock=request_lock or asyncio.Lock(),
         event_poll_interval=0.01,
         event_heartbeat_interval=0.05,
         event_authentication_recheck_interval=0.01,
@@ -908,7 +909,12 @@ class TestHumanNotificationApi:
         tmp_path: Path,
     ) -> None:
         store, daniel_id, scott_id, channel_id, _ = await _notification_context(tmp_path / "kai.db")
-        client = await _open_client(store, _Authenticator({"scott": scott_id}))
+        request_lock = asyncio.Lock()
+        client = await _open_client(
+            store,
+            _Authenticator({"scott": scott_id}),
+            request_lock=request_lock,
+        )
         stream = None
         try:
             async with store.connection.execute("SELECT COALESCE(MAX(position), 0) FROM event_log") as cursor:
@@ -923,13 +929,14 @@ class TestHumanNotificationApi:
             )
             assert stream.status == 200
 
-            await _record(
-                store,
-                daniel_id,
-                channel_id,
-                "multiplexed-principal-event",
-                "@scott one canonical message",
-            )
+            async with request_lock:
+                await _record(
+                    store,
+                    daniel_id,
+                    channel_id,
+                    "multiplexed-principal-event",
+                    "@scott one canonical message",
+                )
             event = await _next_sse_event(stream)
 
             assert event["event"] == "workshop.principal.changed"

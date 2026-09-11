@@ -2648,100 +2648,22 @@ async def _handle_workspace_allowed(
 _NO_BASE_MSG = "No workspace base configured. Ask the operator to set a runtime workspace base or WORKSPACE_BASE."
 
 
-# Project ids are retrieval-time labels stored in memory rows, so
-# they get the same conservative shape discipline as tag slugs:
-# lowercase, digits, hyphen/underscore, no leading separator, 64-char
-# ceiling. Display names keep the user's original casing.
-_PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-
-
 async def _register_memory_project_for(
     config: Config,
     chat_id: int,
     root: Path,
     raw_name: str,
 ) -> tuple[bool, str]:
-    """
-    Shared registration core for /project register and the
-    /workspace new auto-hook. Returns (ok, user_message); never
-    raises, because the auto-hook must not fail workspace creation
-    over a registration problem.
+    """Compatibility wrapper around the transport-neutral registry operation."""
+    from kai.memory_projects import register_workspace_memory_project
 
-    Guards, in order:
-    - project_id shape (lowercased raw_name must match _PROJECT_ID_RE).
-    - nested-root guard: if ANY registered project (merged view)
-      already owns this root, including via containment, the
-      registration is rejected naming the owner. A nested project
-      would steal scope from its parent through longest-prefix
-      detection.
-    - id collision against the merged view.
-
-    On success the row is persisted AND pushed into the detection
-    cache, so the user's next message in the workspace routes to the
-    new project with no restart.
-    """
-    from kai.memory_projects import (
-        db_registry_upsert,
-        detect_active_memory_project,
-        merged_registry,
-        registry_mutation_lock,
+    registered, _changed, note = await register_workspace_memory_project(
+        config,
+        chat_id,
+        root,
+        raw_name,
     )
-
-    project_id = raw_name.strip().lower()
-    if not _PROJECT_ID_RE.match(project_id):
-        return False, f"Invalid project name {raw_name!r}: use letters, digits, - or _ (max 64 chars)."
-
-    # Guard + persist + cache update under the registry mutation
-    # lock: the guards read the merged view, and without the lock a
-    # second registration can pass its own guards against the same
-    # stale view while this one is awaiting the DB insert, committing
-    # a parent/child pair the nested-root guard exists to prevent.
-    async with registry_mutation_lock():
-        merged = merged_registry(config.memory_projects)
-        owner = detect_active_memory_project(root, merged)
-        if owner is not None:
-            return False, f"This workspace is already inside project '{owner.project_id}'."
-        if project_id in merged:
-            return False, f"Project id '{project_id}' is already registered; pick another name."
-
-        resolved_root = root.expanduser().resolve()
-        row = {
-            "project_id": project_id,
-            "display_name": raw_name.strip(),
-            "workspace_root": str(resolved_root),
-            "memory_enabled": True,
-            "default_scope_for_new_facts": "project",
-            "created_by": chat_id,
-        }
-        try:
-            await sessions.register_memory_project(
-                project_id=project_id,
-                display_name=raw_name.strip(),
-                workspace_root=str(resolved_root),
-                created_by=chat_id,
-            )
-        except Exception as e:
-            # IntegrityError covers id/root collisions that raced a
-            # restart-era row the cache never saw; anything else is a
-            # DB-layer failure. Both collapse to a user-facing message
-            # because the caller may be the auto-hook, which must not
-            # raise.
-            log.warning("memory project registration failed for %r: %s", project_id, e)
-            return False, f"Could not register project '{project_id}': {e}"
-        if not db_registry_upsert(row):
-            # The handler validated every field above, so a cache
-            # rejection here means validation drift between this guard
-            # and _row_to_config; the row is persisted and will load on
-            # next restart regardless.
-            log.error("memory project cache rejected validated row %r", project_id)
-    log.info(
-        "memory.project.registry %s",
-        json.dumps(
-            {"action": "register", "project_id": project_id, "root": str(resolved_root), "by": chat_id},
-            separators=(",", ":"),
-        ),
-    )
-    return True, f"Registered memory project '{project_id}' for this workspace."
+    return registered, note
 
 
 @_require_auth
@@ -2928,10 +2850,33 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if len(parts) < 2:
             await update.message.reply_text("Usage: /workspace new <name>")
             return
+        name = parts[1]
+        authority = _canonical_settings_authority(context, chat_id)
+        if authority is not None:
+            try:
+                result = await _get_core_services(context).settings_workspaces.create_workspace(
+                    authority,
+                    name,
+                )
+            except WorkshopSettingsWorkspaceConflict as exc:
+                await update.message.reply_text(str(exc))
+                return
+            except WorkshopSettingsWorkspaceValidationError as exc:
+                await update.message.reply_text(str(exc))
+                return
+            if result.directory_created:
+                await update.message.reply_text(f"Workspace created and selected:\n{result.path}\nSession cleared.")
+            else:
+                await update.message.reply_text(f"Workspace already existed and is selected:\n{result.path}")
+            if not result.git_ready:
+                await update.message.reply_text(
+                    "Warning: git init failed. The workspace is usable but has no Git repository."
+                )
+            await update.message.reply_text(result.memory_project_note)
+            return
         if not base:
             await update.message.reply_text(_NO_BASE_MSG)
             return
-        name = parts[1]
         resolved = _resolve_workspace_path(name, base)
         if resolved is None:
             await update.message.reply_text("Invalid workspace name.")

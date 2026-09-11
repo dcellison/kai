@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import stat
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,6 +61,24 @@ class WorkshopSettingsWorkspaceConsistencyError(WorkshopSettingsWorkspaceError):
 
 MIN_SELF_SERVICE_TIMEOUT_SECONDS = 1
 MAX_SELF_SERVICE_PROMPT_CHARACTERS = 32_000
+MAX_SELF_SERVICE_WORKSPACE_NAME_CHARACTERS = 64
+
+
+async def _register_workspace_memory_project(
+    config: Config,
+    creator_runtime_key: int,
+    root: Path,
+    name: str,
+) -> tuple[bool, bool, str]:
+    """Load the memory registry lazily to avoid its sessions import cycle."""
+    from kai.memory_projects import register_workspace_memory_project
+
+    return await register_workspace_memory_project(
+        config,
+        creator_runtime_key,
+        root,
+        name,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +161,16 @@ class SettingsWorkspaceSnapshot:
     backend_options: tuple[BackendOption, ...] = ()
     model_catalogue: ModelCatalogueSummary | None = None
     mutation: SettingsMutationOutcome | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceCreationResult:
+    snapshot: SettingsWorkspaceSnapshot
+    path: str
+    directory_created: bool
+    git_ready: bool
+    memory_project_registered: bool
+    memory_project_note: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,71 +646,193 @@ class WorkshopSettingsWorkspaceService:
             raise WorkshopSettingsWorkspaceValidationError("Workspace path must be absolute")
         requested = Path(workspace_path).expanduser().resolve()
         async with self._lock(authority):
-            home = self._runtime_pool.get_home_workspace(self._runtime_authority(authority)).resolve()
-            base, allowed = await self._runtime_pool.resolve_workspace_access(self._runtime_authority(authority))
-            if not requested.is_dir():
-                raise WorkshopSettingsWorkspaceValidationError("Workspace directory is unavailable")
-            if requested != home and not is_workspace_allowed(
+            return await self._switch_workspace_locked(
+                authority,
                 requested,
-                base,
-                allowed,
-            ):
-                raise WorkshopSettingsWorkspaceAccessDenied("Workspace is outside this runtime profile's grants")
+                expected_revision=expected_revision,
+            )
+
+    async def _switch_workspace_locked(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        requested: Path,
+        *,
+        expected_revision: str | None,
+    ) -> SettingsWorkspaceSnapshot:
+        home = self._runtime_pool.get_home_workspace(self._runtime_authority(authority)).resolve()
+        base, allowed = await self._runtime_pool.resolve_workspace_access(self._runtime_authority(authority))
+        if not requested.is_dir():
+            raise WorkshopSettingsWorkspaceValidationError("Workspace directory is unavailable")
+        if requested != home and not is_workspace_allowed(
+            requested,
+            base,
+            allowed,
+        ):
+            raise WorkshopSettingsWorkspaceAccessDenied("Workspace is outside this runtime profile's grants")
+        current = await self._inspect_locked(authority)
+        self._check_revision(current.revision, expected_revision)
+        runtime_authority = self._runtime_authority(authority)
+        if self._runtime_pool.requester_workspace_is_in_flight(runtime_authority):
+            raise WorkshopSettingsWorkspaceBusy(
+                "The workspace cannot be changed while this conversation has an active run"
+            )
+        was_running = self._runtime_pool.is_running(runtime_authority)
+        namespace = self._namespace(authority)
+        prior_settings = await sessions.get_canonical_execution_settings(namespace)
+        prior_workspace = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
+        desired_settings = dict(prior_settings)
+        if requested == home:
+            desired_settings.pop("workspace", None)
+        else:
+            desired_settings["workspace"] = str(requested)
+        changed = requested != prior_workspace.resolve()
+        if not changed:
+            return await self._inspect_locked(
+                authority,
+                mutation=SettingsMutationOutcome(
+                    operation="switch_workspace",
+                    changed=False,
+                    runtime_action="unchanged",
+                    provider_session_invalidated=False,
+                ),
+            )
+        await sessions.replace_canonical_settings_state(namespace, desired_settings)
+        try:
+            await self._apply_runtime_state(authority, requested)
+            await self._runtime_pool.invalidate_requester_workspace_lanes(
+                runtime_authority,
+            )
+            if requested != home:
+                await sessions.upsert_canonical_workspace_history(
+                    namespace,
+                    str(requested),
+                )
+            await sessions.clear_canonical_runtime_session(namespace)
+        except BaseException:
+            await self._restore_after_failure(
+                authority,
+                namespace,
+                execution_settings=prior_settings,
+                workspace=prior_workspace,
+            )
+            raise
+        return await self._inspect_locked(
+            authority,
+            mutation=SettingsMutationOutcome(
+                operation="switch_workspace",
+                changed=True,
+                runtime_action="restarted" if was_running else "deferred_until_next_run",
+                provider_session_invalidated=True,
+            ),
+        )
+
+    async def create_workspace(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        name: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> WorkspaceCreationResult:
+        workspace_name = self._validate_workspace_name(name)
+        async with self._lock(authority):
             current = await self._inspect_locked(authority)
             self._check_revision(current.revision, expected_revision)
             runtime_authority = self._runtime_authority(authority)
             if self._runtime_pool.requester_workspace_is_in_flight(runtime_authority):
                 raise WorkshopSettingsWorkspaceBusy(
-                    "The workspace cannot be changed while this conversation has an active run"
+                    "A workspace cannot be created while this conversation has an active run"
                 )
-            was_running = self._runtime_pool.is_running(runtime_authority)
-            namespace = self._namespace(authority)
-            prior_settings = await sessions.get_canonical_execution_settings(namespace)
-            prior_workspace = await self._runtime_pool.get_effective_workspace(self._runtime_authority(authority))
-            desired_settings = dict(prior_settings)
-            if requested == home:
-                desired_settings.pop("workspace", None)
-            else:
-                desired_settings["workspace"] = str(requested)
-            changed = requested != prior_workspace.resolve()
-            if not changed:
-                return await self._inspect_locked(
-                    authority,
-                    mutation=SettingsMutationOutcome(
-                        operation="switch_workspace",
-                        changed=False,
-                        runtime_action="unchanged",
-                        provider_session_invalidated=False,
-                    ),
+            home = self._runtime_pool.get_home_workspace(runtime_authority)
+            if not home.is_absolute() or home.is_symlink() or not home.is_dir():
+                raise WorkshopSettingsWorkspaceValidationError("The private workspace home is unavailable")
+            home_resolved = home.resolve()
+            workspace_root = home_resolved / "workspaces"
+            if workspace_root.is_symlink():
+                raise WorkshopSettingsWorkspaceValidationError("The private workspace directory is invalid")
+            if workspace_root.exists() and not workspace_root.is_dir():
+                raise WorkshopSettingsWorkspaceValidationError("The private workspace directory is unavailable")
+            workspace_root.mkdir(mode=0o700, exist_ok=True)
+            if workspace_root.is_symlink() or workspace_root.resolve().parent != home_resolved:
+                raise WorkshopSettingsWorkspaceValidationError("The private workspace directory is invalid")
+            if stat.S_IMODE(workspace_root.stat().st_mode) & 0o077:
+                raise WorkshopSettingsWorkspaceValidationError(
+                    "The private workspace directory permissions are not private"
                 )
-            await sessions.replace_canonical_settings_state(namespace, desired_settings)
+            target = workspace_root / workspace_name
+            created_directory = False
+            if target.is_symlink():
+                raise WorkshopSettingsWorkspaceValidationError("The workspace name resolves through a symbolic link")
             try:
-                await self._apply_runtime_state(authority, requested)
-                await self._runtime_pool.invalidate_requester_workspace_lanes(
-                    runtime_authority,
+                target.mkdir(mode=0o700)
+                created_directory = True
+            except FileExistsError:
+                if target.is_symlink() or not target.is_dir():
+                    raise WorkshopSettingsWorkspaceValidationError(
+                        "A non-directory entry already uses this workspace name"
+                    ) from None
+            target_resolved = target.resolve()
+            if target_resolved.parent != workspace_root.resolve():
+                raise WorkshopSettingsWorkspaceValidationError(
+                    "The workspace would escape the private workspace directory"
                 )
-                if requested != home:
-                    await sessions.upsert_canonical_workspace_history(
-                        namespace,
-                        str(requested),
+            if stat.S_IMODE(target_resolved.stat().st_mode) & 0o077:
+                raise WorkshopSettingsWorkspaceValidationError("The workspace directory permissions are not private")
+            grant_created = await sessions.add_canonical_workspace_grant(
+                self._namespace(authority),
+                str(target_resolved),
+            )
+            git_ready = (target_resolved / ".git").is_dir()
+            if not git_ready:
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        "git",
+                        "init",
+                        cwd=str(target_resolved),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
                     )
-                await sessions.clear_canonical_runtime_session(namespace)
-            except BaseException:
-                await self._restore_after_failure(
-                    authority,
-                    namespace,
-                    execution_settings=prior_settings,
-                    workspace=prior_workspace,
+                    git_ready = await process.wait() == 0
+                except OSError:
+                    git_ready = False
+            creator_runtime_key = self._runtime_pool.legacy_runtime_key(authority.runtime_profile_id)
+            if creator_runtime_key is None:
+                memory_project_registered = False
+                memory_project_created = False
+                memory_project_note = "This runtime has no memory-project registration identity."
+            else:
+                (
+                    memory_project_registered,
+                    memory_project_created,
+                    memory_project_note,
+                ) = await _register_workspace_memory_project(
+                    self._config,
+                    creator_runtime_key,
+                    target_resolved,
+                    workspace_name,
                 )
-                raise
-            return await self._inspect_locked(
+            switched = await self._switch_workspace_locked(
+                authority,
+                target_resolved,
+                expected_revision=None,
+            )
+            switch_mutation = switched.mutation
+            assert switch_mutation is not None
+            snapshot = await self._inspect_locked(
                 authority,
                 mutation=SettingsMutationOutcome(
-                    operation="switch_workspace",
-                    changed=True,
-                    runtime_action="restarted" if was_running else "deferred_until_next_run",
-                    provider_session_invalidated=True,
+                    operation="create_workspace",
+                    changed=(created_directory or grant_created or memory_project_created or switch_mutation.changed),
+                    runtime_action=switch_mutation.runtime_action,
+                    provider_session_invalidated=switch_mutation.provider_session_invalidated,
                 ),
+            )
+            return WorkspaceCreationResult(
+                snapshot=snapshot,
+                path=str(target_resolved),
+                directory_created=created_directory,
+                git_ready=git_ready,
+                memory_project_registered=memory_project_registered,
+                memory_project_note=memory_project_note,
             )
 
     async def workspace_config(
@@ -1549,9 +1701,30 @@ class WorkshopSettingsWorkspaceService:
     def _workspace_name(path: Path, base: Path | None, home: Path) -> str:
         if path == home:
             return "Home"
+        private_workspaces = home / "workspaces"
+        if path.parent == private_workspaces:
+            return path.name
         if base is not None:
             try:
                 return str(path.relative_to(base.resolve())) or path.name
             except ValueError:
                 pass
         return path.name
+
+    @staticmethod
+    def _validate_workspace_name(name: str) -> str:
+        if not isinstance(name, str):
+            raise WorkshopSettingsWorkspaceValidationError("Workspace name must be text")
+        if name != name.strip() or not name:
+            raise WorkshopSettingsWorkspaceValidationError(
+                "Workspace name cannot be empty or start or end with whitespace"
+            )
+        if len(name) > MAX_SELF_SERVICE_WORKSPACE_NAME_CHARACTERS:
+            raise WorkshopSettingsWorkspaceValidationError(
+                f"Workspace name must be at most {MAX_SELF_SERVICE_WORKSPACE_NAME_CHARACTERS} characters"
+            )
+        if name in {".", ".."} or "/" in name or "\\" in name:
+            raise WorkshopSettingsWorkspaceValidationError("Workspace name must be one directory name")
+        if any(unicodedata.category(character).startswith("C") for character in name):
+            raise WorkshopSettingsWorkspaceValidationError("Workspace name cannot contain control characters")
+        return name
