@@ -2356,6 +2356,88 @@ describe("Workshop React client", () => {
     expect(timeline.scrollTop).toBe(100);
   });
 
+  it("restores the conversation viewport after auxiliary workspace navigation", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const scrollHeightDescriptor = Object.getOwnPropertyDescriptor(
+      HTMLDivElement.prototype,
+      "scrollHeight",
+    );
+    const clientHeightDescriptor = Object.getOwnPropertyDescriptor(
+      HTMLDivElement.prototype,
+      "clientHeight",
+    );
+    Object.defineProperties(HTMLDivElement.prototype, {
+      clientHeight: { configurable: true, get: () => 300 },
+      scrollHeight: { configurable: true, get: () => 1000 },
+    });
+
+    try {
+      render(<App />);
+      const initialTimeline = await screen.findByLabelText("Conversation timeline");
+      expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+      await waitFor(() => expect(initialTimeline.scrollTop).toBe(1000));
+
+      await user.click(screen.getByRole("button", { name: "Memory" }));
+      await user.click(screen.getByRole("button", { name: "Back to conversation" }));
+      const followedTimeline = await screen.findByLabelText("Conversation timeline");
+      expect(followedTimeline).not.toBe(initialTimeline);
+      await waitFor(() => expect(followedTimeline.scrollTop).toBe(1000));
+      expect(
+        screen.queryByRole("button", { name: "Jump to latest messages" }),
+      ).toBeNull();
+
+      followedTimeline.scrollTop = 100;
+      fireEvent.scroll(followedTimeline);
+      await user.click(screen.getByRole("button", { name: "Memory" }));
+      await user.click(screen.getByRole("button", { name: "Back to conversation" }));
+      const historicalTimeline = await screen.findByLabelText("Conversation timeline");
+      expect(historicalTimeline).not.toBe(followedTimeline);
+      await waitFor(() => expect(historicalTimeline.scrollTop).toBe(100));
+      expect(
+        screen.getByRole("button", { name: "Jump to latest messages" }),
+      ).toBeVisible();
+
+      await user.click(screen.getByRole("button", { name: /GitHub notifications/ }));
+      const notificationTimeline = await screen.findByLabelText("Conversation timeline");
+      expect(notificationTimeline).not.toBe(historicalTimeline);
+      await waitFor(() => expect(notificationTimeline.scrollTop).toBe(1000));
+      expect(
+        screen.queryByRole("button", { name: "Jump to latest messages" }),
+      ).toBeNull();
+
+      await user.click(screen.getByRole("button", { name: "Kai" }));
+      const restoredChannelTimeline = await screen.findByLabelText("Conversation timeline");
+      expect(restoredChannelTimeline).not.toBe(notificationTimeline);
+      await waitFor(() => expect(restoredChannelTimeline.scrollTop).toBe(100));
+      expect(
+        screen.getByRole("button", { name: "Jump to latest messages" }),
+      ).toBeVisible();
+    } finally {
+      if (scrollHeightDescriptor) {
+        Object.defineProperty(
+          HTMLDivElement.prototype,
+          "scrollHeight",
+          scrollHeightDescriptor,
+        );
+      } else {
+        Reflect.deleteProperty(HTMLDivElement.prototype, "scrollHeight");
+      }
+      if (clientHeightDescriptor) {
+        Object.defineProperty(
+          HTMLDivElement.prototype,
+          "clientHeight",
+          clientHeightDescriptor,
+        );
+      } else {
+        Reflect.deleteProperty(HTMLDivElement.prototype, "clientHeight");
+      }
+    }
+  });
+
   it("offers jump-to-latest while reading history with no new arrivals", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
