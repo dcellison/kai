@@ -108,6 +108,88 @@ class TestInstanceCreation:
         assert a is not b
         assert a._api_context.webhook_secret != b._api_context.webhook_secret
 
+    def test_primary_canonical_lane_reuses_protected_adapter_runtime(self, tmp_path):
+        """Telegram's compatibility key and Workshop's primary lane are one runtime."""
+        runtime_id = profile_id(111)
+        primary = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="shared policy",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((primary,)),
+        )
+
+        telegram = pool.get(111)
+        workshop = pool.get(primary)
+        profile = pool.get(runtime_id)
+
+        assert telegram is workshop is profile
+        assert len(pool._pool) == 1
+
+    @pytest.mark.asyncio
+    async def test_primary_workspace_change_is_live_across_adapters(self, tmp_path):
+        """Neither adapter may retain a stale primary workspace process."""
+        home = tmp_path / "home"
+        repository = tmp_path / "repository"
+        home.mkdir()
+        repository.mkdir()
+        runtime_id = profile_id(111)
+        primary = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="shared policy",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=home,
+                    workspace_base=tmp_path,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((primary,)),
+        )
+
+        telegram = pool.get(111)
+        await pool.change_workspace(primary, repository)
+
+        assert telegram.workspace == repository
+        assert await pool.get_effective_workspace(111) == repository
+
+        await pool.change_workspace(111, home)
+
+        assert pool.get(primary).workspace == home
+        assert await pool.get_effective_workspace(primary) == home
+        assert len(pool._pool) == 1
+
     def test_same_profile_uses_distinct_channel_agent_runtime_lanes(self, tmp_path):
         runtime_id = profile_id(111)
         primary = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
@@ -807,15 +889,17 @@ class TestPerUserActions:
         first.shutdown = AsyncMock()
         second = MagicMock()
         second.shutdown = AsyncMock()
-        pool._pool[first_id] = first
-        pool._pool[second_id] = second
+        first_key = pool._resolve_runtime(first_id)[0]
+        second_key = pool._resolve_runtime(second_id)[0]
+        pool._pool[first_key] = first
+        pool._pool[second_key] = second
 
         assert await pool.select_backend(first_id, "claude")
 
         first.shutdown.assert_awaited_once()
         second.shutdown.assert_not_awaited()
-        assert first_id not in pool._pool
-        assert pool._pool[second_id] is second
+        assert first_key not in pool._pool
+        assert pool._pool[second_key] is second
         assert pool.get_backend_provider(first_id) == ("claude", "anthropic")
         assert pool.get_backend_provider(second_id) == ("codex", "openai")
 
@@ -1087,7 +1171,7 @@ class TestPropertyAccessors:
         )
         instance = pool.get(111)
         assert instance.model == "gpt-5.6-sol"
-        assert profile_id(111) in pool._pending_settings_restore
+        assert pool._resolve_runtime(111)[0] in pool._pending_settings_restore
 
         with patch(
             "kai.pool.sessions.get_canonical_execution_settings",

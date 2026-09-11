@@ -455,7 +455,15 @@ class SubprocessPool:
                 raise RuntimeError("Runtime profile selector requires protected runtime policy")
             profile = self._runtime_profiles.resolve(runtime)
             legacy_key = self._runtime_profiles.legacy_runtime_key(profile.profile_id)
-            return profile.profile_id, legacy_key, profile
+            primary = self._contexts_by_runtime.get(profile.profile_id)
+            if not isinstance(primary, WorkshopInternalAPIExecutionContext):
+                raise RuntimeError("Protected runtime has no canonical execution context")
+            # Profile selectors and adapter compatibility keys address the
+            # primary canonical lane.  Giving them a second profile-keyed
+            # cache entry lets Workshop and an adapter retain different live
+            # workspaces (and backend state) for the same runtime.
+            self._register_lane_state(primary)
+            return _CanonicalRuntimeLaneKey.from_context(primary), legacy_key, profile
         if not isinstance(runtime, int):
             raise TypeError("Runtime selector must be a runtime profile ID or integer")
         if self._runtime_profiles is None:
@@ -466,7 +474,14 @@ class SubprocessPool:
             if runtime >= 0:
                 raise
             return runtime, runtime, None
-        return profile.profile_id, runtime, profile
+        primary = self._contexts_by_runtime.get(profile.profile_id)
+        if not isinstance(primary, WorkshopInternalAPIExecutionContext):
+            raise RuntimeError("Protected runtime has no canonical execution context")
+        # Telegram still identifies the caller with this compatibility
+        # key; lifecycle state belongs to the same canonical lane used by
+        # every other adapter.
+        self._register_lane_state(primary)
+        return _CanonicalRuntimeLaneKey.from_context(primary), runtime, profile
 
     def _register_lane_state(self, context: WorkshopInternalAPIExecutionContext) -> None:
         """Register one channel-agent lane while inheriting protected policy."""
@@ -604,7 +619,7 @@ class SubprocessPool:
             runtime_profile_id=context.runtime_profile_id,
             legacy_runtime_key=(
                 self._runtime_profiles.legacy_runtime_key(profile.profile_id)
-                if runtime_key == profile.profile_id
+                if isinstance(runtime, (int, RuntimeProfileId))
                 else None
             ),
             sponsor_principal_id=context.runtime_owner_principal_id,

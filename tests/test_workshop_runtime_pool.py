@@ -134,7 +134,7 @@ def test_protected_profile_selects_backend_and_os_user_over_compatibility_config
     assert instance.timeout_seconds == 345
 
 
-def test_protected_runtime_lifecycle_is_keyed_by_canonical_profile():
+def test_protected_runtime_lifecycle_is_keyed_by_primary_canonical_lane():
     from kai.pool import SubprocessPool
 
     profiles = profile_registry(111)
@@ -149,12 +149,13 @@ def test_protected_runtime_lifecycle_is_keyed_by_canonical_profile():
 
     from_profile = pool.get(profile_id(111))
     from_compatibility_adapter = pool.get(111)
+    primary_key = pool._resolve_runtime(111)[0]
 
     assert from_profile is from_compatibility_adapter
-    assert set(pool._pool) == {profile_id(111)}
-    assert set(pool._last_activity) == {profile_id(111)}
-    assert set(pool._pending_workspace_restore) == {profile_id(111)}
-    assert set(pool._pending_settings_restore) == {profile_id(111)}
+    assert set(pool._pool) == {primary_key}
+    assert set(pool._last_activity) == {primary_key}
+    assert set(pool._pending_workspace_restore) == {primary_key}
+    assert set(pool._pending_settings_restore) == {primary_key}
 
 
 def test_protected_profile_service_scopes_override_compatibility_config(tmp_path, monkeypatch):
