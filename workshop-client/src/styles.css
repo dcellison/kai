@@ -607,10 +607,21 @@ button:disabled {
 
 .channel-link {
   position: relative;
-  grid-template-columns: 1.25rem 1fr auto;
-  gap: 0.38rem;
+  grid-template-columns: 1.05rem minmax(0, 1fr) auto;
+  gap: 0.58rem;
   padding: 0.28rem 0.65rem;
   font-size: 0.8rem;
+}
+
+.channel-link > span:first-child,
+.agent-link > span:first-child {
+  display: inline-grid;
+  width: 1.05rem;
+  height: 1.05rem;
+  align-self: center;
+  justify-self: center;
+  place-items: center;
+  line-height: 1;
 }
 
 .channel-link > span:first-child {
@@ -619,12 +630,8 @@ button:disabled {
 }
 
 .workspace-nav-icon {
-  display: inline-grid;
-  width: 1.25rem;
-  height: 1.25rem;
-  align-self: center;
-  place-items: center;
-  line-height: 1;
+  width: 1.05rem;
+  height: 1.05rem;
 }
 
 .channel-link.active {
@@ -687,9 +694,9 @@ button:disabled {
 }
 
 .agent-link {
-  grid-template-columns: 1.35rem minmax(0, 1fr) auto;
-  gap: 0.42rem;
-  padding: 0.25rem 0.6rem;
+  grid-template-columns: 1.05rem minmax(0, 1fr) auto;
+  gap: 0.58rem;
+  padding: 0.25rem 0.65rem;
 }
 
 .agent-link.active {
@@ -705,8 +712,8 @@ button:disabled {
 .mini-avatar {
   display: inline-grid;
   place-items: center;
-  width: 1.15rem;
-  height: 1.15rem;
+  width: 1.05rem;
+  height: 1.05rem;
   border-radius: 0.28rem;
   background: color-mix(in srgb, var(--color-success) 15%, transparent);
   color: var(--color-success);
