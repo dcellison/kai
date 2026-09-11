@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +31,11 @@ from kai.workshop.model_catalogue import (
 )
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
+from kai.workshop.workspace_provisioning import (
+    WorkspaceProvisioningError,
+    provision_via_helper,
+    provision_workspace,
+)
 from kai.workspace_utils import is_workspace_allowed
 
 
@@ -742,58 +746,37 @@ class WorkshopSettingsWorkspaceService:
                 raise WorkshopSettingsWorkspaceBusy(
                     "A workspace cannot be created while this conversation has an active run"
                 )
-            home = self._runtime_pool.get_home_workspace(runtime_authority)
-            if not home.is_absolute() or home.is_symlink() or not home.is_dir():
-                raise WorkshopSettingsWorkspaceValidationError("The private workspace home is unavailable")
-            home_resolved = home.resolve()
-            workspace_root = home_resolved / "workspaces"
-            if workspace_root.is_symlink():
-                raise WorkshopSettingsWorkspaceValidationError("The private workspace directory is invalid")
-            if workspace_root.exists() and not workspace_root.is_dir():
-                raise WorkshopSettingsWorkspaceValidationError("The private workspace directory is unavailable")
-            workspace_root.mkdir(mode=0o700, exist_ok=True)
-            if workspace_root.is_symlink() or workspace_root.resolve().parent != home_resolved:
-                raise WorkshopSettingsWorkspaceValidationError("The private workspace directory is invalid")
-            if stat.S_IMODE(workspace_root.stat().st_mode) & 0o077:
-                raise WorkshopSettingsWorkspaceValidationError(
-                    "The private workspace directory permissions are not private"
-                )
-            target = workspace_root / workspace_name
-            created_directory = False
-            if target.is_symlink():
-                raise WorkshopSettingsWorkspaceValidationError("The workspace name resolves through a symbolic link")
+            workspace_base, _allowed = await self._runtime_pool.resolve_workspace_access(runtime_authority)
+            if workspace_base is None:
+                raise WorkshopSettingsWorkspaceValidationError("No workspace base is configured for this runtime")
+            profile = self._runtime_pool.runtime_profile(runtime_authority)
+            os_user = profile.os_user
             try:
-                target.mkdir(mode=0o700)
-                created_directory = True
-            except FileExistsError:
-                if target.is_symlink() or not target.is_dir():
-                    raise WorkshopSettingsWorkspaceValidationError(
-                        "A non-directory entry already uses this workspace name"
-                    ) from None
-            target_resolved = target.resolve()
-            if target_resolved.parent != workspace_root.resolve():
-                raise WorkshopSettingsWorkspaceValidationError(
-                    "The workspace would escape the private workspace directory"
+                if self._config.protected_install and os_user is not None:
+                    provisioned = await asyncio.to_thread(
+                        provision_via_helper,
+                        authority.runtime_profile_id,
+                        workspace_name,
+                    )
+                else:
+                    provisioned = await asyncio.to_thread(
+                        provision_workspace,
+                        workspace_base,
+                        workspace_name,
+                    )
+            except WorkspaceProvisioningError as exc:
+                raise WorkshopSettingsWorkspaceValidationError(str(exc)) from exc
+            target_resolved = Path(provisioned.path)
+            expected_target = workspace_base.resolve() / workspace_name
+            if target_resolved != expected_target:
+                raise WorkshopSettingsWorkspaceConsistencyError(
+                    "Workspace provisioner returned a path outside the configured workspace base"
                 )
-            if stat.S_IMODE(target_resolved.stat().st_mode) & 0o077:
-                raise WorkshopSettingsWorkspaceValidationError("The workspace directory permissions are not private")
             grant_created = await sessions.add_canonical_workspace_grant(
                 self._namespace(authority),
                 str(target_resolved),
             )
-            git_ready = (target_resolved / ".git").is_dir()
-            if not git_ready:
-                try:
-                    process = await asyncio.create_subprocess_exec(
-                        "git",
-                        "init",
-                        cwd=str(target_resolved),
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    git_ready = await process.wait() == 0
-                except OSError:
-                    git_ready = False
+            git_ready = provisioned.git_ready
             creator_runtime_key = self._runtime_pool.legacy_runtime_key(authority.runtime_profile_id)
             if creator_runtime_key is None:
                 memory_project_registered = False
@@ -821,7 +804,12 @@ class WorkshopSettingsWorkspaceService:
                 authority,
                 mutation=SettingsMutationOutcome(
                     operation="create_workspace",
-                    changed=(created_directory or grant_created or memory_project_created or switch_mutation.changed),
+                    changed=(
+                        provisioned.directory_created
+                        or grant_created
+                        or memory_project_created
+                        or switch_mutation.changed
+                    ),
                     runtime_action=switch_mutation.runtime_action,
                     provider_session_invalidated=switch_mutation.provider_session_invalidated,
                 ),
@@ -829,7 +817,7 @@ class WorkshopSettingsWorkspaceService:
             return WorkspaceCreationResult(
                 snapshot=snapshot,
                 path=str(target_resolved),
-                directory_created=created_directory,
+                directory_created=provisioned.directory_created,
                 git_ready=git_ready,
                 memory_project_registered=memory_project_registered,
                 memory_project_note=memory_project_note,

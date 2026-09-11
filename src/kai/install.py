@@ -144,6 +144,7 @@ _DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 # hardcodes the same path; keep them in sync.
 PRINCIPAL_MEMORY_READER = Path("/etc/kai/read-principal-memory")
 PRINCIPAL_PREFERENCE_MANAGER = Path("/etc/kai/manage-principal-preferences")
+PRINCIPAL_WORKSPACE_PROVISIONER = Path("/etc/kai/provision-principal-workspace")
 
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
@@ -4399,6 +4400,39 @@ def _generate_principal_preference_manager(
     """)
 
 
+def _generate_principal_workspace_provisioner(install_dir: str = "/opt/kai") -> str:
+    """Generate the fixed root wrapper for bounded workspace provisioning."""
+    python = repr(str(Path(install_dir) / "venv" / "bin" / "python"))
+    return textwrap.dedent(f"""\
+        #!/usr/bin/python3
+        # Kai - provision one runtime-owned workspace below protected policy.
+        # Managed by 'python -m kai install apply'. Do not edit manually.
+        import os
+        import sys
+
+        PYTHON = {python}
+
+
+        def main() -> int:
+            argv = [
+                PYTHON,
+                "-I",
+                "-m",
+                "kai.workshop.workspace_provisioning",
+                *sys.argv[1:],
+            ]
+            os.execve(
+                PYTHON,
+                argv,
+                {{"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}},
+            )
+            return 1
+
+
+        sys.exit(main())
+    """)
+
+
 def _generate_sudoers(
     service_user: str,
     os_users: Iterable[str] = (),
@@ -4485,6 +4519,7 @@ def _generate_sudoers(
     if target_users:
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_MEMORY_READER} *\n"
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_PREFERENCE_MANAGER} *\n"
+        rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_WORKSPACE_PROVISIONER} *\n"
 
     if target_users:
         # In protected installs, these arguments come from
@@ -9021,8 +9056,8 @@ def _apply_sudoers(
     checks. `agent_backend` and users.yaml retain compatibility coverage for
     the global/default runtime path.
 
-    `data_dir` additionally installs the principal-memory reader and preference
-    manager helpers
+    `data_dir` additionally installs the principal-memory reader, preference
+    manager, and bounded workspace-provisioning helpers
     when the deployment has foreign os_users (the only case where its
     sudoers rule is emitted); None (direct/dev callers) always skips
     the helper.
@@ -9129,6 +9164,7 @@ def _apply_sudoers(
         if install_reader:
             print(f"[DRY RUN] Would write: {PRINCIPAL_MEMORY_READER} (mode 0755)")
             print(f"[DRY RUN] Would write: {PRINCIPAL_PREFERENCE_MANAGER} (mode 0755)")
+            print(f"[DRY RUN] Would write: {PRINCIPAL_WORKSPACE_PROVISIONER} (mode 0755)")
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")
         print("[DRY RUN] Would validate with visudo -cf")
         return
@@ -9168,6 +9204,21 @@ def _apply_sudoers(
         os.chmod(PRINCIPAL_PREFERENCE_MANAGER, 0o755)
         os.chown(PRINCIPAL_PREFERENCE_MANAGER, 0, 0)
         print(f"  Wrote {PRINCIPAL_PREFERENCE_MANAGER}")
+
+        fd, tmp_name = tempfile.mkstemp(prefix="kai-workspace-provisioner-", suffix=".tmp")
+        try:
+            os.write(
+                fd,
+                _generate_principal_workspace_provisioner(install_dir).encode(),
+            )
+            os.close(fd)
+            shutil.move(tmp_name, str(PRINCIPAL_WORKSPACE_PROVISIONER))
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        os.chmod(PRINCIPAL_WORKSPACE_PROVISIONER, 0o755)
+        os.chown(PRINCIPAL_WORKSPACE_PROVISIONER, 0, 0)
+        print(f"  Wrote {PRINCIPAL_WORKSPACE_PROVISIONER}")
 
     # Write to a secure temp file first, validate, then move into place.
     # Uses mkstemp (random name, restrictive permissions) instead of a
