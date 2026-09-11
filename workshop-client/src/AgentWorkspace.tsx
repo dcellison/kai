@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 import {
+  type AgentProvisioningInput,
   AuthenticationError,
   ChannelAccessError,
   activateAgentRevision,
@@ -8,92 +9,32 @@ import {
   archiveAgentDefinition,
   createAgentDefinition,
   enableAgentDefinition,
+  loadAgentCreationOptions,
   loadAgentCollaborationPolicy,
   loadAgentDefinitions,
   loadAgentEnablements,
+  provisionAgent,
   startAgentConversation,
   updateAgentCollaborationPolicy,
   revokeAgentCollaborationGrants,
 } from "./api";
+import {
+  AgentCreationDialog,
+  type AgentDefinitionFormState,
+} from "./AgentCreationDialog";
+import { AGENT_CAPABILITIES, COLLABORATION_TOOLS } from "./agentChoices";
 import type {
   WorkshopAgentCapability,
   WorkshopAgentDefinition,
   WorkshopAgentEnablement,
+  WorkshopAgentCreationOptions,
+  WorkshopAgentProvisioning,
   WorkshopCollaborationOperation,
   WorkshopCollaborationPolicy,
 } from "./types";
 import { useConfirmation } from "./ConfirmationDialog";
 import { AgentRuntimeControls } from "./SettingsWorkspace";
 import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
-
-const CAPABILITIES: {
-  description: string;
-  label: string;
-  value: WorkshopAgentCapability;
-}[] = [
-  {
-    description: "Create ordinary text responses.",
-    label: "Text generation",
-    value: "text_generation",
-  },
-  {
-    description: "Expose bounded tool activity in the run inspector.",
-    label: "Tool activity",
-    value: "tool_activity",
-  },
-  {
-    description: "Work within an already-authorized workspace.",
-    label: "Workspace execution",
-    value: "workspace_execution",
-  },
-  {
-    description: "Accept images when the selected runtime supports them.",
-    label: "Image input",
-    value: "image_input",
-  },
-  {
-    description:
-      "Delegate bounded tasks to other active agents in a shared channel.",
-    label: "Agent delegation",
-    value: "agent_delegation",
-  },
-];
-
-const COLLABORATION_TOOLS: {
-  description: string;
-  label: string;
-  value: WorkshopCollaborationOperation;
-}[] = [
-  { description: "Read bounded canonical conversation context.", label: "Context reading", value: "context_read" },
-  { description: "Add or remove reactions on messages.", label: "Reactions", value: "reaction" },
-  { description: "Publish visible progress updates while working.", label: "Progress updates", value: "progress_publish" },
-  { description: "Reply inside an existing thread.", label: "Thread replies", value: "thread_reply" },
-  { description: "Publish a bounded artifact with provenance.", label: "Artifacts", value: "artifact_publish" },
-  { description: "Delegate bounded work to another active agent.", label: "Agent delegation", value: "agent_delegation" },
-  { description: "Remain available for bounded observation in opted-in group channels.", label: "Standing participation", value: "standing_participation" },
-];
-
-interface DefinitionFormState {
-  avatar: string;
-  capabilities: WorkshopAgentCapability[];
-  collaborationOperations: WorkshopCollaborationOperation[];
-  description: string;
-  displayName: string;
-  handle: string;
-  instructions: string;
-  purpose: string;
-}
-
-const EMPTY_DEFINITION: DefinitionFormState = {
-  avatar: "",
-  capabilities: ["text_generation"],
-  collaborationOperations: [],
-  description: "",
-  displayName: "",
-  handle: "",
-  instructions: "",
-  purpose: "",
-};
 
 function operationKey(kind: string): string {
   if (typeof globalThis.crypto?.getRandomValues !== "function") {
@@ -158,7 +99,7 @@ function CapabilityChoices({
         Capabilities describe requirements. They never grant tools, credentials,
         workspaces, services, or data access.
       </p>
-      {CAPABILITIES.map((capability) => (
+      {AGENT_CAPABILITIES.map((capability) => (
         <label key={capability.value}>
           <input
             type="checkbox"
@@ -212,201 +153,6 @@ function CollaborationToolChoices({
         </label>
       ))}
     </fieldset>
-  );
-}
-
-function AgentCreationForm({
-  busy,
-  onCancel,
-  onCreate,
-}: {
-  busy: boolean;
-  onCancel: () => void;
-  onCreate: (form: DefinitionFormState) => Promise<void>;
-}): React.JSX.Element {
-  const confirm = useConfirmation();
-  const [form, setForm] = useState(EMPTY_DEFINITION);
-  const [error, setError] = useState<string | null>(null);
-  const dirty =
-    form.avatar !== EMPTY_DEFINITION.avatar ||
-    form.description !== EMPTY_DEFINITION.description ||
-    form.displayName !== EMPTY_DEFINITION.displayName ||
-    form.handle !== EMPTY_DEFINITION.handle ||
-    form.instructions !== EMPTY_DEFINITION.instructions ||
-    form.purpose !== EMPTY_DEFINITION.purpose ||
-    form.capabilities.length !== EMPTY_DEFINITION.capabilities.length ||
-    form.capabilities.some(
-      (capability, index) => capability !== EMPTY_DEFINITION.capabilities[index],
-    ) ||
-    form.collaborationOperations.length !== EMPTY_DEFINITION.collaborationOperations.length;
-
-  const close = async (): Promise<void> => {
-    if (busy) return;
-    if (dirty && !await confirm("Discard your unsaved agent changes?")) return;
-    onCancel();
-  };
-
-  const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
-    event.preventDefault();
-    if (form.capabilities.length === 0) {
-      setError("Select at least one declared capability.");
-      return;
-    }
-    setError(null);
-    try {
-      await onCreate(form);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not create this agent.");
-    }
-  };
-
-  return (
-    <div className="modal-backdrop" role="presentation">
-      <section
-        className="channel-creation-dialog agent-creation-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="create-agent-title"
-      >
-        <form className="agent-editor" onSubmit={(event) => void submit(event)}>
-          <div className="agent-creation-header">
-            <div>
-              <p className="overline">New software participant</p>
-              <h2 id="create-agent-title">Create agent</h2>
-            </div>
-            <button
-              className="panel-icon-button"
-              type="button"
-              aria-label="Close agent creation"
-              title="Close agent creation"
-              onClick={() => void close()}
-              disabled={busy}
-            >
-              <span aria-hidden="true">×</span>
-            </button>
-          </div>
-          <div className="agent-editor-grid">
-            <label>
-              Stable handle
-              <span className="agent-field-hint">
-                Lowercase letters, numbers, and underscores
-              </span>
-              <div className="agent-handle-input">
-                <span aria-hidden="true">@</span>
-                <input
-                  autoFocus
-                  maxLength={32}
-                  pattern="[a-z][a-z0-9_]{0,31}"
-                  required
-                  value={form.handle}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      handle: event.target.value.toLowerCase(),
-                    }))
-                  }
-                />
-              </div>
-            </label>
-            <label>
-              Display name
-              <span
-                className="agent-field-hint agent-field-hint-placeholder"
-                aria-hidden="true"
-              >
-                Optional guidance
-              </span>
-              <input
-                maxLength={80}
-                required
-                value={form.displayName}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    displayName: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Avatar text
-              <span className="agent-field-hint">Optional, up to 16 characters</span>
-              <input
-                maxLength={16}
-                value={form.avatar}
-                onChange={(event) =>
-                  setForm((current) => ({ ...current, avatar: event.target.value }))
-                }
-              />
-            </label>
-          </div>
-          <label>
-            Description
-            <textarea
-              maxLength={1000}
-              rows={3}
-              value={form.description}
-              onChange={(event) =>
-                setForm((current) => ({
-                  ...current,
-                  description: event.target.value,
-                }))
-              }
-            />
-          </label>
-          <label>
-            Purpose
-            <textarea
-              maxLength={2000}
-              required
-              rows={3}
-              value={form.purpose}
-              onChange={(event) =>
-                setForm((current) => ({ ...current, purpose: event.target.value }))
-              }
-            />
-          </label>
-          <label>
-            Instructions
-            <span className="agent-field-hint">
-              Behavioral guidance only. Instructions cannot grant authority.
-            </span>
-            <textarea
-              maxLength={20000}
-              required
-              rows={10}
-              value={form.instructions}
-              onChange={(event) =>
-                setForm((current) => ({
-                  ...current,
-                  instructions: event.target.value,
-                }))
-              }
-            />
-          </label>
-          <CapabilityChoices
-            disabled={busy}
-            selected={form.capabilities}
-            onChange={(capabilities) =>
-              setForm((current) => ({ ...current, capabilities }))
-            }
-          />
-          <CollaborationToolChoices
-            disabled={busy}
-            selected={form.collaborationOperations}
-            onChange={(collaborationOperations) =>
-              setForm((current) => ({ ...current, collaborationOperations }))
-            }
-          />
-          {error && <p className="form-error" role="alert">{error}</p>}
-          <div className="form-actions">
-            <button className="primary-button" type="submit" disabled={busy}>
-              {busy ? "Creating…" : "Create draft"}
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
   );
 }
 
@@ -643,6 +389,10 @@ export function AgentWorkspace({
     initialDefinitionId,
   );
   const [creating, setCreating] = useState(initialCreating);
+  const [creationOptions, setCreationOptions] = useState<WorkshopAgentCreationOptions | null>(null);
+  const [creationOptionsError, setCreationOptionsError] = useState<string | null>(null);
+  const [creationOptionsLoading, setCreationOptionsLoading] = useState(false);
+  const [creationReadyDefinitionId, setCreationReadyDefinitionId] = useState<string | null>(null);
   const [editingRevision, setEditingRevision] = useState(false);
   const [runtimeProfileId, setRuntimeProfileId] = useState("");
   const [loading, setLoading] = useState(true);
@@ -730,6 +480,40 @@ export function AgentWorkspace({
   }, [initialCreating, initialDefinitionId]);
 
   useEffect(() => {
+    let cancelled = false;
+    if (!creating) {
+      setCreationOptions(null);
+      setCreationOptionsError(null);
+      setCreationOptionsLoading(false);
+      return () => { cancelled = true; };
+    }
+    setCreationOptions(null);
+    setCreationOptionsError(null);
+    setCreationOptionsLoading(true);
+    void loadAgentCreationOptions(token).then(
+      (nextOptions) => {
+        if (!cancelled) {
+          setCreationOptions(nextOptions);
+          setCreationOptionsLoading(false);
+        }
+      },
+      (caught: unknown) => {
+        if (cancelled) return;
+        if (caught instanceof AuthenticationError) {
+          onAuthenticationFailure(caught.message);
+        } else if (caught instanceof ChannelAccessError) {
+          onChannelAccessFailure(caught.message);
+        }
+        setCreationOptionsError(
+          caught instanceof Error ? caught.message : "Could not load agent creation options.",
+        );
+        setCreationOptionsLoading(false);
+      },
+    );
+    return () => { cancelled = true; };
+  }, [creating, onAuthenticationFailure, onChannelAccessFailure, token]);
+
+  useEffect(() => {
     setEditingRevision(false);
   }, [selectedDefinitionId]);
 
@@ -779,17 +563,59 @@ export function AgentWorkspace({
     }
   };
 
-  const create = (form: DefinitionFormState): Promise<void> =>
-    runMutation(async () => {
+  const finishCreation = async (
+    definitionId: string,
+    ready: boolean,
+  ): Promise<void> => {
+    await refresh();
+    await onNavigationChanged();
+    setCreating(false);
+    setSelectedDefinitionId(definitionId);
+    setCreationReadyDefinitionId(ready ? definitionId : null);
+    onSelectAgent(definitionId);
+  };
+
+  const createDraft = async (form: AgentDefinitionFormState): Promise<void> => {
+    setBusy(true);
+    try {
       const created = await createAgentDefinition(token, {
         ...form,
         idempotencyKey: operationKey("create"),
       });
-      await refresh();
-      setCreating(false);
-      setSelectedDefinitionId(created.definitionId);
-      onSelectAgent(created.definitionId);
-    }, "Could not create this agent.");
+      await finishCreation(created.definitionId, false);
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        onAuthenticationFailure(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        onChannelAccessFailure(caught.message);
+      }
+      throw caught;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const createReady = async (
+    input: AgentProvisioningInput,
+  ): Promise<WorkshopAgentProvisioning> => {
+    setBusy(true);
+    try {
+      const result = await provisionAgent(token, input);
+      if (result.status === "ready" && result.definitionId) {
+        await finishCreation(result.definitionId, true);
+      }
+      return result;
+    } catch (caught) {
+      if (caught instanceof AuthenticationError) {
+        onAuthenticationFailure(caught.message);
+      } else if (caught instanceof ChannelAccessError) {
+        onChannelAccessFailure(caught.message);
+      }
+      throw caught;
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const addRevision = (input: {
     capabilities: WorkshopAgentCapability[];
@@ -1057,6 +883,17 @@ export function AgentWorkspace({
                 </div>
               </div>
 
+              {creationReadyDefinitionId === selected.definitionId && (
+                <section className="agent-ready-summary" role="status">
+                  <strong>Agent ready</strong>
+                  <p>
+                    Revision 1 and the selected runtime settings are active. Start a
+                    conversation with the speech-bubble action when you are ready;
+                    no conversation was created automatically.
+                  </p>
+                </section>
+              )}
+
               <section className="agent-authority-note">
                 <strong>
                   {canManage
@@ -1274,13 +1111,18 @@ export function AgentWorkspace({
         </section>
       </div>
       {creating && (
-        <AgentCreationForm
+        <AgentCreationDialog
           busy={busy}
+          existingHandles={definitions.map((definition) => definition.handle)}
+          options={creationOptions}
+          optionsError={creationOptionsError}
+          optionsLoading={creationOptionsLoading}
           onCancel={() => {
             setCreating(false);
             onSelectAgent(selectedDefinitionId);
           }}
-          onCreate={create}
+          onCreateReady={createReady}
+          onSaveDraft={createDraft}
         />
       )}
     </main>
