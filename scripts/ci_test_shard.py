@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 
-CI_TEST_SHARDS = ("core", "memory", "workshop")
+WORKSHOP_TEST_SHARDS = ("workshop-1", "workshop-2", "workshop-3")
+CI_TEST_SHARDS = ("core", "memory", *WORKSHOP_TEST_SHARDS)
 _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+_WORKSHOP_SHARD_SALT = b"kai-workshop-shards-v6540:"
+
+
+def _workshop_test_shard(path: Path) -> str:
+    """Assign Workshop modules without reshuffling existing paths."""
+    digest = hashlib.sha256(_WORKSHOP_SHARD_SALT + path.as_posix().encode()).digest()
+    index = int.from_bytes(digest[:8], "big") % len(WORKSHOP_TEST_SHARDS)
+    return WORKSHOP_TEST_SHARDS[index]
 
 
 def classify_test_file(path: Path) -> str:
     """Assign one test module to exactly one stable CI shard."""
     name = path.name
     if name.startswith("test_workshop_"):
-        return "workshop"
+        return _workshop_test_shard(path)
     if name.startswith(("test_memory", "test_eval_")):
         return "memory"
     return "core"
