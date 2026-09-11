@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import aiosqlite
 
@@ -55,6 +55,15 @@ class Projection(Protocol):
     async def reset(self, connection: aiosqlite.Connection) -> None: ...
 
     async def apply(self, connection: aiosqlite.Connection, event: StoredEvent) -> None: ...
+
+
+@runtime_checkable
+class ProjectionRebuildHooks(Protocol):
+    """Optional hooks for non-projected state that spans an atomic rebuild."""
+
+    async def prepare_rebuild(self, connection: aiosqlite.Connection) -> None: ...
+
+    async def finish_rebuild(self, connection: aiosqlite.Connection) -> None: ...
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -268,10 +277,14 @@ class WorkshopEventStore:
 
         try:
             await self._connection.execute("BEGIN IMMEDIATE")
+            if isinstance(projection, ProjectionRebuildHooks):
+                await projection.prepare_rebuild(self._connection)
             await projection.reset(self._connection)
             events = await self.read_events()
             for event in events:
                 await projection.apply(self._connection, event)
+            if isinstance(projection, ProjectionRebuildHooks):
+                await projection.finish_rebuild(self._connection)
             last_position = events[-1].position if events else 0
             updated_at = _format_timestamp(datetime.now(UTC))
             await self._connection.execute(
