@@ -53,6 +53,37 @@ def test_local_provisioning_rejects_symlinked_base_and_target(tmp_path: Path) ->
         provision_workspace(real_base, "linked-target")
 
 
+def test_git_identity_drop_clears_supplementary_groups(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    base = tmp_path / "configured-projects"
+    base.mkdir()
+    target = base / "research"
+    recorded: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "kai.workshop.workspace_provisioning._target_identity",
+        lambda _user: (501, 20, "/Users/daniel"),
+    )
+    monkeypatch.setattr("kai.workshop.workspace_provisioning.os.geteuid", lambda: 0)
+    monkeypatch.setattr("kai.workshop.workspace_provisioning.os.fchown", lambda *_args: None)
+
+    def run(_argv, **kwargs):
+        recorded.update(kwargs)
+        (target / ".git").mkdir()
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("kai.workshop.workspace_provisioning.subprocess.run", run)
+
+    result = provision_workspace(base, "research", os_user="daniel")
+
+    assert result.git_ready is True
+    assert recorded["user"] == 501
+    assert recorded["group"] == 20
+    assert recorded["extra_groups"] == ()
+
+
 def test_helper_invocation_accepts_only_bounded_json_result(monkeypatch) -> None:
     profile_id = RuntimeProfileId("rtp_" + "1" * 32)
     monkeypatch.setattr(

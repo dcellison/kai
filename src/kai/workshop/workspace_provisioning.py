@@ -45,15 +45,14 @@ def _validate_flat_name(name: str) -> str:
     return name
 
 
-def _target_identity(os_user: str | None) -> tuple[int, int, tuple[int, ...], str] | None:
+def _target_identity(os_user: str | None) -> tuple[int, int, str] | None:
     if os_user is None:
         return None
     try:
         account = pwd.getpwnam(os_user)
     except KeyError as exc:
         raise WorkspaceProvisioningError("The runtime OS identity is unavailable") from exc
-    groups = tuple(os.getgrouplist(account.pw_name, account.pw_gid))
-    return account.pw_uid, account.pw_gid, groups, account.pw_dir
+    return account.pw_uid, account.pw_gid, account.pw_dir
 
 
 def provision_workspace(
@@ -96,7 +95,7 @@ def provision_workspace(
         if not stat.S_ISDIR(info.st_mode):
             raise WorkspaceProvisioningError("A non-directory entry already uses this workspace name")
         if identity is not None:
-            uid, gid, _groups, _home = identity
+            uid, gid, _home = identity
             if created:
                 if os.geteuid() != 0 and info.st_uid != uid:
                     raise WorkspaceProvisioningError("Protected workspace provisioning requires root authority")
@@ -122,8 +121,12 @@ def provision_workspace(
             "env": {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
         }
         if identity is not None:
-            uid, gid, groups, home = identity
-            command.update(user=uid, group=gid, extra_groups=groups)
+            uid, gid, home = identity
+            # The workspace is owned by this UID/GID, so Git needs no
+            # supplementary groups. Clearing them also prevents inheriting
+            # root's groups and avoids macOS's small setgroups(2) limit for
+            # users with many directory-service memberships.
+            command.update(user=uid, group=gid, extra_groups=())
             environment = command["env"]
             assert isinstance(environment, dict)
             environment["HOME"] = home
