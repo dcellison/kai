@@ -500,7 +500,7 @@ export interface WorkshopAgentProvisioning {
   replayed: boolean;
   revisionId: string | null;
   runtimeProfileId: string;
-  status: "draft" | "needs_attention" | "ready";
+  status: "draft" | "needs_attention" | "provisioning" | "ready";
 }
 
 export interface WorkshopAgentChangeSignal {

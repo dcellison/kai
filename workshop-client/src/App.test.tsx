@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import {
+  type AgentProvisioningInput,
   archiveChannel,
   archiveDirectMessage,
   advanceChannelReadPosition,
@@ -22,6 +23,7 @@ import {
   loadAgentCreationOptions,
   loadAgentDefinitions,
   loadAgentEnablements,
+  loadAgentProvisioningSetups,
   loadEarlierTimeline,
   loadArtifactBlob,
   loadChannelMembers,
@@ -113,6 +115,7 @@ vi.mock("./api", async (importOriginal) => {
     loadAgentCreationOptions: vi.fn(),
     loadAgentDefinitions: vi.fn(),
     loadAgentEnablements: vi.fn(),
+    loadAgentProvisioningSetups: vi.fn(),
     loadNavigation: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadMemoryDetail: vi.fn(),
@@ -776,6 +779,7 @@ describe("Workshop React client", () => {
     vi.mocked(loadAgentCreationOptions).mockResolvedValue(agentCreationOptions);
     vi.mocked(loadAgentDefinitions).mockResolvedValue([agentDefinition]);
     vi.mocked(loadAgentEnablements).mockResolvedValue([agentEnablement]);
+    vi.mocked(loadAgentProvisioningSetups).mockResolvedValue([]);
     vi.mocked(provisionAgent).mockResolvedValue(agentProvisioning);
     vi.mocked(createAgentDefinition).mockResolvedValue(agentDefinition);
     vi.mocked(enableAgentDefinition).mockResolvedValue(agentEnablement);
@@ -3969,6 +3973,80 @@ describe("Workshop React client", () => {
     ).toBeVisible();
   });
 
+  it("reloads an incomplete setup with exact saved choices and retries it", async () => {
+    const user = userEvent.setup();
+    const savedProvisioning: WorkshopAgentProvisioning = {
+      ...agentProvisioning,
+      blockers: [{ code: "stage_failed", detail: "The model stage needs attention." }],
+      completedStages: ["definition_created", "revision_activated", "enablement_created"],
+      nextStage: "runtime_registered",
+      status: "needs_attention",
+    };
+    const savedInput: AgentProvisioningInput = {
+      allowedCollaborationOperations: [],
+      avatar: "R",
+      backendOptionId: "codex:openai",
+      capabilities: ["text_generation"],
+      clientOperationId: savedProvisioning.clientOperationId,
+      collaborationOperations: [],
+      description: "Resumes safely.",
+      displayName: "Recovery helper",
+      handle: "recovery_helper",
+      instructions: "Preserve every saved choice.",
+      model: "gpt-5.6-sol",
+      purpose: "Qualify recovery.",
+      runtimeProfileId,
+      timeoutSeconds: 300,
+      workspace: "/srv/workspaces/kai",
+    };
+    vi.mocked(loadAgentProvisioningSetups).mockResolvedValue([{
+      input: savedInput,
+      provisioning: savedProvisioning,
+    }]);
+    window.history.replaceState(
+      null,
+      "",
+      `/workshop/?view=agents&new=1&setup=${savedProvisioning.operationId}`,
+    );
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog", { name: "Continue Recovery helper" });
+    expect(within(dialog).getByRole("heading", { name: "Review" })).toBeVisible();
+    expect(within(dialog).getByText("Setup needs attention")).toBeVisible();
+    expect(within(dialog).getByText(/next step is to connect the runtime/)).toBeVisible();
+    expect(within(dialog).getByText("codex · openai")).toBeVisible();
+    expect(within(dialog).getByText("GPT-5.6 Sol")).toBeVisible();
+
+    await user.click(within(dialog).getByRole("button", { name: "Retry setup" }));
+    expect(provisionAgent).toHaveBeenCalledWith("existing-session", savedInput);
+    expect(createAgentDefinition).not.toHaveBeenCalled();
+    expect(startAgentConversation).not.toHaveBeenCalled();
+  });
+
+  it("shows the ready definition when a saved setup completed before reload", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      `/workshop/?view=agents&new=1&agent=${agentDefinition.definitionId}` +
+        `&setup=${agentProvisioning.operationId}`,
+    );
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: agentDefinition.displayName })).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: /Create|Continue/ })).not.toBeInTheDocument();
+    expect(window.location.search).toContain("view=agents");
+    expect(window.location.search).not.toContain("setup=");
+    expect(window.location.search).not.toContain("new=1");
+  });
+
   it("keeps ready creation blocked while preserving explicit draft saving", async () => {
     const user = userEvent.setup();
     const blockedOptions: WorkshopAgentCreationOptions = {
@@ -4139,20 +4217,21 @@ describe("Workshop React client", () => {
     );
     let archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
     expect(within(archive).getByText("Archived specialist")).toBeVisible();
-    expect(within(archive).getByText("@archived_specialist · archived")).toBeVisible();
+    expect(within(archive).getByText("@archived_specialist · Archived")).toBeVisible();
     expect(within(archive).getByText("Daniel draft")).toBeVisible();
-    expect(within(archive).getByText("@daniel_draft · draft")).toBeVisible();
+    expect(within(archive).getByText("@daniel_draft · Draft")).toBeVisible();
+    expect(within(archive).getByRole("heading", { name: "Drafts" })).toBeVisible();
+    expect(within(archive).getByRole("heading", { name: "Archived agents" })).toBeVisible();
+    expect(within(archive).getByRole("button", { name: "Continue setup" })).toBeVisible();
     await user.click(
-      within(archive).getByRole("button", {
-        name: "View draft agent Daniel draft",
-      }),
+      within(archive).getByRole("button", { name: "Continue setup" }),
     );
     expect(
-      await screen.findByRole("heading", { name: "Daniel draft", level: 2 }),
+      await screen.findByRole("heading", { name: "Continue Daniel draft", level: 2 }),
     ).toBeVisible();
-    expect(screen.getByText("You own and manage this agent.")).toBeVisible();
-    expect(screen.getByText("Owner controls")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Activate" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Runtime", level: 3 })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Close agent creation" }));
 
     await user.click(
       sidebar.getByRole("button", { name: "Your drafts and archived agents" }),

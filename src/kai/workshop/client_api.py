@@ -44,6 +44,7 @@ from kai.workshop.agent_lifecycle import (
 )
 from kai.workshop.agent_provisioning import (
     AgentProvisioningResult,
+    AgentProvisioningSetup,
     WorkshopAgentProvisioningAccessDenied,
     WorkshopAgentProvisioningConflict,
     WorkshopAgentProvisioningError,
@@ -1180,6 +1181,13 @@ def _serialize_agent_provisioning(result: AgentProvisioningResult) -> dict[str, 
         "completed_stages": list(result.completed_stages),
         "next_stage": result.next_stage,
         "blockers": [{"code": blocker.code, "detail": blocker.detail} for blocker in result.blockers],
+    }
+
+
+def _serialize_agent_provisioning_setup(setup: AgentProvisioningSetup) -> dict[str, object]:
+    return {
+        "provisioning": _serialize_agent_provisioning(setup.provisioning),
+        "request": setup.request,
     }
 
 
@@ -5218,6 +5226,37 @@ async def _handle_agent_provisioning(
     )
 
 
+async def _handle_agent_provisioning_list(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopAgentProvisioningService,
+) -> web.Response:
+    principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid agent provisioning request")
+    try:
+        setups = await service.list_incomplete(principal_id)
+    except WorkshopAgentProvisioningAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopAgentProvisioningStorageError:
+        return _error_response(
+            status=503,
+            code="agent_provisioning_unavailable",
+            message="Agent provisioning is temporarily unavailable",
+        )
+    return _json_response(
+        {
+            "version": 1,
+            "setups": [_serialize_agent_provisioning_setup(setup) for setup in setups],
+        },
+        status=200,
+    )
+
+
 async def _handle_agent_definition_detail(
     request: web.Request,
     *,
@@ -8116,6 +8155,15 @@ def register_workshop_read_routes(
                 service=agent_provisioning,
             )
 
+    async def handle_agent_provisioning_list(request: web.Request) -> web.Response:
+        assert agent_provisioning is not None
+        async with request_lock:
+            return await _handle_agent_provisioning_list(
+                request,
+                authenticator=authenticator,
+                service=agent_provisioning,
+            )
+
     async def handle_agent_definition_detail(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_agent_definition_detail(
@@ -8406,6 +8454,7 @@ def register_workshop_read_routes(
     if agent_creation_options is not None:
         app.router.add_get(_AGENT_CREATION_OPTIONS_PATH, handle_agent_creation_options)
     if agent_provisioning is not None:
+        app.router.add_get(_AGENT_PROVISIONING_PATH, handle_agent_provisioning_list)
         app.router.add_post(_AGENT_PROVISIONING_PATH, handle_agent_provisioning)
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
     app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)

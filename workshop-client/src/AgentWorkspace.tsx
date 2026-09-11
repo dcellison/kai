@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   type AgentProvisioningInput,
+  type AgentProvisioningSetup,
   AuthenticationError,
   ChannelAccessError,
   activateAgentRevision,
@@ -13,6 +14,7 @@ import {
   loadAgentCollaborationPolicy,
   loadAgentDefinitions,
   loadAgentEnablements,
+  loadAgentProvisioningSetups,
   provisionAgent,
   startAgentConversation,
   updateAgentCollaborationPolicy,
@@ -52,6 +54,10 @@ function activeRevision(agent: WorkshopAgentDefinition) {
   return agent.revisions.find(
     (revision) => revision.revisionId === agent.activeRevisionId,
   ) ?? null;
+}
+
+function agentStateLabel(state: WorkshopAgentDefinition["lifecycleState"]): string {
+  return state === "active" ? "Ready" : state === "draft" ? "Draft" : "Archived";
 }
 
 function ConversationIcon(): React.JSX.Element {
@@ -345,6 +351,7 @@ export function AgentWorkspace({
   activeChannelId,
   initialCreating,
   initialDefinitionId,
+  initialSetupId,
   initialSection,
   isAdministrator,
   onAuthenticationFailure,
@@ -363,6 +370,7 @@ export function AgentWorkspace({
   activeChannelId: string;
   initialCreating: boolean;
   initialDefinitionId: string | null;
+  initialSetupId: string | null;
   initialSection: "runtime" | null;
   isAdministrator: boolean;
   onAuthenticationFailure: (message: string) => void;
@@ -384,6 +392,7 @@ export function AgentWorkspace({
   const confirm = useConfirmation();
   const [definitions, setDefinitions] = useState<WorkshopAgentDefinition[]>([]);
   const [enablements, setEnablements] = useState<WorkshopAgentEnablement[]>([]);
+  const [provisioningSetups, setProvisioningSetups] = useState<AgentProvisioningSetup[]>([]);
   const [collaborationPolicy, setCollaborationPolicy] = useState<WorkshopCollaborationPolicy | null>(null);
   const [selectedDefinitionId, setSelectedDefinitionId] = useState<string | null>(
     initialDefinitionId,
@@ -410,12 +419,14 @@ export function AgentWorkspace({
   }, [onAuthenticationFailure, onChannelAccessFailure]);
 
   const refresh = useCallback(async (): Promise<void> => {
-    const [nextDefinitions, nextEnablements] = await Promise.all([
+    const [nextDefinitions, nextEnablements, nextSetups] = await Promise.all([
       loadAgentDefinitions(token),
       loadAgentEnablements(token),
+      loadAgentProvisioningSetups(token),
     ]);
     setDefinitions(nextDefinitions);
     setEnablements(nextEnablements);
+    setProvisioningSetups(nextSetups);
     setSelectedDefinitionId((current) => {
       const candidate = current ?? initialDefinitionId;
       if (candidate && nextDefinitions.some((item) => item.definitionId === candidate)) {
@@ -465,6 +476,27 @@ export function AgentWorkspace({
     (item) => item.definitionId === selectedDefinitionId,
   ) ?? null;
   const selectedRevision = selected ? activeRevision(selected) : null;
+  const resumeSetup = provisioningSetups.find(
+    (setup) => setup.provisioning.operationId === initialSetupId,
+  ) ?? null;
+  const resumeDraft = creating && !resumeSetup && selected?.lifecycleState === "draft"
+    ? (() => {
+        const revision = selected.revisions[0];
+        if (!revision) return null;
+        return {
+          avatar: selected.presentation.avatar ?? "",
+          capabilities: revision.capabilities,
+          collaborationOperations: revision.collaborationOperations,
+          definitionId: selected.definitionId,
+          description: selected.description,
+          displayName: selected.displayName,
+          handle: selected.handle,
+          instructions: revision.instructions,
+          purpose: revision.purpose,
+        };
+      })()
+    : null;
+  const freshCreation = !initialDefinitionId && !initialSetupId;
   const canManage = selected?.ownerPrincipalId === principalId;
   const runtimeSession = useMemo(() => (
     enablement?.lifecycleState === "enabled" && enablement.directChannelId
@@ -478,6 +510,29 @@ export function AgentWorkspace({
       setSelectedDefinitionId(initialDefinitionId);
     }
   }, [initialCreating, initialDefinitionId]);
+
+  useEffect(() => {
+    if (
+      loading ||
+      !creating ||
+      freshCreation ||
+      resumeSetup ||
+      resumeDraft
+    ) return;
+    // A saved operation can become ready between navigation and reload. In
+    // that case show its canonical definition instead of an empty new-agent
+    // form with none of the submitted choices.
+    setCreating(false);
+    onSelectAgent(selectedDefinitionId);
+  }, [
+    creating,
+    freshCreation,
+    loading,
+    onSelectAgent,
+    resumeDraft,
+    resumeSetup,
+    selectedDefinitionId,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -603,6 +658,9 @@ export function AgentWorkspace({
       const result = await provisionAgent(token, input);
       if (result.status === "ready" && result.definitionId) {
         await finishCreation(result.definitionId, true);
+      } else {
+        await refresh();
+        await onNavigationChanged();
       }
       return result;
     } catch (caught) {
@@ -750,10 +808,21 @@ export function AgentWorkspace({
     }, "Could not open this agent conversation.");
   };
 
-  const counts = useMemo(() => ({
-    active: definitions.filter((item) => item.lifecycleState === "active").length,
-    enabled: enablements.filter((item) => item.lifecycleState === "enabled").length,
-  }), [definitions, enablements]);
+  const counts = useMemo(() => {
+    const incomplete = new Set(
+      provisioningSetups.map((setup) => setup.provisioning.definitionId),
+    );
+    return {
+      archived: definitions.filter((item) => item.lifecycleState === "archived").length,
+      drafts: definitions.filter(
+        (item) => item.lifecycleState === "draft" && !incomplete.has(item.definitionId),
+      ).length,
+      needsAttention: provisioningSetups.length,
+      ready: definitions.filter(
+        (item) => item.lifecycleState === "active" && !incomplete.has(item.definitionId),
+      ).length,
+    };
+  }, [definitions, provisioningSetups]);
   const executionProfileControl =
     selected &&
     enablement?.canManage &&
@@ -804,7 +873,7 @@ export function AgentWorkspace({
           <p className="overline">Software participants</p>
           <h1>Agents</h1>
           <p>
-            {counts.enabled} enabled · {counts.active} active · {principalName}
+            {counts.ready} ready · {counts.drafts} drafts · {counts.needsAttention} need attention · {principalName}
           </p>
         </div>
         <div className="agent-header-actions">
@@ -852,7 +921,7 @@ export function AgentWorkspace({
                   <div className="agent-detail-title-row">
                     <h2>{selected.displayName}</h2>
                     <span className={`agent-status ${selected.lifecycleState}`}>
-                      {selected.lifecycleState}
+                      {agentStateLabel(selected.lifecycleState)}
                     </span>
                     {selected.lifecycleState === "active" &&
                       enablement &&
@@ -1110,13 +1179,17 @@ export function AgentWorkspace({
           {error && <p className="agent-workspace-error" role="alert">{error}</p>}
         </section>
       </div>
-      {creating && (
+      {creating && (freshCreation || resumeSetup || resumeDraft) && (
         <AgentCreationDialog
+          key={resumeSetup?.provisioning.operationId ?? resumeDraft?.definitionId ?? "new"}
           busy={busy}
           existingHandles={definitions.map((definition) => definition.handle)}
           options={creationOptions}
           optionsError={creationOptionsError}
           optionsLoading={creationOptionsLoading}
+          resumeDraft={resumeDraft}
+          resumeInput={resumeSetup?.input ?? null}
+          resumeProvisioning={resumeSetup?.provisioning ?? null}
           onCancel={() => {
             setCreating(false);
             onSelectAgent(selectedDefinitionId);

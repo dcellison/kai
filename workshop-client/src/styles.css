@@ -2635,6 +2635,30 @@ button:disabled {
   height: 1rem;
 }
 
+.inactive-agent-sections {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.inactive-agent-sections h3 {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.inactive-agent-sections .channel-archive-list {
+  margin-top: 0.35rem;
+}
+
+.inactive-agent-sections .primary-button {
+  min-height: 2rem;
+  padding: 0.4rem 0.65rem;
+  white-space: nowrap;
+}
+
 .archived-read-only {
   margin: 0;
   border-top: 1px solid var(--color-border);
@@ -3533,9 +3557,37 @@ button:disabled {
 .agent-creation-stage-heading p,
 .agent-runtime-notice,
 .agent-conversation-notice,
-.agent-creation-recovery {
+.agent-creation-recovery p,
+.agent-creation-recovery small {
   color: var(--color-text-muted);
   font-size: 0.68rem;
+}
+
+.agent-creation-recovery {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 1rem;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 55%, var(--color-border));
+  border-radius: 0.45rem;
+  padding: 0.8rem;
+  background: color-mix(in srgb, var(--color-warning) 7%, var(--color-panel));
+}
+
+.agent-creation-recovery p,
+.agent-creation-recovery details {
+  margin: 0;
+}
+
+.agent-creation-recovery summary {
+  cursor: pointer;
+  color: var(--color-text-muted);
+  font-size: 0.66rem;
+}
+
+.agent-creation-recovery code,
+.agent-creation-recovery small {
+  display: block;
+  margin-top: 0.3rem;
 }
 
 .agent-creation-stage-heading p {
