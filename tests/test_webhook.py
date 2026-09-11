@@ -898,6 +898,7 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/runs/{run_id}/cancel",
                 "/v1/channels/{channel_id}/runs/{run_id}/trace",
                 "/v1/channels/{channel_id}/settings",
+                "/v1/channels/{channel_id}/effective-agent-runtime",
                 "/v1/channels/{channel_id}/models",
                 "/v1/channels/{channel_id}/workspace",
                 "/v1/channels/{channel_id}/workspace-config",

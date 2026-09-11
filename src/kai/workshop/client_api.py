@@ -380,6 +380,7 @@ _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
+_EFFECTIVE_AGENT_RUNTIME_PATH = "/v1/channels/{channel_id}/effective-agent-runtime"
 _ROUTING_ELIGIBILITY_PATH = "/v1/channels/{channel_id}/routing-eligibility"
 _ROUTING_POLICY_PATH = "/v1/channels/{channel_id}/routing-policy"
 _MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
@@ -3298,6 +3299,112 @@ async def _handle_runtime_settings(
         )
     return _json_response(
         _serialize_settings_workspace(await service.inspect(authority)),
+        status=200,
+    )
+
+
+async def _handle_effective_agent_runtime(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    """Project the runtime that will execute one direct-agent conversation."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid effective runtime request",
+        )
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+    except (KeyError, TypeError, ValueError):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid channel request",
+        )
+    if not await CanonicalChannelAuthorizer(store).can_read_channel(principal_id, channel_id):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+
+    async with store.connection.execute(
+        "SELECT a.id, a.name, ad.handle, ad.owner_principal_id, "
+        "ad.owner_runtime_profile_id, owner.display_name "
+        "FROM channels c "
+        "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.detached_at IS NULL "
+        "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
+        "JOIN agent_definitions ad ON ad.agent_id = a.id AND ad.lifecycle_state = 'active' "
+        "JOIN principals owner ON owner.id = ad.owner_principal_id AND owner.kind = 'human' "
+        "WHERE c.id = ? AND c.kind = 'direct' "
+        "ORDER BY a.id",
+        (channel_id,),
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    if len(rows) != 1:
+        code = "effective_runtime_ambiguous" if len(rows) > 1 else "effective_runtime_unavailable"
+        return _error_response(
+            status=409,
+            code=code,
+            message=(
+                "This conversation has more than one effective agent runtime"
+                if len(rows) > 1
+                else "This conversation has no effective agent runtime"
+            ),
+        )
+    row = rows[0]
+    if row[3] is None or row[4] is None:
+        return _error_response(
+            status=409,
+            code="effective_runtime_unavailable",
+            message="This agent has no owner-sponsored runtime",
+        )
+    try:
+        agent_id = AgentId(str(row[0]))
+        sponsor_principal_id = PrincipalId(str(row[3]))
+        runtime_profile_id = RuntimeProfileId(str(row[4]))
+        authority = service.authority_for_principal_profile(
+            sponsor_principal_id,
+            runtime_profile_id,
+        )
+        snapshot = await service.inspect(authority)
+    except (TypeError, ValueError, WorkshopSettingsWorkspaceAccessDenied):
+        return _error_response(
+            status=409,
+            code="effective_runtime_unavailable",
+            message="This agent has no valid owner-sponsored runtime",
+        )
+    return _json_response(
+        {
+            "version": 1,
+            "channel_id": str(channel_id),
+            "agent_id": str(agent_id),
+            "agent_name": str(row[1]),
+            "agent_handle": str(row[2]),
+            "sponsor_principal_id": str(sponsor_principal_id),
+            "sponsor_display_name": str(row[5]),
+            "can_manage": principal_id == sponsor_principal_id,
+            "backend": snapshot.backend,
+            "provider": snapshot.provider,
+            "model": {
+                "value": snapshot.model.value,
+                "source": snapshot.model.source,
+            },
+            "timeout_seconds": {
+                "value": snapshot.timeout_seconds.value,
+                "source": snapshot.timeout_seconds.source,
+            },
+            "workspace": snapshot.workspace,
+        },
         status=200,
     )
 
@@ -8767,6 +8874,15 @@ def register_workshop_read_routes(
                     service=settings_workspaces,
                 )
 
+        async def handle_effective_agent_runtime(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_effective_agent_runtime(
+                    request,
+                    store=store,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
         async def handle_runtime_settings_update(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_runtime_settings_update(
@@ -8847,6 +8963,10 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_RUNTIME_SETTINGS_PATH, handle_runtime_settings)
+        app.router.add_get(
+            _EFFECTIVE_AGENT_RUNTIME_PATH,
+            handle_effective_agent_runtime,
+        )
         app.router.add_patch(
             _RUNTIME_SETTINGS_PATH,
             handle_runtime_settings_update,

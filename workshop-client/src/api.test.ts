@@ -34,6 +34,7 @@ import {
   loadAgentCollaborationPolicy,
   loadAppearancePreferences,
   loadEarlierTimeline,
+  loadEffectiveAgentRuntime,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
@@ -482,6 +483,24 @@ function settingsPayload(overrides: Record<string, unknown> = {}): Record<string
     ],
     mutation: null,
     ...overrides,
+  };
+}
+
+function effectiveAgentRuntimePayload(): Record<string, unknown> {
+  return {
+    version: 1,
+    channel_id: channelId,
+    agent_id: agentId,
+    agent_name: "Kai",
+    agent_handle: "kai",
+    sponsor_principal_id: "prn_00000000000000000000000000000001",
+    sponsor_display_name: "Daniel",
+    can_manage: false,
+    backend: "codex",
+    provider: "openai",
+    model: { value: "gpt-5.6-sol", source: "runtime policy" },
+    timeout_seconds: { value: 1800, source: "runtime policy" },
+    workspace: "/Users/kai/Projects/kai",
   };
 }
 
@@ -1173,6 +1192,31 @@ describe("Workshop client API", () => {
       revision: "sws_current",
       timeout_seconds: 601,
     });
+  });
+
+  it("loads the read-only effective agent runtime projection", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json(effectiveAgentRuntimePayload()),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadEffectiveAgentRuntime(session)).resolves.toEqual({
+      agentHandle: "kai",
+      agentId,
+      agentName: "Kai",
+      backend: "codex",
+      canManage: false,
+      channelId,
+      model: { value: "gpt-5.6-sol", source: "runtime policy" },
+      provider: "openai",
+      sponsorDisplayName: "Daniel",
+      sponsorPrincipalId: "prn_00000000000000000000000000000001",
+      timeoutSeconds: { value: 1800, source: "runtime policy" },
+      workspace: "/Users/kai/Projects/kai",
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `/v1/channels/${channelId}/effective-agent-runtime`,
+    );
   });
 
   it("uses the canonical catalogue for principal refresh and operator actions", async () => {

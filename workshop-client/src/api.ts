@@ -15,6 +15,7 @@ import type {
   WorkshopRunTransition,
   WorkshopSession,
   WorkshopEditableCapability,
+  WorkshopEffectiveAgentRuntime,
   WorkshopSettingsMutation,
   WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
@@ -4059,6 +4060,62 @@ export async function loadSettingsWorkspace(
     );
   }
   return parseSettingsWorkspace(payload, session.channelId);
+}
+
+export async function loadEffectiveAgentRuntime(
+  session: WorkshopSession,
+): Promise<WorkshopEffectiveAgentRuntime> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/effective-agent-runtime`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(
+      safeErrorMessage(payload, "Could not load the effective agent runtime."),
+    );
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.channel_id !== session.channelId ||
+    typeof payload.agent_id !== "string" ||
+    !AGENT_PATTERN.test(payload.agent_id) ||
+    typeof payload.agent_name !== "string" ||
+    typeof payload.agent_handle !== "string" ||
+    typeof payload.sponsor_principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(payload.sponsor_principal_id) ||
+    typeof payload.sponsor_display_name !== "string" ||
+    typeof payload.can_manage !== "boolean" ||
+    typeof payload.backend !== "string" ||
+    typeof payload.provider !== "string" ||
+    !isRecord(payload.model) ||
+    typeof payload.model.value !== "string" ||
+    typeof payload.model.source !== "string" ||
+    !isRecord(payload.timeout_seconds) ||
+    !Number.isSafeInteger(payload.timeout_seconds.value) ||
+    typeof payload.timeout_seconds.source !== "string" ||
+    typeof payload.workspace !== "string"
+  ) {
+    throw new Error("Kai returned an unsupported effective agent runtime.");
+  }
+  return {
+    agentHandle: payload.agent_handle,
+    agentId: payload.agent_id,
+    agentName: payload.agent_name,
+    backend: payload.backend,
+    canManage: payload.can_manage,
+    channelId: payload.channel_id,
+    model: { source: payload.model.source, value: payload.model.value },
+    provider: payload.provider,
+    sponsorDisplayName: payload.sponsor_display_name,
+    sponsorPrincipalId: payload.sponsor_principal_id,
+    timeoutSeconds: {
+      source: payload.timeout_seconds.source,
+      value: payload.timeout_seconds.value as number,
+    },
+    workspace: payload.workspace,
+  };
 }
 
 export async function loadRoutingEligibility(

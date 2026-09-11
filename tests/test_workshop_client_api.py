@@ -308,6 +308,11 @@ class _SettingsWorkspaces:
             raise WorkshopSettingsWorkspaceAccessDenied("denied")
         return SimpleNamespace(principal_id=principal_id, channel_id=channel_id)
 
+    def authority_for_principal_profile(self, principal_id, runtime_profile_id):
+        if principal_id != self.principal_id or runtime_profile_id != profile_id(101):
+            raise WorkshopSettingsWorkspaceAccessDenied("denied")
+        return SimpleNamespace(principal_id=principal_id, channel_id=self.channel_id)
+
     @staticmethod
     def _check_revision(expected, current: str) -> None:
         if expected != current:
@@ -3921,6 +3926,78 @@ class TestWorkshopRoutingPolicyHTTPContract:
 
 
 class TestWorkshopSettingsWorkspaceHTTPContract:
+    async def test_nonowner_reads_only_the_effective_owner_sponsored_runtime(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, bob_channel = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            settings_workspaces=service,
+        )
+        headers = {"Authorization": "Bearer bob-token"}
+        try:
+            effective = await client.get(
+                f"/v1/channels/{bob_channel}/effective-agent-runtime",
+                headers=headers,
+            )
+            owner_effective = await client.get(
+                f"/v1/channels/{alice_channel}/effective-agent-runtime",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            cross_principal = await client.get(
+                f"/v1/channels/{alice_channel}/effective-agent-runtime",
+                headers=headers,
+            )
+            owner_mutation = await client.patch(
+                f"/v1/channels/{alice_channel}/settings",
+                headers={**headers, "Content-Type": "application/json"},
+                json={
+                    "field": "backend",
+                    "value": "claude:anthropic",
+                    "revision": "sws_current",
+                },
+            )
+
+            assert effective.status == 200
+            payload = await effective.json()
+            assert isinstance(payload["agent_id"], str)
+            assert payload["agent_id"].startswith("agt_")
+            effective_agent_id = payload["agent_id"]
+            assert payload == {
+                "version": 1,
+                "channel_id": str(bob_channel),
+                "agent_id": effective_agent_id,
+                "agent_name": "Kai",
+                "agent_handle": "kai",
+                "sponsor_principal_id": str(alice_id),
+                "sponsor_display_name": "Alice",
+                "can_manage": False,
+                "backend": "codex",
+                "provider": "openai",
+                "model": {"value": "gpt-5.6-sol", "source": "runtime policy"},
+                "timeout_seconds": {"value": 120, "source": "runtime policy"},
+                "workspace": "/srv/kai",
+            }
+            assert "capabilities" not in payload
+            assert "workspaces" not in payload
+            assert "revision" not in payload
+            owner_payload = await owner_effective.json()
+            assert owner_effective.status == 200
+            assert owner_payload["can_manage"] is True
+            assert owner_payload["sponsor_principal_id"] == str(alice_id)
+            for field in ("agent_id", "backend", "provider", "model", "timeout_seconds", "workspace"):
+                assert owner_payload[field] == payload[field]
+            assert cross_principal.status == 403
+            assert await cross_principal.json() == {"error": {"code": "access_denied", "message": "Access denied"}}
+            assert owner_mutation.status == 403
+            assert service.runtime_changes == []
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_model_catalogue_read_refresh_and_operator_actions_are_canonical(
         self,
         tmp_path: Path,
