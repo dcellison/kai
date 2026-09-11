@@ -164,10 +164,12 @@ from kai.workshop.settings_workspaces import (
     EditableCapability,
     EffectiveValue,
     ModelOption,
+    SettingsMutationOutcome,
     SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
     WorkshopSettingsWorkspaceConflict,
     WorkspaceConfigSnapshot,
+    WorkspaceCreationResult,
     WorkspaceOption,
 )
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
@@ -301,6 +303,7 @@ class _SettingsWorkspaces:
     secondary_principal_id: PrincipalId | None = None
     secondary_channel_id: ChannelId | None = None
     switched: list[str] = field(default_factory=list)
+    created_workspaces: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
     runtime_changes: list[tuple[str, object]] = field(default_factory=list)
     catalogue_calls: list[tuple[str, str | None]] = field(default_factory=list)
@@ -381,6 +384,33 @@ class _SettingsWorkspaces:
         self.switched.append(path)
         return self._snapshot(workspace=path)
 
+    async def create_workspace(self, _authority, name: str, *, expected_revision=None):
+        self._check_revision(expected_revision, "sws_current")
+        changed = name not in self.created_workspaces
+        if changed:
+            self.created_workspaces.append(name)
+        path = f"/srv/home/workspaces/{name}"
+        return WorkspaceCreationResult(
+            snapshot=self._snapshot(
+                workspace=path,
+                workspaces=(
+                    WorkspaceOption("/srv/kai", "kai", False, False),
+                    WorkspaceOption(path, name, True, False),
+                ),
+                mutation=SettingsMutationOutcome(
+                    "create_workspace",
+                    changed,
+                    "restarted" if changed else "unchanged",
+                    changed,
+                ),
+            ),
+            path=path,
+            directory_created=changed,
+            git_ready=True,
+            memory_project_registered=True,
+            memory_project_note=(f"Registered memory project '{name.lower().replace(' ', '-')}' for this workspace."),
+        )
+
     async def set_model(
         self,
         _authority,
@@ -450,6 +480,7 @@ class _SettingsWorkspaces:
         runtime_profile_id=None,
         workspace: str = "/srv/kai",
         workspaces: tuple[WorkspaceOption, ...] | None = None,
+        mutation: SettingsMutationOutcome | None = None,
     ):
         return SettingsWorkspaceSnapshot(
             principal_id=principal_id or self.principal_id,
@@ -469,6 +500,7 @@ class _SettingsWorkspaces:
             workspaces=workspaces or (WorkspaceOption(workspace, "kai", True, False),),
             revision="sws_current",
             capabilities=(EditableCapability("model", "runtime", "model_id", True),),
+            mutation=mutation,
         )
 
     def _catalogue_snapshot(self, option_id: str | None = None) -> ModelCatalogueSnapshot:
@@ -4246,6 +4278,69 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
                 ("timeout", 180),
                 ("backend", "claude"),
             ]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_owner_creates_workspace_with_replay_safe_status(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            settings_workspaces=service,
+        )
+        path = f"/v1/channels/{alice_channel}/workspaces"
+        headers = {
+            "Authorization": "Bearer alice-token",
+            "Content-Type": "application/json",
+        }
+        try:
+            first = await client.post(
+                path,
+                headers=headers,
+                json={"name": "Research Notes", "revision": "sws_current"},
+            )
+            replay = await client.post(
+                path,
+                headers=headers,
+                json={"name": "Research Notes", "revision": "sws_current"},
+            )
+            malformed = await client.post(
+                path,
+                headers=headers,
+                json={"name": "escape", "path": "/tmp", "revision": "sws_current"},
+            )
+            foreign = await client.post(
+                path,
+                headers={
+                    "Authorization": "Bearer bob-token",
+                    "Content-Type": "application/json",
+                },
+                json={"name": "Forbidden", "revision": "sws_current"},
+            )
+
+            assert first.status == 201
+            first_payload = await first.json()
+            assert first_payload["mutation"] == {
+                "operation": "create_workspace",
+                "changed": True,
+                "runtime_action": "restarted",
+                "provider_session_invalidated": True,
+            }
+            assert first_payload["creation"]["directory_created"] is True
+            assert first_payload["creation"]["git_ready"] is True
+            assert first_payload["creation"]["memory_project_registered"] is True
+            assert first_payload["workspaces"][-1]["name"] == "Research Notes"
+            assert replay.status == 200
+            assert (await replay.json())["mutation"]["changed"] is False
+            assert malformed.status == 400
+            assert (await malformed.json())["error"]["code"] == "invalid_request"
+            assert foreign.status == 403
+            assert service.created_workspaces == ["Research Notes"]
         finally:
             await client.close()
             await store.close()

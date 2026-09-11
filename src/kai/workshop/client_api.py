@@ -386,6 +386,7 @@ _ROUTING_POLICY_PATH = "/v1/channels/{channel_id}/routing-policy"
 _MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
 _MODEL_CATALOGUE_ADMIN_REFRESH_PATH = "/v1/settings/model-catalogue/refresh-all"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
+_WORKSPACE_COLLECTION_PATH = "/v1/channels/{channel_id}/workspaces"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
 _PREFERENCES_PATH = "/v1/preferences"
 _PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
@@ -439,6 +440,8 @@ _SETTINGS_REQUEST_FIELDS = _SETTINGS_OPERATION_FIELDS | {"revision"}
 _MODEL_CATALOGUE_REFRESH_FIELDS = frozenset({"option_id"})
 _MODEL_CATALOGUE_OPERATOR_FIELDS = frozenset({"option_id", "model_id", "display_label"})
 _WORKSPACE_REQUEST_FIELDS = frozenset({"path", "revision"})
+_WORKSPACE_CREATION_REQUEST_FIELDS = frozenset({"name", "revision"})
+_MAX_WORKSPACE_CREATION_BODY_BYTES = 2_048
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
 _PREFERENCE_UPDATE_FIELDS = frozenset({"content", "revision"})
@@ -3802,6 +3805,81 @@ async def _handle_active_workspace_update(
     except WorkshopSettingsWorkspaceValidationError as exc:
         return _error_response(status=400, code="invalid_workspace", message=str(exc))
     return _json_response(_serialize_settings_workspace(snapshot), status=200)
+
+
+async def _handle_workspace_creation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query or request.content_type != "application/json":
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid workspace creation request",
+        )
+    if request.content_length is not None and request.content_length > _MAX_WORKSPACE_CREATION_BODY_BYTES:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Workspace creation request is too large",
+        )
+    raw = await request.content.read(_MAX_WORKSPACE_CREATION_BODY_BYTES + 1)
+    if len(raw) > _MAX_WORKSPACE_CREATION_BODY_BYTES:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Workspace creation request is too large",
+        )
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _WORKSPACE_CREATION_REQUEST_FIELDS
+        or not isinstance(payload.get("name"), str)
+        or not isinstance(payload.get("revision"), str)
+    ):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid workspace creation request",
+        )
+    try:
+        result = await service.create_workspace(
+            authority,
+            payload["name"],
+            expected_revision=payload["revision"],
+        )
+    except WorkshopSettingsWorkspaceBusy as exc:
+        return _error_response(status=409, code="runtime_busy", message=str(exc))
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_workspace", message=str(exc))
+    response_payload = _serialize_settings_workspace(result.snapshot)
+    response_payload["creation"] = {
+        "path": result.path,
+        "directory_created": result.directory_created,
+        "git_ready": result.git_ready,
+        "memory_project_registered": result.memory_project_registered,
+        "memory_project_note": result.memory_project_note,
+    }
+    return _json_response(response_payload, status=201 if result.directory_created else 200)
 
 
 async def _handle_workspace_config(
@@ -8959,6 +9037,14 @@ def register_workshop_read_routes(
                     service=settings_workspaces,
                 )
 
+        async def handle_workspace_creation(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_workspace_creation(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
         async def handle_workspace_config(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_workspace_config(
@@ -8995,6 +9081,7 @@ def register_workshop_read_routes(
             handle_model_catalogue_refresh_all,
         )
         app.router.add_post(_ACTIVE_WORKSPACE_PATH, handle_active_workspace_update)
+        app.router.add_post(_WORKSPACE_COLLECTION_PATH, handle_workspace_creation)
         app.router.add_get(_WORKSPACE_CONFIG_PATH, handle_workspace_config)
         app.router.add_patch(
             _WORKSPACE_CONFIG_PATH,

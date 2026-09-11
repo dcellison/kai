@@ -15,6 +15,7 @@ import {
   archiveDirectMessage,
   advanceThreadReadPosition,
   createChannel,
+  createWorkspace,
   createAgentDefinition,
   provisionAgent,
   createMemoryFact,
@@ -1200,6 +1201,65 @@ describe("Workshop client API", () => {
     expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
       revision: "sws_current",
       timeout_seconds: 601,
+    });
+  });
+
+  it("creates a principal-private workspace without accepting a path", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json(
+        {
+          ...settingsPayload({
+          mutation: {
+            operation: "create_workspace",
+            changed: true,
+            runtime_action: "restarted",
+            provider_session_invalidated: true,
+          },
+          workspace: "/srv/home/workspaces/Research Notes",
+          workspaces: [
+            { path: "/srv/kai", name: "Kai", current: false, home: false },
+            {
+              path: "/srv/home/workspaces/Research Notes",
+              name: "Research Notes",
+              current: true,
+              home: false,
+            },
+          ],
+          }),
+          creation: {
+            path: "/srv/home/workspaces/Research Notes",
+            directory_created: true,
+            git_ready: true,
+            memory_project_registered: true,
+            memory_project_note: "Registered memory project 'research-notes' for this workspace.",
+          },
+        },
+        { status: 201 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createWorkspace(session, "Research Notes", "sws_current"),
+    ).resolves.toMatchObject({
+      directoryCreated: true,
+      gitReady: true,
+      memoryProjectRegistered: true,
+      settings: {
+        mutation: { operation: "create_workspace", changed: true },
+        workspace: "/srv/home/workspaces/Research Notes",
+        workspaces: [
+          { name: "Kai" },
+          { name: "Research Notes" },
+        ],
+      },
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `/v1/channels/${channelId}/workspaces`,
+    );
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      name: "Research Notes",
+      revision: "sws_current",
     });
   });
 

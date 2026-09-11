@@ -39,7 +39,9 @@ later issues in the scoped-memory epic.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakKeyDictionary
@@ -48,6 +50,8 @@ from kai import sessions
 from kai.config import Config, MemoryProjectConfig
 
 log = logging.getLogger(__name__)
+
+_PROJECT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 @dataclass(frozen=True)
@@ -297,6 +301,69 @@ def db_registry_creator(project_id: str) -> int | None:
     """chat_id that registered a project, for the unregister
     permission check. None for YAML-pinned or unknown projects."""
     return _db_creators.get(project_id)
+
+
+async def register_workspace_memory_project(
+    config: Config,
+    creator_runtime_key: int,
+    root: Path,
+    raw_name: str,
+) -> tuple[bool, bool, str]:
+    """Register a newly created workspace in the live memory-project registry.
+
+    Workspace creation is allowed to succeed when registration cannot: the
+    directory and runtime grant remain useful, and callers surface the bounded
+    registration result to the user. Exact retries recognize an already
+    registered project at the same root as success.
+    """
+    project_id = raw_name.strip().lower()
+    if not _PROJECT_ID_RE.match(project_id):
+        return False, False, f"Invalid project name {raw_name!r}: use letters, digits, - or _ (max 64 chars)."
+
+    async with registry_mutation_lock():
+        merged = merged_registry(config.memory_projects)
+        resolved_root = root.expanduser().resolve()
+        owner = detect_active_memory_project(resolved_root, merged)
+        if owner is not None:
+            if owner.project_id == project_id and owner.matched_root == resolved_root:
+                return True, False, f"Memory project '{project_id}' was already registered for this workspace."
+            return False, False, f"This workspace is already inside project '{owner.project_id}'."
+        if project_id in merged:
+            return False, False, f"Project id '{project_id}' is already registered; pick another name."
+
+        row = {
+            "project_id": project_id,
+            "display_name": raw_name.strip(),
+            "workspace_root": str(resolved_root),
+            "memory_enabled": True,
+            "default_scope_for_new_facts": "project",
+            "created_by": creator_runtime_key,
+        }
+        try:
+            await sessions.register_memory_project(
+                project_id=project_id,
+                display_name=raw_name.strip(),
+                workspace_root=str(resolved_root),
+                created_by=creator_runtime_key,
+            )
+        except Exception as exc:
+            log.warning("memory project registration failed for %r: %s", project_id, exc)
+            return False, False, f"Could not register project '{project_id}': {exc}"
+        if not db_registry_upsert(row):
+            log.error("memory project cache rejected validated row %r", project_id)
+    log.info(
+        "memory.project.registry %s",
+        json.dumps(
+            {
+                "action": "register",
+                "project_id": project_id,
+                "root": str(resolved_root),
+                "by": creator_runtime_key,
+            },
+            separators=(",", ":"),
+        ),
+    )
+    return True, True, f"Registered memory project '{project_id}' for this workspace."
 
 
 def merged_registry(yaml_projects: dict[str, MemoryProjectConfig]) -> dict[str, MemoryProjectConfig]:
