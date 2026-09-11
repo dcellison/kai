@@ -442,8 +442,8 @@ class WorkshopAgentProvisioningService:
         self._validate_model(backend, request.model)
         try:
             self._collaboration_policy.validate_initial_allowed_operations(
-                request.collaboration_operations,
-                request.allowed_collaboration_operations,
+                list(request.collaboration_operations),
+                list(request.allowed_collaboration_operations),
             )
         except WorkshopCollaborationPolicyValidationError as exc:
             raise WorkshopAgentProvisioningValidationError(str(exc)) from exc
