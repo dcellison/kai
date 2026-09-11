@@ -2,12 +2,12 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from kai import sessions
-from kai.config import Config, WorkspaceConfig
+from kai.config import Config, DeploymentMode, WorkspaceConfig
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId
 from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
@@ -21,6 +21,7 @@ from kai.workshop.settings_workspaces import (
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
 )
+from kai.workshop.workspace_provisioning import WorkspaceProvisioningResult
 from tests.workshop_profiles import profile_id
 
 
@@ -43,6 +44,8 @@ class _RuntimePool:
             timeout_seconds=120,
             maximum_timeout_seconds=600,
             allowed_models=None,
+            os_user=None,
+            workspace_base=allowed.parent,
         )
         self.profile.backend_options = (
             SimpleNamespace(option_id="codex:openai", backend="codex", provider="openai"),
@@ -406,7 +409,7 @@ async def test_workspace_switch_rejects_paths_outside_runtime_grants(
     assert pool.events == []
 
 
-async def test_workspace_creation_is_private_registered_and_idempotent(
+async def test_workspace_creation_uses_configured_base_and_is_idempotent(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -457,10 +460,10 @@ async def test_workspace_creation_is_private_registered_and_idempotent(
         expected_revision=created.snapshot.revision,
     )
 
-    path = pool.home / "workspaces" / "research-notes"
+    path = pool.allowed.parent / "research-notes"
     assert path.is_dir()
     assert (path / ".git").is_dir()
-    assert path.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o755
     assert created.directory_created is True
     assert created.git_ready is True
     assert created.memory_project_registered is True
@@ -494,7 +497,7 @@ async def test_workspace_creation_rejects_unsafe_names(
     with pytest.raises(WorkshopSettingsWorkspaceValidationError):
         await service.create_workspace(authority, name)
 
-    assert not (pool.home / "workspaces").exists()
+    assert [path.name for path in pool.allowed.parent.iterdir()] == ["kai"]
     add_grant.assert_not_awaited()
 
 
@@ -504,12 +507,10 @@ async def test_workspace_creation_rejects_symlink_and_file_collisions(
 ) -> None:
     service, pool, authority, _, _ = _service(tmp_path)
     _canonical_state(monkeypatch)
-    workspace_root = pool.home / "workspaces"
-    workspace_root.mkdir(mode=0o700)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (workspace_root / "linked").symlink_to(outside, target_is_directory=True)
-    (workspace_root / "occupied").write_text("not a directory")
+    (pool.allowed.parent / "linked").symlink_to(outside, target_is_directory=True)
+    (pool.allowed.parent / "occupied").write_text("not a directory")
     add_grant = AsyncMock()
     monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
 
@@ -521,7 +522,7 @@ async def test_workspace_creation_rejects_symlink_and_file_collisions(
     add_grant.assert_not_awaited()
 
 
-async def test_workspace_creation_rejects_symlinked_private_workspace_root(
+async def test_workspace_creation_rejects_symlinked_workspace_base(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -529,15 +530,77 @@ async def test_workspace_creation_rejects_symlinked_private_workspace_root(
     _canonical_state(monkeypatch)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (pool.home / "workspaces").symlink_to(outside, target_is_directory=True)
+    symlinked_base = tmp_path / "linked-projects"
+    symlinked_base.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(pool, "resolve_workspace_access", AsyncMock(return_value=(symlinked_base, [])))
     add_grant = AsyncMock()
     monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
 
-    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="private workspace directory"):
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="workspace base"):
         await service.create_workspace(authority, "Research")
 
     assert not (outside / "Research").exists()
     add_grant.assert_not_awaited()
+
+
+async def test_workspace_creation_requires_configured_base(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _canonical_state(monkeypatch)
+    monkeypatch.setattr(pool, "resolve_workspace_access", AsyncMock(return_value=(None, [])))
+    add_grant = AsyncMock()
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
+
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="No workspace base"):
+        await service.create_workspace(authority, "Research")
+
+    add_grant.assert_not_awaited()
+
+
+async def test_protected_workspace_creation_uses_privileged_runtime_provisioner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = Config(
+        telegram_bot_token="unused",
+        allowed_user_ids=set(),
+        default_backend="codex",
+        default_model="gpt-5.6-sol",
+        deployment_mode=DeploymentMode.PROTECTED,
+    )
+    service, pool, authority, _, _ = _service(tmp_path, config=config)
+    _canonical_state(monkeypatch)
+    base = pool.allowed.parent
+    target = base / "protected-project"
+    pool.profile.os_user = "daniel"
+
+    def provision(_profile_id, name: str) -> WorkspaceProvisioningResult:
+        assert name == "protected-project"
+        target.mkdir(mode=0o755)
+        (target / ".git").mkdir()
+        return WorkspaceProvisioningResult(str(target), True, True)
+
+    provisioner = MagicMock(side_effect=provision)
+    monkeypatch.setattr(
+        "kai.workshop.settings_workspaces.provision_via_helper",
+        provisioner,
+    )
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", AsyncMock(return_value=True))
+    monkeypatch.setattr(sessions, "upsert_canonical_workspace_history", AsyncMock())
+    monkeypatch.setattr(
+        "kai.workshop.settings_workspaces._register_workspace_memory_project",
+        AsyncMock(return_value=(True, True, "Registered memory project.")),
+    )
+
+    result = await service.create_workspace(authority, "protected-project")
+
+    provisioner.assert_called_once_with(authority.runtime_profile_id, "protected-project")
+    assert result.path == str(target)
+    assert result.directory_created is True
+    assert result.git_ready is True
+    assert pool.workspace == target
 
 
 async def test_timeout_validation_precedes_persistence(tmp_path: Path) -> None:
