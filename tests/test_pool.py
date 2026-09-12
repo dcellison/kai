@@ -33,6 +33,7 @@ from kai.workshop.runtime_profiles import (
     ProtectedRuntimeProfile,
     WorkshopRuntimeProfileRegistry,
 )
+from kai.workshop.sponsored_workspaces import SponsoredWorkspaceResult
 from tests.workshop_profiles import profile_id, profile_registry
 
 
@@ -1288,7 +1289,7 @@ class TestShutdown:
 
 class TestWorkspaceRestoration:
     @pytest.mark.asyncio
-    async def test_sponsored_private_runtime_uses_requester_workspace_policy(self, tmp_path):
+    async def test_sponsored_private_runtime_uses_neutral_workspace(self, tmp_path):
         owner_home = tmp_path / "owner-home"
         owner_repo = tmp_path / "owner-repo"
         requester_home = tmp_path / "requester-home"
@@ -1324,7 +1325,7 @@ class TestWorkspaceRestoration:
                 ProtectedRuntimeProfile(
                     profile_id=owner_profile_id,
                     display_name="owner",
-                    os_user=None,
+                    os_user="owner-user",
                     backend="codex",
                     provider="openai",
                     model="gpt-5.6-sol",
@@ -1337,7 +1338,7 @@ class TestWorkspaceRestoration:
                 ProtectedRuntimeProfile(
                     profile_id=requester_profile_id,
                     display_name="requester",
-                    os_user=None,
+                    os_user="requester-user",
                     backend="claude",
                     provider="anthropic",
                     model="sonnet",
@@ -1352,6 +1353,8 @@ class TestWorkspaceRestoration:
         )
         pool = SubprocessPool(
             config=_make_config(
+                session_db_path=tmp_path / "kai.db",
+                deployment_mode=DeploymentMode.PROTECTED,
                 workspace_configs={
                     requester_home.resolve(): WorkspaceConfig(
                         path=requester_home.resolve(),
@@ -1384,16 +1387,39 @@ class TestWorkspaceRestoration:
         assert namespace.runtime_profile_id == requester_profile_id
         assert resolve_access.await_args.kwargs["static_allowed_workspaces"] == (requester_repo,)
 
-        sponsored_instance = pool.get(context)
+        expected_neutral = (
+            tmp_path
+            / "sponsored-workspaces"
+            / str(owner_profile_id)
+            / str(requester_principal_id)
+            / str(requester_channel_id)
+            / str(context.agent_id)
+        )
+        expected_neutral.mkdir(parents=True)
+        with patch(
+            "kai.workshop.sponsored_workspaces.provision_via_helper",
+            return_value=SponsoredWorkspaceResult(str(expected_neutral), True),
+        ) as provision:
+            sponsored_instance = pool.get(context)
+        provision.assert_called_once_with(
+            requester_principal_id=requester_principal_id,
+            channel_id=requester_channel_id,
+            agent_id=context.agent_id,
+            runtime_profile_id=owner_profile_id,
+        )
+        assert sponsored_instance.workspace == expected_neutral
+        assert sponsored_instance.home_workspace == expected_neutral
+        assert expected_neutral.is_dir()
+        assert expected_neutral != requester_home
+        assert expected_neutral != owner_home
         assert sponsored_instance.model == "gpt-5.6-sol"
+        assert sponsored_instance.codex_user == "owner-user"
         assert sponsored_instance.timeout_seconds == 120
-        assert sponsored_instance.workspace_config is not None
-        assert sponsored_instance.workspace_config.model is None
-        assert sponsored_instance.workspace_config.timeout is None
+        assert sponsored_instance.workspace_config is None
         sponsored_instance.shutdown = AsyncMock()
         await pool.invalidate_requester_workspace_lanes(requester_authority)
-        sponsored_instance.shutdown.assert_awaited_once()
-        assert pool.get_if_exists(context) is None
+        sponsored_instance.shutdown.assert_not_awaited()
+        assert pool.get_if_exists(context) is sponsored_instance
 
     @pytest.mark.asyncio
     async def test_restore_saved_workspace(self, tmp_path):

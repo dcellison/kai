@@ -3825,7 +3825,12 @@ function WorkshopView({
   ]);
 
   const selectWorkspace = async (path: string): Promise<void> => {
-    if (!effectiveAgentRuntime || path === effectiveAgentRuntime.workspace) {
+    if (
+      !effectiveAgentRuntime ||
+      effectiveAgentRuntime.workspaceMode === "neutral" ||
+      effectiveAgentRuntime.workspaceRevision === null ||
+      path === effectiveAgentRuntime.workspace
+    ) {
       return;
     }
     setSettingsWorkspaceError(null);
@@ -5450,19 +5455,31 @@ function WorkshopView({
                   Model: {effectiveAgentRuntime.model.source}; timeout:{" "}
                   {effectiveAgentRuntime.timeoutSeconds.source}
                 </p>
-                <label htmlFor={`workspace-${channelId}`}>Your workspace</label>
-                <select
-                  id={`workspace-${channelId}`}
-                  value={effectiveAgentRuntime.workspace}
-                  disabled={switchingWorkspace || isRunActive(activeRun)}
-                  onChange={(event) => void selectWorkspace(event.target.value)}
-                >
-                  {effectiveAgentRuntime.workspaces.map((workspaceOption) => (
-                    <option key={workspaceOption.path} value={workspaceOption.path}>
-                      {workspaceOption.name}
-                    </option>
-                  ))}
-                </select>
+                {effectiveAgentRuntime.workspaceMode === "neutral" ? (
+                  <>
+                    <p className="settings-source">No shared workspace</p>
+                    <p>
+                      This conversation runs in an isolated Kai-managed workspace.
+                      Your files remain private until workspace collaboration is explicitly granted.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <label htmlFor={`workspace-${channelId}`}>Your workspace</label>
+                    <select
+                      id={`workspace-${channelId}`}
+                      value={effectiveAgentRuntime.workspace ?? ""}
+                      disabled={switchingWorkspace || isRunActive(activeRun)}
+                      onChange={(event) => void selectWorkspace(event.target.value)}
+                    >
+                      {effectiveAgentRuntime.workspaces.map((workspaceOption) => (
+                        <option key={workspaceOption.path} value={workspaceOption.path}>
+                          {workspaceOption.name}
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                )}
               </div>
             ) : settingsWorkspaceError ? (
               <p className="settings-error">{settingsWorkspaceError}</p>

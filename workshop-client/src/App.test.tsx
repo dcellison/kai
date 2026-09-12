@@ -654,6 +654,7 @@ const effectiveAgentRuntime: WorkshopEffectiveAgentRuntime = {
     source: settingsWorkspace.timeoutSeconds.source,
     value: settingsWorkspace.timeoutSeconds.value,
   },
+  workspaceMode: "owner",
   workspace: settingsWorkspace.workspace,
   workspaceRevision: settingsWorkspace.revision,
   workspaces: settingsWorkspace.workspaces,
@@ -1881,15 +1882,10 @@ describe("Workshop React client", () => {
     vi.mocked(loadEffectiveAgentRuntime).mockResolvedValue({
       ...effectiveAgentRuntime,
       canManageRuntime: false,
-      workspace: "/var/lib/kai/home/scott",
-      workspaces: [
-        {
-          current: true,
-          home: true,
-          name: "Home",
-          path: "/var/lib/kai/home/scott",
-        },
-      ],
+      workspaceMode: "neutral",
+      workspace: null,
+      workspaceRevision: null,
+      workspaces: [],
     });
 
     render(<App />);
@@ -1898,9 +1894,8 @@ describe("Workshop React client", () => {
     expect(screen.getByText("codex")).toBeVisible();
     expect(screen.getByText("· openai")).toBeVisible();
     expect(screen.queryByText("/Users/kai/Projects/kai")).toBeNull();
-    expect(screen.getByLabelText("Your workspace")).toHaveValue(
-      "/var/lib/kai/home/scott",
-    );
+    expect(screen.getByText("No shared workspace")).toBeVisible();
+    expect(screen.queryByLabelText("Your workspace")).toBeNull();
     expect(loadSettingsWorkspace).not.toHaveBeenCalled();
     expect(switchWorkspace).not.toHaveBeenCalled();
   });

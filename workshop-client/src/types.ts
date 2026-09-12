@@ -618,8 +618,9 @@ export interface WorkshopEffectiveAgentRuntime {
   sponsorDisplayName: string;
   sponsorPrincipalId: string;
   timeoutSeconds: { source: string; value: number };
-  workspace: string;
-  workspaceRevision: string;
+  workspaceMode: "owner" | "neutral";
+  workspace: string | null;
+  workspaceRevision: string | null;
   workspaces: WorkshopWorkspaceOption[];
 }
 
