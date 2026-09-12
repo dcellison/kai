@@ -1594,7 +1594,7 @@ def build_foreign_workspace_reminder(workspace: Path, home_workspace: Path) -> s
     if workspace == home_workspace:
         return None
     return (
-        "[IMPORTANT: This message is from a user via Telegram. "
+        "[IMPORTANT: This is the user's current message. "
         "Respond ONLY to what they wrote below. Do NOT continue, "
         "resume, or start any previous work, plans, or tasks.]"
     )

@@ -872,14 +872,17 @@ class TestBuildForeignWorkspaceReminder:
         assert build_foreign_workspace_reminder(ws, ws) is None
 
     def test_foreign_workspace_returns_reminder(self):
-        """Reminder string returned when in a foreign workspace."""
+        """Foreign-workspace reminder is exact and transport-neutral."""
         result = build_foreign_workspace_reminder(
             Path("/home/user/project"),
             Path("/var/lib/kai/home/12345"),
         )
-        assert result is not None
-        assert "IMPORTANT" in result
-        assert "Respond ONLY" in result
+        assert result == (
+            "[IMPORTANT: This is the user's current message. "
+            "Respond ONLY to what they wrote below. Do NOT continue, "
+            "resume, or start any previous work, plans, or tasks.]"
+        )
+        assert "Telegram" not in result
 
 
 # ── Test ensure_user_home / resolve_home_workspace (#353) ───────────

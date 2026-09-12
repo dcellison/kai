@@ -1960,8 +1960,9 @@ class TestContextInjection:
         # it natively from cwd; bot-side reads risk PermissionError on Linux)
         assert "Foreign workspace memory" not in prompt
         # Per-message reminder should be present
-        assert "IMPORTANT" in prompt
+        assert "This is the user's current message" in prompt
         assert "Respond ONLY" in prompt
+        assert "Telegram" not in prompt
 
     @pytest.mark.asyncio
     async def test_home_workspace_no_identity_injection(self, home_workspace):

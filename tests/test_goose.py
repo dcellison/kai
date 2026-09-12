@@ -730,7 +730,8 @@ class TestContextInjection:
         # block prepended
         prompt_texts = [b["text"] for b in prompt_msg["params"]["prompt"]]
         combined = " ".join(prompt_texts)
-        assert "IMPORTANT" in combined
+        assert "This is the user's current message" in combined
+        assert "Telegram" not in combined
         assert "hello" in combined
 
     @pytest.mark.asyncio

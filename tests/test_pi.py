@@ -259,6 +259,41 @@ class TestPiTurns:
         assert transport.sent[0]["type"] == "prompt"
 
     @pytest.mark.asyncio
+    async def test_foreign_workspace_uses_transport_neutral_reminder(self, tmp_path, monkeypatch):
+        from kai.backend import build_foreign_workspace_reminder
+
+        captured: dict[str, str] = {}
+
+        async def capture_context(prompt, **kwargs):
+            captured["workspace_reminder"] = kwargs["workspace_reminder"]
+            return prompt
+
+        monkeypatch.setattr("kai.pi.build_foreign_workspace_reminder", build_foreign_workspace_reminder)
+        monkeypatch.setattr("kai.pi.assemble_turn_context", capture_context)
+
+        backend = make_backend(
+            tmp_path,
+            workspace=tmp_path / "project",
+            home_workspace=tmp_path / "home",
+        )
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._supports_image_input = True
+        backend._fresh_session = False
+        backend._transport = FakeTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                {"type": "agent_settled"},
+            ]
+        )
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        await collect(backend)
+
+        assert "This is the user's current message" in captured["workspace_reminder"]
+        assert "Telegram" not in captured["workspace_reminder"]
+
+    @pytest.mark.asyncio
     async def test_image_is_forwarded_in_documented_shape(self, tmp_path, monkeypatch):
         backend = make_backend(tmp_path)
         backend._proc = FakeProcess()

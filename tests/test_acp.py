@@ -1168,6 +1168,8 @@ class TestContextInjection:
         assert prompt_text.count(USER_MESSAGE_MARKER) == 1
         assert memory_block in prompt_text
         assert "ACTUAL_USER_TEXT" in prompt_text
+        assert "This is the user's current message" in prompt_text
+        assert "Telegram" not in prompt_text
         # Marker sits between any injected layer and the user text. Per
         # assemble_turn_context's documented stacking, the final reading
         # order from top to bottom is: workspace_reminder, semantic
