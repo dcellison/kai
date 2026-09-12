@@ -1977,12 +1977,15 @@ async def delete_canonical_workspace_history(
     await _get_db().commit()
 
 
-async def canonical_workspace_active_references(principal_id: str, path: str) -> int:
-    """Count the principal-owned runtime lanes currently selecting a workspace."""
+async def canonical_workspace_in_flight_references(principal_id: str, path: str) -> int:
+    """Count nonterminal runs on principal-owned lanes selecting a workspace."""
     async with _get_db().execute(
         "SELECT COUNT(*) AS count FROM channel_agent_execution_settings s "
         "JOIN runtime_profile_owners o ON o.runtime_profile_id = s.runtime_profile_id "
-        "WHERE o.principal_id = ? AND s.field = 'workspace' AND s.value = ?",
+        "JOIN runs r ON r.channel_id = s.channel_id AND r.agent_id = s.agent_id "
+        "AND r.runtime_profile_id = s.runtime_profile_id "
+        "WHERE o.principal_id = ? AND s.field = 'workspace' AND s.value = ? "
+        "AND r.status IN ('accepted', 'started')",
         (principal_id, path),
     ) as cursor:
         row = await cursor.fetchone()
@@ -1997,6 +2000,12 @@ async def delete_canonical_workspace_state(
     db = _get_db()
     await db.execute("BEGIN IMMEDIATE")
     try:
+        await db.execute(
+            "DELETE FROM channel_agent_execution_settings WHERE field = 'workspace' AND value = ? "
+            "AND runtime_profile_id IN (SELECT runtime_profile_id FROM runtime_profile_owners "
+            "WHERE principal_id = ?)",
+            (path, namespace.principal_id),
+        )
         await db.execute(
             "DELETE FROM channel_agent_workspace_settings WHERE workspace_path = ? "
             "AND runtime_profile_id IN (SELECT runtime_profile_id FROM runtime_profile_owners "

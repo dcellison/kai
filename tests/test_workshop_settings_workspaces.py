@@ -501,7 +501,7 @@ async def test_workspace_deletion_removes_files_and_canonical_state(
     )
     monkeypatch.setattr(
         sessions,
-        "canonical_workspace_active_references",
+        "canonical_workspace_in_flight_references",
         AsyncMock(return_value=0),
     )
     delete_state = AsyncMock()

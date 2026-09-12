@@ -888,7 +888,10 @@ class WorkshopSettingsWorkspaceService:
                 raise WorkshopSettingsWorkspaceAccessDenied(
                     "Only a principal-owned workspace created or added through Kai can be deleted"
                 )
-            if await sessions.canonical_workspace_active_references(str(authority.principal_id), str(target_resolved)):
+            if await sessions.canonical_workspace_in_flight_references(
+                str(authority.principal_id),
+                str(target_resolved),
+            ):
                 raise WorkshopSettingsWorkspaceBusy("Another agent runtime is currently using this workspace")
             profile = self._runtime_pool.runtime_profile(runtime_authority)
             try:

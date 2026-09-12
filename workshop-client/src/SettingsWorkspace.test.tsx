@@ -1040,7 +1040,8 @@ describe("Settings workspace", () => {
     });
     renderAgentRuntime();
 
-    await user.click(await screen.findByRole("button", { name: "Delete workspace" }));
+    expect(screen.queryByRole("button", { name: "Delete Kai" })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "Delete qualification-1520" }));
     const dialog = screen.getByRole("dialog", { name: "Delete workspace" });
     const submit = within(dialog).getByRole("button", { name: "Delete permanently" });
     expect(submit).toBeDisabled();

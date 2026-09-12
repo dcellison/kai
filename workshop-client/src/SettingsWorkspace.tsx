@@ -1271,11 +1271,15 @@ function SettingsWorkspaceContent({
     }
   };
 
+  const workspaceDeletionTarget = runtime?.workspaces.find(
+    (item) => item.name === workspaceDeletionName && item.deletable,
+  );
+
   const removeWorkspace = async (): Promise<void> => {
     if (
       !runtime ||
       workspaceDeletionBusy ||
-      !workspaceDeletionName ||
+      !workspaceDeletionTarget ||
       workspaceDeletionConfirmation !== workspaceDeletionName
     ) {
       return;
@@ -1914,25 +1918,37 @@ function SettingsWorkspaceContent({
               >
                 <WorkspaceAddIcon />
               </button>
-              {runtime.workspaces.some((item) => item.deletable) && (
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label="Delete workspace"
-                  title="Delete workspace"
-                  disabled={runtimeBusy}
-                  onClick={() => {
-                    const first = runtime.workspaces.find((item) => item.deletable);
-                    setWorkspaceDeletionName(first?.name ?? "");
-                    setWorkspaceDeletionConfirmation("");
-                    setWorkspaceDeletionError(null);
-                    setWorkspaceDeletionOpen(true);
-                  }}
-                >
-                  <WorkspaceDeleteIcon />
-                </button>
-              )}
             </div>
+            {runtime.workspaces.some((item) => item.deletable) && (
+              <div className="workspace-deletion-list">
+                <p>Workspaces available for deletion</p>
+                <ul>
+                  {runtime.workspaces.filter((item) => item.deletable).map((item) => (
+                    <li key={item.path}>
+                      <span>
+                        <strong>{item.name}</strong>
+                        <small>{item.path}</small>
+                      </span>
+                      <button
+                        className="panel-icon-button"
+                        type="button"
+                        aria-label={`Delete ${item.name}`}
+                        title={`Delete ${item.name}`}
+                        disabled={runtimeBusy}
+                        onClick={() => {
+                          setWorkspaceDeletionName(item.name);
+                          setWorkspaceDeletionConfirmation("");
+                          setWorkspaceDeletionError(null);
+                          setWorkspaceDeletionOpen(true);
+                        }}
+                      >
+                        <WorkspaceDeleteIcon />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="settings-card-stack workspace-overrides">
               <div className="settings-card-columns">
                 <div className="settings-card-column">
@@ -2051,22 +2067,10 @@ function SettingsWorkspaceContent({
                   <span aria-hidden="true">×</span>
                 </button>
               </header>
-              <p>This permanently deletes the workspace directory and removes it from Kai.</p>
+              <p>
+                This permanently deletes <strong>{workspaceDeletionName}</strong> and removes it from Kai.
+              </p>
               <form onSubmit={(event) => { event.preventDefault(); void removeWorkspace(); }}>
-                <label htmlFor="workspace-delete-name">Workspace</label>
-                <select
-                  id="workspace-delete-name"
-                  value={workspaceDeletionName}
-                  disabled={workspaceDeletionBusy}
-                  onChange={(event) => {
-                    setWorkspaceDeletionName(event.target.value);
-                    setWorkspaceDeletionConfirmation("");
-                  }}
-                >
-                  {runtime.workspaces.filter((item) => item.deletable).map((item) => (
-                    <option key={item.path} value={item.name}>{item.name}</option>
-                  ))}
-                </select>
                 <label htmlFor="workspace-delete-confirmation">
                   Type <strong>{workspaceDeletionName}</strong> to confirm
                 </label>
@@ -2087,7 +2091,7 @@ function SettingsWorkspaceContent({
                     type="submit"
                     disabled={
                       workspaceDeletionBusy ||
-                      !workspaceDeletionName ||
+                      !workspaceDeletionTarget ||
                       workspaceDeletionConfirmation !== workspaceDeletionName
                     }
                   >
