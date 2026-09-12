@@ -10,7 +10,8 @@ import aiosqlite
 import pytest
 
 from kai import sessions
-from kai.workshop.domain import MessageId
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RuntimeProfileId
+from kai.workshop.execution_state import WorkshopExecutionStateNamespace
 from kai.workshop.outbound import OutboundMessage
 from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 
@@ -922,6 +923,60 @@ class TestWorkspaceHistory:
             await sessions.upsert_workspace_history(f"/path/{i}", 12345)
         history = await sessions.get_workspace_history(12345, limit=3)
         assert len(history) == 3
+
+
+class TestCanonicalWorkspaceDeletion:
+    async def test_stale_selection_is_not_in_flight_and_is_cleaned(self, db):
+        principal_id = PrincipalId("prn_" + "1" * 32)
+        channel_id = ChannelId("chn_" + "2" * 32)
+        agent_id = AgentId("agt_" + "3" * 32)
+        runtime_profile_id = RuntimeProfileId("rtp_" + "4" * 32)
+        path = "/projects/qualification-1520"
+        namespace = WorkshopExecutionStateNamespace(
+            principal_id=principal_id,
+            channel_id=channel_id,
+            agent_id=agent_id,
+            runtime_profile_id=runtime_profile_id,
+            legacy_runtime_key=111,
+        )
+        connection = sessions._get_db()
+        await connection.execute(
+            "INSERT INTO runtime_profile_owners (runtime_profile_id, principal_id) VALUES (?, ?)",
+            (runtime_profile_id, principal_id),
+        )
+        await connection.execute(
+            "INSERT INTO channel_agent_execution_settings "
+            "(channel_id, agent_id, runtime_profile_id, field, value) VALUES (?, ?, ?, 'workspace', ?)",
+            (channel_id, agent_id, runtime_profile_id, path),
+        )
+        await connection.execute(
+            "INSERT INTO channel_agent_workspace_settings "
+            "(channel_id, agent_id, runtime_profile_id, workspace_path, field, value) "
+            "VALUES (?, ?, ?, ?, 'prompt', 'temporary')",
+            (channel_id, agent_id, runtime_profile_id, path),
+        )
+        await connection.execute(
+            "INSERT INTO principal_workspace_history (principal_id, path) VALUES (?, ?)",
+            (principal_id, path),
+        )
+        await connection.execute(
+            "INSERT INTO principal_workspace_grants (principal_id, path) VALUES (?, ?)",
+            (principal_id, path),
+        )
+        await connection.commit()
+
+        assert await sessions.canonical_workspace_in_flight_references(str(principal_id), path) == 0
+
+        await sessions.delete_canonical_workspace_state(namespace, path)
+
+        for query in (
+            "SELECT COUNT(*) FROM channel_agent_execution_settings WHERE value = ?",
+            "SELECT COUNT(*) FROM channel_agent_workspace_settings WHERE workspace_path = ?",
+            "SELECT COUNT(*) FROM principal_workspace_history WHERE path = ?",
+            "SELECT COUNT(*) FROM principal_workspace_grants WHERE path = ?",
+        ):
+            async with connection.execute(query, (path,)) as cursor:
+                assert (await cursor.fetchone())[0] == 0
 
 
 # ── Allowed workspaces ──────────────────────────────────────────────

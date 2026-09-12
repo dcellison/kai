@@ -4661,6 +4661,7 @@ button:disabled {
 }
 
 .workspace-settings-heading .panel-icon-button svg,
+.workspace-deletion-list .panel-icon-button svg,
 .workspace-creation-header .panel-icon-button svg {
   width: 1rem;
   height: 1rem;
@@ -4668,6 +4669,60 @@ button:disabled {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-width: 1.8;
+}
+
+.workspace-deletion-list {
+  grid-column: 2;
+  min-width: 0;
+  margin-top: 0.65rem;
+}
+
+.agent-runtime-controls .workspace-deletion-list {
+  grid-column: auto;
+}
+
+.workspace-deletion-list > p {
+  margin: 0 0 0.35rem;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.workspace-deletion-list ul {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workspace-deletion-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.42rem;
+  background: var(--color-panel);
+}
+
+.workspace-deletion-list li > span,
+.workspace-deletion-list small {
+  min-width: 0;
+}
+
+.workspace-deletion-list strong,
+.workspace-deletion-list small {
+  display: block;
+}
+
+.workspace-deletion-list small {
+  overflow: hidden;
+  margin-top: 0.15rem;
+  color: var(--color-text-muted);
+  font: 0.61rem var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .workspace-creation-header {
