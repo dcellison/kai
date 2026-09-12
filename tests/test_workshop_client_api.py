@@ -6129,6 +6129,38 @@ async def _insert_trace_rows(store: WorkshopEventStore, run_id: str, count: int,
 
 
 class TestWorkshopRunTraceHTTPContract:
+    async def test_context_manifest_access_is_requester_scoped(self, tmp_path: Path):
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        submitter = _CommandSubmitter()
+        client = await _open_command_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            submitter,
+        )
+        try:
+            accepted = await client.post(
+                f"/v1/channels/{alice_channel}/commands",
+                headers={"Authorization": "Bearer alice-token"},
+                json={"client_message_id": "context-manifest-command-1", "body": "Private work"},
+            )
+            run_id = (await accepted.json())["run_id"]
+            path = f"/v1/channels/{alice_channel}/runs/{run_id}/context-manifests"
+
+            denied = await client.get(path, headers={"Authorization": "Bearer bob-token"})
+            allowed = await client.get(path, headers={"Authorization": "Bearer alice-token"})
+
+            assert denied.status == 403
+            assert allowed.status == 200
+            assert await allowed.json() == {
+                "version": 1,
+                "channel_id": alice_channel,
+                "run_id": run_id,
+                "manifests": [],
+            }
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_trace_access_is_denied_across_principals(self, tmp_path: Path):
         store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
         submitter = _CommandSubmitter()

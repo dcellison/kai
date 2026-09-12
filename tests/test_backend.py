@@ -2422,3 +2422,31 @@ class TestAssembleTurnContext:
         assert "scoped_error" not in result  # nothing scoped-specific prepended
         assert emit_mock.call_count == 1
         assert emit_mock.call_args.args[0]["reason"] == "scoped_error"
+
+    async def test_context_observer_reports_actual_delivery_without_content(self, monkeypatch):
+        from kai.backend import ContextAssemblyObservation, assemble_turn_context
+
+        _patch_scoped_recall(monkeypatch, rendered_context="PRIVATE RECALL")
+        observations: list[ContextAssemblyObservation] = []
+
+        async def observe(value: ContextAssemblyObservation) -> None:
+            observations.append(value)
+
+        await assemble_turn_context(
+            "private input",
+            chat_id=42,
+            session_context="PRIVATE BOOTSTRAP",
+            workspace_reminder="PRIVATE REMINDER",
+            context_observer=observe,
+        )
+
+        assert len(observations) == 1
+        observation = observations[0]
+        assert observation.provider_dispatch_reached is True
+        assert observation.session_context_delivered is True
+        assert observation.semantic_recall_attempted is True
+        assert observation.semantic_recall_delivered is True
+        assert observation.semantic_recall_reason == "matches_delivered"
+        assert observation.semantic_recall_revision is not None
+        assert "PRIVATE" not in repr(observation)
+        assert observation.workspace_reminder_delivered is True

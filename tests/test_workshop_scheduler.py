@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kai import sessions
-from kai.backend import AgentResponse, StreamEvent
+from kai.backend import AgentResponse, ContextAssemblyObservation, StreamEvent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.client_events import ClientTimelineMessageEvent, read_client_channel_events
 from kai.workshop.conversation_commands import ConversationCommandDisposition
@@ -111,13 +111,18 @@ class _CanonicalRuntime:
             model="gpt-5.6-sol",
         )
         self.workspace = workspace
+        self.home_workspace = workspace
         self.collaboration_proof: str | None = None
+        self.context_observer = None
 
     def stage_canonical_history(self, _history: str) -> None:
         pass
 
     def stage_canonical_agent_context(self, _context: str) -> None:
         pass
+
+    def stage_context_assembly_observer(self, observer) -> None:
+        self.context_observer = observer
 
     def stage_collaboration_invocation(self, _context: str, proof: str) -> None:
         self.collaboration_proof = proof
@@ -133,6 +138,20 @@ class _CanonicalRuntime:
         pass
 
     async def stream(self, _prompt: str):
+        if self.context_observer is not None:
+            observer, self.context_observer = self.context_observer, None
+            await observer(
+                ContextAssemblyObservation(
+                    provider_dispatch_reached=True,
+                    session_context_delivered=True,
+                    session_context_revision="0" * 64,
+                    semantic_recall_attempted=True,
+                    semantic_recall_delivered=False,
+                    semantic_recall_reason="no_matches",
+                    semantic_recall_revision=None,
+                    workspace_reminder_delivered=False,
+                )
+            )
         yield StreamEvent(
             text_so_far="Scheduled agent answer",
             done=True,

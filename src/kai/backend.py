@@ -14,6 +14,7 @@ process management; the context functions here handle the Kai-specific
 prompt assembly that is identical across all backends.
 """
 
+import hashlib
 import hmac
 import logging
 import os
@@ -21,7 +22,7 @@ import shutil
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
@@ -62,6 +63,24 @@ class AgentRuntimeIdentity(Protocol):
     agent_id: str
     runtime_profile_id: str
     private_context: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ContextAssemblyObservation:
+    """Content-free facts observed immediately before provider dispatch."""
+
+    provider_dispatch_reached: bool | None
+    session_context_delivered: bool
+    session_context_revision: str | None
+    semantic_recall_attempted: bool
+    semantic_recall_delivered: bool
+    semantic_recall_reason: str
+    semantic_recall_revision: str | None
+    workspace_reminder_delivered: bool
+    workspace_reminder_revision: str | None = None
+
+
+type ContextAssemblyObserver = Callable[[ContextAssemblyObservation], Awaitable[None]]
 
 
 def _principal_directories(
@@ -557,6 +576,22 @@ class AgentBackend(ABC):
         """Clear unconsumed definition context after protected dispatch."""
         if hasattr(self, "_canonical_agent_context"):
             del self._canonical_agent_context
+
+    def stage_context_assembly_observer(self, observer: ContextAssemblyObserver) -> None:
+        """Stage a one-shot redacted context observer for protected execution."""
+        if not callable(observer):
+            raise TypeError("context assembly observer must be callable")
+        self._context_assembly_observer = observer
+
+    def consume_context_assembly_observer(self) -> ContextAssemblyObserver | None:
+        """Consume the protected execution's one-shot context observer."""
+        observer = getattr(self, "_context_assembly_observer", None)
+        self.discard_context_assembly_observer()
+        return observer
+
+    def discard_context_assembly_observer(self) -> None:
+        if hasattr(self, "_context_assembly_observer"):
+            del self._context_assembly_observer
 
     def stage_collaboration_invocation(self, context: str, proof: str) -> None:
         """Stage exact-attempt collaboration authority for one protected turn.
@@ -1694,6 +1729,7 @@ async def assemble_turn_context(
     backend_name: str | None = None,
     job_type: str | None = None,
     session_id: str | None = None,
+    context_observer: ContextAssemblyObserver | None = None,
 ) -> str | list:
     """
     Assemble the per-turn prompt context for an interactive backend.
@@ -1794,7 +1830,11 @@ async def assemble_turn_context(
         else None
     )
     private_context = runtime_identity is None or getattr(runtime_identity, "private_context", True)
-    if private_context and memory_user_id is not None and search_query.strip():
+    recall_attempted = private_context and memory_user_id is not None and bool(search_query.strip())
+    recall_delivered = False
+    recall_reason = "ineligible"
+    recall_revision: str | None = None
+    if recall_attempted:
         from kai.memory import (
             _emit_recall_log,
             format_scoped_context_with_recall_payload,
@@ -1820,6 +1860,12 @@ async def assemble_turn_context(
         _emit_recall_log(scoped_recall.recall_payload)
         if scoped_recall.rendered_context:
             prompt = prepend_to_prompt(prompt, scoped_recall.rendered_context)
+            recall_delivered = True
+            recall_reason = "matches_delivered"
+            recall_revision = hashlib.sha256(scoped_recall.rendered_context.encode("utf-8")).hexdigest()
+        else:
+            reason = scoped_recall.recall_payload.get("reason")
+            recall_reason = str(reason) if isinstance(reason, str) and reason else "no_matches"
 
     # Foreign-workspace reminder is built fresh by the caller on
     # every turn (it depends on the workspace state at call time).
@@ -1827,6 +1873,25 @@ async def assemble_turn_context(
     # matching the pre-extraction Claude behavior.
     if workspace_reminder:
         prompt = prepend_to_prompt(prompt, workspace_reminder)
+
+    if context_observer is not None:
+        await context_observer(
+            ContextAssemblyObservation(
+                provider_dispatch_reached=True,
+                session_context_delivered=bool(session_context),
+                session_context_revision=(
+                    hashlib.sha256(session_context.encode("utf-8")).hexdigest() if session_context else None
+                ),
+                semantic_recall_attempted=recall_attempted,
+                semantic_recall_delivered=recall_delivered,
+                semantic_recall_reason=recall_reason,
+                semantic_recall_revision=recall_revision,
+                workspace_reminder_delivered=bool(workspace_reminder),
+                workspace_reminder_revision=(
+                    hashlib.sha256(workspace_reminder.encode("utf-8")).hexdigest() if workspace_reminder else None
+                ),
+            )
+        )
 
     return prompt
 

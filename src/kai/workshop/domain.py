@@ -84,6 +84,7 @@ class WorkshopEventType(StrEnum):
     RUN_ATTEMPT_COMPLETED = "run_attempt.completed"
     RUN_ATTEMPT_FAILED = "run_attempt.failed"
     RUN_ATTEMPT_CANCELLED = "run_attempt.cancelled"
+    RUN_ATTEMPT_CONTEXT_MANIFEST_RECORDED = "run_attempt.context_manifest_recorded"
     COLLABORATION_GRANT_ISSUED = "collaboration_grant.issued"
     COLLABORATION_GRANT_REVOKED = "collaboration_grant.revoked"
     COLLABORATION_OPERATION_DECIDED = "collaboration_operation.decided"

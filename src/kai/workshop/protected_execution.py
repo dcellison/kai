@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kai.backend import StreamEvent
+from kai.backend import ContextAssemblyObserver, StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
 from kai.workshop.collaboration_authority import CollaborationInvocation
 from kai.workshop.domain import ChannelId, RunId, RuntimeProfileId
@@ -46,6 +46,7 @@ class PreparedWorkshopExecution:
     runtime_profile_id: RuntimeProfileId
     selection: RunExecutionSelection
     workspace: Path
+    home_workspace: Path
     history_reader_user: str | None
     routing_decision: RunRoutingDecision
     _runtime: PreparedBackendExecution = field(repr=False, compare=False)
@@ -60,6 +61,9 @@ class PreparedWorkshopExecution:
 
     def stage_agent_definition_context(self, context: str) -> None:
         self._runtime.stage_canonical_agent_context(context)
+
+    def stage_context_assembly_observer(self, observer: ContextAssemblyObserver) -> None:
+        self._runtime.stage_context_assembly_observer(observer)
 
     def stage_collaboration_invocation(self, invocation: CollaborationInvocation) -> None:
         self._runtime.stage_collaboration_invocation(invocation.render_context(), invocation.token)
@@ -175,6 +179,7 @@ class WorkshopProtectedExecutionPreparationService:
             runtime_profile_id=run.runtime_profile_id,
             selection=selection,
             workspace=runtime.workspace,
+            home_workspace=runtime.home_workspace,
             history_reader_user=profile.os_user,
             routing_decision=decision,
             _runtime=runtime,

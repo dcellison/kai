@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kai import sessions
-from kai.backend import AgentBackend, StreamEvent, require_backend_name, resolve_home_workspace
+from kai.backend import (
+    AgentBackend,
+    ContextAssemblyObserver,
+    StreamEvent,
+    require_backend_name,
+    resolve_home_workspace,
+)
 from kai.claude import ClaudeCodeBackend
 from kai.config import (
     OPEN_ENDED_PROVIDERS,
@@ -153,6 +159,10 @@ class PreparedBackendExecution:
     def workspace(self) -> Path:
         return self._fingerprint.workspace
 
+    @property
+    def home_workspace(self) -> Path:
+        return self._instance.home_workspace
+
     def stage_canonical_history(self, history: str) -> None:
         """Stage restart context on this exact protected runtime."""
         self._pool._validate_prepared(self)
@@ -162,6 +172,11 @@ class PreparedBackendExecution:
         """Stage the run-bound agent revision on this exact runtime."""
         self._pool._validate_prepared(self)
         self._instance.stage_canonical_agent_context(context)
+
+    def stage_context_assembly_observer(self, observer: ContextAssemblyObserver) -> None:
+        """Stage one redacted pre-dispatch observer on the exact runtime."""
+        self._pool._validate_prepared(self)
+        self._instance.stage_context_assembly_observer(observer)
 
     def stage_collaboration_invocation(self, context: str, proof: str) -> None:
         """Stage exact-attempt collaboration authority on this runtime."""
@@ -1274,6 +1289,7 @@ class SubprocessPool:
         finally:
             instance.discard_canonical_history()
             instance.discard_canonical_agent_context()
+            instance.discard_context_assembly_observer()
             self._in_flight.discard(runtime_key)
             self._last_activity[runtime_key] = time.monotonic()
 
@@ -1304,6 +1320,7 @@ class SubprocessPool:
         finally:
             instance.discard_canonical_history()
             instance.discard_canonical_agent_context()
+            instance.discard_context_assembly_observer()
             self._in_flight.discard(instance_key)
             self._last_activity[instance_key] = time.monotonic()
 

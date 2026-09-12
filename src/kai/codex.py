@@ -972,6 +972,7 @@ class CodexBackend(AgentBackend):
             workspace=self.workspace,
             backend_name=self.backend_name,
             job_type="interactive",
+            context_observer=self.consume_context_assembly_observer(),
         )
 
         # Coerce to the JSON-RPC content-block shape. `prompt` is

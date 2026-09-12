@@ -1519,6 +1519,60 @@ def workshop_runtime_session_status(db_path: Path) -> str:
     )
 
 
+def workshop_context_manifest_status(db_path: Path) -> str:
+    """Describe post-cutover run-attempt manifest coverage and integrity."""
+    prefix = "Workshop context manifests:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical manifest schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            required = {"workshop_context_manifest_cutover", "run_context_manifests", "run_attempts"}
+            if not tables >= required:
+                return f"{prefix} pending; canonical manifest schema unavailable"
+            cutover_row = connection.execute(
+                "SELECT event_position FROM workshop_context_manifest_cutover WHERE singleton = 1"
+            ).fetchone()
+            if cutover_row is None:
+                return f"{prefix} pending; canonical manifest cutover unavailable"
+            cutover = int(cutover_row[0])
+            attempts = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM run_attempts WHERE last_event_position > ?",
+                (cutover,),
+            )
+            manifests = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM run_context_manifests WHERE created_event_position > ?",
+                (cutover,),
+            )
+            missing = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM run_attempts ra WHERE ra.last_event_position > ? "
+                "AND NOT EXISTS (SELECT 1 FROM run_context_manifests m WHERE m.attempt_id = ra.id)",
+                (cutover,),
+            )
+            malformed = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM run_context_manifests WHERE json_valid(sources_json) = 0 "
+                "OR json_array_length(sources_json) != 12",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if missing == 0 and malformed == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; post-cutover attempts={attempts}, manifests={manifests}, "
+        f"missing={missing}, malformed={malformed}; authority=immutable/redacted"
+    )
+
+
 def workshop_execution_state_status(db_path: Path) -> str:
     """Describe canonical mutable execution-state authority and backfill."""
     prefix = "Workshop execution state:"

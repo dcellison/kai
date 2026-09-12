@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import kai.workshop.private_text_execution as private_text_execution_module
-from kai.backend import AgentResponse, StreamEvent
+from kai.backend import AgentResponse, ContextAssemblyObservation, StreamEvent
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop, bootstrap_human_principal_id
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.domain import ChannelId, PrincipalId
@@ -47,18 +47,23 @@ class _Runtime:
     def __init__(self, workspace: Path, *, wait: asyncio.Event | None = None) -> None:
         self.selection = SimpleNamespace(backend="codex", provider="openai", model="gpt-5.6-sol")
         self.workspace = workspace
+        self.home_workspace = workspace
         self.wait = wait
         self.validated = False
         self.cancelled = False
         self.canonical_histories: list[str] = []
         self.agent_definition_contexts: list[str] = []
         self.collaboration_proof: str | None = None
+        self.context_observer = None
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
 
     def stage_canonical_agent_context(self, context: str) -> None:
         self.agent_definition_contexts.append(context)
+
+    def stage_context_assembly_observer(self, observer) -> None:
+        self.context_observer = observer
 
     def stage_collaboration_invocation(self, _context: str, proof: str) -> None:
         self.collaboration_proof = proof
@@ -76,6 +81,20 @@ class _Runtime:
             self.wait.set()
 
     async def stream(self, prompt: str):
+        if self.context_observer is not None:
+            observer, self.context_observer = self.context_observer, None
+            await observer(
+                ContextAssemblyObservation(
+                    provider_dispatch_reached=True,
+                    session_context_delivered=True,
+                    session_context_revision="0" * 64,
+                    semantic_recall_attempted=True,
+                    semantic_recall_delivered=False,
+                    semantic_recall_reason="no_matches",
+                    semantic_recall_revision=None,
+                    workspace_reminder_delivered=False,
+                )
+            )
         yield StreamEvent(text_so_far="Stable preview.", done=False)
         if self.wait is not None:
             await self.wait.wait()

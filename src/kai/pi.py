@@ -457,6 +457,7 @@ class PiBackend(AgentBackend):
             backend_name=self.backend_name,
             job_type="interactive",
             session_id=self._session_id,
+            context_observer=self.consume_context_assembly_observer(),
         )
         if isinstance(prompt, str):
             message_text = prompt

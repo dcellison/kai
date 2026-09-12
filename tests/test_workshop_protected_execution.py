@@ -58,6 +58,7 @@ class _PreparedRuntime:
             provider="openai",
         )
         self.workspace = workspace
+        self.home_workspace = workspace
 
     async def cancel(self) -> None:
         return None

@@ -865,6 +865,7 @@ class ClaudeCodeBackend(AgentBackend):
             workspace=self.workspace,
             backend_name=self.backend_name,
             job_type="interactive",
+            context_observer=self.consume_context_assembly_observer(),
         )
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
