@@ -1,7 +1,7 @@
 """Tests for the tracked backend-neutral AGENTS.md template.
 
 The template at templates/AGENTS.md is the source for every per-user
-inner-agent identity file. It ships to new users via the install-time seed
+principal-policy file. It ships to new users via the install-time seed
 step and is the upstream of the _migrate_recalled_memory_section helper.
 Regressions to the structure or wording of pinned sections would propagate
 into every freshly-seeded per-user copy on the next install.

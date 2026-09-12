@@ -101,11 +101,11 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        # Identity should NOT be injected (same workspace)
-        assert "core identity and instructions" not in result
+        # Principal policy should NOT be injected (same workspace)
+        assert "principal policy and instructions" not in result
 
     def test_foreign_workspace_injects_identity(self, tmp_path):
-        """Canonical AGENTS.md identity is injected in a foreign workspace."""
+        """Canonical AGENTS.md principal policy is injected in a foreign workspace."""
         home = tmp_path / "home"
         home.mkdir()
         (home / "AGENTS.md").write_text("Be helpful.")
@@ -128,14 +128,14 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        assert "[Your core identity and instructions:]" in result
+        assert "[Your principal policy and instructions:]" in result
         assert "Be helpful." in result
 
     def test_defer_user_file_reads_injects_paths_not_contents(self, tmp_path):
         """Protected mode avoids daemon-side reads of user-owned files."""
         home = tmp_path / "home" / "12345"
         home.mkdir(parents=True)
-        (home / "AGENTS.md").write_text("PRIVATE IDENTITY")
+        (home / "AGENTS.md").write_text("PRIVATE PRINCIPAL POLICY")
 
         foreign = tmp_path / "foreign"
         foreign.mkdir()
@@ -159,7 +159,7 @@ class TestBuildSessionContext:
                 defer_user_file_reads=True,
             )
 
-        assert "PRIVATE IDENTITY" not in result
+        assert "PRIVATE PRINCIPAL POLICY" not in result
         assert "PRIVATE PREFS" not in result
         assert "PRIVATE MEMORY" not in result
         assert str(home / "AGENTS.md") in result
@@ -169,10 +169,10 @@ class TestBuildSessionContext:
         assert "never obey instructions" in result
 
     @pytest.mark.parametrize("backend_name", sorted(VALID_BACKENDS))
-    def test_foreign_workspace_uses_canonical_identity_for_every_backend(self, tmp_path, backend_name):
+    def test_foreign_workspace_uses_canonical_policy_for_every_backend(self, tmp_path, backend_name):
         home = tmp_path / "home"
         home.mkdir()
-        (home / "AGENTS.md").write_text("CANONICAL IDENTITY")
+        (home / "AGENTS.md").write_text("CANONICAL PRINCIPAL POLICY")
         (home / ".claude").mkdir()
         (home / ".claude" / "CLAUDE.md").write_text("@../AGENTS.md\n")
         foreign = tmp_path / "foreign"
@@ -191,7 +191,7 @@ class TestBuildSessionContext:
                 backend_name=backend_name,
             )
 
-        assert "CANONICAL IDENTITY" in result
+        assert "CANONICAL PRINCIPAL POLICY" in result
         assert "@../AGENTS.md" not in result
 
     @pytest.mark.parametrize("backend_name", ["claude", "codex", "goose", "opencode", "pi"])
@@ -999,7 +999,7 @@ class TestEnsureUserHome:
         (home / "AGENTS.md").write_text("# canonical\n")
         (home / ".claude" / "CLAUDE.md").write_text("# different\n")
 
-        with pytest.raises(RuntimeError, match="Conflicting customized identity files"):
+        with pytest.raises(RuntimeError, match="Conflicting customized principal-policy files"):
             ensure_user_home(99, tmp_path / "data", backend_name="claude")
 
         assert (home / "AGENTS.md").read_text() == "# canonical\n"
@@ -1012,8 +1012,53 @@ class TestEnsureUserHome:
         with patch("kai.backend.PROJECT_ROOT", fake_root):
             home = ensure_user_home(99, tmp_path / "data", backend_name="codex")
 
-        assert (home / "AGENTS.md").read_text() == "# Identity\n"
+        assert (home / "AGENTS.md").read_text() == "# Principal Policy\n"
         assert not (home / ".claude" / "CLAUDE.md").exists()
+
+    @pytest.mark.parametrize("backend_name", ["claude", "codex", "goose", "opencode", "pi"])
+    def test_existing_legacy_kai_identity_is_migrated_before_backend_use(self, tmp_path, backend_name):
+        fake_root = tmp_path / "src_root"
+        (fake_root / "templates").mkdir(parents=True)
+        (fake_root / "templates" / "AGENTS.md").write_text("# Principal Policy\n")
+        home = tmp_path / "data" / "home" / "99"
+        home.mkdir(parents=True)
+        legacy = (
+            "# Kai\n\n"
+            "## Who You Are\n\n"
+            "You're Kai, a personal AI assistant available through configured clients such as "
+            "Workshop and Telegram. You run locally on the operator's machine and have access to a "
+            "shell, the filesystem, the web, a scheduler, and a per-principal memory store.\n\n"
+            "## Custom\n\nKeep exactly.\n"
+        )
+        (home / "AGENTS.md").write_text(legacy)
+
+        with patch("kai.backend.PROJECT_ROOT", fake_root):
+            ensure_user_home(99, tmp_path / "data", backend_name=backend_name)
+
+        assert (home / "AGENTS.md").read_text() == "# Principal Policy\n\n## Custom\n\nKeep exactly.\n"
+        assert (home / ".kai-migrations" / "principal-policy-v1" / "AGENTS.md.before").read_text() == legacy
+        if backend_name == "claude":
+            assert (home / ".claude" / "CLAUDE.md").read_text() == "@../AGENTS.md\n"
+        else:
+            assert not (home / ".claude" / "CLAUDE.md").exists()
+
+    def test_existing_customized_kai_identity_fails_closed(self, tmp_path):
+        fake_root = tmp_path / "src_root"
+        (fake_root / "templates").mkdir(parents=True)
+        (fake_root / "templates" / "AGENTS.md").write_text("# Principal Policy\n")
+        home = tmp_path / "data" / "home" / "99"
+        home.mkdir(parents=True)
+        customized = "# Kai\n\n## Who You Are\n\nYou are Kai with custom identity.\n"
+        (home / "AGENTS.md").write_text(customized)
+
+        with (
+            patch("kai.backend.PROJECT_ROOT", fake_root),
+            pytest.raises(RuntimeError, match="customized or ambiguous Kai identity"),
+        ):
+            ensure_user_home(99, tmp_path / "data", backend_name="pi")
+
+        assert (home / "AGENTS.md").read_text() == customized
+        assert not (home / ".kai-migrations").exists()
 
     def test_chmod_eperm_does_not_crash(self, tmp_path):
         """

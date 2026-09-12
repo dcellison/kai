@@ -1870,10 +1870,10 @@ class TestContextInjection:
 
     @pytest.fixture()
     def home_workspace(self, tmp_path, monkeypatch):
-        """Create a home workspace with identity file and DATA_DIR memory."""
+        """Create a home workspace with principal policy and DATA_DIR memory."""
         home = tmp_path / "home"
         home.mkdir(parents=True)
-        (home / "AGENTS.md").write_text("You are Kai.")
+        (home / "AGENTS.md").write_text("Follow neutral principal policy.")
 
         # Personal memory now lives under DATA_DIR, not the workspace
         data_dir = tmp_path / "data"
@@ -1954,8 +1954,8 @@ class TestContextInjection:
             await _collect_events(claude, "Help me")
 
         prompt = self._extract_prompt(proc)
-        # Identity from home workspace should be injected
-        assert "You are Kai" in prompt
+        # Principal policy from home workspace should be injected
+        assert "Follow neutral principal policy" in prompt
         # Foreign workspace memory should NOT be injected (Claude Code reads
         # it natively from cwd; bot-side reads risk PermissionError on Linux)
         assert "Foreign workspace memory" not in prompt
@@ -1979,8 +1979,8 @@ class TestContextInjection:
             await _collect_events(claude, "Test")
 
         prompt = self._extract_prompt(proc)
-        # Identity text should NOT be injected when in home workspace
-        assert "core identity" not in prompt.lower()
+        # Principal policy text should NOT be injected when in home workspace
+        assert "principal policy" not in prompt.lower()
         # No per-message reminder either
         assert "Respond ONLY" not in prompt
 
@@ -2164,7 +2164,7 @@ class TestContextInjection:
         # All three other context blocks fired and are present.
         assert memory_block in prompt
         assert "Respond ONLY" in prompt  # foreign-workspace reminder
-        assert "You are Kai" in prompt  # session_ctx (identity)
+        assert "Follow neutral principal policy" in prompt  # session_ctx (principal policy)
 
         marker_idx = prompt.index(USER_MESSAGE_MARKER)
 
@@ -2172,7 +2172,7 @@ class TestContextInjection:
         # top-to-bottom. Every other block must have a smaller index.
         assert prompt.index(memory_block) < marker_idx
         assert prompt.index("Respond ONLY") < marker_idx
-        assert prompt.index("You are Kai") < marker_idx
+        assert prompt.index("Follow neutral principal policy") < marker_idx
 
         # (c) User's actual text immediately follows the marker, with
         # nothing but whitespace between them. We compute the substring
