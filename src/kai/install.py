@@ -152,6 +152,7 @@ _DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 # steered outside DATA_DIR/memory/<name>/MEMORY.md. memory_backup.py
 # hardcodes the same path; keep them in sync.
 PRINCIPAL_MEMORY_READER = Path("/etc/kai/read-principal-memory")
+PRINCIPAL_DOCUMENT_READER = Path("/etc/kai/read-principal-document")
 PRINCIPAL_PREFERENCE_MANAGER = Path("/etc/kai/manage-principal-preferences")
 PRINCIPAL_WORKSPACE_PROVISIONER = Path("/etc/kai/provision-principal-workspace")
 
@@ -4362,6 +4363,136 @@ def _generate_principal_memory_reader(data_dir: str) -> str:
     """)
 
 
+def _generate_principal_document_reader(
+    documents: dict[str, tuple[str, dict[str, Path]]],
+) -> str:
+    """Generate the fixed allowlist reader for principal context documents.
+
+    The generated root-owned program accepts only a canonical principal ID and
+    a fixed document kind. It resolves both through its install-time allowlist,
+    drops to the document owner's OS identity, and only then opens the exact
+    file with no-follow and bounded-read checks.
+    """
+    payload = {
+        principal_id: {
+            "os_user": os_user,
+            "paths": {kind: str(path.parent.resolve() / path.name) for kind, path in paths.items()},
+        }
+        for principal_id, (os_user, paths) in sorted(documents.items())
+    }
+    encoded = repr(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return textwrap.dedent(f"""\
+        #!/usr/bin/python3
+        # Kai - read one allowlisted principal context document as its owner.
+        # Managed by 'python -m kai install apply'. Do not edit manually.
+        import errno
+        import hashlib
+        import json
+        import os
+        import pwd
+        import re
+        import stat
+        import sys
+
+        DOCUMENTS = json.loads({encoded})
+        KINDS = {{"principal_policy", "personal_preferences", "file_memory"}}
+        MAX_BYTES = 131072
+
+
+        def emit(kind, state, reason, content=None):
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest() if content is not None else None
+            print(json.dumps({{
+                "version": 1,
+                "kind": kind,
+                "state": state,
+                "reason": reason,
+                "content": content,
+                "sha256": digest,
+            }}, ensure_ascii=False, separators=(",", ":")))
+
+
+        def main():
+            if len(sys.argv) != 3:
+                return 64
+            principal_id, kind = sys.argv[1:]
+            if re.fullmatch(r"[A-Za-z0-9_-]+", principal_id) is None or kind not in KINDS:
+                return 64
+            entry = DOCUMENTS.get(principal_id)
+            if not isinstance(entry, dict):
+                return 65
+            path = entry.get("paths", {{}}).get(kind)
+            user_name = entry.get("os_user")
+            if not isinstance(path, str) or not isinstance(user_name, str):
+                return 65
+            try:
+                account = pwd.getpwnam(user_name)
+                os.initgroups(user_name, account.pw_gid)
+                os.setgid(account.pw_gid)
+                os.setuid(account.pw_uid)
+            except (KeyError, OSError):
+                emit(kind, "unreadable", "owner_identity_unavailable")
+                return 0
+            try:
+                parent = os.stat(os.path.dirname(path), follow_symlinks=False)
+                if not stat.S_ISDIR(parent.st_mode):
+                    emit(kind, "unsafe", "parent_not_directory")
+                    return 0
+                if parent.st_uid != account.pw_uid:
+                    emit(kind, "wrong_owner", "parent_owner_mismatch")
+                    return 0
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except FileNotFoundError:
+                emit(kind, "missing", "missing")
+                return 0
+            except PermissionError:
+                emit(kind, "unreadable", "permission_denied")
+                return 0
+            except OSError as exc:
+                emit(kind, "unsafe" if exc.errno == errno.ELOOP else "unreadable", "open_rejected")
+                return 0
+            try:
+                before = os.fstat(descriptor)
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    emit(kind, "unsafe", "not_single_regular_file")
+                    return 0
+                if before.st_uid != account.pw_uid:
+                    emit(kind, "wrong_owner", "file_owner_mismatch")
+                    return 0
+                if before.st_size > MAX_BYTES:
+                    emit(kind, "oversized", "size_limit_exceeded")
+                    return 0
+                chunks = []
+                remaining = MAX_BYTES + 1
+                while remaining:
+                    chunk = os.read(descriptor, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if len(raw) > MAX_BYTES:
+                emit(kind, "oversized", "size_limit_exceeded")
+                return 0
+            stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(before, field) != getattr(after, field) for field in stable):
+                emit(kind, "read_race", "file_changed_during_read")
+                return 0
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                emit(kind, "malformed", "invalid_utf8")
+                return 0
+            emit(kind, "present", "verified_owner_read", content)
+            return 0
+
+
+        sys.exit(main())
+    """)
+
+
 def _generate_principal_preference_manager(
     data_dir: str,
     install_dir: str = "/opt/kai",
@@ -4450,12 +4581,14 @@ def _generate_sudoers(
     opencode_bin: str | None = None,
     goose_bin: str | None = None,
     pi_bin: str | None = None,
+    principal_document_reader: bool = False,
 ) -> str:
     """
-    Generate sudoers rules for the service user to read protected config files.
+    Generate sudoers rules for the service user to access protected resources.
 
-    The rules allow passwordless `sudo cat` on specific files only. This is
-    validated with `visudo -cf` before being written to /etc/sudoers.d/.
+    Config reads remain fixed `sudo cat` rules. Optional privileged helpers
+    enforce their own bounded argument and path contracts. The complete file
+    is validated with `visudo -cf` before being written to /etc/sudoers.d/.
 
     Uses shutil.which() to resolve the actual paths of `cat` and `tee`,
     since they live at /bin/ on macOS but /usr/bin/ on many Linux distros.
@@ -4529,6 +4662,8 @@ def _generate_sudoers(
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_MEMORY_READER} *\n"
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_PREFERENCE_MANAGER} *\n"
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_WORKSPACE_PROVISIONER} *\n"
+    if principal_document_reader:
+        rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_DOCUMENT_READER} *\n"
 
     if target_users:
         # In protected installs, these arguments come from
@@ -7361,6 +7496,7 @@ def _cmd_apply() -> None:
             install_dir=install_dir,
             agent_backend=agent_backend,
             runtime_profiles=runtime_policy,
+            runtime_storage_targets=runtime_storage_targets,
         )
 
         # -- Step 9: Migrate runtime data --
@@ -9101,6 +9237,7 @@ def _apply_sudoers(
     goose_bin: str | None = None,
     agent_backend: str = "",
     runtime_profiles: WorkshopRuntimeProfileRegistry | None = None,
+    runtime_storage_targets: tuple[_RuntimeStorageTarget, ...] = (),
 ) -> None:
     """
     Write sudoers rules for the service user to read protected config.
@@ -9121,10 +9258,10 @@ def _apply_sudoers(
     the global/default runtime path.
 
     `data_dir` additionally installs the principal-memory reader, preference
-    manager, and bounded workspace-provisioning helpers
-    when the deployment has foreign os_users (the only case where its
-    sudoers rule is emitted); None (direct/dev callers) always skips
-    the helper.
+    manager, and bounded workspace-provisioning helpers when the deployment
+    has foreign os_users. Runtime storage targets independently enable the
+    owner-authorized principal-document reader. None (direct/dev callers)
+    skips all helper installation.
     """
     # None resolves to the module-level USERS_YAML at call time rather
     # than in the signature: a def-time default would bake the
@@ -9162,6 +9299,7 @@ def _apply_sudoers(
         opencode_bin=registry_commands.get("opencode"),
         goose_bin=registry_commands.get("goose"),
         pi_bin=registry_commands.get("pi"),
+        principal_document_reader=bool(runtime_storage_targets),
     )
 
     # Backstop check: each per-user rule pins a backend binary to a
@@ -9219,16 +9357,32 @@ def _apply_sudoers(
                     file=sys.stderr,
                 )
 
-    # The reader helper accompanies its sudoers rule: both exist only
-    # when some inner agent runs as a foreign OS user (mirrors the
-    # target_users gate inside _generate_sudoers).
+    # Legacy mutation/backup helpers follow the foreign-user sudo rules. The
+    # context-document reader instead follows canonical runtime storage so it
+    # is present for same-owner and non-owner private lanes alike.
     install_reader = data_dir is not None and any(u and u != service_user for u in os_users)
+    install_document_reader = data_dir is not None and bool(runtime_storage_targets)
+    principal_documents: dict[str, tuple[str, dict[str, Path]]] = {}
+    if install_document_reader:
+        assert data_dir is not None
+        root = Path(data_dir)
+        for target in runtime_storage_targets:
+            principal_documents[target.storage_name] = (
+                target.os_user or service_user,
+                {
+                    "principal_policy": (target.home_workspace or root / "home" / target.storage_name) / "AGENTS.md",
+                    "personal_preferences": root / "preferences" / target.storage_name / "PREFERENCES.md",
+                    "file_memory": root / "memory" / target.storage_name / "MEMORY.md",
+                },
+            )
 
     if dry_run:
         if install_reader:
             print(f"[DRY RUN] Would write: {PRINCIPAL_MEMORY_READER} (mode 0755)")
             print(f"[DRY RUN] Would write: {PRINCIPAL_PREFERENCE_MANAGER} (mode 0755)")
             print(f"[DRY RUN] Would write: {PRINCIPAL_WORKSPACE_PROVISIONER} (mode 0755)")
+        if install_document_reader:
+            print(f"[DRY RUN] Would write: {PRINCIPAL_DOCUMENT_READER} (mode 0755)")
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")
         print("[DRY RUN] Would validate with visudo -cf")
         return
@@ -9283,6 +9437,19 @@ def _apply_sudoers(
         os.chmod(PRINCIPAL_WORKSPACE_PROVISIONER, 0o755)
         os.chown(PRINCIPAL_WORKSPACE_PROVISIONER, 0, 0)
         print(f"  Wrote {PRINCIPAL_WORKSPACE_PROVISIONER}")
+
+    if install_document_reader:
+        fd, tmp_name = tempfile.mkstemp(prefix="kai-document-reader-", suffix=".tmp")
+        try:
+            os.write(fd, _generate_principal_document_reader(principal_documents).encode())
+            os.close(fd)
+            shutil.move(tmp_name, str(PRINCIPAL_DOCUMENT_READER))
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        os.chmod(PRINCIPAL_DOCUMENT_READER, 0o755)
+        os.chown(PRINCIPAL_DOCUMENT_READER, 0, 0)
+        print(f"  Wrote {PRINCIPAL_DOCUMENT_READER}")
 
     # Write to a secure temp file first, validate, then move into place.
     # Uses mkstemp (random name, restrictive permissions) instead of a

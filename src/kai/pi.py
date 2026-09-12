@@ -26,6 +26,7 @@ from kai.backend import (
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_context_files,
+    observe_context_preparation_failure,
     sanitize_agent_environment,
     scrub_trace_text,
     trace_secret_values,
@@ -43,6 +44,7 @@ from kai.pi_rpc import (
     pi_rpc_text_delta,
     require_pi_rpc_response,
 )
+from kai.principal_documents import PrincipalDocumentReport, PrincipalPolicyUnavailable
 from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
@@ -399,26 +401,41 @@ class PiBackend(AgentBackend):
             return
 
         session_context = ""
+        context_observer = self.consume_context_assembly_observer()
+        principal_documents: PrincipalDocumentReport | None = None
+
+        def capture_principal_documents(report: PrincipalDocumentReport) -> None:
+            nonlocal principal_documents
+            principal_documents = report
+
         if self._fresh_session:
-            self._fresh_session = False
             ensure_user_context_files(
                 chat_id,
                 DATA_DIR,
                 defer_user_file_reads=self.defer_user_file_reads,
             )
-            session_context = build_session_context(
-                workspace=self.workspace,
-                home_workspace=self.home_workspace,
-                api=self._api_context,
-                workspace_config=self.workspace_config,
-                chat_id=chat_id,
-                runtime_identity=runtime_identity,
-                data_dir=DATA_DIR,
-                backend_name=self.backend_name,
-                memory_enabled=self.memory_enabled,
-                defer_user_file_reads=self.defer_user_file_reads,
-                canonical_history=self.consume_canonical_history(),
-            )
+            try:
+                session_context = build_session_context(
+                    workspace=self.workspace,
+                    home_workspace=self.home_workspace,
+                    api=self._api_context,
+                    workspace_config=self.workspace_config,
+                    chat_id=chat_id,
+                    runtime_identity=runtime_identity,
+                    data_dir=DATA_DIR,
+                    backend_name=self.backend_name,
+                    memory_enabled=self.memory_enabled,
+                    defer_user_file_reads=self.defer_user_file_reads,
+                    canonical_history=self.consume_canonical_history(),
+                    principal_document_observer=capture_principal_documents,
+                )
+            except PrincipalPolicyUnavailable:
+                await observe_context_preparation_failure(
+                    context_observer,
+                    principal_documents or PrincipalDocumentReport(),
+                )
+                raise
+            self._fresh_session = False
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
 
         images: list[dict[str, str]] = []
@@ -457,7 +474,8 @@ class PiBackend(AgentBackend):
             backend_name=self.backend_name,
             job_type="interactive",
             session_id=self._session_id,
-            context_observer=self.consume_context_assembly_observer(),
+            context_observer=context_observer,
+            principal_documents=principal_documents,
         )
         if isinstance(prompt, str):
             message_text = prompt

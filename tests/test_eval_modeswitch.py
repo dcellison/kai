@@ -87,8 +87,9 @@ class TestVerifyInvariants:
 
     def test_disabled_mode_injects_memory_md(self, tmp_path: Path) -> None:
         """Under memory_enabled=False, the build_session_context output
-        contains the [Your persistent memory (file: ...):] block. This
-        is the load-bearing positive assertion for disabled mode."""
+        contains the path-free [Your persistent memory (verified revision
+        ...):] block. This is the load-bearing positive assertion for
+        disabled mode."""
         ctx = _build_disabled_ctx(tmp_path)
         assert _MARKER_PERSISTENT_MEMORY in ctx
         assert _MARKER_DISABLED in ctx

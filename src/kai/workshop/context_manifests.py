@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from kai.principal_documents import PrincipalDocument, PrincipalDocumentState
 from kai.workshop.domain import (
     AgentId,
     ChannelId,
@@ -434,6 +435,40 @@ def build_context_manifest_draft(
         else provider_session_revision
     )
     session_revision = observation.session_context_revision or effective_provider_session_revision
+
+    def principal_document_facts(
+        document: PrincipalDocument | None,
+        *,
+        absent_reason: str,
+    ) -> tuple[ContextSourceState, str, str | None]:
+        if observation.principal_documents is None:
+            return granular_session_state, granular_session_reason, session_revision
+        if document is None:
+            return ContextSourceState.OMITTED, absent_reason, None
+        reason = _safe_code(document.reason, fallback=document.state.value)
+        if document.state is PrincipalDocumentState.PRESENT:
+            return (
+                ContextSourceState.NEWLY_DELIVERED if dispatch_reached else ContextSourceState.UNAVAILABLE,
+                reason if dispatch_reached else "dispatch_not_reached",
+                document.revision,
+            )
+        if document.state is PrincipalDocumentState.MISSING and dispatch_reached:
+            return ContextSourceState.OMITTED, reason, None
+        return ContextSourceState.UNAVAILABLE, reason, None
+
+    document_report = observation.principal_documents
+    principal_policy_facts = principal_document_facts(
+        document_report.policy if document_report is not None else None,
+        absent_reason="private_document_not_applicable",
+    )
+    preferences_facts = principal_document_facts(
+        document_report.preferences if document_report is not None else None,
+        absent_reason="private_document_not_applicable",
+    )
+    file_memory_facts = principal_document_facts(
+        document_report.file_memory if document_report is not None else None,
+        absent_reason="semantic_memory_enabled_or_shared",
+    )
     sources = (
         ContextSourceDescriptor(
             ContextSourceKind.HOST_POLICY,
@@ -458,10 +493,10 @@ def build_context_manifest_draft(
             ContextAuthorityClass.PRINCIPAL,
             ContextRefreshClass.PROVIDER_SESSION,
             ContextDeliveryRole.SESSION_CONTEXT,
-            granular_session_state,
-            granular_session_reason,
-            revision=session_revision,
-            delivery_shape="protected_document_pointer",
+            principal_policy_facts[0],
+            principal_policy_facts[1],
+            revision=principal_policy_facts[2],
+            delivery_shape="inline_verified_document",
         ),
         ContextSourceDescriptor(
             ContextSourceKind.AGENT_DEFINITION,
@@ -500,10 +535,10 @@ def build_context_manifest_draft(
             ContextAuthorityClass.PRINCIPAL,
             ContextRefreshClass.PROVIDER_SESSION,
             ContextDeliveryRole.UNTRUSTED_CONTEXT,
-            granular_session_state,
-            granular_session_reason,
-            revision=session_revision,
-            delivery_shape="protected_document_pointer",
+            preferences_facts[0],
+            preferences_facts[1],
+            revision=preferences_facts[2],
+            delivery_shape="inline_verified_document",
         ),
         ContextSourceDescriptor(
             ContextSourceKind.FILE_MEMORY,
@@ -514,10 +549,10 @@ def build_context_manifest_draft(
             ContextAuthorityClass.PRINCIPAL,
             ContextRefreshClass.PROVIDER_SESSION,
             ContextDeliveryRole.UNTRUSTED_CONTEXT,
-            granular_session_state,
-            granular_session_reason,
-            revision=session_revision,
-            delivery_shape="protected_document_pointer",
+            file_memory_facts[0],
+            file_memory_facts[1],
+            revision=file_memory_facts[2],
+            delivery_shape="randomized_untrusted_block",
         ),
         ContextSourceDescriptor(
             ContextSourceKind.SEMANTIC_RECALL,

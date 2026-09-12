@@ -64,6 +64,7 @@ from kai.install import (
     _generate_env_file,
     _generate_launchd_plist,
     _generate_launcher_script,
+    _generate_principal_document_reader,
     _generate_principal_memory_reader,
     _generate_principal_preference_manager,
     _generate_principal_workspace_provisioner,
@@ -458,6 +459,41 @@ class TestGenerateSudoers:
         assert rule in _generate_sudoers("kai", ["daniel"])
         assert rule not in _generate_sudoers("kai")
         assert rule not in _generate_sudoers("kai", ["kai"])
+
+    def test_principal_document_reader_rule_is_explicitly_gated(self):
+        rule = "kai ALL=(root) NOPASSWD: /etc/kai/read-principal-document *"
+        assert rule in _generate_sudoers("kai", principal_document_reader=True)
+        assert rule not in _generate_sudoers("kai")
+
+
+class TestGeneratePrincipalDocumentReader:
+    def test_embeds_only_fixed_owner_and_allowlisted_paths(self, tmp_path):
+        principal_id = "prn_" + "a" * 32
+        home = tmp_path / "home" / principal_id
+        script = _generate_principal_document_reader(
+            {
+                principal_id: (
+                    "alice",
+                    {
+                        "principal_policy": home / "AGENTS.md",
+                        "personal_preferences": tmp_path / "preferences" / principal_id / "PREFERENCES.md",
+                        "file_memory": tmp_path / "memory" / principal_id / "MEMORY.md",
+                    },
+                )
+            }
+        )
+
+        assert script.startswith("#!/usr/bin/python3\n")
+        assert "os.initgroups(user_name, account.pw_gid)" in script
+        assert script.index("os.setuid(account.pw_uid)") < script.index("descriptor = os.open(path")
+        assert 'KINDS = {"principal_policy", "personal_preferences", "file_memory"}' in script
+        assert "MAX_BYTES = 131072" in script
+        assert "O_NOFOLLOW" in script
+        assert "file_owner_mismatch" in script
+        assert "file_changed_during_read" in script
+        assert "alice" in script
+        assert str(home / "AGENTS.md") in script
+        compile(script, "<principal-document-reader>", "exec")
 
 
 class TestGeneratePrincipalPreferenceManager:
