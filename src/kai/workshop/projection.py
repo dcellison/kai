@@ -1177,6 +1177,90 @@ async def _apply_run_attempt_event(connection: aiosqlite.Connection, event: Stor
     )
 
 
+async def _apply_run_context_manifest_event(
+    connection: aiosqlite.Connection,
+    event: StoredEvent,
+) -> None:
+    """Project one immutable, content-free manifest for a fenced attempt."""
+    from kai.workshop.context_manifests import validate_manifest_event_payload
+
+    envelope = event.envelope
+    if not isinstance(envelope.aggregate_id, RunAttemptId) or envelope.aggregate_type != "run_attempt":
+        raise ValueError("Workshop context manifests require a typed run-attempt aggregate")
+    if envelope.event_version != 1:
+        raise ValueError("Unsupported Workshop context-manifest event version")
+    draft, digest = validate_manifest_event_payload(envelope.payload)
+    run_id = RunId(_required_text(envelope.payload, "run_id"))
+    channel_id = ChannelId(_required_text(envelope.payload, "channel_id"))
+    requester = PrincipalId(_required_text(envelope.payload, "requested_by_principal_id"))
+    agent_id = AgentId(_required_text(envelope.payload, "agent_id"))
+    async with connection.execute(
+        "SELECT ra.run_id, ra.status, ra.backend, ra.provider, ra.model, "
+        "r.workshop_id, r.channel_id, r.requested_by_principal_id, r.agent_id, "
+        "r.runtime_profile_id, a.principal_id FROM run_attempts ra "
+        "JOIN runs r ON r.id = ra.run_id JOIN agents a ON a.id = r.agent_id "
+        "WHERE ra.id = ?",
+        (envelope.aggregate_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if (
+        row is None
+        or RunId(str(row[0])) != run_id
+        or str(row[1]) not in {"granted", "started"}
+        or str(row[2]) != draft.selection.backend
+        or (None if row[3] is None else str(row[3])) != draft.selection.provider
+        or str(row[4]) != draft.selection.model
+        or WorkshopId(str(row[5])) != envelope.workshop_id
+        or ChannelId(str(row[6])) != channel_id
+        or PrincipalId(str(row[7])) != requester
+        or AgentId(str(row[8])) != agent_id
+        or RuntimeProfileId(str(row[9])) != draft.runtime_profile_id
+        or envelope.actor_principal_id != PrincipalId(str(row[10]))
+    ):
+        raise ValueError("Workshop context manifest does not match its started execution attempt")
+    sources_json = json.dumps(
+        [source.payload() for source in draft.sources],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    async with connection.execute(
+        "SELECT manifest_sha256 FROM run_context_manifests WHERE attempt_id = ?",
+        (envelope.aggregate_id,),
+    ) as cursor:
+        existing = await cursor.fetchone()
+    if existing is not None:
+        if str(existing[0]) != digest:
+            raise ValueError("Workshop context manifest immutable replay conflicts with existing facts")
+        return
+    await connection.execute(
+        "INSERT INTO run_context_manifests "
+        "(attempt_id, run_id, workshop_id, channel_id, requested_by_principal_id, agent_id, "
+        "runtime_profile_id, backend, provider, model, workspace_kind, workspace_digest, "
+        "provider_session_revision, sources_json, manifest_sha256, created_at, created_event_position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            envelope.aggregate_id,
+            run_id,
+            envelope.workshop_id,
+            channel_id,
+            requester,
+            agent_id,
+            draft.runtime_profile_id,
+            draft.selection.backend,
+            draft.selection.provider,
+            draft.selection.model,
+            draft.workspace_kind,
+            draft.workspace_digest,
+            draft.provider_session_revision,
+            sources_json,
+            digest,
+            envelope.occurred_at.isoformat(),
+            event.position,
+        ),
+    )
+
+
 async def _apply_collaboration_grant_event(
     connection: aiosqlite.Connection,
     event: StoredEvent,
@@ -2089,6 +2173,7 @@ class CanonicalConversationProjection:
             "collaboration_reaction_receipts",
             "collaboration_operation_decisions",
             "collaboration_grants",
+            "run_context_manifests",
             "run_attempts",
             "runs",
             "human_notification_adapter_delivery_decisions",
@@ -2238,6 +2323,10 @@ class CanonicalConversationProjection:
             WorkshopEventType.RUN_ATTEMPT_CANCELLED,
         }:
             await _apply_run_attempt_event(connection, event)
+            return
+
+        if envelope.event_type == WorkshopEventType.RUN_ATTEMPT_CONTEXT_MANIFEST_RECORDED:
+            await _apply_run_context_manifest_event(connection, event)
             return
 
         if envelope.event_type == WorkshopEventType.WORKSHOP_CREATED:

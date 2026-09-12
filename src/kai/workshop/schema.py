@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 76
+WORKSHOP_SCHEMA_VERSION = 77
 
 
 @dataclass(frozen=True, slots=True)
@@ -3409,6 +3409,66 @@ _REPLAY_SAFE_AGENT_PROVISIONING_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_CANONICAL_CONTEXT_MANIFEST_SCHEMA = SchemaMigration(
+    version=77,
+    name="canonical_run_context_manifests",
+    statements=(
+        """
+        CREATE TABLE workshop_context_manifest_cutover (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            event_position INTEGER NOT NULL CHECK (event_position >= 0)
+        )
+        """,
+        "INSERT INTO workshop_context_manifest_cutover (singleton, event_position) "
+        "SELECT 1, COALESCE(MAX(position), 0) FROM event_log",
+        """
+        CREATE TABLE run_context_manifests (
+            attempt_id TEXT PRIMARY KEY
+                REFERENCES run_attempts(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            requested_by_principal_id TEXT NOT NULL
+                REFERENCES principals(id) ON DELETE RESTRICT,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+            runtime_profile_id TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            provider TEXT,
+            model TEXT NOT NULL,
+            workspace_kind TEXT NOT NULL CHECK (
+                workspace_kind IN ('home', 'foreign', 'unknown')
+            ),
+            workspace_digest TEXT CHECK (
+                workspace_digest IS NULL OR (
+                    length(workspace_digest) = 64
+                    AND workspace_digest NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            provider_session_revision TEXT CHECK (
+                provider_session_revision IS NULL OR (
+                    length(provider_session_revision) = 64
+                    AND provider_session_revision NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            sources_json TEXT NOT NULL CHECK (
+                json_valid(sources_json) AND json_type(sources_json) = 'array'
+            ),
+            manifest_sha256 TEXT NOT NULL CHECK (
+                length(manifest_sha256) = 64
+                AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX run_context_manifests_run_idx ON run_context_manifests (run_id, attempt_id)",
+        "CREATE INDEX run_context_manifests_principal_idx ON run_context_manifests "
+        "(requested_by_principal_id, created_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3486,6 +3546,7 @@ _MIGRATIONS = (
     _STANDING_OBSERVE_EXECUTION_SCHEMA,
     _RUN_KIND_SCOPED_IDENTITY_SCHEMA,
     _REPLAY_SAFE_AGENT_PROVISIONING_SCHEMA,
+    _CANONICAL_CONTEXT_MANIFEST_SCHEMA,
 )
 
 

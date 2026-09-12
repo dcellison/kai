@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Protocol
 
 from kai.agent_failure import AgentFailureKind
-from kai.backend import AgentResponse, StreamEvent
+from kai.backend import AgentResponse, ContextAssemblyObservation, StreamEvent
 from kai.workshop.agent_definitions import (
     load_agent_definition_revision,
     render_agent_definition_context,
@@ -26,9 +26,21 @@ from kai.workshop.collaboration_authority import (
     CollaborationOperation,
     WorkshopCollaborationAuthority,
 )
+from kai.workshop.context_manifests import (
+    WorkshopContextManifestService,
+    build_context_manifest_draft,
+    content_digest,
+)
 from kai.workshop.conversation_context import assemble_canonical_conversation_context
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
-from kai.workshop.domain import AgentDefinitionId, AgentId, ChannelId, RunExecutionOwnerId, RunId
+from kai.workshop.domain import (
+    AgentDefinitionId,
+    AgentId,
+    ChannelId,
+    RunExecutionOwnerId,
+    RunId,
+    RuntimeProfileId,
+)
 from kai.workshop.protected_execution import (
     PreparedWorkshopExecution,
     ProtectedExecutionRoutingRejected,
@@ -42,7 +54,7 @@ from kai.workshop.run_execution_authority import (
 )
 from kai.workshop.run_lifecycle import DurableRun, RunKind, RunStatus, WorkshopRunLifecycle
 from kai.workshop.run_traces import WorkshopRunTraceStore
-from kai.workshop.runtime_sessions import RuntimeSessionSettlement
+from kai.workshop.runtime_sessions import RuntimeSessionSettlement, load_runtime_session
 from kai.workshop.standing_observation import (
     StandingObserveSettlement,
     WorkshopStandingObservationService,
@@ -351,11 +363,19 @@ class WorkshopCanonicalExecutionCoordinator:
             for attempt in attempts:
                 authority = self._authority(attempt.selection)
                 claim = RunExecutionClaim.from_attempt(attempt)
+                run = await WorkshopRunLifecycle(self._store).state(attempt.run_id)
+                if run.runtime_profile_id is not None:
+                    await self._record_unprepared_manifest_locked(
+                        run,
+                        claim,
+                        runtime_profile_id=run.runtime_profile_id,
+                        selection=attempt.selection,
+                        dispatch_reached=(False if attempt.status == RunAttemptStatus.GRANTED else None),
+                    )
                 if attempt.status == RunAttemptStatus.GRANTED:
                     await authority.expire_grant(claim, occurred_at=now)
                     expired += 1
                 else:
-                    run = await WorkshopRunLifecycle(self._store).state(attempt.run_id)
                     if run.kind == RunKind.OBSERVE:
                         await authority.interrupt_observe_expired(
                             claim,
@@ -403,6 +423,7 @@ class WorkshopCanonicalExecutionCoordinator:
             active.ready.set()
 
             if active.cancellation_requested:
+                await self._record_undispatched_manifest(active, prepared)
                 return await self._settle_requested_cancellation(active)
 
             prepared.validate_current()
@@ -569,6 +590,16 @@ class WorkshopCanonicalExecutionCoordinator:
                 active.claim = started.claim
                 active.started = True
                 active.ready.set()
+                runtime_profile_id = run.runtime_profile_id
+                if runtime_profile_id is None:
+                    raise RuntimeError("accepted run is missing its canonical runtime profile") from rejection
+                await self._record_unprepared_manifest_locked(
+                    run,
+                    started.claim,
+                    runtime_profile_id=runtime_profile_id,
+                    selection=rejection.decision.selection,
+                    dispatch_reached=False,
+                )
                 if run.kind == RunKind.OBSERVE:
                     if await self._collaboration_authority.available():
                         grant, active.collaboration_invocation = await self._collaboration_authority.issue(
@@ -605,6 +636,8 @@ class WorkshopCanonicalExecutionCoordinator:
             )
         except Exception:
             if active.cancellation_requested and active.claim is not None:
+                if active.prepared is not None:
+                    await self._record_undispatched_manifest(active, active.prepared)
                 return await self._settle_requested_cancellation(active)
             if active.settling:
                 raise
@@ -644,6 +677,8 @@ class WorkshopCanonicalExecutionCoordinator:
                     selection=active.prepared.selection if active.prepared is not None else None,
                 )
             log.exception("Workshop run %s preparation deferred", run.run_id)
+            if active.claim is not None and active.prepared is not None:
+                await self._record_undispatched_manifest(active, active.prepared)
             return CanonicalExecutionResult(
                 CanonicalExecutionDisposition.PREPARATION_DEFERRED, await self._run(run.run_id)
             )
@@ -663,6 +698,125 @@ class WorkshopCanonicalExecutionCoordinator:
                     # attempted, so failure remains fail-closed. Recovery and
                     # diagnostics can reconcile the immutable grant later.
                     log.exception("Workshop collaboration-grant revocation could not be recorded")
+
+    async def _record_undispatched_manifest(
+        self,
+        active: _ActiveExecution,
+        prepared: PreparedWorkshopExecution,
+    ) -> None:
+        """Record an honest omitted-source manifest when dispatch never begins."""
+        if active.claim is None:
+            return
+        claim = active.claim
+        async with self._database_lock:
+            service = WorkshopContextManifestService(self._store)
+            if not await service.available() or await service.load_attempt(claim.attempt_id) is not None:
+                return
+            context = await assemble_canonical_conversation_context(self._store, prepared.run)
+            revision_id = prepared.run.agent_definition_revision_id
+            if revision_id is None:
+                return
+            definition_revision = await load_agent_definition_revision(self._store, revision_id)
+            if definition_revision is None:
+                return
+            async with self._store.connection.execute(
+                "SELECT body FROM messages WHERE id = ? AND channel_id = ?",
+                (prepared.run.inbound_message_id, prepared.run.channel_id),
+            ) as cursor:
+                input_row = await cursor.fetchone()
+            if input_row is None:
+                return
+            agent_context = render_agent_definition_context(definition_revision)
+            workspace_digest = content_digest(str(prepared.workspace.resolve()))
+            draft = build_context_manifest_draft(
+                runtime_profile_id=prepared.runtime_profile_id,
+                selection=prepared.selection,
+                workspace_kind=(
+                    "home" if prepared.workspace.resolve() == prepared.home_workspace.resolve() else "foreign"
+                ),
+                workspace_digest=workspace_digest,
+                provider_session_revision=None,
+                principal_id=prepared.run.requested_by_principal_id,
+                agent_id=prepared.run.agent_id,
+                agent_revision=str(definition_revision.revision_id),
+                agent_context_digest=content_digest(agent_context),
+                channel_id=prepared.run.channel_id,
+                history_boundary=context.through_event_position,
+                history_digest=content_digest(context.text),
+                current_input_digest=content_digest(str(input_row[0])),
+                attempt_id=claim.attempt_id,
+                attempt_authority_revision=None,
+                observation=ContextAssemblyObservation(
+                    provider_dispatch_reached=False,
+                    session_context_delivered=False,
+                    session_context_revision=None,
+                    semantic_recall_attempted=False,
+                    semantic_recall_delivered=False,
+                    semantic_recall_reason="dispatch_not_reached",
+                    semantic_recall_revision=None,
+                    workspace_reminder_delivered=False,
+                ),
+            )
+            await service.record(claim, draft, occurred_at=self._now())
+
+    async def _record_unprepared_manifest_locked(
+        self,
+        run: DurableRun,
+        claim: RunExecutionClaim,
+        *,
+        runtime_profile_id: RuntimeProfileId,
+        selection: RunExecutionSelection,
+        dispatch_reached: bool | None,
+    ) -> None:
+        """Record a content-free manifest when no prepared runtime survives."""
+        service = WorkshopContextManifestService(self._store)
+        if not await service.available() or await service.load_attempt(claim.attempt_id) is not None:
+            return
+        context = await assemble_canonical_conversation_context(self._store, run)
+        revision_id = run.agent_definition_revision_id
+        if revision_id is None:
+            return
+        definition_revision = await load_agent_definition_revision(self._store, revision_id)
+        if definition_revision is None or definition_revision.agent_id != run.agent_id:
+            return
+        async with self._store.connection.execute(
+            "SELECT body FROM messages WHERE id = ? AND channel_id = ?",
+            (run.inbound_message_id, run.channel_id),
+        ) as cursor:
+            input_row = await cursor.fetchone()
+        if input_row is None:
+            return
+        agent_context = render_agent_definition_context(definition_revision)
+        draft = build_context_manifest_draft(
+            runtime_profile_id=runtime_profile_id,
+            selection=selection,
+            workspace_kind="unknown",
+            workspace_digest=None,
+            provider_session_revision=None,
+            principal_id=run.requested_by_principal_id,
+            agent_id=run.agent_id,
+            agent_revision=str(definition_revision.revision_id),
+            agent_context_digest=content_digest(agent_context),
+            channel_id=run.channel_id,
+            history_boundary=context.through_event_position,
+            history_digest=content_digest(context.text),
+            current_input_digest=content_digest(str(input_row[0])),
+            attempt_id=claim.attempt_id,
+            attempt_authority_revision=None,
+            observation=ContextAssemblyObservation(
+                provider_dispatch_reached=dispatch_reached,
+                session_context_delivered=False,
+                session_context_revision=None,
+                semantic_recall_attempted=False,
+                semantic_recall_delivered=False,
+                semantic_recall_reason=(
+                    "dispatch_not_reached" if dispatch_reached is False else "dispatch_state_unknown"
+                ),
+                semantic_recall_revision=None,
+                workspace_reminder_delivered=False,
+            ),
+        )
+        await service.record(claim, draft, occurred_at=self._now())
 
     async def _settle_requested_cancellation(self, active: _ActiveExecution) -> CanonicalExecutionResult:
         await active.cancellation_done.wait()
@@ -756,6 +910,13 @@ class WorkshopCanonicalExecutionCoordinator:
             definition_revision = await load_agent_definition_revision(self._store, revision_id)
             if definition_revision is None or definition_revision.agent_id != prepared.run.agent_id:
                 raise RuntimeError("Canonical run agent definition revision is unavailable")
+            prior_session = await load_runtime_session(
+                self._store,
+                prepared.run.channel_id,
+                prepared.run.agent_id,
+            )
+            manifest_service = WorkshopContextManifestService(self._store)
+            manifest_available = await manifest_service.available()
         history = context.text
         if self._transcript_projection is not None:
             try:
@@ -771,30 +932,108 @@ class WorkshopCanonicalExecutionCoordinator:
                 log.warning("Canonical transcript projection refresh failed", exc_info=True)
             else:
                 history = _history_with_transcript_pointer(history, transcript_path)
+        agent_context = render_agent_definition_context(definition_revision)
         prepared.stage_canonical_history(history)
-        prepared.stage_agent_definition_context(render_agent_definition_context(definition_revision))
+        prepared.stage_agent_definition_context(agent_context)
+        assert active.claim is not None
+        claim = active.claim
+        workspace_digest = content_digest(str(prepared.workspace.resolve()))
+        provider_session_revision = None
+        if (
+            prior_session is not None
+            and prior_session.runtime_profile_id == prepared.runtime_profile_id
+            and prior_session.selection == prepared.selection
+            and Path(prior_session.workspace).resolve() == prepared.workspace.resolve()
+        ):
+            provider_session_revision = content_digest(
+                {
+                    "channel_id": str(prior_session.channel_id),
+                    "agent_id": str(prior_session.agent_id),
+                    "last_run_id": str(prior_session.last_run_id),
+                    "context_through_event_position": prior_session.context_through_event_position,
+                }
+            )
+        attempt_authority_revision = (
+            content_digest(
+                {
+                    "attempt_id": str(claim.attempt_id),
+                    "operations": sorted(operation.value for operation in active.collaboration_operations),
+                }
+            )
+            if active.collaboration_invocation is not None
+            else None
+        )
+        manifest_recorded = False
+
+        async def record_manifest(observation: ContextAssemblyObservation) -> None:
+            nonlocal manifest_recorded
+            draft = build_context_manifest_draft(
+                runtime_profile_id=prepared.runtime_profile_id,
+                selection=prepared.selection,
+                workspace_kind=(
+                    "home" if prepared.workspace.resolve() == prepared.home_workspace.resolve() else "foreign"
+                ),
+                workspace_digest=workspace_digest,
+                provider_session_revision=provider_session_revision,
+                principal_id=prepared.run.requested_by_principal_id,
+                agent_id=prepared.run.agent_id,
+                agent_revision=str(definition_revision.revision_id),
+                agent_context_digest=content_digest(agent_context),
+                channel_id=prepared.run.channel_id,
+                history_boundary=context.through_event_position,
+                history_digest=content_digest(history),
+                current_input_digest=content_digest(prompt),
+                attempt_id=claim.attempt_id,
+                attempt_authority_revision=attempt_authority_revision,
+                observation=observation,
+            )
+            async with self._database_lock:
+                await manifest_service.record(
+                    claim,
+                    draft,
+                    occurred_at=self._now(),
+                )
+            manifest_recorded = True
+
+        if manifest_available:
+            prepared.stage_context_assembly_observer(record_manifest)
         response: AgentResponse | None = None
         traces_truncated = False
-        async for event in prepared.stream(prompt):
-            if active.collaboration_invocation is not None:
-                event = _redact_collaboration_event(event, active.collaboration_invocation)
-            if event.done:
-                response = event.response
-                break
-            if event.trace is not None and not traces_truncated:
-                # Persisted under the current fenced claim so a
-                # superseded attempt cannot write; staleness raises
-                # and aborts the doomed attempt, the same posture the
-                # lease-renewal task takes. Once the run's cap is
-                # reached, later trace events skip the write
-                # transaction entirely.
-                assert active.claim is not None
-                async with self._database_lock:
-                    appended = await self._trace_store.append(active.claim, event.trace, occurred_at=self._now())
-                if not appended:
-                    traces_truncated = True
-            if stream_observer is not None:
-                await stream_observer(event)
+        try:
+            async for event in prepared.stream(prompt):
+                if active.collaboration_invocation is not None:
+                    event = _redact_collaboration_event(event, active.collaboration_invocation)
+                if event.done:
+                    response = event.response
+                    break
+                if event.trace is not None and not traces_truncated:
+                    # Persisted under the current fenced claim so a
+                    # superseded attempt cannot write; staleness raises
+                    # and aborts the doomed attempt, the same posture the
+                    # lease-renewal task takes. Once the run's cap is
+                    # reached, later trace events skip the write
+                    # transaction entirely.
+                    assert active.claim is not None
+                    async with self._database_lock:
+                        appended = await self._trace_store.append(active.claim, event.trace, occurred_at=self._now())
+                    if not appended:
+                        traces_truncated = True
+                if stream_observer is not None:
+                    await stream_observer(event)
+        finally:
+            if manifest_available and not manifest_recorded:
+                await record_manifest(
+                    ContextAssemblyObservation(
+                        provider_dispatch_reached=False,
+                        session_context_delivered=False,
+                        session_context_revision=None,
+                        semantic_recall_attempted=False,
+                        semantic_recall_delivered=False,
+                        semantic_recall_reason="dispatch_not_reached",
+                        semantic_recall_revision=None,
+                        workspace_reminder_delivered=False,
+                    )
+                )
         return response
 
     async def _consume_with_renewal(

@@ -10,12 +10,13 @@ from pathlib import Path
 import pytest
 
 from kai.agent_failure import AgentFailureKind
-from kai.backend import AgentResponse, StreamEvent, TraceEntry
+from kai.backend import AgentResponse, ContextAssemblyObservation, StreamEvent, TraceEntry
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
+from kai.workshop.context_manifests import CONTEXT_SOURCE_ORDER, WorkshopContextManifestService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.diagnostics import workshop_runtime_session_status
+from kai.workshop.diagnostics import workshop_context_manifest_status, workshop_runtime_session_status
 from kai.workshop.domain import ChannelId, PrincipalId, RunExecutionOwnerId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
@@ -57,6 +58,7 @@ class _Prepared:
         self.runtime_profile_id = _RUNTIME_PROFILE_ID
         self.selection = RunExecutionSelection("codex", "gpt-5.6-sol")
         self.workspace = Path("/private/tmp/kai-workshop-test-workspace")
+        self.home_workspace = self.workspace
         self.response = response or AgentResponse(success=True, text="Canonical answer")
         self.wait = wait
         self.on_stream = on_stream
@@ -68,12 +70,16 @@ class _Prepared:
         self.agent_definition_contexts: list[str] = []
         self.collaboration_invocations = []
         self.discarded_collaboration_invocations = []
+        self.context_observer = None
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
 
     def stage_agent_definition_context(self, context: str) -> None:
         self.agent_definition_contexts.append(context)
+
+    def stage_context_assembly_observer(self, observer) -> None:
+        self.context_observer = observer
 
     def stage_collaboration_invocation(self, invocation) -> None:
         self.collaboration_invocations.append(invocation)
@@ -94,6 +100,20 @@ class _Prepared:
 
     async def stream(self, prompt: str) -> AsyncIterator[StreamEvent]:
         self.prompts.append(prompt)
+        if self.context_observer is not None:
+            observer, self.context_observer = self.context_observer, None
+            await observer(
+                ContextAssemblyObservation(
+                    provider_dispatch_reached=True,
+                    session_context_delivered=True,
+                    session_context_revision="0" * 64,
+                    semantic_recall_attempted=True,
+                    semantic_recall_delivered=False,
+                    semantic_recall_reason="no_matches",
+                    semantic_recall_revision=None,
+                    workspace_reminder_delivered=False,
+                )
+            )
         if self.on_stream is not None:
             await self.on_stream()
         if self.wait is not None:
@@ -119,7 +139,10 @@ class _PreparationByRun:
         self.prepared = {item.run.run_id: item for item in prepared}
 
     async def prepare(self, run_id):
-        return self.prepared[run_id]
+        prepared = self.prepared[run_id]
+        assert prepared.run.runtime_profile_id is not None
+        prepared.runtime_profile_id = prepared.run.runtime_profile_id
+        return prepared
 
 
 class _RejectedPreparation:
@@ -250,6 +273,39 @@ async def _terminal_bodies(store: WorkshopEventStore) -> list[str]:
 
 
 class TestCanonicalExecutionCoordinator:
+    async def test_records_redacted_context_manifest_before_dispatch_and_replays_it(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(run)
+        coordinator = _coordinator(store, _Preparation(prepared))
+        try:
+            result = await coordinator.execute(run.run_id)
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+
+            manifests = await WorkshopContextManifestService(store).load_run(run.run_id)
+            assert len(manifests) == 1
+            manifest = manifests[0]
+            assert tuple(source.kind for source in manifest.draft.sources) == CONTEXT_SOURCE_ORDER
+            assert manifest.draft.workspace_kind == "home"
+            assert manifest.draft.selection == prepared.selection
+            assert manifest.draft.sources[2].reason == "run_bound_revision"
+            assert manifest.draft.sources[7].history_boundary == 0
+            assert manifest.draft.sources[10].reason == "accepted_input"
+            assert prepared.collaboration_invocations[0].token not in repr(manifest)
+            assert workshop_context_manifest_status(tmp_path / "kai.db").startswith(
+                "Workshop context manifests: active; post-cutover attempts=1, manifests=1, missing=0, malformed=0"
+            )
+
+            digest = manifest.manifest_sha256
+            await store.rebuild_projection(CanonicalConversationProjection())
+            replayed = await WorkshopContextManifestService(store).load_run(run.run_id)
+            assert len(replayed) == 1
+            assert replayed[0].manifest_sha256 == digest
+        finally:
+            await store.close()
+
     async def test_two_humans_alternate_in_one_group_agent_lane_in_order(
         self,
         tmp_path: Path,
@@ -285,6 +341,34 @@ class TestCanonicalExecutionCoordinator:
                 first_run.requested_by_principal_id,
                 second_run.requested_by_principal_id,
             ]
+            first_manifests = await WorkshopContextManifestService(store).load_run(first_run.run_id)
+            second_manifests = await WorkshopContextManifestService(store).load_run(second_run.run_id)
+            assert len(first_manifests) == len(second_manifests) == 1
+            assert first_manifests[0].requested_by_principal_id == first_run.requested_by_principal_id
+            assert second_manifests[0].requested_by_principal_id == second_run.requested_by_principal_id
+            assert first_manifests[0].requested_by_principal_id != second_manifests[0].requested_by_principal_id
+        finally:
+            await store.close()
+
+    async def test_foreign_workspace_manifest_records_only_redacted_workspace_identity(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(run)
+        prepared.home_workspace = Path("/private/home/principal")
+        prepared.workspace = Path("/private/workspaces/secret-project-name")
+        try:
+            result = await _coordinator(store, _Preparation(prepared)).execute(run.run_id)
+
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+            manifests = await WorkshopContextManifestService(store).load_run(run.run_id)
+            assert len(manifests) == 1
+            manifest = manifests[0]
+            assert manifest.draft.workspace_kind == "foreign"
+            assert manifest.draft.workspace_digest is not None
+            assert "secret-project-name" not in repr(manifest)
+            assert all("/private/" not in repr(source) for source in manifest.draft.sources)
         finally:
             await store.close()
 
@@ -304,6 +388,12 @@ class TestCanonicalExecutionCoordinator:
                 (run.run_id,),
             ) as cursor:
                 assert [str(row[0]) for row in await cursor.fetchall()] == ["failed"]
+            manifests = await WorkshopContextManifestService(store).load_run(run.run_id)
+            assert len(manifests) == 1
+            assert manifests[0].draft.workspace_kind == "unknown"
+            assert manifests[0].draft.workspace_digest is None
+            assert {source.reason for source in manifests[0].draft.sources} >= {"dispatch_not_reached"}
+            assert "not_observable" not in {source.reason for source in manifests[0].draft.sources}
         finally:
             await store.close()
 
@@ -412,7 +502,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 76
+            assert await upgraded.schema_version() == 77
             assert await load_runtime_session(upgraded, run.channel_id, run.agent_id) is None
             after = workshop_runtime_session_status(path)
             assert after.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
@@ -440,7 +530,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 76
+            assert await upgraded.schema_version() == 77
             session = await load_runtime_session(upgraded, run.channel_id, run.agent_id)
             assert session is not None
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
@@ -785,6 +875,13 @@ class TestCanonicalExecutionCoordinator:
             assert (await _terminal_bodies(store))[-1] == (
                 "Kai was interrupted while the configured agent was working. This request was not retried."
             )
+            manifests = await WorkshopContextManifestService(store).load_run(run.run_id)
+            assert len(manifests) == 1
+            assert manifests[0].draft.workspace_kind == "unknown"
+            assert {source.reason for source in manifests[0].draft.sources} >= {
+                "dispatch_state_unknown",
+                "not_observable",
+            }
             replay = await coordinator.execute(run.run_id)
             assert replay.disposition == CanonicalExecutionDisposition.TERMINAL_REPLAY
             assert preparation.calls == 0

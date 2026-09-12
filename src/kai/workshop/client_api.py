@@ -136,6 +136,7 @@ from kai.workshop.collaboration_policy import (
     WorkshopCollaborationPolicyStorageError,
     WorkshopCollaborationPolicyValidationError,
 )
+from kai.workshop.context_manifests import RunContextManifest, WorkshopContextManifestService
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.direct_message_archives import (
     WorkshopDirectMessageArchiveAccessDenied,
@@ -378,6 +379,7 @@ _ARTIFACT_CONTENT_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/cont
 _ARTIFACT_DOWNLOAD_PATH = "/v1/channels/{channel_id}/artifacts/{artifact_id}/download"
 _RUN_STATE_PATH = "/v1/channels/{channel_id}/runs/{run_id}"
 _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
+_RUN_CONTEXT_MANIFESTS_PATH = "/v1/channels/{channel_id}/runs/{run_id}/context-manifests"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
 _EFFECTIVE_AGENT_RUNTIME_PATH = "/v1/channels/{channel_id}/effective-agent-runtime"
@@ -8030,6 +8032,60 @@ async def _handle_run_state(
     )
 
 
+def _serialize_context_manifest(manifest: RunContextManifest) -> dict[str, object]:
+    return {
+        "attempt_id": str(manifest.attempt_id),
+        "run_id": str(manifest.run_id),
+        "channel_id": str(manifest.channel_id),
+        "agent_id": str(manifest.agent_id),
+        "runtime_profile_id": str(manifest.draft.runtime_profile_id),
+        "backend": manifest.draft.selection.backend,
+        "provider": manifest.draft.selection.provider,
+        "model": manifest.draft.selection.model,
+        "workspace_kind": manifest.draft.workspace_kind,
+        "workspace_digest": manifest.draft.workspace_digest,
+        "provider_session_revision": manifest.draft.provider_session_revision,
+        "manifest_sha256": manifest.manifest_sha256,
+        "created_at": manifest.created_at.isoformat().replace("+00:00", "Z"),
+        "created_event_position": manifest.created_event_position,
+        "sources": [source.payload() for source in manifest.draft.sources],
+    }
+
+
+async def _handle_run_context_manifests(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    submitter: WorkshopClientCommandSubmitter,
+    request_lock: asyncio.Lock,
+) -> web.Response:
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid context-manifest request")
+    authorized = await _authorized_run(
+        request,
+        authenticator=authenticator,
+        submitter=submitter,
+        request_lock=request_lock,
+    )
+    if isinstance(authorized, web.Response):
+        return authorized
+    principal_id, channel_id, run = authorized
+    async with request_lock:
+        manifests = await WorkshopContextManifestService(store).load_run(run.run_id)
+    if any(item.requested_by_principal_id != principal_id or item.channel_id != channel_id for item in manifests):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    return _json_response(
+        {
+            "version": 1,
+            "channel_id": str(channel_id),
+            "run_id": str(run.run_id),
+            "manifests": [_serialize_context_manifest(item) for item in manifests],
+        },
+        status=200,
+    )
+
+
 async def _handle_run_trace(
     request: web.Request,
     *,
@@ -9349,6 +9405,15 @@ def register_workshop_command_routes(
             collaboration_policy=collaboration_policy,
         )
 
+    async def handle_run_context_manifests(request: web.Request) -> web.Response:
+        return await _handle_run_context_manifests(
+            request,
+            store=store,
+            authenticator=authenticator,
+            submitter=submitter,
+            request_lock=request_lock,
+        )
+
     async def handle_run_cancellation(request: web.Request) -> web.Response:
         return await _handle_run_cancellation(
             request,
@@ -9368,5 +9433,6 @@ def register_workshop_command_routes(
     app.router.add_post(_COMMAND_SUBMISSION_PATH, handle_command_submission)
     app.router.add_get(_RUN_STATE_PATH, handle_run_state)
     app.router.add_get(_RUN_TRACE_PATH, handle_run_trace)
+    app.router.add_get(_RUN_CONTEXT_MANIFESTS_PATH, handle_run_context_manifests)
     app.router.add_post(_RUN_CANCELLATION_PATH, handle_run_cancellation)
     app.router.add_post(_AGENT_DISMISSAL_PATH, handle_agent_dismissal)
