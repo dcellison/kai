@@ -3850,6 +3850,9 @@ class TestCmdApply:
         # visibility into both failure modes.
         out = capsys.readouterr().out
         assert "Manual recovery" in out
+        assert "Installation failed: ApplyBlewUp: simulated apply step failure" in out
+        assert "Fix the issue and re-run: make install" in out
+        assert "sudo python -m kai install apply" not in out
 
 
 class TestProtectedUserIsolationPreflight:
@@ -9469,6 +9472,35 @@ class TestApplyMigrateManagedIdentity:
         assert (artifacts / "AGENTS.md.before").read_text() == legacy
         assert '"migration": "principal-policy-v1"' in (artifacts / "receipt.json").read_text()
 
+    @pytest.mark.parametrize(
+        "identity",
+        (
+            "You're Kai, a personal AI assistant accessed via Telegram. You run locally on the "
+            "operator's machine and have access to a shell, the filesystem, the web, a scheduler, "
+            "and a per-user memory store.",
+            "You're Kai, an agentic AI coding assistant who lives in Telegram and runs locally on "
+            "your user's machine. You're not a butler or a service. You're a peer who happens to "
+            "have access to a shell, the filesystem, the web, and a scheduling API. Act like one.",
+        ),
+        ids=("tracked-telegram-era", "installed-operator-personality"),
+    )
+    def test_installed_legacy_identity_variants_migrate_with_backup(self, tmp_path, identity):
+        home = tmp_path / "data" / "home" / "12345"
+        home.mkdir(parents=True)
+        custom_rules = "## Operator Rules\n\nPreserve this exact custom rule.  \n"
+        legacy = f"# Kai\n\n## Who You Are\n\n{identity}\n\n{custom_rules}"
+        (home / "AGENTS.md").write_text(legacy)
+
+        self._apply(
+            tmp_path,
+            backend="codex",
+            source_identity="# Principal Policy\n",
+        )
+
+        assert (home / "AGENTS.md").read_text() == f"# Principal Policy\n\n{custom_rules}"
+        artifacts = home / ".kai-migrations" / "principal-policy-v1"
+        assert (artifacts / "AGENTS.md.before").read_text() == legacy
+
     def test_customized_kai_identity_aborts_without_writes(self, tmp_path):
         home = tmp_path / "data" / "home" / "12345"
         home.mkdir(parents=True)
@@ -9476,7 +9508,10 @@ class TestApplyMigrateManagedIdentity:
         agents = home / "AGENTS.md"
         agents.write_text(customized)
 
-        with pytest.raises(RuntimeError, match="customized or ambiguous Kai identity"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"home/12345/AGENTS\.md: Managed AGENTS\.md contains a customized or ambiguous Kai identity",
+        ):
             self._apply(tmp_path, backend="codex")
 
         assert agents.read_text() == customized

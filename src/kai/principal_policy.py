@@ -22,6 +22,15 @@ _LEGACY_ABOUT = (
     "to add operator-personal content; the tracked template ships universal content only. "
     'Once customized, you can delete this "About This File" section from the per-principal copy.'
 )
+_LEGACY_CHAT_ID_ABOUT = (
+    "This file is the bootstrap template for Kai's backend-neutral identity. The installer "
+    "copies it to `<DATA_DIR>/home/<chat_id>/AGENTS.md` for every user in `users.yaml` at "
+    "install time; `backend.ensure_user_home` lazily seeds it for users added later in "
+    "development mode. Claude receives a thin `.claude/CLAUDE.md` import adapter; all managed "
+    "identity content remains here. Edit the per-user `AGENTS.md` to add operator-personal "
+    "content; the tracked template ships universal content only. Once customized, you can "
+    'delete this "About This File" section from the per-user copy.'
+)
 _NEUTRAL_ABOUT = (
     "This file is the bootstrap template for Kai's backend-neutral principal policy. The "
     "installer copies it to `<DATA_DIR>/home/<principal_id>/AGENTS.md` for each canonical "
@@ -39,6 +48,24 @@ _LEGACY_IDENTITY_SECTION = (
     "Workshop and Telegram. You run locally on the operator's machine and have access to a "
     "shell, the filesystem, the web, a scheduler, and a per-principal memory store.\n\n"
 )
+_LEGACY_TELEGRAM_IDENTITY_SECTION = (
+    "## Who You Are\n\n"
+    "You're Kai, a personal AI assistant accessed via Telegram. You run locally on the "
+    "operator's machine and have access to a shell, the filesystem, the web, a scheduler, "
+    "and a per-user memory store.\n\n"
+)
+_LEGACY_OPERATOR_IDENTITY_SECTION = (
+    "## Who You Are\n\n"
+    "You're Kai, an agentic AI coding assistant who lives in Telegram and runs locally on "
+    "your user's machine. You're not a butler or a service. You're a peer who happens to "
+    "have access to a shell, the filesystem, the web, and a scheduling API. Act like one.\n\n"
+)
+_LEGACY_IDENTITY_SECTIONS = (
+    _LEGACY_IDENTITY_SECTION,
+    _LEGACY_TELEGRAM_IDENTITY_SECTION,
+    _LEGACY_OPERATOR_IDENTITY_SECTION,
+)
+_LEGACY_ABOUT_SECTIONS = (_LEGACY_ABOUT, _LEGACY_CHAT_ID_ABOUT)
 _IDENTITY_MARKERS = ("you're kai", "you are kai")
 
 
@@ -61,8 +88,9 @@ def plan_principal_policy_migration(content: str) -> PrincipalPolicyMigrationPla
     closed instead of silently rewriting operator-authored content.
     """
     migrated = content
-    if _LEGACY_IDENTITY_SECTION in migrated:
-        migrated = migrated.replace(_LEGACY_IDENTITY_SECTION, "", 1)
+    for legacy_identity in _LEGACY_IDENTITY_SECTIONS:
+        if legacy_identity in migrated:
+            migrated = migrated.replace(legacy_identity, "", 1)
 
     identity_scan = migrated.casefold().replace("\u2019", "'")
     if "## who you are" in identity_scan or any(marker in identity_scan for marker in _IDENTITY_MARKERS):
@@ -74,8 +102,9 @@ def plan_principal_policy_migration(content: str) -> PrincipalPolicyMigrationPla
 
     if migrated.startswith(_LEGACY_TITLE + "\n"):
         migrated = _NEUTRAL_TITLE + migrated[len(_LEGACY_TITLE) :]
-    if _LEGACY_ABOUT in migrated:
-        migrated = migrated.replace(_LEGACY_ABOUT, _NEUTRAL_ABOUT, 1)
+    for legacy_about in _LEGACY_ABOUT_SECTIONS:
+        if legacy_about in migrated:
+            migrated = migrated.replace(legacy_about, _NEUTRAL_ABOUT, 1)
 
     return PrincipalPolicyMigrationPlan(content=migrated, changed=migrated != content)
 
