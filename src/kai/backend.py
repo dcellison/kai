@@ -87,6 +87,7 @@ class ContextAssemblyObservation:
     workspace_reminder_delivered: bool
     workspace_reminder_revision: str | None = None
     principal_documents: PrincipalDocumentReport | None = None
+    ambient_context_discovery_enabled: bool | None = None
 
 
 type ContextAssemblyObserver = Callable[[ContextAssemblyObservation], Awaitable[None]]
@@ -1777,6 +1778,7 @@ async def assemble_turn_context(
     session_id: str | None = None,
     context_observer: ContextAssemblyObserver | None = None,
     principal_documents: PrincipalDocumentReport | None = None,
+    ambient_context_discovery_enabled: bool | None = None,
 ) -> str | list:
     """
     Assemble the per-turn prompt context for an interactive backend.
@@ -1827,6 +1829,10 @@ async def assemble_turn_context(
     inputs (fresh-session detection, workspace state, API context)
     and stay backend-owned. The backend builds those strings and
     passes them in. The helper owns only the ordering invariant.
+
+    ``ambient_context_discovery_enabled`` records whether the backend admits
+    ambient context files or equivalent native resources. ``None`` means the
+    adapter does not make that behavior observable to Kai.
 
     Returns the assembled prompt in the same type family as the
     input (`str | list`). Backends do their own protocol-specific
@@ -1938,6 +1944,7 @@ async def assemble_turn_context(
                     hashlib.sha256(workspace_reminder.encode("utf-8")).hexdigest() if workspace_reminder else None
                 ),
                 principal_documents=principal_documents,
+                ambient_context_discovery_enabled=ambient_context_discovery_enabled,
             )
         )
 

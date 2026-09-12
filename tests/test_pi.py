@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -211,6 +212,92 @@ class TestPiStartup:
 
         with pytest.raises(Exception, match="different model"):
             await backend._ensure_started()
+
+
+class TestPiCanonicalContext:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("foreign_workspace", [False, True], ids=["home", "foreign"])
+    async def test_fresh_private_lane_delivers_principal_policy_once(
+        self,
+        tmp_path,
+        monkeypatch,
+        foreign_workspace,
+    ):
+        data_dir = tmp_path / "data"
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "AGENTS.md").write_text("DURABLE OPERATOR RULE\nKeep this principal policy active.\n")
+        workspace = tmp_path / "project" if foreign_workspace else home
+        workspace.mkdir(exist_ok=True)
+        backend = make_backend(
+            tmp_path,
+            workspace=workspace,
+            home_workspace=home,
+            memory_enabled=True,
+        )
+        backend._proc = FakeProcess()
+        backend._session_id = "session-1"
+        backend._supports_image_input = True
+        backend._transport = FakeTransport(
+            [
+                {"id": "kai-prompt-1", "type": "response", "command": "prompt", "success": True},
+                {"type": "agent_settled"},
+                {"id": "kai-prompt-2", "type": "response", "command": "prompt", "success": True},
+                {"type": "agent_settled"},
+            ]
+        )
+        identity = SimpleNamespace(
+            principal_id="prn_" + "1" * 32,
+            channel_id="chn_" + "2" * 32,
+            agent_id="agt_" + "3" * 32,
+            runtime_profile_id="rtp_" + "4" * 32,
+            private_context=True,
+        )
+        assemblies: list[dict] = []
+
+        async def capture_assembly(prompt, **kwargs):
+            assemblies.append(kwargs)
+            return "\n\n".join(
+                part
+                for part in (
+                    kwargs["session_context"],
+                    kwargs["agent_definition_context"],
+                    str(prompt),
+                )
+                if part
+            )
+
+        monkeypatch.setattr("kai.pi.DATA_DIR", data_dir)
+        monkeypatch.setattr("kai.pi.ensure_user_context_files", lambda *a, **kw: None)
+        monkeypatch.setattr("kai.pi.assemble_turn_context", capture_assembly)
+        monkeypatch.setattr(backend, "_ensure_started", AsyncMock())
+
+        for marker in ("FIRST", "SECOND"):
+            backend.stage_canonical_agent_context(f"CUSTOM AGENT IDENTITY {marker}")
+            events = [
+                event
+                async for event in backend.send(
+                    f"request {marker}",
+                    runtime_identity=identity,
+                )
+            ]
+            assert events[-1].done is True
+
+        first, second = assemblies
+        assert first["session_context"].count("DURABLE OPERATOR RULE") == 1
+        assert second["session_context"] == ""
+        assert first["agent_definition_context"] == "CUSTOM AGENT IDENTITY FIRST"
+        assert second["agent_definition_context"] == "CUSTOM AGENT IDENTITY SECOND"
+        assert first["ambient_context_discovery_enabled"] is False
+        assert second["ambient_context_discovery_enabled"] is False
+        assert first["principal_documents"].policy.content == (
+            "DURABLE OPERATOR RULE\nKeep this principal policy active.\n"
+        )
+        assert bool(first["workspace_reminder"]) is foreign_workspace
+        sent_text = "\n".join(str(command["message"]) for command in backend._transport.sent)
+        assert sent_text.count("DURABLE OPERATOR RULE") == 1
+        assert "CUSTOM AGENT IDENTITY FIRST" in sent_text
+        assert "CUSTOM AGENT IDENTITY SECOND" in sent_text
 
 
 class TestPiTurns:

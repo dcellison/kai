@@ -639,8 +639,20 @@ def build_context_manifest_draft(
                 if observation.provider_dispatch_reached is False
                 else ContextSourceState.PROVIDER_CONTROLLED
             ),
-            "dispatch_not_reached" if observation.provider_dispatch_reached is False else "not_observable",
-            delivery_shape="provider_managed_unknown",
+            (
+                "dispatch_not_reached"
+                if observation.provider_dispatch_reached is False
+                else "ambient_discovery_disabled"
+                if observation.ambient_context_discovery_enabled is False
+                else "ambient_discovery_enabled"
+                if observation.ambient_context_discovery_enabled is True
+                else "not_observable"
+            ),
+            delivery_shape=(
+                "provider_managed_ambient_disabled"
+                if observation.ambient_context_discovery_enabled is False
+                else "provider_managed_unknown"
+            ),
         ),
     )
     return ContextManifestDraft(
