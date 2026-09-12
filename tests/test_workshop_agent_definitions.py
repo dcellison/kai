@@ -323,7 +323,8 @@ class TestAgentDefinitionRevisions:
             assert revision is not None
             rendered = render_agent_definition_context(revision)
             assert f"Definition revision: 2 ({revision.revision_id})" in rendered
-            assert "does not grant tools, credentials, data access, identity, or permission" in rendered
+            assert "supplies this agent's behavior and conversational identity only" in rendered
+            assert "does not grant tools, credentials, data access, principal identity" in rendered
         finally:
             await store.close()
 

@@ -5,7 +5,7 @@ Provides:
 1. AgentBackend ABC - the interface that pool.py programs against
 2. AgentResponse / StreamEvent - backend-agnostic protocol types
 3. ApiContext - groups webhook/service info for context injection
-4. Context injection functions - build the identity/memory/history/API
+4. Context injection functions - build the principal-policy/memory/history/API
    prefix that gets prepended to the first message of each session
 
 The ABC defines the minimal surface that SubprocessPool needs. Concrete
@@ -38,6 +38,7 @@ from kai.config import (
     validate_model_for_backend,
 )
 from kai.history import get_recent_history, history_search_directories
+from kai.principal_policy import plan_principal_policy_migration, record_principal_policy_migration
 from kai.prompt_utils import render_untrusted_json_block
 
 log = logging.getLogger(__name__)
@@ -680,7 +681,7 @@ def build_session_context(
 
     Args:
         workspace: The backend's current working directory.
-        home_workspace: Kai's home workspace (identity + memory source).
+        home_workspace: The principal's home workspace (policy + memory source).
         api: Webhook port, secret, and services info.
         workspace_config: Per-workspace config (for system_prompt).
         chat_id: Private compatibility runtime key used by transitional
@@ -688,7 +689,7 @@ def build_session_context(
             routing derive from the credential-bound canonical context.
         data_dir: Root data directory (memory, history, files live here).
         backend_name: Canonical backend identifier used to validate explicit
-            identity routing. Required whenever the active workspace differs
+            principal-policy routing. Required whenever the active workspace differs
             from the home workspace.
         memory_enabled: Operator-intent flag (Config.memory_enabled).
             Drives the memory subsystem marker emission and gates
@@ -705,31 +706,31 @@ def build_session_context(
     """
     parts: list[str] = []
 
-    # When in a foreign workspace, inject Kai's identity from home.
+    # When in a foreign workspace, inject the principal's neutral policy from home.
     # try/except guards against race (file deleted between exists()
     # and read_text()) and permission errors, matching the pattern
     # in get_workspace_system_prompt().
     if workspace != home_workspace:
         if backend_name is None:
-            raise ValueError("backend_name is required for foreign-workspace identity routing")
+            raise ValueError("backend_name is required for foreign-workspace principal-policy routing")
         if backend_name not in VALID_BACKENDS:
-            raise ValueError(f"Unknown backend for identity routing: {backend_name!r}")
+            raise ValueError(f"Unknown backend for principal-policy routing: {backend_name!r}")
         # AGENTS.md is the canonical content source for every backend. Claude's
         # native home-workspace surface is a thin import adapter, but injecting
         # that literal adapter text into a foreign-workspace prompt would not
         # cause Claude's file loader to expand it. Read (or ask the isolated
         # subprocess to read) the canonical source directly here.
-        identity_path = home_workspace / "AGENTS.md"
+        policy_path = home_workspace / "AGENTS.md"
         if defer_user_file_reads:
             parts.append(
-                "[Your core identity and instructions are stored at "
-                f"{identity_path}. Read this file before applying identity-specific instructions.]"
+                "[Your principal policy and instructions are stored at "
+                f"{policy_path}. Read this file before applying principal-specific instructions.]"
             )
         else:
             try:
-                identity = identity_path.read_text().strip()
-                if identity:
-                    parts.append(f"[Your core identity and instructions:]\n{identity}")
+                policy = policy_path.read_text().strip()
+                if policy:
+                    parts.append(f"[Your principal policy and instructions:]\n{policy}")
             except OSError:
                 pass
 
@@ -1297,7 +1298,7 @@ def _write_private_text_atomic(path: Path, content: str) -> None:
 
 
 def _ensure_development_identity_files(home: Path, backend_name: str) -> None:
-    """Seed the canonical identity and the selected backend's adapter.
+    """Seed the canonical principal policy and the selected backend's adapter.
 
     Protected installations use the stricter installer migration instead.
     This helper preserves the historical lazy bootstrap for development and
@@ -1312,39 +1313,48 @@ def _ensure_development_identity_files(home: Path, backend_name: str) -> None:
     template = PROJECT_ROOT / "templates" / "AGENTS.md"
 
     if claude_dir.is_symlink():
-        raise RuntimeError(f"Refusing symlinked Kai identity directory: {claude_dir}")
+        raise RuntimeError(f"Refusing symlinked Kai principal-policy directory: {claude_dir}")
     if claude_dir.exists() and not claude_dir.is_dir():
-        raise RuntimeError(f"Kai Claude identity path is not a directory: {claude_dir}")
+        raise RuntimeError(f"Kai Claude policy path is not a directory: {claude_dir}")
     if agents_dst.is_symlink() or claude_dst.is_symlink():
-        raise RuntimeError(f"Refusing symlinked Kai identity surface under {home}")
+        raise RuntimeError(f"Refusing symlinked Kai principal-policy surface under {home}")
     if agents_dst.exists() and not agents_dst.is_file():
-        raise RuntimeError(f"Kai identity path is not a regular file: {agents_dst}")
+        raise RuntimeError(f"Kai principal-policy path is not a regular file: {agents_dst}")
     if claude_dst.exists() and not claude_dst.is_file():
-        raise RuntimeError(f"Kai Claude adapter path is not a regular file: {claude_dst}")
+        raise RuntimeError(f"Kai Claude policy adapter path is not a regular file: {claude_dst}")
 
     claude_content = claude_dst.read_text() if claude_dst.is_file() else None
     if not agents_dst.exists():
         if claude_content is not None:
             if claude_content == _CLAUDE_IDENTITY_ADAPTER:
-                raise RuntimeError(f"Claude identity adapter exists but canonical identity is missing: {agents_dst}")
+                raise RuntimeError(
+                    f"Claude policy adapter exists but canonical principal policy is missing: {agents_dst}"
+                )
             _write_private_text_atomic(agents_dst, claude_content)
         elif template.is_file():
             shutil.copy2(template, agents_dst)
             _chmod_private_user_file(agents_dst)
         else:
-            _write_private_text_atomic(agents_dst, "# Identity\n")
+            _write_private_text_atomic(agents_dst, "# Principal Policy\n")
 
     agents_content = agents_dst.read_text()
-    if claude_content not in (None, _CLAUDE_IDENTITY_ADAPTER, agents_content):
+    original_agents_content = agents_content
+    if claude_content not in (None, _CLAUDE_IDENTITY_ADAPTER, original_agents_content):
         raise RuntimeError(
-            f"Conflicting customized identity files: {agents_dst} and {claude_dst}. Reconcile them before continuing."
+            f"Conflicting customized principal-policy files: {agents_dst} and {claude_dst}. "
+            "Reconcile them before continuing."
         )
+    policy_plan = plan_principal_policy_migration(original_agents_content)
+    if policy_plan.changed:
+        record_principal_policy_migration(home, original_agents_content, policy_plan.content)
+        _write_private_text_atomic(agents_dst, policy_plan.content)
+        agents_content = policy_plan.content
     if backend_name == "claude":
         claude_dir.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
         _chmod_private_user_dir(claude_dir)
         if claude_content != _CLAUDE_IDENTITY_ADAPTER:
             _write_private_text_atomic(claude_dst, _CLAUDE_IDENTITY_ADAPTER)
-    elif claude_content in (_CLAUDE_IDENTITY_ADAPTER, agents_content):
+    elif claude_content in (_CLAUDE_IDENTITY_ADAPTER, original_agents_content):
         claude_dst.unlink(missing_ok=True)
 
     _chmod_private_user_file(agents_dst)
@@ -1393,7 +1403,7 @@ def ensure_user_home(chat_id: int | None, data_dir: Path, *, backend_name: str) 
     os_user entries added after install still require a reinstall so
     install.py can apply the correct ownership.
 
-    The lazy path also seeds the canonical `AGENTS.md`. Claude receives a
+    The lazy path also seeds the canonical principal-policy `AGENTS.md`. Claude receives a
     `.claude/CLAUDE.md` adapter importing that file; other backends use
     `AGENTS.md` directly. Existing customized CLAUDE.md content is migrated
     into AGENTS.md before the adapter is written.

@@ -74,7 +74,15 @@ async def _eligible_authority(
         idempotency_key="standing-activate",
         expected_version=revised.state_version,
     )
-    host_policy = CollaborationHostPolicy(standing_participation=StandingParticipationHostPolicy(enabled=True))
+    # Keep general fixtures independent of wall-clock time. Quiet expiry has
+    # dedicated coverage below; a fixed historical _NOW plus the production
+    # three-day expiry otherwise turns unrelated tests into a calendar bomb.
+    host_policy = CollaborationHostPolicy(
+        standing_participation=StandingParticipationHostPolicy(
+            enabled=True,
+            quiet_expiry_seconds=0,
+        )
+    )
     authority = WorkshopCollaborationAuthority(store, host_policy=host_policy)
     owner_policy = WorkshopCollaborationPolicyService(
         store,

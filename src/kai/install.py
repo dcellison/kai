@@ -75,6 +75,12 @@ from kai.config import (
     validate_model_for_backend_policy,
 )
 from kai.named_access import replace_named_inherited_read_access, replace_named_read_access
+from kai.principal_policy import (
+    PrincipalPolicyMigrationPlan,
+    plan_principal_policy_migration,
+    record_principal_policy_migration,
+    validate_principal_policy_migration_record,
+)
 from kai.protected_config import ProtectedConfigError, validate_protected_file_metadata
 from kai.user_isolation import validate_protected_user_isolation
 from kai.workshop.agent_enablement import initial_kai_enablement_ids
@@ -157,7 +163,7 @@ _BACKEND_SELECTION_POLICY_VERSION = 1
 _CONF_VERSION = 1
 
 # Claude discovers instructions through CLAUDE.md, while Kai's canonical
-# managed identity is backend-neutral AGENTS.md. Keep the compatibility file
+# managed principal policy is backend-neutral AGENTS.md. Keep the compatibility file
 # deliberately content-free so there is only one editable source of truth.
 _CLAUDE_IDENTITY_ADAPTER = "@../AGENTS.md\n"
 
@@ -6003,7 +6009,7 @@ def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, st
         raise RuntimeError(f"Refusing non-directory Claude identity path: {claude_dir}")
     agents_path = user_home / "AGENTS.md"
     claude_path = claude_dir / "CLAUDE.md"
-    for label, path in (("canonical identity", agents_path), ("Claude adapter", claude_path)):
+    for label, path in (("canonical principal policy", agents_path), ("Claude policy adapter", claude_path)):
         if path.is_symlink():
             raise RuntimeError(f"Refusing symlinked {label} path: {path}")
         if path.exists() and not path.is_file():
@@ -6012,21 +6018,21 @@ def _managed_identity_state(user_home: Path) -> tuple[Path, Path, str | None, st
     agents_content = agents_path.read_text() if agents_path.is_file() else None
     claude_content = claude_path.read_text() if claude_path.is_file() else None
     if agents_content is None and claude_content == _CLAUDE_IDENTITY_ADAPTER:
-        raise RuntimeError(f"Claude identity adapter exists but canonical identity is missing: {agents_path}")
+        raise RuntimeError(f"Claude policy adapter exists but canonical principal policy is missing: {agents_path}")
     if (
         agents_content is not None
         and claude_content is not None
         and claude_content not in (_CLAUDE_IDENTITY_ADAPTER, agents_content)
     ):
         raise RuntimeError(
-            f"Conflicting customized identity files: {agents_path} and {claude_path}. "
+            f"Conflicting customized principal-policy files: {agents_path} and {claude_path}. "
             "Reconcile their content before re-running `make install`; neither file was changed."
         )
     return agents_path, claude_path, agents_content, claude_content
 
 
 def _write_managed_identity_atomic(path: Path, content: str) -> None:
-    """Atomically write a private managed identity file in its directory."""
+    """Atomically write a private managed principal-policy file in its directory."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
@@ -6608,8 +6614,8 @@ def _apply_migrate(
         if not user_dir_exists:
             print(f"  Created {user_dir}")
 
-    # -- Canonical per-user identity and backend-native adapters --
-    # AGENTS.md is the sole editable Kai-managed identity source. Claude's
+    # -- Canonical per-user principal policy and backend-native adapters --
+    # AGENTS.md is the sole editable Kai-managed principal-policy source. Claude's
     # native CLAUDE.md surface imports it; every other backend consumes
     # AGENTS.md directly. Existing customized CLAUDE.md content is migrated
     # losslessly before compatibility files are changed.
@@ -6624,7 +6630,17 @@ def _apply_migrate(
     # Validate every managed identity surface before changing any of them.
     # This prevents a conflict for a later user from leaving earlier users
     # partially migrated.
-    managed_identities: list[tuple[int, str | None, Path, Path, str | None, str | None]] = []
+    managed_identities: list[
+        tuple[
+            int,
+            str | None,
+            Path,
+            Path,
+            str | None,
+            str | None,
+            PrincipalPolicyMigrationPlan | None,
+        ]
+    ] = []
     for chat_id, _os_user in memory_owners:
         if chat_id is None:
             continue
@@ -6641,8 +6657,16 @@ def _apply_migrate(
         if dry_run and migration is not None and not user_home.exists() and migration[0].is_dir():
             inspection_home = migration[0]
         _source_agents, _source_claude, agents_content, claude_content = _managed_identity_state(inspection_home)
+        source_content = agents_content if agents_content is not None else claude_content
+        policy_plan = plan_principal_policy_migration(source_content) if source_content is not None else None
         agents_path = user_home / "AGENTS.md"
         claude_path = user_home / ".claude" / "CLAUDE.md"
+        if policy_plan is not None and policy_plan.changed and source_content is not None:
+            validate_principal_policy_migration_record(
+                agents_path.parent,
+                source_content,
+                policy_plan.content,
+            )
         managed_identities.append(
             (
                 chat_id,
@@ -6651,6 +6675,7 @@ def _apply_migrate(
                 claude_path,
                 agents_content,
                 claude_content,
+                policy_plan,
             )
         )
 
@@ -6661,7 +6686,15 @@ def _apply_migrate(
             dry_run=False,
         )
 
-    for chat_id, backend_name, agents_path, claude_path, agents_content, claude_content in managed_identities:
+    for (
+        chat_id,
+        backend_name,
+        agents_path,
+        claude_path,
+        agents_content,
+        claude_content,
+        policy_plan,
+    ) in managed_identities:
         if dry_run:
             if agents_content is None:
                 if claude_content is not None:
@@ -6670,6 +6703,11 @@ def _apply_migrate(
                     print(f"[DRY RUN] Would seed {agents_path} from {home_template}")
                 else:
                     print(f"[DRY RUN] Would seed {agents_path} with placeholder (template missing)")
+            if policy_plan is not None and policy_plan.changed:
+                print(
+                    f"[DRY RUN] Would migrate {agents_path} from Kai identity to neutral "
+                    "principal policy and retain a private backup/receipt"
+                )
 
             migration_source: Path | None = None
             if agents_content is not None:
@@ -6708,16 +6746,32 @@ def _apply_migrate(
             continue
 
         try:
+            migration_dir: Path | None = None
             if agents_content is None:
                 if claude_content is not None:
-                    _write_managed_identity_atomic(agents_path, claude_content)
-                    print(f"  Migrated identity {claude_path} -> {agents_path}")
+                    migrated_content = policy_plan.content if policy_plan is not None else claude_content
+                    if policy_plan is not None and policy_plan.changed:
+                        migration_dir = record_principal_policy_migration(
+                            agents_path.parent,
+                            claude_content,
+                            migrated_content,
+                        )
+                    _write_managed_identity_atomic(agents_path, migrated_content)
+                    print(f"  Migrated principal policy {claude_path} -> {agents_path}")
                 elif home_template_exists:
                     _write_managed_identity_atomic(agents_path, home_template.read_text())
                     print(f"  Seeded {agents_path} from AGENTS.md template")
                 else:
-                    _write_managed_identity_atomic(agents_path, "# Identity\n")
+                    _write_managed_identity_atomic(agents_path, "# Principal Policy\n")
                     print(f"  WARNING: {home_template} not found; wrote placeholder to {agents_path}")
+            elif policy_plan is not None and policy_plan.changed:
+                migration_dir = record_principal_policy_migration(
+                    agents_path.parent,
+                    agents_content,
+                    policy_plan.content,
+                )
+                _write_managed_identity_atomic(agents_path, policy_plan.content)
+                print(f"  Migrated {agents_path} from Kai identity to neutral principal policy")
 
             if (
                 home_template_exists
@@ -6756,6 +6810,9 @@ def _apply_migrate(
             os.chmod(agents_path, _PRIVATE_USER_FILE_MODE)
             uid, gid = per_user_ids.get(str(chat_id), (svc_uid, svc_gid))
             _set_ownership(agents_path, uid, gid, recursive=False)
+            if migration_dir is not None:
+                _set_ownership(migration_dir.parent, uid, gid, recursive=True)
+                _set_private_user_tree_modes(migration_dir.parent)
             if claude_path.parent.is_dir():
                 _set_ownership(claude_path.parent, uid, gid, recursive=True)
                 _set_private_user_tree_modes(claude_path.parent)

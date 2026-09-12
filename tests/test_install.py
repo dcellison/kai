@@ -9385,7 +9385,7 @@ class TestApplyMigrateManagedIdentity:
         (home / "AGENTS.md").write_text("# canonical\n")
         (home / ".claude" / "CLAUDE.md").write_text("# different\n")
 
-        with pytest.raises(RuntimeError, match="Conflicting customized identity files"):
+        with pytest.raises(RuntimeError, match="Conflicting customized principal-policy files"):
             self._apply(tmp_path, backend="claude")
 
         assert (home / "AGENTS.md").read_text() == "# canonical\n"
@@ -9398,7 +9398,7 @@ class TestApplyMigrateManagedIdentity:
         target.write_text("outside\n")
         (home / "AGENTS.md").symlink_to(target)
 
-        with pytest.raises(RuntimeError, match="Refusing symlinked canonical identity"):
+        with pytest.raises(RuntimeError, match="Refusing symlinked canonical principal policy"):
             self._apply(tmp_path, backend="codex")
 
         assert target.read_text() == "outside\n"
@@ -9441,8 +9441,46 @@ class TestApplyMigrateManagedIdentity:
             backend="codex",
             source_identity=None,
         )
-        assert (home / "AGENTS.md").read_text() == "# Identity\n"
+        assert (home / "AGENTS.md").read_text() == "# Principal Policy\n"
         assert not (home / ".claude" / "CLAUDE.md").exists()
+
+    def test_legacy_kai_identity_becomes_neutral_policy_with_private_backup(self, tmp_path):
+        home = tmp_path / "data" / "home" / "12345"
+        home.mkdir(parents=True)
+        legacy = (
+            "# Kai\n\n"
+            "## Who You Are\n\n"
+            "You're Kai, a personal AI assistant available through configured clients such as "
+            "Workshop and Telegram. You run locally on the operator's machine and have access to a "
+            "shell, the filesystem, the web, a scheduler, and a per-principal memory store.\n\n"
+            "## Operator Rules\n\nPreserve this exact custom rule.  \n"
+        )
+        (home / "AGENTS.md").write_text(legacy)
+
+        self._apply(
+            tmp_path,
+            backend="codex",
+            source_identity="# Principal Policy\n",
+        )
+
+        migrated = (home / "AGENTS.md").read_text()
+        assert migrated == "# Principal Policy\n\n## Operator Rules\n\nPreserve this exact custom rule.  \n"
+        artifacts = home / ".kai-migrations" / "principal-policy-v1"
+        assert (artifacts / "AGENTS.md.before").read_text() == legacy
+        assert '"migration": "principal-policy-v1"' in (artifacts / "receipt.json").read_text()
+
+    def test_customized_kai_identity_aborts_without_writes(self, tmp_path):
+        home = tmp_path / "data" / "home" / "12345"
+        home.mkdir(parents=True)
+        customized = "# Kai\n\n## Who You Are\n\nYou are Kai with operator-specific identity text.\n"
+        agents = home / "AGENTS.md"
+        agents.write_text(customized)
+
+        with pytest.raises(RuntimeError, match="customized or ambiguous Kai identity"):
+            self._apply(tmp_path, backend="codex")
+
+        assert agents.read_text() == customized
+        assert not (home / ".kai-migrations").exists()
 
     def test_replaces_legacy_internal_api_block_without_touching_custom_identity(
         self,
