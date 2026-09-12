@@ -59,10 +59,12 @@ class _Prepared:
         response: AgentResponse | None = None,
         wait: asyncio.Event | None = None,
         on_stream: Callable[[], Awaitable[None]] | None = None,
+        selection: RunExecutionSelection | None = None,
+        ambient_context_discovery_enabled: bool | None = None,
     ) -> None:
         self.run = run
         self.runtime_profile_id = _RUNTIME_PROFILE_ID
-        self.selection = RunExecutionSelection("codex", "gpt-5.6-sol")
+        self.selection = selection or RunExecutionSelection("codex", "gpt-5.6-sol")
         self.workspace = Path("/private/tmp/kai-workshop-test-workspace")
         self.home_workspace = self.workspace
         self.response = response or AgentResponse(success=True, text="Canonical answer")
@@ -77,6 +79,7 @@ class _Prepared:
         self.collaboration_invocations = []
         self.discarded_collaboration_invocations = []
         self.context_observer = None
+        self.ambient_context_discovery_enabled = ambient_context_discovery_enabled
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
@@ -134,6 +137,7 @@ class _Prepared:
                             "missing",
                         ),
                     ),
+                    ambient_context_discovery_enabled=self.ambient_context_discovery_enabled,
                 )
             )
         if self.on_stream is not None:
@@ -278,11 +282,17 @@ async def _accepted_group_pair(path: Path):
     return store, first.command.runs[0], second.command.runs[0]
 
 
-def _coordinator(store, preparation, *, lease_seconds: int = 60):
+def _coordinator(
+    store,
+    preparation,
+    *,
+    lease_seconds: int = 60,
+    registered_backend_ids: frozenset[str] = frozenset({"codex"}),
+):
     return WorkshopCanonicalExecutionCoordinator(
         store,
         preparation,
-        registered_backend_ids=frozenset({"codex"}),
+        registered_backend_ids=registered_backend_ids,
         clock=lambda: _NOW + timedelta(seconds=10),
         lease_duration=timedelta(seconds=lease_seconds),
         delivery_policy=TELEGRAM_DELIVERY_POLICY,
@@ -319,6 +329,8 @@ class TestCanonicalExecutionCoordinator:
             assert manifest.draft.sources[5].reason == "semantic_memory_enabled_or_shared"
             assert manifest.draft.sources[7].history_boundary == 0
             assert manifest.draft.sources[10].reason == "accepted_input"
+            assert manifest.draft.sources[11].reason == "not_observable"
+            assert manifest.draft.sources[11].delivery_shape == "provider_managed_unknown"
             assert prepared.collaboration_invocations[0].token not in repr(manifest)
             assert workshop_context_manifest_status(tmp_path / "kai.db").startswith(
                 "Workshop context manifests: active; post-cutover attempts=1, manifests=1, missing=0, malformed=0"
@@ -329,6 +341,37 @@ class TestCanonicalExecutionCoordinator:
             replayed = await WorkshopContextManifestService(store).load_run(run.run_id)
             assert len(replayed) == 1
             assert replayed[0].manifest_sha256 == digest
+        finally:
+            await store.close()
+
+    async def test_pi_manifest_records_disabled_ambient_context_discovery(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, run = await _accepted(tmp_path / "kai.db")
+        prepared = _Prepared(
+            run,
+            selection=RunExecutionSelection(
+                "pi",
+                "anthropic/claude-sonnet-4-6",
+                provider="anthropic",
+            ),
+            ambient_context_discovery_enabled=False,
+        )
+        coordinator = _coordinator(
+            store,
+            _Preparation(prepared),
+            registered_backend_ids=frozenset({"codex", "pi"}),
+        )
+        try:
+            result = await coordinator.execute(run.run_id)
+            assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+
+            manifests = await WorkshopContextManifestService(store).load_run(run.run_id)
+            assert len(manifests) == 1
+            provider_native = manifests[0].draft.sources[11]
+            assert provider_native.reason == "ambient_discovery_disabled"
+            assert provider_native.delivery_shape == "provider_managed_ambient_disabled"
         finally:
             await store.close()
 

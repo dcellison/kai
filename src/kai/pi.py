@@ -476,6 +476,7 @@ class PiBackend(AgentBackend):
             session_id=self._session_id,
             context_observer=context_observer,
             principal_documents=principal_documents,
+            ambient_context_discovery_enabled=False,
         )
         if isinstance(prompt, str):
             message_text = prompt
