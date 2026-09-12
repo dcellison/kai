@@ -8,7 +8,7 @@ Provides functionality to:
 
 The two-step workflow separates privilege levels:
     python -m kai install config   -- interactive Q&A, writes install.conf (no sudo)
-    sudo python -m kai install apply  -- reads install.conf, creates /opt layout (root)
+    make install                    -- reads install.conf, creates /opt layout (root)
     python -m kai install status   -- shows current state (no sudo)
 
 A protected installation puts read-only source in /opt/kai/ (root-owned) and
@@ -76,6 +76,7 @@ from kai.config import (
 )
 from kai.named_access import replace_named_inherited_read_access, replace_named_read_access
 from kai.principal_policy import (
+    PrincipalPolicyMigrationConflict,
     PrincipalPolicyMigrationPlan,
     plan_principal_policy_migration,
     record_principal_policy_migration,
@@ -3439,7 +3440,7 @@ def _cmd_config() -> None:
     os.chmod(INSTALL_CONF, 0o600)
     print(f"Configuration written to {INSTALL_CONF}")
     if deployment_mode == "protected":
-        print("Review the file, then run: sudo python -m kai install apply")
+        print("Review the file, then run: make install")
     else:
         # In single-user mode, also write the local .env so the
         # daemon can find runtime env config via `load_dotenv`
@@ -6657,10 +6658,14 @@ def _apply_migrate(
         if dry_run and migration is not None and not user_home.exists() and migration[0].is_dir():
             inspection_home = migration[0]
         _source_agents, _source_claude, agents_content, claude_content = _managed_identity_state(inspection_home)
-        source_content = agents_content if agents_content is not None else claude_content
-        policy_plan = plan_principal_policy_migration(source_content) if source_content is not None else None
         agents_path = user_home / "AGENTS.md"
         claude_path = user_home / ".claude" / "CLAUDE.md"
+        source_content = agents_content if agents_content is not None else claude_content
+        source_path = agents_path if agents_content is not None else claude_path
+        try:
+            policy_plan = plan_principal_policy_migration(source_content) if source_content is not None else None
+        except PrincipalPolicyMigrationConflict as exc:
+            raise PrincipalPolicyMigrationConflict(f"{source_path}: {exc}") from exc
         if policy_plan is not None and policy_plan.changed and source_content is not None:
             validate_principal_policy_migration_record(
                 agents_path.parent,
@@ -6936,7 +6941,7 @@ def _cmd_apply() -> None:
     """
     # -- Validate preconditions --
     if os.geteuid() != 0:
-        raise SystemExit("'install apply' must be run as root (try: sudo python -m kai install apply)")
+        raise SystemExit("'install apply' must be run as root (run it through: make install)")
 
     if not INSTALL_CONF.exists():
         raise SystemExit(f"{INSTALL_CONF} not found. Run 'python -m kai install config' first.")
@@ -7413,10 +7418,10 @@ def _cmd_apply() -> None:
             else:
                 Path(runtime_profiles_staging_path).unlink(missing_ok=True)
                 _strip_install_conf_keys("runtime_profiles_staging_path")
-    except Exception:
-        print("\nInstallation failed. See error above.")
+    except Exception as exc:
+        print(f"\nInstallation failed: {type(exc).__name__}: {exc}")
         print("The installation may be in a partial state.")
-        print("Fix the issue and re-run: sudo python -m kai install apply")
+        print("Fix the issue and re-run: make install")
         raise
     finally:
         # Always restart the service, even after failure. A partially updated

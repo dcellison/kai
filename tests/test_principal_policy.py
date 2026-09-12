@@ -38,6 +38,28 @@ _LEGACY_PREFIX = (
     "Workshop and Telegram. You run locally on the operator's machine and have access to a "
     "shell, the filesystem, the web, a scheduler, and a per-principal memory store.\n\n"
 )
+_LEGACY_TELEGRAM_PREFIX = (
+    "# Kai\n\n"
+    "## About This File\n\n"
+    "This file is the bootstrap template for Kai's backend-neutral identity. The installer "
+    "copies it to `<DATA_DIR>/home/<chat_id>/AGENTS.md` for every user in `users.yaml` at "
+    "install time; `backend.ensure_user_home` lazily seeds it for users added later in "
+    "development mode. Claude receives a thin `.claude/CLAUDE.md` import adapter; all managed "
+    "identity content remains here. Edit the per-user `AGENTS.md` to add operator-personal "
+    "content; the tracked template ships universal content only. Once customized, you can "
+    'delete this "About This File" section from the per-user copy.\n\n'
+    "## Who You Are\n\n"
+    "You're Kai, a personal AI assistant accessed via Telegram. You run locally on the "
+    "operator's machine and have access to a shell, the filesystem, the web, a scheduler, "
+    "and a per-user memory store.\n\n"
+)
+_LEGACY_OPERATOR_PREFIX = (
+    "# Kai\n\n"
+    "## Who You Are\n\n"
+    "You're Kai, an agentic AI coding assistant who lives in Telegram and runs locally on "
+    "your user's machine. You're not a butler or a service. You're a peer who happens to "
+    "have access to a shell, the filesystem, the web, and a scheduling API. Act like one.\n\n"
+)
 
 
 def test_tracked_policy_is_identity_neutral() -> None:
@@ -60,6 +82,33 @@ def test_known_legacy_prefix_migrates_without_changing_custom_rules() -> None:
     assert "## Who You Are" not in plan.content
     assert "backend-neutral principal policy" in plan.content
     assert plan.content.endswith(custom_rules)
+
+
+@pytest.mark.parametrize(
+    "legacy_prefix",
+    (_LEGACY_TELEGRAM_PREFIX, _LEGACY_OPERATOR_PREFIX),
+    ids=("tracked-telegram-era", "installed-operator-personality"),
+)
+def test_installed_legacy_identity_variants_migrate_losslessly(legacy_prefix: str) -> None:
+    custom_rules = "## Operator Rules\n\n- Preserve this exact text.  \n- Keep spacing.\n"
+
+    plan = plan_principal_policy_migration(legacy_prefix + custom_rules)
+
+    assert plan.changed is True
+    assert plan.content.startswith("# Principal Policy\n")
+    assert "## Who You Are" not in plan.content
+    assert "You're Kai" not in plan.content
+    assert "you are Kai" not in plan.content
+    assert plan.content.endswith(custom_rules)
+
+
+def test_tracked_telegram_about_text_becomes_current_principal_policy_text() -> None:
+    plan = plan_principal_policy_migration(_LEGACY_TELEGRAM_PREFIX)
+
+    assert "<chat_id>" not in plan.content
+    assert "every user in `users.yaml`" not in plan.content
+    assert "backend-neutral principal policy" in plan.content
+    assert "<principal_id>" in plan.content
 
 
 @pytest.mark.parametrize(
