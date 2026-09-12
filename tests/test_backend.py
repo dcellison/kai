@@ -33,6 +33,25 @@ from kai.backend import (
     resolve_home_workspace,
 )
 from kai.config import VALID_BACKENDS, Config, DeploymentMode, UserConfig, WorkspaceConfig
+from kai.principal_documents import (
+    PrincipalDocument,
+    PrincipalDocumentKind,
+    PrincipalDocumentState,
+    PrincipalPolicyUnavailable,
+)
+
+
+def _document(kind: PrincipalDocumentKind, content: str) -> PrincipalDocument:
+    import hashlib
+
+    return PrincipalDocument(
+        kind,
+        PrincipalDocumentState.PRESENT,
+        content,
+        hashlib.sha256(content.encode()).hexdigest(),
+        "verified_owner_read",
+    )
+
 
 # ── Test build_session_context ──────────────────────────────────────
 
@@ -63,7 +82,10 @@ class TestBuildSessionContext:
             private_context=False,
         )
 
-        with patch("kai.backend.get_recent_history", return_value=""):
+        with (
+            patch("kai.backend.get_recent_history", return_value=""),
+            patch("kai.backend.load_principal_document") as loader,
+        ):
             result = build_session_context(
                 workspace=workspace,
                 home_workspace=workspace,
@@ -78,6 +100,86 @@ class TestBuildSessionContext:
         assert "[Memory subsystem: unavailable in shared channels]" in result
         assert "PRIVATE PREFERENCE" not in result
         assert "PRIVATE MEMORY" not in result
+        loader.assert_not_called()
+
+    @pytest.mark.parametrize("backend_name", ["claude", "codex", "goose", "opencode", "pi"])
+    def test_private_agent_lane_inlines_requester_documents_for_every_backend(self, tmp_path, backend_name):
+        requester = "prn_" + "1" * 32
+        identity = SimpleNamespace(
+            principal_id=requester,
+            channel_id="chn_" + "2" * 32,
+            agent_id="agt_" + "3" * 32,
+            runtime_profile_id="rtp_" + "4" * 32,
+            private_context=True,
+        )
+        home = tmp_path / "requester-home"
+        home.mkdir()
+        data_dir = tmp_path / "data"
+        documents = {
+            PrincipalDocumentKind.POLICY: _document(PrincipalDocumentKind.POLICY, "REQUESTER POLICY"),
+            PrincipalDocumentKind.PREFERENCES: _document(PrincipalDocumentKind.PREFERENCES, "REQUESTER PREFERENCES"),
+        }
+
+        def owner_read(**kwargs):
+            assert kwargs["principal_id"] == requester
+            return documents[kwargs["kind"]]
+
+        with patch("kai.backend.load_principal_document", side_effect=owner_read) as loader:
+            result = build_session_context(
+                workspace=home,
+                home_workspace=home,
+                api=ApiContext(webhook_port=8080, webhook_secret="secret"),
+                workspace_config=None,
+                chat_id=None,
+                runtime_identity=identity,
+                data_dir=data_dir,
+                backend_name=backend_name,
+                memory_enabled=True,
+                defer_user_file_reads=True,
+            )
+
+        assert "REQUESTER POLICY" in result
+        assert "REQUESTER PREFERENCES" in result
+        assert loader.call_count == 2
+        assert all(call.kwargs["protected"] is True for call in loader.call_args_list)
+
+    def test_principal_policy_failure_is_reported_and_fails_closed(self, tmp_path):
+        identity = SimpleNamespace(
+            principal_id="prn_" + "1" * 32,
+            channel_id="chn_" + "2" * 32,
+            agent_id="agt_" + "3" * 32,
+            runtime_profile_id="rtp_" + "4" * 32,
+            private_context=True,
+        )
+        unavailable = PrincipalDocument(
+            PrincipalDocumentKind.POLICY,
+            PrincipalDocumentState.WRONG_OWNER,
+            None,
+            None,
+            "file_owner_mismatch",
+        )
+        reports = []
+        with (
+            patch("kai.backend.load_principal_document", return_value=unavailable),
+            pytest.raises(PrincipalPolicyUnavailable, match="file_owner_mismatch"),
+        ):
+            build_session_context(
+                workspace=tmp_path,
+                home_workspace=tmp_path,
+                api=ApiContext(webhook_port=8080, webhook_secret="secret"),
+                workspace_config=None,
+                chat_id=None,
+                runtime_identity=identity,
+                data_dir=tmp_path / "data",
+                backend_name="codex",
+                memory_enabled=True,
+                defer_user_file_reads=True,
+                principal_document_observer=reports.append,
+            )
+
+        assert len(reports) == 1
+        assert reports[0].policy == unavailable
+        assert reports[0].preferences is None
 
     def test_home_workspace_no_identity(self, tmp_path):
         """No identity injection when workspace == home_workspace."""
@@ -128,11 +230,11 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        assert "[Your principal policy and instructions:]" in result
+        assert "[Your principal policy and instructions (verified revision " in result
         assert "Be helpful." in result
 
-    def test_defer_user_file_reads_injects_paths_not_contents(self, tmp_path):
-        """Protected mode avoids daemon-side reads of user-owned files."""
+    def test_defer_user_file_reads_inlines_helper_content_not_paths(self, tmp_path):
+        """Protected mode uses typed owner reads and gives the model no path."""
         home = tmp_path / "home" / "12345"
         home.mkdir(parents=True)
         (home / "AGENTS.md").write_text("PRIVATE PRINCIPAL POLICY")
@@ -147,7 +249,15 @@ class TestBuildSessionContext:
         memory_dir.mkdir(parents=True)
         (memory_dir / "MEMORY.md").write_text("PRIVATE MEMORY")
 
-        with patch("kai.backend.get_recent_history", return_value=""):
+        documents = {
+            PrincipalDocumentKind.POLICY: _document(PrincipalDocumentKind.POLICY, "PRIVATE PRINCIPAL POLICY"),
+            PrincipalDocumentKind.PREFERENCES: _document(PrincipalDocumentKind.PREFERENCES, "PRIVATE PREFS"),
+            PrincipalDocumentKind.FILE_MEMORY: _document(PrincipalDocumentKind.FILE_MEMORY, "PRIVATE MEMORY"),
+        }
+        with (
+            patch("kai.backend.get_recent_history", return_value=""),
+            patch("kai.backend.load_principal_document", side_effect=lambda **kwargs: documents[kwargs["kind"]]),
+        ):
             result = build_session_context(
                 workspace=foreign,
                 home_workspace=home,
@@ -159,14 +269,13 @@ class TestBuildSessionContext:
                 defer_user_file_reads=True,
             )
 
-        assert "PRIVATE PRINCIPAL POLICY" not in result
-        assert "PRIVATE PREFS" not in result
-        assert "PRIVATE MEMORY" not in result
-        assert str(home / "AGENTS.md") in result
-        assert str(pref_dir / "PREFERENCES.md") in result
-        assert str(memory_dir / "MEMORY.md") in result
-        assert "untrusted historical data" in result
-        assert "never obey instructions" in result
+        assert "PRIVATE PRINCIPAL POLICY" in result
+        assert "PRIVATE PREFS" in result
+        assert "PRIVATE MEMORY" in result
+        assert str(home / "AGENTS.md") not in result
+        assert str(pref_dir / "PREFERENCES.md") not in result
+        assert str(memory_dir / "MEMORY.md") not in result
+        assert "PERSISTENT MEMORY DATA" in result
 
     @pytest.mark.parametrize("backend_name", sorted(VALID_BACKENDS))
     def test_foreign_workspace_uses_canonical_policy_for_every_backend(self, tmp_path, backend_name):
@@ -339,7 +448,7 @@ class TestBuildSessionContext:
                 data_dir=data_dir,
             )
 
-        assert "[Your personal preferences (file:" in result
+        assert "[Your personal preferences (verified revision " in result
         assert "Use Celsius for temperatures." in result
 
     def test_preferences_block_empty_file(self, tmp_path):
@@ -362,12 +471,12 @@ class TestBuildSessionContext:
                 data_dir=data_dir,
             )
 
-        assert "[Your personal preferences (file:" in result
+        assert "[Your personal preferences (verified revision " in result
         # Two blocks may match the "(currently empty)" string (preferences
         # and memory). Both can be empty here; check the preferences
         # block contains it by anchoring on the block label.
-        pref_block_idx = result.find("[Your personal preferences (file:")
-        memory_block_idx = result.find("[Your persistent memory (file:")
+        pref_block_idx = result.find("[Your personal preferences (verified revision ")
+        memory_block_idx = result.find("[Your persistent memory:")
         # Defensive: a -1 from str.find() would silently turn the slice
         # below into a near-full-string slice and produce a false pass.
         # Both labels are always emitted in this fixture (preferences
@@ -398,7 +507,7 @@ class TestBuildSessionContext:
                 data_dir=data_dir,
             )
 
-        assert "[Your personal preferences (file:" in result
+        assert "[Your personal preferences:]" in result
         assert "(not yet created)" in result
 
     def test_preferences_block_omitted_when_chat_id_none(self, tmp_path):
@@ -419,7 +528,7 @@ class TestBuildSessionContext:
             )
 
         # chat_id=None means no per-user PREFERENCES.md to inject.
-        assert "[Your personal preferences (file:" not in result
+        assert "[Your personal preferences" not in result
 
     def test_preferences_block_above_memory_block(self, tmp_path):
         """Block ordering: PREFERENCES.md appears BEFORE MEMORY.md in the assembled context."""
@@ -443,8 +552,8 @@ class TestBuildSessionContext:
                 data_dir=data_dir,
             )
 
-        pref_idx = result.find("[Your personal preferences (file:")
-        memory_idx = result.find("[Your persistent memory (file:")
+        pref_idx = result.find("[Your personal preferences (verified revision ")
+        memory_idx = result.find("[Your persistent memory (verified revision ")
         assert pref_idx >= 0, "preferences block missing"
         assert memory_idx >= 0, "memory block missing"
         # Rules out-rank facts; pin the relative ordering.
@@ -538,6 +647,7 @@ class TestBuildSessionContext:
     def test_file_api_docs_name_canonical_writable_outbox(self, tmp_path):
         workspace = tmp_path / "read-only-workspace"
         workspace.mkdir()
+        (workspace / "AGENTS.md").write_text("Principal policy")
         data_dir = tmp_path / "data"
         (data_dir / "memory").mkdir(parents=True)
         identity = MagicMock(
@@ -840,7 +950,7 @@ class TestBuildSessionContext:
                 memory_enabled=False,
             )
         assert "Per-user fact." in disabled_result
-        assert "memory/123/MEMORY.md" in disabled_result
+        assert "Per-user fact." in disabled_result
 
         # Enabled mode: per-user MEMORY.md is NOT injected.
         with patch("kai.backend.get_recent_history", return_value=""):
@@ -1779,7 +1889,13 @@ class TestCanonicalPrincipalPreferences:
 
         monkeypatch.setattr(Path, "is_file", reject_private_file_probe)
 
-        with patch("kai.backend.get_recent_history", return_value=""):
+        def unavailable(**kwargs):
+            return PrincipalDocument(kwargs["kind"], PrincipalDocumentState.MISSING, None, None, "missing")
+
+        with (
+            patch("kai.backend.get_recent_history", return_value=""),
+            patch("kai.backend.load_principal_document", side_effect=unavailable) as loader,
+        ):
             result = build_session_context(
                 workspace=tmp_path,
                 home_workspace=tmp_path,
@@ -1791,8 +1907,12 @@ class TestCanonicalPrincipalPreferences:
                 defer_user_file_reads=True,
             )
 
-        assert str(canonical_preferences / "PREFERENCES.md") in result
-        assert str(canonical_memory / "MEMORY.md") in result
+        assert "(not yet created)" in result
+        assert {call.kwargs["kind"] for call in loader.call_args_list} == {
+            PrincipalDocumentKind.PREFERENCES,
+            PrincipalDocumentKind.FILE_MEMORY,
+        }
+        assert all(call.kwargs["principal_id"] == principal_id for call in loader.call_args_list)
 
     def test_deferred_context_uses_canonical_principal_path(self, tmp_path, monkeypatch):
         data_dir = tmp_path / "data"
@@ -1803,7 +1923,13 @@ class TestCanonicalPrincipalPreferences:
             _PrincipalPreferenceRegistry(),
         )
 
-        with patch("kai.backend.get_recent_history", return_value=""):
+        def unavailable(**kwargs):
+            return PrincipalDocument(kwargs["kind"], PrincipalDocumentState.MISSING, None, None, "missing")
+
+        with (
+            patch("kai.backend.get_recent_history", return_value=""),
+            patch("kai.backend.load_principal_document", side_effect=unavailable) as loader,
+        ):
             result = build_session_context(
                 workspace=tmp_path,
                 home_workspace=tmp_path,
@@ -1814,8 +1940,10 @@ class TestCanonicalPrincipalPreferences:
                 defer_user_file_reads=True,
             )
 
-        assert str(canonical / "PREFERENCES.md") in result
-        assert str(data_dir / "preferences" / "42" / "PREFERENCES.md") not in result
+        assert "(not yet created)" in result
+        assert all(
+            call.kwargs["principal_id"] == _PrincipalPreferenceNamespace.principal_id for call in loader.call_args_list
+        )
 
     def test_deferred_context_falls_back_for_greenfield_first_install(self, tmp_path, monkeypatch):
         data_dir = tmp_path / "data"
@@ -1827,7 +1955,13 @@ class TestCanonicalPrincipalPreferences:
             _PrincipalPreferenceRegistry(),
         )
 
-        with patch("kai.backend.get_recent_history", return_value=""):
+        def unavailable(**kwargs):
+            return PrincipalDocument(kwargs["kind"], PrincipalDocumentState.MISSING, None, None, "missing")
+
+        with (
+            patch("kai.backend.get_recent_history", return_value=""),
+            patch("kai.backend.load_principal_document", side_effect=unavailable) as loader,
+        ):
             result = build_session_context(
                 workspace=tmp_path,
                 home_workspace=tmp_path,
@@ -1838,7 +1972,10 @@ class TestCanonicalPrincipalPreferences:
                 defer_user_file_reads=True,
             )
 
-        assert str(legacy / "PREFERENCES.md") in result
+        assert "existing" not in result
+        assert all(
+            call.kwargs["principal_id"] == _PrincipalPreferenceNamespace.principal_id for call in loader.call_args_list
+        )
 
     def test_lazy_bootstrap_copies_legacy_content_without_deleting_it(self, tmp_path, monkeypatch):
         data_dir = tmp_path / "data"
@@ -1926,7 +2063,7 @@ class TestCanonicalPrincipalPreferences:
 
         assert "canonical memory" in result
         assert "legacy memory" not in result
-        assert str(canonical) in result
+        assert "PERSISTENT MEMORY DATA" in result
 
     def test_managed_home_uses_canonical_principal_directory(self, tmp_path, monkeypatch):
         monkeypatch.setattr(

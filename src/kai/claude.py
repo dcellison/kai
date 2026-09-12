@@ -43,12 +43,14 @@ from kai.backend import (
     build_foreign_workspace_reminder,
     build_session_context,
     ensure_user_context_files,
+    observe_context_preparation_failure,
     sanitize_agent_environment,
     scrub_trace_text,
     trace_secret_values,
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
+from kai.principal_documents import PrincipalDocumentReport, PrincipalPolicyUnavailable
 from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
@@ -824,26 +826,41 @@ class ClaudeCodeBackend(AgentBackend):
         # Protected installs skip service-side file mutation here because
         # make install has already provisioned the user-owned files.
         session_ctx = ""
+        context_observer = self.consume_context_assembly_observer()
+        principal_documents: PrincipalDocumentReport | None = None
+
+        def capture_principal_documents(report: PrincipalDocumentReport) -> None:
+            nonlocal principal_documents
+            principal_documents = report
+
         if self._fresh_session:
-            self._fresh_session = False
             ensure_user_context_files(
                 chat_id,
                 DATA_DIR,
                 defer_user_file_reads=self.defer_user_file_reads,
             )
-            session_ctx = build_session_context(
-                workspace=self.workspace,
-                home_workspace=self.home_workspace,
-                api=self._api_context,
-                workspace_config=self.workspace_config,
-                chat_id=chat_id,
-                runtime_identity=runtime_identity,
-                data_dir=DATA_DIR,
-                backend_name=self.backend_name,
-                memory_enabled=self.memory_enabled,
-                defer_user_file_reads=self.defer_user_file_reads,
-                canonical_history=self.consume_canonical_history(),
-            )
+            try:
+                session_ctx = build_session_context(
+                    workspace=self.workspace,
+                    home_workspace=self.home_workspace,
+                    api=self._api_context,
+                    workspace_config=self.workspace_config,
+                    chat_id=chat_id,
+                    runtime_identity=runtime_identity,
+                    data_dir=DATA_DIR,
+                    backend_name=self.backend_name,
+                    memory_enabled=self.memory_enabled,
+                    defer_user_file_reads=self.defer_user_file_reads,
+                    canonical_history=self.consume_canonical_history(),
+                    principal_document_observer=capture_principal_documents,
+                )
+            except PrincipalPolicyUnavailable:
+                await observe_context_preparation_failure(
+                    context_observer,
+                    principal_documents or PrincipalDocumentReport(),
+                )
+                raise
+            self._fresh_session = False
 
         # Foreign-workspace reminder is built fresh per turn (its
         # value depends on the current workspace, which the operator
@@ -865,7 +882,8 @@ class ClaudeCodeBackend(AgentBackend):
             workspace=self.workspace,
             backend_name=self.backend_name,
             job_type="interactive",
-            context_observer=self.consume_context_assembly_observer(),
+            context_observer=context_observer,
+            principal_documents=principal_documents,
         )
 
         content = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]

@@ -97,11 +97,10 @@ class _InvariantResult:
 # untrusted JSON Lines envelope). These are the load-bearing strings the
 # harness asserts on.
 #
-# `_MARKER_PERSISTENT_MEMORY` matches the `[Your persistent memory
-# (file: ...):]` block that build_session_context emits ONLY in
-# disabled mode. The match is a leading-substring check rather than
-# a full-line match so the test does not have to predict the
-# tmp-path part of the format string.
+# `_MARKER_PERSISTENT_MEMORY` matches the path-free `[Your persistent memory
+# (verified revision ...):]` block that build_session_context emits ONLY in
+# disabled mode. The match is a leading-substring check because the revision
+# digest is content-derived.
 #
 # `_MARKER_RELEVANT_MEMORIES` matches the recall block's randomized
 # boundary prefix. The generic JSON Lines label is shared with the
@@ -109,7 +108,7 @@ class _InvariantResult:
 # the two mode-switch surfaces.
 _MARKER_DISABLED = "[Memory subsystem: disabled]"
 _MARKER_ENABLED = "[Memory subsystem: enabled]"
-_MARKER_PERSISTENT_MEMORY = "[Your persistent memory (file:"
+_MARKER_PERSISTENT_MEMORY = "[Your persistent memory (verified revision "
 _MARKER_RELEVANT_MEMORIES = "--- BEGIN MEMORY DATA "
 
 

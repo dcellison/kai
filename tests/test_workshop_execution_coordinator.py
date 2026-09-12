@@ -11,6 +11,12 @@ import pytest
 
 from kai.agent_failure import AgentFailureKind
 from kai.backend import AgentResponse, ContextAssemblyObservation, StreamEvent, TraceEntry
+from kai.principal_documents import (
+    PrincipalDocument,
+    PrincipalDocumentKind,
+    PrincipalDocumentReport,
+    PrincipalDocumentState,
+)
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.context_manifests import CONTEXT_SOURCE_ORDER, WorkshopContextManifestService
@@ -112,6 +118,22 @@ class _Prepared:
                     semantic_recall_reason="no_matches",
                     semantic_recall_revision=None,
                     workspace_reminder_delivered=False,
+                    principal_documents=PrincipalDocumentReport(
+                        policy=PrincipalDocument(
+                            PrincipalDocumentKind.POLICY,
+                            PrincipalDocumentState.PRESENT,
+                            "redacted",
+                            "1" * 64,
+                            "verified_owner_read",
+                        ),
+                        preferences=PrincipalDocument(
+                            PrincipalDocumentKind.PREFERENCES,
+                            PrincipalDocumentState.MISSING,
+                            None,
+                            None,
+                            "missing",
+                        ),
+                    ),
                 )
             )
         if self.on_stream is not None:
@@ -291,6 +313,10 @@ class TestCanonicalExecutionCoordinator:
             assert manifest.draft.workspace_kind == "home"
             assert manifest.draft.selection == prepared.selection
             assert manifest.draft.sources[2].reason == "run_bound_revision"
+            assert manifest.draft.sources[1].delivery_shape == "inline_verified_document"
+            assert manifest.draft.sources[1].revision == "1" * 64
+            assert manifest.draft.sources[4].reason == "missing"
+            assert manifest.draft.sources[5].reason == "semantic_memory_enabled_or_shared"
             assert manifest.draft.sources[7].history_boundary == 0
             assert manifest.draft.sources[10].reason == "accepted_input"
             assert prepared.collaboration_invocations[0].token not in repr(manifest)
