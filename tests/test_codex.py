@@ -1177,7 +1177,9 @@ class TestContextInjection:
         assert prompt_text.count(USER_MESSAGE_MARKER) == 1
         # All three other context blocks fired.
         assert memory_block in prompt_text
+        assert "This is the user's current message" in prompt_text
         assert "Respond ONLY" in prompt_text  # foreign-workspace reminder
+        assert "Telegram" not in prompt_text
         assert "[CONTEXT]" in prompt_text  # session_ctx
 
         marker_idx = prompt_text.index(USER_MESSAGE_MARKER)
