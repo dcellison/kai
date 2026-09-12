@@ -4099,8 +4099,9 @@ export async function loadEffectiveAgentRuntime(
     !isRecord(payload.timeout_seconds) ||
     !Number.isSafeInteger(payload.timeout_seconds.value) ||
     typeof payload.timeout_seconds.source !== "string" ||
-    typeof payload.workspace !== "string" ||
-    typeof payload.workspace_revision !== "string" ||
+    !["owner", "neutral"].includes(String(payload.workspace_mode)) ||
+    !(typeof payload.workspace === "string" || payload.workspace === null) ||
+    !(typeof payload.workspace_revision === "string" || payload.workspace_revision === null) ||
     !Array.isArray(payload.workspaces)
   ) {
     throw new Error("Kai returned an unsupported effective agent runtime.");
@@ -4122,6 +4123,18 @@ export async function loadEffectiveAgentRuntime(
       path: rawWorkspace.path,
     };
   });
+  const workspaceMode = payload.workspace_mode as "owner" | "neutral";
+  if (
+    (workspaceMode === "neutral" &&
+      (payload.workspace !== null ||
+        payload.workspace_revision !== null ||
+        workspaces.length !== 0)) ||
+    (workspaceMode === "owner" &&
+      (typeof payload.workspace !== "string" ||
+        typeof payload.workspace_revision !== "string"))
+  ) {
+    throw new Error("Kai returned an inconsistent effective workspace.");
+  }
   return {
     agentHandle: payload.agent_handle,
     agentId: payload.agent_id,
@@ -4137,6 +4150,7 @@ export async function loadEffectiveAgentRuntime(
       source: payload.timeout_seconds.source,
       value: payload.timeout_seconds.value as number,
     },
+    workspaceMode,
     workspace: payload.workspace,
     workspaceRevision: payload.workspace_revision,
     workspaces,

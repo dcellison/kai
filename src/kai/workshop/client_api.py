@@ -3383,12 +3383,15 @@ async def _handle_effective_agent_runtime(
             sponsor_principal_id,
             runtime_profile_id,
         )
-        workspace_authority = service.authority_for_principal_channel(
-            principal_id,
-            channel_id,
-        )
         runtime_snapshot = await service.inspect(runtime_authority)
-        workspace_snapshot = await service.inspect(workspace_authority)
+        owns_agent = principal_id == sponsor_principal_id
+        workspace_snapshot = None
+        if owns_agent:
+            workspace_authority = service.authority_for_principal_channel(
+                principal_id,
+                channel_id,
+            )
+            workspace_snapshot = await service.inspect(workspace_authority)
     except (TypeError, ValueError, WorkshopSettingsWorkspaceAccessDenied):
         return _error_response(
             status=409,
@@ -3404,7 +3407,7 @@ async def _handle_effective_agent_runtime(
             "agent_handle": str(row[2]),
             "sponsor_principal_id": str(sponsor_principal_id),
             "sponsor_display_name": str(row[5]),
-            "can_manage_runtime": principal_id == sponsor_principal_id,
+            "can_manage_runtime": owns_agent,
             "backend": runtime_snapshot.backend,
             "provider": runtime_snapshot.provider,
             "model": {
@@ -3415,8 +3418,9 @@ async def _handle_effective_agent_runtime(
                 "value": runtime_snapshot.timeout_seconds.value,
                 "source": runtime_snapshot.timeout_seconds.source,
             },
-            "workspace": workspace_snapshot.workspace,
-            "workspace_revision": workspace_snapshot.revision,
+            "workspace_mode": "owner" if owns_agent else "neutral",
+            "workspace": workspace_snapshot.workspace if workspace_snapshot is not None else None,
+            "workspace_revision": workspace_snapshot.revision if workspace_snapshot is not None else None,
             "workspaces": [
                 {
                     "path": option.path,
@@ -3424,7 +3428,7 @@ async def _handle_effective_agent_runtime(
                     "current": option.current,
                     "home": option.home,
                 }
-                for option in workspace_snapshot.workspaces
+                for option in (workspace_snapshot.workspaces if workspace_snapshot is not None else ())
             ],
         },
         status=200,

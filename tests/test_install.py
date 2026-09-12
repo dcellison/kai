@@ -68,6 +68,7 @@ from kai.install import (
     _generate_principal_memory_reader,
     _generate_principal_preference_manager,
     _generate_principal_workspace_provisioner,
+    _generate_sponsored_workspace_provisioner,
     _generate_sudoers,
     _generate_systemd_unit,
     _generate_users_yaml,
@@ -460,6 +461,12 @@ class TestGenerateSudoers:
         assert rule not in _generate_sudoers("kai")
         assert rule not in _generate_sudoers("kai", ["kai"])
 
+    def test_sponsored_workspace_provisioner_rule_requires_foreign_users(self):
+        rule = "kai ALL=(root) NOPASSWD: /etc/kai/provision-sponsored-workspace *"
+        assert rule in _generate_sudoers("kai", ["daniel"])
+        assert rule not in _generate_sudoers("kai")
+        assert rule not in _generate_sudoers("kai", ["kai"])
+
     def test_principal_document_reader_rule_is_explicitly_gated(self):
         rule = "kai ALL=(root) NOPASSWD: /etc/kai/read-principal-document *"
         assert rule in _generate_sudoers("kai", principal_document_reader=True)
@@ -521,6 +528,21 @@ class TestGeneratePrincipalWorkspaceProvisioner:
         assert "os.execve(" in script
         assert "environ" not in script
         compile(script, "<workspace-provisioner>", "exec")
+
+
+class TestGenerateSponsoredWorkspaceProvisioner:
+    def test_wrapper_pins_interpreter_module_and_data_root(self):
+        script = _generate_sponsored_workspace_provisioner(
+            "/var/lib/kai",
+            "/opt/kai",
+        )
+        assert script.startswith("#!/usr/bin/python3\n")
+        assert "PYTHON = '/opt/kai/venv/bin/python'" in script
+        assert "DATA_DIR = '/var/lib/kai'" in script
+        assert '"kai.workshop.sponsored_workspaces"' in script
+        assert "os.execve(" in script
+        assert "environ" not in script
+        compile(script, "<sponsored-workspace-provisioner>", "exec")
 
     def test_paths_are_baked_in_as_literals(self):
         script = _generate_principal_preference_manager(

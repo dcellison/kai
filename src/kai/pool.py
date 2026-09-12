@@ -43,6 +43,7 @@ from kai.config import (
     get_effective_provider,
     get_model_for,
     get_user_backend_and_provider,
+    resolve_claude_user,
     resolve_user_model,
     validate_model_for_backend,
     validate_model_for_backend_policy,
@@ -552,18 +553,13 @@ class SubprocessPool:
         self,
         requester: WorkshopInternalAPIExecutionContext,
     ) -> tuple[_CanonicalRuntimeLaneKey, ...]:
-        """Find sponsored private runtimes that consume one requester's workspace."""
-        return tuple(
-            key
-            for key, context in self._contexts_by_runtime.items()
-            if isinstance(key, _CanonicalRuntimeLaneKey)
-            and context.private_context
-            and context.principal_id == requester.principal_id
-            and context.channel_id == requester.channel_id
-            and context.agent_id == requester.agent_id
-            and context.runtime_profile_id != requester.runtime_profile_id
-            and context.effective_workspace_runtime_profile_id == requester.runtime_profile_id
-        )
+        """Return sponsored lanes coupled to requester workspace state.
+
+        Cross-owner private lanes now use neutral Kai-managed workspaces, so
+        they are deliberately absent.  Keep the helper as the single policy
+        point for callers that invalidate requester-owned workspace state.
+        """
+        return ()
 
     def requester_workspace_is_in_flight(
         self,
@@ -676,6 +672,47 @@ class SubprocessPool:
         return self._runtime_profiles.resolve(
             context.effective_workspace_runtime_profile_id,
         )
+
+    @staticmethod
+    def _uses_neutral_sponsored_workspace(
+        context: WorkshopInternalAPIExecutionContext | None,
+    ) -> bool:
+        """Return whether filesystem authority must exclude both principals."""
+        return bool(
+            context is not None
+            and context.private_context
+            and context.runtime_owner_principal_id != context.principal_id
+        )
+
+    def _neutral_sponsored_workspace(self, runtime: RuntimeSelector) -> Path | None:
+        """Provision the opaque workspace for one cross-owner private lane."""
+        runtime_key, _legacy_key, profile = self._resolve_runtime(runtime)
+        context = self._runtime_identity(runtime, runtime_key)
+        if profile is None or not self._uses_neutral_sponsored_workspace(context):
+            return None
+        assert context is not None
+        from kai.workshop.sponsored_workspaces import (
+            provision_sponsored_workspace,
+            provision_via_helper,
+        )
+
+        if self._config.protected_install and resolve_claude_user(profile.os_user) is not None:
+            result = provision_via_helper(
+                requester_principal_id=context.principal_id,
+                channel_id=context.channel_id,
+                agent_id=context.agent_id,
+                runtime_profile_id=context.runtime_profile_id,
+            )
+        else:
+            result = provision_sponsored_workspace(
+                Path(self._config.session_db_path).parent,
+                requester_principal_id=context.principal_id,
+                channel_id=context.channel_id,
+                agent_id=context.agent_id,
+                runtime_profile_id=context.runtime_profile_id,
+                os_user=None,
+            )
+        return Path(result.path)
 
     def _workspace_config_for_runtime(
         self,
@@ -901,7 +938,7 @@ class SubprocessPool:
         # helper: users.yaml override first, else DATA_DIR/home/<principal_id>/.
         # The old global home field on Config was removed by #353 because
         # it pointed every unconfigured user at a shared directory.
-        workspace = self.get_home_workspace(runtime)
+        workspace = self._neutral_sponsored_workspace(runtime) or self.get_home_workspace(runtime)
 
         ws_config = self._workspace_config_for_runtime(
             runtime,
@@ -998,7 +1035,17 @@ class SubprocessPool:
         # non-home default. The redundant stat/mkdir inside
         # ensure_user_home is cheap (idempotent mkdir + chmod); the
         # clarity of two separate resolution calls is worth it.
-        home_ws = self.get_home_workspace(runtime)
+        # Cross-owner private lanes deliberately have no shared filesystem
+        # authority.  Treat the provisioned neutral directory as both the
+        # working directory and backend home so requester-private paths never
+        # reach provider context or backend reminder logic.  Principal policy,
+        # preferences, and file memory are still loaded by principal ID through
+        # the protected document reader below.
+        home_ws = (
+            workspace
+            if self._uses_neutral_sponsored_workspace(self._runtime_identity(runtime, runtime_key))
+            else self.get_home_workspace(runtime)
+        )
 
         # os_user for sudo -u isolation. None = run as bot user.
         # Resolved here (rather than inside each branch) because all
@@ -1370,6 +1417,12 @@ class SubprocessPool:
         otherwise the user's home workspace).
         """
         runtime_key, chat_id, profile = self._resolve_runtime(runtime)
+        neutral_workspace = self._neutral_sponsored_workspace(runtime)
+        if neutral_workspace is not None:
+            self._pending_workspace_restore.discard(runtime_key)
+            if instance.workspace.resolve() != neutral_workspace.resolve():
+                await instance.change_workspace(neutral_workspace, workspace_config=None)
+            return neutral_workspace
         namespace = self._canonical_workspace_namespace(runtime)
         if profile is not None:
             assert namespace is not None
@@ -1764,6 +1817,13 @@ class SubprocessPool:
         already finalized the workspace half.
         """
         runtime_key, chat_id, _profile = self._resolve_runtime(runtime)
+        neutral_workspace = self._neutral_sponsored_workspace(runtime)
+        if neutral_workspace is not None:
+            instance = self._pool.get(runtime_key)
+            if instance is not None and instance.workspace.resolve() != neutral_workspace.resolve():
+                await instance.change_workspace(neutral_workspace, workspace_config=None)
+            self._pending_workspace_restore.discard(runtime_key)
+            return neutral_workspace
         namespace = self._canonical_workspace_namespace(runtime)
         instance = self._pool.get(runtime_key)
         if instance is not None and runtime_key not in self._pending_workspace_restore:

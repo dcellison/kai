@@ -155,6 +155,7 @@ PRINCIPAL_MEMORY_READER = Path("/etc/kai/read-principal-memory")
 PRINCIPAL_DOCUMENT_READER = Path("/etc/kai/read-principal-document")
 PRINCIPAL_PREFERENCE_MANAGER = Path("/etc/kai/manage-principal-preferences")
 PRINCIPAL_WORKSPACE_PROVISIONER = Path("/etc/kai/provision-principal-workspace")
+SPONSORED_WORKSPACE_PROVISIONER = Path("/etc/kai/provision-sponsored-workspace")
 
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
@@ -4573,6 +4574,45 @@ def _generate_principal_workspace_provisioner(install_dir: str = "/opt/kai") -> 
     """)
 
 
+def _generate_sponsored_workspace_provisioner(
+    data_dir: str,
+    install_dir: str = "/opt/kai",
+) -> str:
+    """Generate the fixed root wrapper for neutral cross-owner workspaces."""
+    python = repr(str(Path(install_dir) / "venv" / "bin" / "python"))
+    fixed_data_dir = repr(str(Path(data_dir)))
+    return textwrap.dedent(f"""\
+        #!/usr/bin/python3
+        # Kai - provision one canonical cross-owner agent lane workspace.
+        # Managed by 'python -m kai install apply'. Do not edit manually.
+        import os
+        import sys
+
+        PYTHON = {python}
+        DATA_DIR = {fixed_data_dir}
+
+
+        def main() -> int:
+            argv = [
+                PYTHON,
+                "-I",
+                "-m",
+                "kai.workshop.sponsored_workspaces",
+                DATA_DIR,
+                *sys.argv[1:],
+            ]
+            os.execve(
+                PYTHON,
+                argv,
+                {{"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}},
+            )
+            return 1
+
+
+        sys.exit(main())
+    """)
+
+
 def _generate_sudoers(
     service_user: str,
     os_users: Iterable[str] = (),
@@ -4662,6 +4702,7 @@ def _generate_sudoers(
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_MEMORY_READER} *\n"
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_PREFERENCE_MANAGER} *\n"
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_WORKSPACE_PROVISIONER} *\n"
+        rules += f"{service_user} ALL=(root) NOPASSWD: {SPONSORED_WORKSPACE_PROVISIONER} *\n"
     if principal_document_reader:
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_DOCUMENT_READER} *\n"
 
@@ -9381,6 +9422,7 @@ def _apply_sudoers(
             print(f"[DRY RUN] Would write: {PRINCIPAL_MEMORY_READER} (mode 0755)")
             print(f"[DRY RUN] Would write: {PRINCIPAL_PREFERENCE_MANAGER} (mode 0755)")
             print(f"[DRY RUN] Would write: {PRINCIPAL_WORKSPACE_PROVISIONER} (mode 0755)")
+            print(f"[DRY RUN] Would write: {SPONSORED_WORKSPACE_PROVISIONER} (mode 0755)")
         if install_document_reader:
             print(f"[DRY RUN] Would write: {PRINCIPAL_DOCUMENT_READER} (mode 0755)")
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")
@@ -9437,6 +9479,24 @@ def _apply_sudoers(
         os.chmod(PRINCIPAL_WORKSPACE_PROVISIONER, 0o755)
         os.chown(PRINCIPAL_WORKSPACE_PROVISIONER, 0, 0)
         print(f"  Wrote {PRINCIPAL_WORKSPACE_PROVISIONER}")
+
+        fd, tmp_name = tempfile.mkstemp(prefix="kai-sponsored-workspace-provisioner-", suffix=".tmp")
+        try:
+            os.write(
+                fd,
+                _generate_sponsored_workspace_provisioner(
+                    data_dir,
+                    install_dir,
+                ).encode(),
+            )
+            os.close(fd)
+            shutil.move(tmp_name, str(SPONSORED_WORKSPACE_PROVISIONER))
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        os.chmod(SPONSORED_WORKSPACE_PROVISIONER, 0o755)
+        os.chown(SPONSORED_WORKSPACE_PROVISIONER, 0, 0)
+        print(f"  Wrote {SPONSORED_WORKSPACE_PROVISIONER}")
 
     if install_document_reader:
         fd, tmp_name = tempfile.mkstemp(prefix="kai-document-reader-", suffix=".tmp")

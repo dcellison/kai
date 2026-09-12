@@ -4072,28 +4072,17 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
                 "provider": "openai",
                 "model": {"value": "gpt-5.6-sol", "source": "runtime policy"},
                 "timeout_seconds": {"value": 120, "source": "runtime policy"},
-                "workspace": "/srv/home/scott",
-                "workspace_revision": "sws_current",
-                "workspaces": [
-                    {
-                        "path": "/srv/home/scott",
-                        "name": "Home",
-                        "current": True,
-                        "home": True,
-                    },
-                    {
-                        "path": "/srv/scott/sandbox",
-                        "name": "sandbox",
-                        "current": False,
-                        "home": False,
-                    },
-                ],
+                "workspace_mode": "neutral",
+                "workspace": None,
+                "workspace_revision": None,
+                "workspaces": [],
             }
             assert "capabilities" not in payload
             assert "/srv/kai" not in json.dumps(payload)
             owner_payload = await owner_effective.json()
             assert owner_effective.status == 200
             assert owner_payload["can_manage_runtime"] is True
+            assert owner_payload["workspace_mode"] == "owner"
             assert owner_payload["sponsor_principal_id"] == str(alice_id)
             for field in ("agent_id", "backend", "provider", "model", "timeout_seconds"):
                 assert owner_payload[field] == payload[field]

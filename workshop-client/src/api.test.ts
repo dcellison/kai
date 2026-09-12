@@ -502,16 +502,10 @@ function effectiveAgentRuntimePayload(): Record<string, unknown> {
     provider: "openai",
     model: { value: "gpt-5.6-sol", source: "runtime policy" },
     timeout_seconds: { value: 1800, source: "runtime policy" },
-    workspace: "/var/lib/kai/home/scott",
-    workspace_revision: "sws_scott",
-    workspaces: [
-      {
-        current: true,
-        home: true,
-        name: "Home",
-        path: "/var/lib/kai/home/scott",
-      },
-    ],
+    workspace_mode: "neutral",
+    workspace: null,
+    workspace_revision: null,
+    workspaces: [],
   };
 }
 
@@ -1314,19 +1308,29 @@ describe("Workshop client API", () => {
       sponsorDisplayName: "Daniel",
       sponsorPrincipalId: "prn_00000000000000000000000000000001",
       timeoutSeconds: { value: 1800, source: "runtime policy" },
-      workspace: "/var/lib/kai/home/scott",
-      workspaceRevision: "sws_scott",
-      workspaces: [
-        {
-          current: true,
-          home: true,
-          name: "Home",
-          path: "/var/lib/kai/home/scott",
-        },
-      ],
+      workspaceMode: "neutral",
+      workspace: null,
+      workspaceRevision: null,
+      workspaces: [],
     });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       `/v1/channels/${channelId}/effective-agent-runtime`,
+    );
+  });
+
+  it("rejects a neutral runtime projection that exposes a workspace", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...effectiveAgentRuntimePayload(),
+          workspace: "/var/lib/kai/home/scott",
+        }),
+      ),
+    );
+
+    await expect(loadEffectiveAgentRuntime(session)).rejects.toThrow(
+      "Kai returned an inconsistent effective workspace.",
     );
   });
 
