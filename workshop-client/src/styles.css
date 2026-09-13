@@ -2897,8 +2897,18 @@ button:disabled {
   width: 100%;
   border: 1px solid var(--color-border-strong);
   border-radius: 4px;
+  -webkit-appearance: none;
+  appearance: none;
   background: var(--color-canvas-inset);
-  padding: 0.55rem 0.6rem;
+  padding: 0.55rem 2.3rem 0.55rem 0.6rem;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--color-text) 50%),
+    linear-gradient(135deg, var(--color-text) 50%, transparent 50%);
+  background-repeat: no-repeat;
+  background-position:
+    right 1.05rem center,
+    right 0.75rem center;
+  background-size: 0.3rem 0.3rem;
   color: var(--color-text-strong);
   font: 0.72rem var(--sans);
 }

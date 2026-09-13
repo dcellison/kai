@@ -18,15 +18,32 @@ import type {
 
 function PencilIcon(): React.JSX.Element {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 20h4l11-11-4-4L4 16v4Zm10-13 4 4" />
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.75"
+      aria-hidden="true"
+    >
+      <path d="M4 20h4L19 9l-4-4L4 16v4Z" />
+      <path d="m13.5 6.5 4 4" />
     </svg>
   );
 }
 
 function CheckIcon(): React.JSX.Element {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.75"
+      aria-hidden="true"
+    >
       <path d="m5 12 4 4L19 6" />
     </svg>
   );
@@ -34,7 +51,15 @@ function CheckIcon(): React.JSX.Element {
 
 function CloseIcon(): React.JSX.Element {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.75"
+      aria-hidden="true"
+    >
       <path d="m6 6 12 12M18 6 6 18" />
     </svg>
   );

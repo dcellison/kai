@@ -135,7 +135,10 @@ describe("ContextStackInspector", () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "Edit Principal policy" }));
+    const editButton = await screen.findByRole("button", { name: "Edit Principal policy" });
+    expect(editButton.querySelector("svg")).toHaveAttribute("fill", "none");
+    expect(editButton.querySelector("svg")).toHaveAttribute("stroke", "currentColor");
+    fireEvent.click(editButton);
     const editor = await screen.findByRole("textbox", { name: "Edit Principal policy" });
     fireEvent.change(editor, { target: { value: "# Principal Policy\n\nBe precise." } });
     fireEvent.click(screen.getByRole("button", { name: "Save Principal policy" }));
