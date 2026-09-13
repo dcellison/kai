@@ -9614,6 +9614,53 @@ class TestApplyMigrateManagedIdentity:
         assert _migrate_internal_api_instructions(identity, template, dry_run=False) is False
         assert identity.read_text() == current
 
+    def test_replaces_verbose_managed_api_manual_with_runtime_capability_policy(self, tmp_path):
+        identity = tmp_path / "AGENTS.md"
+        template = tmp_path / "template.md"
+        identity.write_text(
+            "# Principal Policy\n\n"
+            "## Scheduling Jobs\nPOST /api/schedule\n\n"
+            "## Sending Messages\nPOST /api/send-message\n\n"
+            "## Sending Files\nPOST /api/send-file\n\n"
+            "## Memory System\nPOST /api/memory/add\n\n"
+            "## Issue-First Workflow\nKeep personal tail.\n"
+        )
+        template.write_text(
+            "# Principal Policy\n\n"
+            "## Runtime Capabilities\nGenerated contracts are authoritative.\n\n"
+            "## Issue-First Workflow\nTemplate tail.\n"
+        )
+
+        assert _migrate_internal_api_instructions(identity, template, dry_run=False) is True
+        assert identity.read_text() == (
+            "# Principal Policy\n\n"
+            "## Runtime Capabilities\nGenerated contracts are authoritative.\n\n"
+            "## Issue-First Workflow\nKeep personal tail.\n"
+        )
+
+    def test_replaces_external_service_manual_and_preserves_following_section(self, tmp_path):
+        identity = tmp_path / "AGENTS.md"
+        template = tmp_path / "template.md"
+        identity.write_text(
+            "## Runtime Capabilities\nGenerated contracts are authoritative.\n\n"
+            "## Issue-First Workflow\nKeep workflow.\n\n"
+            "## External Services\nPOST /api/services/{name}\nOld fields.\n\n"
+            "## Personal Tail\nPreserve this.\n"
+        )
+        template.write_text(
+            "## Runtime Capabilities\nGenerated contracts are authoritative.\n\n"
+            "## Issue-First Workflow\nTemplate workflow.\n\n"
+            "## External Services\nUse only a generated capability.\n"
+        )
+
+        assert _migrate_internal_api_instructions(identity, template, dry_run=False) is True
+        assert identity.read_text() == (
+            "## Runtime Capabilities\nGenerated contracts are authoritative.\n\n"
+            "## Issue-First Workflow\nKeep workflow.\n\n"
+            "## External Services\nUse only a generated capability.\n\n"
+            "## Personal Tail\nPreserve this.\n"
+        )
+
 
 # ── _migrate_identity_to_claude_md ───────────────────────────────────
 

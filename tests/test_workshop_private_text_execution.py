@@ -24,6 +24,7 @@ from kai.workshop.private_text_execution import (
     RecoverableClientRun,
     WorkshopPrivateTextExecutionService,
 )
+from kai.workshop.protected_execution import execution_context_kind
 from kai.workshop.routing_eligibility import (
     CapabilityAssessment,
     CapabilitySupport,
@@ -34,13 +35,26 @@ from kai.workshop.routing_eligibility import (
     RuntimeEligibilityCandidate,
     RuntimeEligibilityReport,
 )
-from kai.workshop.run_lifecycle import RunStatus
+from kai.workshop.run_lifecycle import RunKind, RunStatus
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_delivery import TELEGRAM_DELIVERY_POLICY
 from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 1, 1, 23, 0, tzinfo=UTC)
+
+
+def test_execution_context_kind_distinguishes_all_canonical_paths() -> None:
+    assert execution_context_kind(SimpleNamespace(kind=RunKind.RESPOND, delegation_id=None), {}) == "interactive"
+    assert execution_context_kind(SimpleNamespace(kind=RunKind.RESPOND, delegation_id="dlg_1"), {}) == "delegated"
+    assert execution_context_kind(SimpleNamespace(kind=RunKind.OBSERVE, delegation_id=None), {}) == "standing_observe"
+    assert (
+        execution_context_kind(
+            SimpleNamespace(kind=RunKind.RESPOND, delegation_id=None),
+            {"source": "scheduled_job"},
+        )
+        == "scheduled"
+    )
 
 
 class _Runtime:
@@ -55,6 +69,7 @@ class _Runtime:
         self.agent_definition_contexts: list[str] = []
         self.collaboration_context: str | None = None
         self.context_observer = None
+        self.execution_context_kind = None
 
     def stage_canonical_history(self, history: str, **_kwargs: object) -> None:
         self.canonical_histories.append(history)
@@ -70,6 +85,9 @@ class _Runtime:
 
     def discard_collaboration_invocation(self) -> None:
         self.collaboration_context = None
+
+    def stage_execution_context(self, kind: str) -> None:
+        self.execution_context_kind = kind
 
     def validate_current(self) -> None:
         self.validated = True
@@ -276,6 +294,7 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         assert result.workspace == str(tmp_path)
         assert observed == ["Stable preview."]
         assert runtime.validated is True
+        assert runtime.execution_context_kind == "interactive"
         assert len(runtime.canonical_histories) == 1
         assert "canonical-transcript.ndjson" in runtime.canonical_histories[0]
         assert "[Untrusted data - JSON Lines]" in runtime.canonical_histories[0]

@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from kai.context_authority import NativeInstructionPolicy, NativeInstructionSource
 from kai.principal_documents import PrincipalDocument, PrincipalDocumentState
@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 _CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class _SourceSize(TypedDict):
+    rendered_bytes: int
+    budget_bytes: int | None
 
 
 class ContextSourceKind(StrEnum):
@@ -136,6 +141,8 @@ class ContextSourceDescriptor:
     delivery_shape: str = "metadata"
     native_instruction_sources: tuple[NativeInstructionSource, ...] = ()
     authorization_operations: tuple[str, ...] | None = None
+    rendered_bytes: int = 0
+    budget_bytes: int | None = None
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -169,6 +176,15 @@ class ContextSourceDescriptor:
             )
         ):
             raise ValueError("authorization operations must be unique sorted identifiers")
+        if not isinstance(self.rendered_bytes, int) or isinstance(self.rendered_bytes, bool) or self.rendered_bytes < 0:
+            raise ValueError("rendered_bytes must be a non-negative integer")
+        if self.budget_bytes is not None and (
+            not isinstance(self.budget_bytes, int)
+            or isinstance(self.budget_bytes, bool)
+            or self.budget_bytes < 1
+            or self.rendered_bytes > self.budget_bytes
+        ):
+            raise ValueError("budget_bytes must cover the rendered byte count")
 
     def payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -185,6 +201,8 @@ class ContextSourceDescriptor:
             "revision": self.revision,
             "history_boundary": self.history_boundary,
             "delivery_shape": self.delivery_shape,
+            "rendered_bytes": self.rendered_bytes,
+            "budget_bytes": self.budget_bytes,
         }
         if self.native_instruction_sources:
             payload["native_instruction_sources"] = [source.payload() for source in self.native_instruction_sources]
@@ -212,12 +230,9 @@ class ContextSourceDescriptor:
         if not isinstance(value, dict):
             raise ValueError("Context source descriptor has an invalid shape")
         keys = frozenset(value)
+        optional = {"native_instruction_sources", "authorization_operations", "rendered_bytes", "budget_bytes"}
         extras = keys - expected
-        if not expected.issubset(keys) or extras not in {
-            frozenset(),
-            frozenset({"native_instruction_sources"}),
-            frozenset({"authorization_operations"}),
-        }:
+        if not expected.issubset(keys) or not extras.issubset(optional):
             raise ValueError("Context source descriptor has an invalid shape")
         owner_id = value["owner_id"]
         revision = value["revision"]
@@ -248,6 +263,8 @@ class ContextSourceDescriptor:
             authorization_operations=(
                 tuple(authorization_operations) if authorization_operations is not None else None
             ),
+            rendered_bytes=int(value.get("rendered_bytes", 0)),
+            budget_bytes=(None if value.get("budget_bytes") is None else int(value["budget_bytes"])),
         )
 
 
@@ -433,22 +450,20 @@ def build_context_manifest_draft(
         if observation.session_context_delivered
         else "live_provider_session"
     )
-    granular_session_state = ContextSourceState.UNAVAILABLE if observation.session_context_delivered else session_state
-    granular_session_reason = (
-        "bootstrap_source_not_individually_observable" if observation.session_context_delivered else session_reason
-    )
     workspace_policy_state = (
         ContextSourceState.UNAVAILABLE
         if not dispatch_reached
-        else ContextSourceState.OMITTED
-        if observation.workspace_policy_revision is None
         else ContextSourceState.NEWLY_DELIVERED
-        if observation.workspace_policy_delivered
+        if observation.workspace_reminder_delivered or observation.workspace_policy_delivered
         else ContextSourceState.RETAINED
+        if observation.workspace_policy_revision is not None
+        else ContextSourceState.OMITTED
     )
     workspace_policy_reason = (
         dispatch_reason
         if not dispatch_reached
+        else "foreign_workspace_reminder"
+        if observation.workspace_reminder_delivered
         else "no_explicit_workspace_policy"
         if observation.workspace_policy_revision is None
         else "principal_precedence_applied"
@@ -491,6 +506,8 @@ def build_context_manifest_draft(
         if not dispatch_reached
         else ContextSourceState.NEWLY_DELIVERED
         if observation.canonical_conversation_delivered
+        else ContextSourceState.RETAINED
+        if provider_session_revision is not None
         else ContextSourceState.OMITTED
     )
     conversation_reason = (
@@ -507,7 +524,7 @@ def build_context_manifest_draft(
         absent_reason: str,
     ) -> tuple[ContextSourceState, str, str | None]:
         if observation.principal_documents is None:
-            return granular_session_state, granular_session_reason, session_revision
+            return session_state, session_reason, session_revision
         if document is None:
             return ContextSourceState.OMITTED, absent_reason, None
         reason = _safe_code(document.reason, fallback=document.state.value)
@@ -534,6 +551,15 @@ def build_context_manifest_draft(
         document_report.file_memory if document_report is not None else None,
         absent_reason="semantic_memory_enabled_or_shared",
     )
+    layer_measurements = {item.kind: item for item in observation.layer_measurements}
+
+    def source_size(kind: ContextSourceKind) -> _SourceSize:
+        measurement = layer_measurements.get(kind.value)
+        return {
+            "rendered_bytes": measurement.rendered_bytes if measurement is not None else 0,
+            "budget_bytes": measurement.budget_bytes if measurement is not None else None,
+        }
+
     sources = (
         ContextSourceDescriptor(
             ContextSourceKind.HOST_POLICY,
@@ -542,12 +568,13 @@ def build_context_manifest_draft(
             "service",
             ContextTrustClass.HOST_POLICY,
             ContextAuthorityClass.HOST,
-            ContextRefreshClass.PER_TURN,
-            ContextDeliveryRole.TURN_CONTEXT,
-            ContextSourceState.NEWLY_DELIVERED if dispatch_reached else ContextSourceState.UNAVAILABLE,
-            "host_turn_contract" if dispatch_reached else dispatch_reason,
+            ContextRefreshClass.PROVIDER_SESSION,
+            ContextDeliveryRole.SESSION_CONTEXT,
+            session_state,
+            session_reason,
             revision="context_contract_v2",
             delivery_shape="inline_host_marker",
+            **source_size(ContextSourceKind.HOST_POLICY),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.PRINCIPAL_POLICY,
@@ -562,6 +589,7 @@ def build_context_manifest_draft(
             principal_policy_facts[1],
             revision=principal_policy_facts[2],
             delivery_shape="inline_verified_document",
+            **source_size(ContextSourceKind.PRINCIPAL_POLICY),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.AGENT_DEFINITION,
@@ -576,6 +604,7 @@ def build_context_manifest_draft(
             "run_bound_revision" if dispatch_reached else dispatch_reason,
             revision=f"{agent_revision}:{agent_context_digest}",
             delivery_shape="inline_redacted_block",
+            **source_size(ContextSourceKind.AGENT_DEFINITION),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.WORKSPACE_POLICY,
@@ -588,8 +617,17 @@ def build_context_manifest_draft(
             ContextDeliveryRole.SESSION_CONTEXT,
             workspace_policy_state,
             workspace_policy_reason,
-            revision=observation.workspace_policy_revision,
-            delivery_shape="inline_explicit_policy",
+            revision=(
+                observation.workspace_reminder_revision
+                if observation.workspace_reminder_delivered
+                else observation.workspace_policy_revision
+            ),
+            delivery_shape=(
+                "inline_foreign_workspace_reminder"
+                if observation.workspace_reminder_delivered
+                else "inline_explicit_policy"
+            ),
+            **source_size(ContextSourceKind.WORKSPACE_POLICY),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.PERSONAL_PREFERENCES,
@@ -604,6 +642,7 @@ def build_context_manifest_draft(
             preferences_facts[1],
             revision=preferences_facts[2],
             delivery_shape="inline_verified_document",
+            **source_size(ContextSourceKind.PERSONAL_PREFERENCES),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.FILE_MEMORY,
@@ -618,6 +657,7 @@ def build_context_manifest_draft(
             file_memory_facts[1],
             revision=file_memory_facts[2],
             delivery_shape="randomized_untrusted_block",
+            **source_size(ContextSourceKind.FILE_MEMORY),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.SEMANTIC_RECALL,
@@ -632,6 +672,7 @@ def build_context_manifest_draft(
             semantic_reason,
             revision=observation.semantic_recall_revision,
             delivery_shape="scoped_recall_block",
+            **source_size(ContextSourceKind.SEMANTIC_RECALL),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.CANONICAL_CONVERSATION,
@@ -651,6 +692,7 @@ def build_context_manifest_draft(
                 if observation.canonical_conversation_mode is not None
                 else "randomized_structured_delta"
             ),
+            **source_size(ContextSourceKind.CANONICAL_CONVERSATION),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.CAPABILITY_GUIDANCE,
@@ -661,10 +703,11 @@ def build_context_manifest_draft(
             ContextAuthorityClass.CAPABILITY_CONTRACT,
             ContextRefreshClass.PROVIDER_SESSION,
             ContextDeliveryRole.SESSION_CONTEXT,
-            granular_session_state,
-            granular_session_reason,
+            session_state,
+            session_reason,
             revision=session_revision or "capability_guidance_v1",
             delivery_shape="generated_guidance",
+            **source_size(ContextSourceKind.CAPABILITY_GUIDANCE),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.ATTEMPT_AUTHORITY,
@@ -680,6 +723,7 @@ def build_context_manifest_draft(
             revision=attempt_authority_revision,
             delivery_shape="server_attached_no_bearer",
             authorization_operations=attempt_authority_operations,
+            **source_size(ContextSourceKind.ATTEMPT_AUTHORITY),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.CURRENT_INPUT,
@@ -694,6 +738,7 @@ def build_context_manifest_draft(
             "accepted_input" if dispatch_reached else dispatch_reason,
             revision=current_input_digest,
             delivery_shape="native_user_input",
+            **source_size(ContextSourceKind.CURRENT_INPUT),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.PROVIDER_NATIVE,

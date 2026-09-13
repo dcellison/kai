@@ -114,6 +114,7 @@ class _CanonicalRuntime:
         self.home_workspace = workspace
         self.collaboration_context: str | None = None
         self.context_observer = None
+        self.execution_context_kind = None
 
     def stage_canonical_history(self, _history: str, **_kwargs: object) -> None:
         pass
@@ -129,6 +130,9 @@ class _CanonicalRuntime:
 
     def discard_collaboration_invocation(self) -> None:
         self.collaboration_context = None
+
+    def stage_execution_context(self, kind: str) -> None:
+        self.execution_context_kind = kind
 
     def validate_current(self) -> None:
         pass
@@ -692,6 +696,7 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
             "completed",
             "[Job: Canonical reminder]\nScheduled agent answer",
         )
+        assert runtime.execution_context_kind == "scheduled"
         async with source_store.connection.execute("SELECT COUNT(*) FROM delivery_outbox") as cursor:
             assert (await cursor.fetchone())[0] == 0
         principal_id, channel_id = await _job_owner(source_store, job_id)

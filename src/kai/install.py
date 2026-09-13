@@ -6904,7 +6904,7 @@ def _apply_migrate(
                     dry_run=True,
                 )
                 if api_migration is True:
-                    print(f"[DRY RUN] Would replace legacy chat-routed internal API instructions in {agents_path}")
+                    print(f"[DRY RUN] Would replace managed internal API instructions in {agents_path}")
                 migration_result = _migrate_recalled_memory_section(
                     migration_source,
                     home_template,
@@ -6970,7 +6970,7 @@ def _apply_migrate(
                 )
                 is True
             ):
-                print(f"  Replaced legacy chat-routed internal API instructions in {agents_path}")
+                print(f"  Replaced managed internal API instructions in {agents_path}")
 
             if backend_name == "claude":
                 claude_path.parent.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_USER_DIR_MODE)
@@ -7943,8 +7943,18 @@ def _migrate_identity_to_claude_md(
 # always missing) and silently double-write the section.
 _RECALLED_MEMORY_SECTION_HEADER = "## Reading Recalled Memory"
 _INTERNAL_API_SECTION_START = "## Scheduling Jobs"
+_INTERNAL_API_SECTION_NEW_START = "## Runtime Capabilities"
 _INTERNAL_API_SECTION_END = "## Issue-First Workflow"
+_INTERNAL_API_EXTERNAL_SECTION = "## External Services"
 _LEGACY_INTERNAL_API_ROUTING = '**Routing:** Always include `"chat_id": <your chat_id>`'
+_MANAGED_INTERNAL_API_MARKERS = frozenset(
+    {
+        "/api/schedule",
+        "/api/send-message",
+        "/api/send-file",
+        "/api/memory/add",
+    }
+)
 
 
 def _migrate_internal_api_instructions(
@@ -7953,7 +7963,7 @@ def _migrate_internal_api_instructions(
     *,
     dry_run: bool,
 ) -> bool | None:
-    """Replace the retired caller-routed API block in managed identities."""
+    """Replace managed API manuals with the compact capability policy."""
     if not identity_dst.is_file() or not template_path.is_file():
         return None
     try:
@@ -7961,17 +7971,46 @@ def _migrate_internal_api_instructions(
         template = template_path.read_text()
     except OSError:
         return None
-    if _LEGACY_INTERNAL_API_ROUTING not in current:
-        return False
-
-    current_start = current.find(_INTERNAL_API_SECTION_START)
+    current_start = current.find(_INTERNAL_API_SECTION_NEW_START)
+    if current_start < 0:
+        current_start = current.find(_INTERNAL_API_SECTION_START)
     current_end = current.find(_INTERNAL_API_SECTION_END, current_start)
-    template_start = template.find(_INTERNAL_API_SECTION_START)
+    template_start = template.find(_INTERNAL_API_SECTION_NEW_START)
+    if template_start < 0:
+        template_start = template.find(_INTERNAL_API_SECTION_START)
     template_end = template.find(_INTERNAL_API_SECTION_END, template_start)
     if min(current_start, current_end, template_start, template_end) < 0:
         return None
     replacement = template[template_start:template_end]
-    migrated = current[:current_start] + replacement + current[current_end:]
+    current_block = current[current_start:current_end]
+    migrated = current
+    changed = False
+    if current_block != replacement:
+        is_managed_manual = _LEGACY_INTERNAL_API_ROUTING in current_block or all(
+            marker in current_block for marker in _MANAGED_INTERNAL_API_MARKERS
+        )
+        if not is_managed_manual:
+            return None
+        migrated = current[:current_start] + replacement + current[current_end:]
+        changed = True
+
+    current_external_start = migrated.find(_INTERNAL_API_EXTERNAL_SECTION)
+    template_external_start = template.find(_INTERNAL_API_EXTERNAL_SECTION)
+    if current_external_start >= 0 and template_external_start >= 0:
+        current_external_end = migrated.find("\n## ", current_external_start + 1)
+        if current_external_end < 0:
+            current_external_end = len(migrated)
+        template_external_end = template.find("\n## ", template_external_start + 1)
+        if template_external_end < 0:
+            template_external_end = len(template)
+        current_external = migrated[current_external_start:current_external_end]
+        replacement_external = template[template_external_start:template_external_end]
+        if current_external != replacement_external and "/api/services/" in current_external:
+            migrated = migrated[:current_external_start] + replacement_external + migrated[current_external_end:]
+            changed = True
+
+    if not changed:
+        return False
     if dry_run:
         return True
     _write_managed_identity_atomic(identity_dst, migrated)

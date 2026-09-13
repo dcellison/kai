@@ -12,41 +12,15 @@ import hmac
 import secrets
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 
+from kai.internal_api_scopes import PERSISTENT_AGENT_BASE_SCOPES, InternalAPIScope
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
-
-
-class InternalAPIScope(StrEnum):
-    """Operations an internal API credential may perform."""
-
-    JOBS_READ = "jobs:read"
-    JOBS_WRITE = "jobs:write"
-    SERVICES_CALL = "services:call"
-    MESSAGES_SEND = "messages:send"
-    FILES_SEND = "files:send"
-    MEMORY_READ = "memory:read"
-    MEMORY_ADD = "memory:add"
-    MEMORY_DELETE_ALL = "memory:delete-all"
-    COLLABORATION_INVOKE = "collaboration:invoke"
-
 
 # Keep the persistent-agent base profile explicit. Constructing it from the
 # enum would silently grant every future capability to every long-lived agent.
 # SERVICES_CALL is added only when that principal has at least one explicitly
 # allowed service name.
-_PERSISTENT_AGENT_BASE_SCOPES = frozenset(
-    {
-        InternalAPIScope.JOBS_READ,
-        InternalAPIScope.JOBS_WRITE,
-        InternalAPIScope.MESSAGES_SEND,
-        InternalAPIScope.FILES_SEND,
-        InternalAPIScope.MEMORY_READ,
-        InternalAPIScope.MEMORY_ADD,
-        InternalAPIScope.COLLABORATION_INVOKE,
-    }
-)
 _NOTIFICATION_SCOPES = frozenset({InternalAPIScope.MESSAGES_SEND})
 
 
@@ -158,7 +132,7 @@ class InternalAPIAuth:
         """Build the persistent-agent principal for one canonical context."""
         allowed_services = self._allowed_services_by_profile.get(context.runtime_profile_id, frozenset())
         if context.private_context:
-            scopes = set(_PERSISTENT_AGENT_BASE_SCOPES)
+            scopes = set(PERSISTENT_AGENT_BASE_SCOPES)
         else:
             # A group-channel process is shared by every human who wakes the
             # same agent in that channel.  Its persistent credential therefore
@@ -177,6 +151,13 @@ class InternalAPIAuth:
             bind_context_principal=context.private_context,
             requesting_principal_bound=context.private_context,
         )
+
+    def principal_for_agent_context(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+    ) -> InternalAPIPrincipal:
+        """Return the exact non-secret authority paired with an agent credential."""
+        return self._agent_principal(context)
 
     @staticmethod
     def _principal(

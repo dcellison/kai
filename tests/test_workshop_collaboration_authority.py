@@ -125,9 +125,7 @@ async def test_grant_snapshots_revision_owner_host_context_and_limits(tmp_path: 
         assert invocation.base_identity == _base_identity(started)
         assert invocation.effective_operations == grant.effective_operations
         assert not hasattr(invocation, "token")
-        rendered = invocation.render_context()
-        assert "agent_delegation" in rendered
-        assert "X-Kai-Collaboration-Proof" not in rendered
+        assert tuple(sorted(item.value for item in invocation.effective_operations)) == ("agent_delegation",)
         async with store.connection.execute(
             "SELECT payload_json, metadata_json FROM event_log WHERE aggregate_id = ? ORDER BY position",
             (grant.grant_id,),

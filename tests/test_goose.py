@@ -743,16 +743,16 @@ class TestContextInjection:
         # block prepended
         prompt_texts = [b["text"] for b in prompt_msg["params"]["prompt"]]
         combined = " ".join(prompt_texts)
-        assert "This is the user's current message" in combined
+        assert "Foreign workspace:" in combined
         assert "Telegram" not in combined
         assert "hello" in combined
 
     @pytest.mark.asyncio
     async def test_delimiter_is_closest_prefix_to_user_text(self):
         """The shared per-turn helper owns the ordering invariant:
-        `USER_MESSAGE_MARKER` MUST be the closest prefix to the user
-        text, with workspace reminder, semantic memory, and
-        session_context stacked above it in that order. The bug this
+        `USER_MESSAGE_MARKER` MUST identify the current-input boundary,
+        with semantic memory and session context above it and the
+        foreign-workspace reminder inside it. The bug this
         guards against is the marker landing at the TOP of the
         assembled prompt instead of immediately above the user text.
         Claude and codex have the same regression guard; keeping the
@@ -780,15 +780,16 @@ class TestContextInjection:
         from kai.memory import ScopedRecallResult
 
         fake_recall = ScopedRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
+        recall_spy = AsyncMock(return_value=fake_recall)
         with (
             patch("kai.acp.build_session_context", return_value="[CONTEXT]"),
-            patch(
-                "kai.memory.format_scoped_context_with_recall_payload",
-                new=AsyncMock(return_value=fake_recall),
-            ),
+            patch("kai.memory.format_scoped_context_with_recall_payload", new=recall_spy),
         ):
             async for _event in g._send_locked("ACTUAL_USER_TEXT", chat_id=42):
                 pass
+
+        assert recall_spy.call_args.kwargs["job_type"] == "interactive"
+        assert recall_spy.call_args.kwargs["session_id"] == "test-session"
 
         write_calls = g._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
@@ -800,19 +801,19 @@ class TestContextInjection:
         assert prompt_text.count(USER_MESSAGE_MARKER) == 1
         # All three other context blocks fired.
         assert memory_block in prompt_text
-        assert "Respond ONLY" in prompt_text  # foreign-workspace reminder
+        assert "Foreign workspace:" in prompt_text
         assert "[CONTEXT]" in prompt_text  # session_ctx
 
         marker_idx = prompt_text.index(USER_MESSAGE_MARKER)
-        # (b) Every other block sits ABOVE the marker.
+        # (b) Session and recall sit above the current-input boundary.
         assert prompt_text.index(memory_block) < marker_idx
-        assert prompt_text.index("Respond ONLY") < marker_idx
         assert prompt_text.index("[CONTEXT]") < marker_idx
+        assert marker_idx < prompt_text.index("Foreign workspace:")
 
-        # (c) Nothing but whitespace between the marker and the user text.
+        # (c) The one workspace note is the only content between marker and input.
         user_idx = prompt_text.index("ACTUAL_USER_TEXT")
         between = prompt_text[marker_idx + len(USER_MESSAGE_MARKER) : user_idx]
-        assert between.strip() == "", f"non-whitespace between marker and user text: {between!r}"
+        assert between.strip().startswith("[Foreign workspace:")
 
     @pytest.mark.asyncio
     async def test_image_only_input_suppresses_semantic_recall(self):

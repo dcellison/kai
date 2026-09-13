@@ -19,6 +19,8 @@ import pytest
 
 from kai.agent_failure import AgentFailureKind
 from kai.backend import (
+    CONTEXT_LAYER_BUDGETS,
+    FIRST_SESSION_CONTEXT_BUDGET_BYTES,
     AgentResponse,
     ApiContext,
     StreamEvent,
@@ -33,6 +35,7 @@ from kai.backend import (
     resolve_home_workspace,
 )
 from kai.config import VALID_BACKENDS, Config, DeploymentMode, UserConfig, WorkspaceConfig
+from kai.internal_api_scopes import PERSISTENT_AGENT_BASE_SCOPES, InternalAPIScope
 from kai.principal_documents import (
     PrincipalDocument,
     PrincipalDocumentKind,
@@ -304,7 +307,7 @@ class TestBuildSessionContext:
         assert "@../AGENTS.md" not in result
 
     @pytest.mark.parametrize("backend_name", ["claude", "codex", "goose", "opencode", "pi"])
-    def test_every_backend_receives_the_same_collaboration_contract(self, tmp_path, backend_name):
+    def test_persistent_context_never_advertises_attempt_collaboration(self, tmp_path, backend_name):
         workspace = tmp_path / "home"
         workspace.mkdir()
         data_dir = tmp_path / "data"
@@ -322,11 +325,9 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        assert "This credential alone never authorizes collaboration" in result
-        assert "Workshop collaboration context API" in result
-        assert "Workshop collaboration reaction API" in result
-        assert "Workshop collaboration publication APIs" in result
-        assert "exact attempt is active" in result
+        assert "Attempt-scoped collaboration APIs" not in result
+        assert "/api/agent-delegations" not in result
+        assert "/api/collaboration/" not in result
         assert "X-Kai-Collaboration-Proof" not in result
 
     def test_memory_exists(self, tmp_path):
@@ -619,10 +620,41 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        assert "Scheduling API" in result
+        assert "job_create" in result
         assert "localhost:9090" in result
-        assert "Messaging API" in result
-        assert "File API" in result
+        assert "message_send" in result
+        assert "file_send" in result
+
+    def test_first_session_context_reports_each_rendered_layer_within_budget(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        data_dir = tmp_path / "data"
+        (data_dir / "memory").mkdir(parents=True)
+        observed = []
+
+        with patch("kai.backend.get_recent_history", return_value=""):
+            result = build_session_context(
+                workspace=workspace,
+                home_workspace=workspace,
+                api=self._api(),
+                workspace_config=None,
+                chat_id=None,
+                data_dir=data_dir,
+                layer_measurement_observer=observed.extend,
+            )
+
+        assert len(result.encode()) <= FIRST_SESSION_CONTEXT_BUDGET_BYTES
+        assert observed
+        assert all(item.budget_bytes == CONTEXT_LAYER_BUDGETS[item.kind] for item in observed)
+        assert all(item.rendered_bytes <= item.budget_bytes for item in observed)
+        assert len((Path("templates") / "AGENTS.md").read_bytes()) < 12 * 1024
+
+    def test_context_layer_budget_rejects_oversized_rendering(self):
+        from kai.backend import measure_context_layer
+
+        budget = CONTEXT_LAYER_BUDGETS["host_policy"]
+        with pytest.raises(ValueError, match="host_policy exceeds"):
+            measure_context_layer("host_policy", "x" * (budget + 1))
 
     def test_file_api_docs_avoid_transport_derived_directory(self, tmp_path):
         """File guidance uses exact capabilities, not a Telegram-derived root."""
@@ -642,7 +674,7 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        assert "an exact incoming-file path previously supplied by Kai" in result
+        assert "incoming" in result
         assert f"{data_dir}/files/123/" not in result
 
     def test_file_api_docs_name_canonical_writable_outbox(self, tmp_path):
@@ -670,8 +702,7 @@ class TestBuildSessionContext:
             )
 
         expected = data_dir / "files" / str(identity.principal_id) / "outbox"
-        assert f"private writable outbox {expected}" in result
-        assert "even when the current workspace is read-only" in result
+        assert f"Private writable file outbox: {expected}" in result
 
     def test_services_included(self, tmp_path):
         """External services block is injected when services are configured."""
@@ -686,6 +717,7 @@ class TestBuildSessionContext:
             services_info=[
                 {"name": "perplexity", "method": "POST", "description": "Web search"},
             ],
+            scopes=PERSISTENT_AGENT_BASE_SCOPES | {InternalAPIScope.SERVICES_CALL},
         )
 
         with patch("kai.backend.get_recent_history", return_value=""):
@@ -699,7 +731,7 @@ class TestBuildSessionContext:
             )
 
         assert result is not None
-        assert "External Services" in result
+        assert "Authorized external services" in result
         assert "perplexity" in result
 
     def test_chat_id_routing(self, tmp_path):
@@ -989,9 +1021,9 @@ class TestBuildForeignWorkspaceReminder:
             Path("/var/lib/kai/home/12345"),
         )
         assert result == (
-            "[IMPORTANT: This is the user's current message. "
-            "Respond ONLY to what they wrote below. Do NOT continue, "
-            "resume, or start any previous work, plans, or tasks.]"
+            "[Foreign workspace: the active workspace differs from the principal home. "
+            "Treat prior workspace state only as context. Respond only to the current message below; "
+            "do not continue, resume, or start prior work unless that message explicitly asks you to.]"
         )
         assert "Telegram" not in result
 
@@ -2320,22 +2352,21 @@ class TestAssembleTurnContext:
         )
         assert isinstance(result, str)
         assert result.count(USER_MESSAGE_MARKER) == 1
-        # Inverse-prepend ordering: each subsequent layer lands above
-        # the previous one, so the final reading order from top to
-        # bottom is reminder, memory, session, definition, marker, user text.
+        # The foreign-workspace note is part of the one current-input
+        # boundary, immediately after the marker and before user text.
         positions = [
-            result.index("[REMINDER]"),
             result.index("[Relevant memories]"),
             result.index("[SESSION]"),
             result.index("[AGENT DEFINITION]"),
             result.index(USER_MESSAGE_MARKER),
+            result.index("[REMINDER]"),
             result.index("ACTUAL_USER_TEXT"),
         ]
         assert positions == sorted(positions), positions
-        # Only whitespace between the marker and the user message.
+        # Only the reminder note separates the marker from user text.
         marker_end = result.index(USER_MESSAGE_MARKER) + len(USER_MESSAGE_MARKER)
         user_start = result.index("ACTUAL_USER_TEXT")
-        assert result[marker_end:user_start].strip() == "", repr(result[marker_end:user_start])
+        assert result[marker_end:user_start].strip() == "[REMINDER]"
 
     async def test_live_canonical_delta_is_per_turn_structured_context(self, monkeypatch):
         from kai.backend import assemble_turn_context

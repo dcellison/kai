@@ -231,20 +231,6 @@ class CollaborationInvocation:
     base_identity: CollaborationBaseIdentity
     effective_operations: frozenset[CollaborationOperation]
 
-    def render_context(self) -> str:
-        """Describe server-attached authority without exposing bearer material."""
-        operations = ", ".join(sorted(item.value for item in self.effective_operations)) or "none"
-        return (
-            "[Attempt-scoped collaboration authority: This turn alone may use "
-            "the collaboration operations granted by your immutable agent revision. "
-            f"Effective operations: {operations}. The server has attached these "
-            "operations to the exact active attempt; send only the API's ordinary "
-            "typed arguments. Never send a collaboration proof, run ID, attempt ID, "
-            "principal ID, agent ID, runtime selector, or other authority selector. "
-            "The persistent $KAI_WEBHOOK_SECRET identifies the runtime lane but does "
-            "not grant collaboration outside this exact active attempt.]"
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class CollaborationAuthorization:
