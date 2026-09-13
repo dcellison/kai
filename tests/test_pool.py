@@ -23,6 +23,11 @@ from kai.config import Config, DeploymentMode, ModelRole, UserConfig, WorkspaceC
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIScope
 from kai.pool import SubprocessPool
+from kai.principal_documents import (
+    PrincipalDocument,
+    PrincipalDocumentKind,
+    PrincipalDocumentState,
+)
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId
 from kai.workshop.internal_api_contexts import (
     WorkshopInternalAPIContextRegistry,
@@ -842,6 +847,195 @@ class TestPerUserBackendRouting:
         assert events[-1].response is not None
         assert instance.send.call_args.kwargs == {"runtime_identity": contexts.for_runtime_profile(runtime_profile_id)}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backend", "provider", "model"),
+        (
+            ("claude", "anthropic", "sonnet"),
+            ("codex", "openai", "gpt-5.6-sol"),
+            ("goose", "openai", "gpt-5.5"),
+            ("opencode", "openai", "openai/gpt-5.5"),
+            ("pi", "openai", "openai/gpt-5.5"),
+        ),
+    )
+    async def test_retained_context_revision_is_backend_neutral_and_source_complete(
+        self,
+        tmp_path: Path,
+        backend: str,
+        provider: str,
+        model: str,
+    ) -> None:
+        runtime_profile_id = profile_id(111)
+        home = tmp_path / backend / "home"
+        workspace = tmp_path / backend / "workspace"
+        home.mkdir(parents=True)
+        workspace.mkdir()
+        context = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(
+            111,
+            runtime_profile_id,
+        )
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_profile_id,
+                    display_name=f"{backend} context revision",
+                    os_user=None,
+                    backend=backend,
+                    provider=provider,
+                    model=model,
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=home,
+                    workspace_base=tmp_path,
+                    allowed_workspaces=(workspace,),
+                ),
+            ),
+            legacy_runtime_keys={runtime_profile_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(
+                allowed_user_ids={111},
+                deployment_mode=DeploymentMode.PROTECTED,
+                session_db_path=tmp_path / backend / "kai.db",
+                memory_enabled=False,
+            ),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((context,)),
+        )
+        revisions = {
+            PrincipalDocumentKind.POLICY: "1" * 64,
+            PrincipalDocumentKind.PREFERENCES: "2" * 64,
+            PrincipalDocumentKind.FILE_MEMORY: "3" * 64,
+        }
+
+        def document(principal_id, kind, path, *, protected):
+            del principal_id, path
+            assert protected is True
+            return PrincipalDocument(
+                kind,
+                PrincipalDocumentState.PRESENT,
+                "redacted",
+                revisions[kind],
+                "available",
+            )
+
+        prompt = WorkspaceConfig(path=workspace, system_prompt="Active workspace prompt one.")
+        with (
+            patch.object(pool, "get_effective_workspace", new=AsyncMock(return_value=workspace)),
+            patch("kai.pool.load_principal_document", side_effect=document),
+            patch(
+                "kai.pool.sessions.read_canonical_workspace_config",
+                new_callable=AsyncMock,
+                return_value=prompt,
+            ) as workspace_config,
+        ):
+            initial = await pool.retained_context_revision(
+                context,
+                agent_definition_context="Agent definition one.",
+            )
+            unchanged = await pool.retained_context_revision(
+                context,
+                agent_definition_context="Agent definition one.",
+            )
+            revisions[PrincipalDocumentKind.PREFERENCES] = "4" * 64
+            changed_preference = await pool.retained_context_revision(
+                context,
+                agent_definition_context="Agent definition one.",
+            )
+            changed_agent = await pool.retained_context_revision(
+                context,
+                agent_definition_context="Agent definition two.",
+            )
+            workspace_config.return_value = WorkspaceConfig(
+                path=workspace,
+                system_prompt="Active workspace prompt two.",
+            )
+            changed_workspace_prompt = await pool.retained_context_revision(
+                context,
+                agent_definition_context="Agent definition two.",
+            )
+
+        assert len(initial) == 64
+        assert unchanged == initial
+        assert len({initial, changed_preference, changed_agent, changed_workspace_prompt}) == 4
+
+    @pytest.mark.asyncio
+    async def test_direct_edits_refresh_only_the_active_lane_context_sources(self, tmp_path: Path) -> None:
+        runtime_id = profile_id(111)
+        context = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        data_dir = tmp_path / "data"
+        home = data_dir / "home"
+        workspace = tmp_path / "active-workspace"
+        inactive_workspace = tmp_path / "inactive-workspace"
+        preferences = data_dir / "preferences" / str(context.principal_id)
+        memory = data_dir / "memory" / str(context.principal_id)
+        for path in (home, workspace, inactive_workspace, preferences, memory):
+            path.mkdir(parents=True)
+        (home / "AGENTS.md").write_text("Principal policy one.\n")
+        (preferences / "PREFERENCES.md").write_text("Preferences one.\n")
+        (memory / "MEMORY.md").write_text("File memory one.\n")
+        active_prompt = workspace / "SYSTEM.md"
+        inactive_prompt = inactive_workspace / "SYSTEM.md"
+        active_prompt.write_text("Active prompt one.\n")
+        inactive_prompt.write_text("Inactive prompt one.\n")
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="source edits",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=home,
+                    workspace_base=tmp_path,
+                    allowed_workspaces=(workspace, inactive_workspace),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(
+                allowed_user_ids={111},
+                session_db_path=data_dir / "kai.db",
+                memory_enabled=False,
+                workspace_configs={
+                    workspace.resolve(): WorkspaceConfig(
+                        path=workspace.resolve(),
+                        system_prompt_file=active_prompt,
+                    ),
+                    inactive_workspace.resolve(): WorkspaceConfig(
+                        path=inactive_workspace.resolve(),
+                        system_prompt_file=inactive_prompt,
+                    ),
+                },
+            ),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((context,)),
+        )
+        with patch.object(pool, "get_effective_workspace", new=AsyncMock(return_value=workspace)):
+            initial = await pool.retained_context_revision(context, agent_definition_context="Agent one.")
+            inactive_prompt.write_text("Inactive prompt two.\n")
+            inactive_change = await pool.retained_context_revision(context, agent_definition_context="Agent one.")
+            (home / "AGENTS.md").write_text("Principal policy two.\n")
+            policy_change = await pool.retained_context_revision(context, agent_definition_context="Agent one.")
+            (preferences / "PREFERENCES.md").write_text("Preferences two.\n")
+            preference_change = await pool.retained_context_revision(context, agent_definition_context="Agent one.")
+            (memory / "MEMORY.md").write_text("File memory two.\n")
+            memory_change = await pool.retained_context_revision(context, agent_definition_context="Agent one.")
+            active_prompt.write_text("Active prompt two.\n")
+            active_prompt_change = await pool.retained_context_revision(
+                context,
+                agent_definition_context="Agent one.",
+            )
+
+        assert inactive_change == initial
+        assert len({initial, policy_change, preference_change, memory_change, active_prompt_change}) == 5
+
 
 # ── Per-user actions ────────────────────────────────────────────────
 
@@ -1454,6 +1648,144 @@ class TestWorkspaceRestoration:
 
 
 class TestPreparedExecution:
+    @pytest.mark.asyncio
+    async def test_changed_context_replaces_a_live_runtime_left_by_a_failed_run(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        runtime_id = profile_id(111)
+        context = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="protected",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((context,)),
+        )
+
+        async def failed_events():
+            yield StreamEvent(
+                text_so_far="",
+                done=True,
+                response=AgentResponse(text="", success=False, error="provider failed"),
+            )
+
+        with patch(
+            "kai.pool.sessions.get_canonical_execution_settings",
+            new_callable=AsyncMock,
+            return_value={},
+        ):
+            failed = await pool.prepare_execution(
+                context,
+                retained_context_revision="a" * 64,
+            )
+            failed_runtime = failed._instance
+            failed_runtime.shutdown = AsyncMock()
+            failed_runtime.send = MagicMock(return_value=failed_events())
+            assert [event async for event in failed.stream("first")]
+            assert pool.get_if_exists(context) is failed_runtime
+
+            replacement = await pool.prepare_execution(
+                context,
+                retained_context_revision="b" * 64,
+            )
+
+        failed_runtime.shutdown.assert_awaited_once()
+        assert replacement._instance is not failed_runtime
+        await replacement.cancel()
+
+    @pytest.mark.asyncio
+    async def test_in_flight_context_invalidation_is_applied_after_the_exact_lane_finishes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        runtime_id = profile_id(111)
+        primary = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        secondary = WorkshopInternalAPIExecutionContext(
+            primary.principal_id,
+            ChannelId("chn_" + "a" * 32),
+            AgentId("agt_" + "b" * 32),
+            runtime_id,
+        )
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="protected",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((primary, secondary)),
+        )
+        first = pool.get(primary)
+        second = pool.get(secondary)
+        first.shutdown = AsyncMock()
+        second.shutdown = AsyncMock()
+        pool._pending_workspace_restore.clear()
+        pool._pending_settings_restore.clear()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def response_events():
+            started.set()
+            await release.wait()
+            yield StreamEvent(
+                text_so_far="done",
+                done=True,
+                response=AgentResponse(text="done", success=True),
+            )
+
+        first.send = MagicMock(return_value=response_events())
+        prepared = await pool.prepare_execution(primary)
+
+        async def consume() -> None:
+            assert [event async for event in prepared.stream("test")]
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        assert await pool.invalidate_retained_context(primary) is False
+        assert pool.get_if_exists(primary) is first
+        assert pool.get_if_exists(secondary) is second
+
+        release.set()
+        await task
+
+        first.shutdown.assert_awaited_once()
+        second.shutdown.assert_not_awaited()
+        assert pool.get_if_exists(primary) is None
+        assert pool.get_if_exists(secondary) is second
+
     @pytest.mark.asyncio
     async def test_explicit_route_preserves_selected_runtime_and_backend_default(self, tmp_path):
         runtime_id = profile_id(111)

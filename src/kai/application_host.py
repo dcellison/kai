@@ -459,6 +459,9 @@ class KaiApplicationHost:
             preference_documents = WorkshopPreferenceService(
                 Path(self._config.session_db_path).parent,
                 self._principal_storage,
+                on_content_changed=lambda principal_id: runtime_pool.invalidate_principal_retained_context(
+                    str(principal_id)
+                ),
             )
             github_settings = await WorkshopGitHubSettingsService.open(
                 Path(self._config.session_db_path),

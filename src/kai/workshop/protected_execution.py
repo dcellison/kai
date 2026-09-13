@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from kai.backend import ContextAssemblyObserver, StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
+from kai.workshop.agent_definitions import load_agent_definition_revision, render_agent_definition_context
 from kai.workshop.collaboration_authority import CollaborationInvocation
 from kai.workshop.domain import ChannelId, RunId, RuntimeProfileId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
@@ -16,6 +17,7 @@ from kai.workshop.routing_policy import RunRoutingDecision, WorkshopRoutingPolic
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.run_lifecycle import DurableRun, RunStatus, WorkshopRunLifecycle
 from kai.workshop.runtime_pool import WorkshopRuntimePool
+from kai.workshop.runtime_sessions import clear_runtime_session, load_runtime_session
 from kai.workshop.store import WorkshopEventStore
 
 # Type-only: kai.pool imports kai.sessions, which imports this package, so
@@ -49,6 +51,7 @@ class PreparedWorkshopExecution:
     home_workspace: Path
     history_reader_user: str | None
     routing_decision: RunRoutingDecision
+    retained_context_revision: str
     _runtime: PreparedBackendExecution = field(repr=False, compare=False)
 
     async def stream(self, prompt: AgentPrompt) -> AsyncIterator[StreamEvent]:
@@ -155,10 +158,29 @@ class WorkshopProtectedExecutionPreparationService:
             settings_channel_id=settings_channel_id,
             workspace_runtime_profile_id=(RuntimeProfileId(str(authority_row[1])) if private_context else None),
         )
+        revision_id = run.agent_definition_revision_id
+        if revision_id is None:
+            raise ProtectedExecutionPreparationError("Canonical run has no bound agent definition revision")
+        definition_revision = await load_agent_definition_revision(self._store, revision_id)
+        if definition_revision is None or definition_revision.agent_id != run.agent_id:
+            raise ProtectedExecutionPreparationError("Canonical run agent definition revision is unavailable")
+        retained_context_revision = await self._pool.retained_context_revision(
+            runtime_authority,
+            agent_definition_context=render_agent_definition_context(definition_revision),
+        )
+        prior_session = await load_runtime_session(self._store, run.channel_id, run.agent_id)
+        if prior_session is not None and prior_session.retained_context_revision != retained_context_revision:
+            invalidated = await self._pool.invalidate_retained_context(runtime_authority)
+            if not invalidated:
+                raise ProtectedExecutionPreparationError(
+                    "Retained context changed while the canonical lane was in flight"
+                )
+            await clear_runtime_session(self._store, run.channel_id, run.agent_id)
         runtime = await self._pool.prepare_routed_execution(
             runtime_authority,
             decision.selected_backend_option_id,
             decision.selection.model,
+            retained_context_revision=retained_context_revision,
         )
         prepared = runtime.selection
         if prepared.backend not in self._registered_backend_ids:
@@ -182,5 +204,6 @@ class WorkshopProtectedExecutionPreparationService:
             home_workspace=runtime.home_workspace,
             history_reader_user=profile.os_user,
             routing_decision=decision,
+            retained_context_revision=retained_context_revision,
             _runtime=runtime,
         )

@@ -132,6 +132,7 @@ from kai.workshop.proactive_publication import (
 from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
+from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.scheduled_jobs import (
     WorkshopScheduledJobAuthority,
     WorkshopScheduledJobUpdate,
@@ -2188,6 +2189,7 @@ async def _register_workshop_client_api(
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
     standing_participation: WorkshopStandingParticipationService | None = None,
+    runtime_pool: WorkshopRuntimePool | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
 
@@ -2236,6 +2238,9 @@ async def _register_workshop_client_api(
             human_avatars=human_avatars,
             collaboration_policy=collaboration_policy,
             standing_participation=standing_participation,
+            invalidate_agent_context=(
+                runtime_pool.invalidate_agent_retained_context if runtime_pool is not None else None
+            ),
         )
         if command_submitter is not None:
             register_workshop_command_routes(
@@ -2329,6 +2334,7 @@ async def start(
             human_avatars=getattr(core_services, "human_avatars", None),
             collaboration_policy=getattr(core_services, "collaboration_policy", None),
             standing_participation=getattr(core_services, "standing_participation", None),
+            runtime_pool=getattr(core_services, "runtime_pool", None),
         )
 
     _runner = web.AppRunner(

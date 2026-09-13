@@ -505,6 +505,7 @@ class WorkshopCanonicalExecutionCoordinator:
                                 selection=prepared.selection,
                                 workspace=str(prepared.workspace),
                                 provider_session_id=response.session_id,
+                                retained_context_revision=prepared.retained_context_revision,
                                 run_id=prepared.run.run_id,
                             )
                             if (
@@ -553,6 +554,7 @@ class WorkshopCanonicalExecutionCoordinator:
                             selection=prepared.selection,
                             workspace=str(prepared.workspace),
                             provider_session_id=response.session_id,
+                            retained_context_revision=prepared.retained_context_revision,
                             run_id=prepared.run.run_id,
                         ),
                     )

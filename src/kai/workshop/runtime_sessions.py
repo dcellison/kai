@@ -27,6 +27,7 @@ class RuntimeSessionSettlement:
     workspace: str
     provider_session_id: str | None
     run_id: RunId
+    retained_context_revision: str = "0" * 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,7 @@ class CanonicalRuntimeSession:
     selection: RunExecutionSelection
     workspace: str
     provider_session_id: str | None
+    retained_context_revision: str | None
     last_run_id: RunId
     last_result_message_id: MessageId
     context_through_event_position: int
@@ -66,7 +68,8 @@ def _require_text(value: str, name: str) -> str:
     return value
 
 
-def _from_row(row) -> CanonicalRuntimeSession:
+def _from_row(row, *, has_retained_context_revision: bool = True) -> CanonicalRuntimeSession:
+    offset = 1 if has_retained_context_revision else 0
     return CanonicalRuntimeSession(
         channel_id=ChannelId(str(row[0])),
         agent_id=AgentId(str(row[1])),
@@ -78,12 +81,20 @@ def _from_row(row) -> CanonicalRuntimeSession:
         ),
         workspace=str(row[6]),
         provider_session_id=str(row[7]) if row[7] is not None else None,
-        last_run_id=RunId(str(row[8])),
-        last_result_message_id=MessageId(str(row[9])),
-        context_through_event_position=int(row[10]),
-        created_at=_parse_timestamp(row[11]),
-        updated_at=_parse_timestamp(row[12]),
+        retained_context_revision=(str(row[8]) if row[8] is not None else None)
+        if has_retained_context_revision
+        else None,
+        last_run_id=RunId(str(row[8 + offset])),
+        last_result_message_id=MessageId(str(row[9 + offset])),
+        context_through_event_position=int(row[10 + offset]),
+        created_at=_parse_timestamp(row[11 + offset]),
+        updated_at=_parse_timestamp(row[12 + offset]),
     )
+
+
+async def _has_retained_context_revision(store: WorkshopEventStore) -> bool:
+    async with store.connection.execute("PRAGMA table_info(channel_agent_runtime_sessions)") as cursor:
+        return "retained_context_revision" in {str(row[1]) for row in await cursor.fetchall()}
 
 
 async def load_runtime_session(
@@ -92,15 +103,31 @@ async def load_runtime_session(
     agent_id: AgentId,
 ) -> CanonicalRuntimeSession | None:
     """Load canonical continuity state for one conversation lane."""
+    has_revision = await _has_retained_context_revision(store)
+    revision_column = "retained_context_revision, " if has_revision else ""
     async with store.connection.execute(
         "SELECT channel_id, agent_id, runtime_profile_id, backend, provider, model, "
-        "workspace, provider_session_id, last_run_id, last_result_message_id, "
+        f"workspace, provider_session_id, {revision_column}last_run_id, last_result_message_id, "
         "context_through_event_position, created_at, updated_at "
         "FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
         (channel_id, agent_id),
     ) as cursor:
         row = await cursor.fetchone()
-    return None if row is None else _from_row(row)
+    return None if row is None else _from_row(row, has_retained_context_revision=has_revision)
+
+
+async def clear_runtime_session(
+    store: WorkshopEventStore,
+    channel_id: ChannelId,
+    agent_id: AgentId,
+) -> bool:
+    """Delete obsolete provider continuity for exactly one canonical lane."""
+    cursor = await store.connection.execute(
+        "DELETE FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+        (channel_id, agent_id),
+    )
+    await store.connection.commit()
+    return cursor.rowcount > 0
 
 
 async def settle_runtime_session_in_transaction(
@@ -151,6 +178,7 @@ async def settle_runtime_session_in_transaction(
         settlement.selection,
         settlement.workspace,
         settlement.provider_session_id,
+        settlement.retained_context_revision,
         settlement.run_id,
         result_message_id,
         context_through_event_position,
@@ -161,6 +189,7 @@ async def settle_runtime_session_in_transaction(
             existing.selection,
             existing.workspace,
             existing.provider_session_id,
+            existing.retained_context_revision,
             existing.last_run_id,
             existing.last_result_message_id,
             existing.context_through_event_position,
@@ -171,34 +200,40 @@ async def settle_runtime_session_in_transaction(
     if existing is not None and existing.context_through_event_position >= context_through_event_position:
         raise RuntimeSessionStateConflictError("Runtime session context boundary cannot move backward")
 
-    await store.connection.execute(
-        "INSERT INTO channel_agent_runtime_sessions ("
+    has_revision = await _has_retained_context_revision(store)
+    columns = (
         "channel_id, agent_id, runtime_profile_id, backend, provider, model, workspace, "
-        "provider_session_id, last_run_id, last_result_message_id, "
-        "context_through_event_position, created_at, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(channel_id, agent_id) DO UPDATE SET "
+        "provider_session_id, "
+        + ("retained_context_revision, " if has_revision else "")
+        + "last_run_id, last_result_message_id, context_through_event_position, created_at, updated_at"
+    )
+    update_revision = "retained_context_revision=excluded.retained_context_revision, " if has_revision else ""
+    values: tuple[object, ...] = (
+        settlement.channel_id,
+        settlement.agent_id,
+        settlement.runtime_profile_id,
+        settlement.selection.backend,
+        settlement.selection.provider,
+        settlement.selection.model,
+        settlement.workspace,
+        settlement.provider_session_id,
+        *((settlement.retained_context_revision,) if has_revision else ()),
+        settlement.run_id,
+        result_message_id,
+        context_through_event_position,
+        existing.created_at.isoformat().replace("+00:00", "Z") if existing else when,
+        when,
+    )
+    await store.connection.execute(
+        f"INSERT INTO channel_agent_runtime_sessions ({columns}) "
+        f"VALUES ({', '.join('?' for _ in values)}) "
+        "ON CONFLICT(channel_id,agent_id) DO UPDATE SET "
         "runtime_profile_id=excluded.runtime_profile_id, backend=excluded.backend, "
         "provider=excluded.provider, model=excluded.model, workspace=excluded.workspace, "
-        "provider_session_id=excluded.provider_session_id, last_run_id=excluded.last_run_id, "
-        "last_result_message_id=excluded.last_result_message_id, "
-        "context_through_event_position=excluded.context_through_event_position, "
-        "updated_at=excluded.updated_at",
-        (
-            settlement.channel_id,
-            settlement.agent_id,
-            settlement.runtime_profile_id,
-            settlement.selection.backend,
-            settlement.selection.provider,
-            settlement.selection.model,
-            settlement.workspace,
-            settlement.provider_session_id,
-            settlement.run_id,
-            result_message_id,
-            context_through_event_position,
-            existing.created_at.isoformat().replace("+00:00", "Z") if existing else when,
-            when,
-        ),
+        f"provider_session_id=excluded.provider_session_id, {update_revision}"
+        "last_run_id=excluded.last_run_id, last_result_message_id=excluded.last_result_message_id, "
+        "context_through_event_position=excluded.context_through_event_position, updated_at=excluded.updated_at",
+        values,
     )
     current = await load_runtime_session(store, settlement.channel_id, settlement.agent_id)
     if current is None:

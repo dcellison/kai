@@ -249,7 +249,12 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
     database = tmp_path / "kai.db"
     eligibility = await _foundation(database)
     runtime = _Runtime(tmp_path)
-    pool = SimpleNamespace(prepare_routed_execution=AsyncMock(return_value=runtime))
+    retained_context_revision = "a" * 64
+    pool = SimpleNamespace(
+        retained_context_revision=AsyncMock(return_value=retained_context_revision),
+        invalidate_retained_context=AsyncMock(return_value=True),
+        prepare_routed_execution=AsyncMock(return_value=runtime),
+    )
     service = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]
@@ -287,6 +292,7 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
             ),
             "codex:openai",
             "gpt-5.6-sol",
+            retained_context_revision=retained_context_revision,
         )
     finally:
         await service.stop()
@@ -319,7 +325,11 @@ async def test_owner_routes_stop_to_exact_active_runtime_and_terminal_cancellati
     eligibility = await _foundation(database)
     release = asyncio.Event()
     runtime = _Runtime(tmp_path, wait=release)
-    pool = SimpleNamespace(prepare_routed_execution=AsyncMock(return_value=runtime))
+    pool = SimpleNamespace(
+        retained_context_revision=AsyncMock(return_value="a" * 64),
+        invalidate_retained_context=AsyncMock(return_value=True),
+        prepare_routed_execution=AsyncMock(return_value=runtime),
+    )
     service = await WorkshopPrivateTextExecutionService.open_and_start(
         database,
         WorkshopRuntimePool(pool, profile_registry(101)),  # type: ignore[arg-type]

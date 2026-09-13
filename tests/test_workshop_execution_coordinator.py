@@ -80,6 +80,7 @@ class _Prepared:
         self.discarded_collaboration_invocations = []
         self.context_observer = None
         self.ambient_context_discovery_enabled = ambient_context_discovery_enabled
+        self.retained_context_revision = "c" * 64
 
     def stage_canonical_history(self, history: str) -> None:
         self.canonical_histories.append(history)
@@ -500,6 +501,7 @@ class TestCanonicalExecutionCoordinator:
             assert session is not None
             assert session.last_run_id == run.run_id
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
+            assert session.retained_context_revision == "c" * 64
             await store.rebuild_projection(CanonicalConversationProjection())
             assert await load_runtime_session(store, run.channel_id, run.agent_id) == session
             assert workshop_runtime_session_status(tmp_path / "kai.db").startswith(
@@ -571,7 +573,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 77
+            assert await upgraded.schema_version() == 78
             assert await load_runtime_session(upgraded, run.channel_id, run.agent_id) is None
             after = workshop_runtime_session_status(path)
             assert after.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
@@ -599,12 +601,13 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 77
+            assert await upgraded.schema_version() == 78
             session = await load_runtime_session(upgraded, run.channel_id, run.agent_id)
             assert session is not None
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
             status = workshop_runtime_session_status(path)
             assert status.startswith("Workshop conversation continuity: active; successful lanes=1, sessions=1")
+            assert "context refresh pending=1" in status
             assert "missing=0, stale=0" in status
         finally:
             await upgraded.close()

@@ -6,12 +6,13 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import math
 import re
 import secrets
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -336,6 +337,8 @@ from kai.workshop.wake_policy import (
     dismiss_channel_agent,
     resolve_agent_engagements,
 )
+
+log = logging.getLogger(__name__)
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _CHANNEL_MESSAGE_PATH = "/v1/channels/{channel_id}/messages/{message_id}"
@@ -686,6 +689,21 @@ def _serialize_preference_document(document: PreferenceDocument) -> dict[str, ob
             "max_bytes": document.max_bytes,
             "editable": document.editable,
         },
+    }
+
+
+def _serialize_preference_context_invalidation(
+    service: WorkshopPreferenceService,
+    authority: PreferenceAuthority,
+    document: PreferenceDocument,
+) -> dict[str, object] | None:
+    invalidation = service.context_invalidation(authority, document.revision)
+    if invalidation is None:
+        return None
+    return {
+        "state": invalidation.state,
+        "applied": invalidation.applied,
+        "pending": invalidation.pending,
     }
 
 
@@ -2223,7 +2241,13 @@ async def _handle_preference_update(
         )
     except WorkshopPreferenceError as exc:
         return _preference_error_response(exc)
-    return _json_response(_serialize_preference_document(document), status=200)
+    response = _serialize_preference_document(document)
+    response["context_invalidation"] = _serialize_preference_context_invalidation(
+        service,
+        authority,
+        document,
+    )
+    return _json_response(response, status=200)
 
 
 async def _handle_preference_history(
@@ -2287,7 +2311,13 @@ async def _handle_preference_restore(
         if isinstance(exc, KeyError):
             return _error_response(status=400, code="invalid_request", message="Invalid preference restore request")
         return _preference_error_response(exc)
-    return _json_response(_serialize_preference_document(document), status=200)
+    response = _serialize_preference_document(document)
+    response["context_invalidation"] = _serialize_preference_context_invalidation(
+        service,
+        authority,
+        document,
+    )
+    return _json_response(response, status=200)
 
 
 async def _authenticate_github_settings_authority(
@@ -5689,6 +5719,7 @@ async def _handle_agent_activation(
     *,
     authenticator: WorkshopClientAuthenticator,
     service: WorkshopAgentLifecycleService,
+    invalidate_agent_context: Callable[[AgentId], Awaitable[tuple[int, int]]] | None = None,
 ) -> web.Response:
     principal_id, error = await _authenticate_agent_lifecycle(request, authenticator)
     if error is not None:
@@ -5699,20 +5730,37 @@ async def _handle_agent_activation(
         return error
     assert payload is not None
     try:
+        definition_id = _agent_definition_id(request)
+        prior = await service.get_visible(principal_id, definition_id)
         try:
             revision_id = AgentDefinitionRevisionId(payload["revision_id"])  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
             raise WorkshopAgentLifecycleValidationError("Invalid agent revision") from exc
         snapshot = await service.activate_revision(
             principal_id,
-            _agent_definition_id(request),
+            definition_id,
             revision_id=revision_id,
             idempotency_key=payload["idempotency_key"],
             expected_version=payload["expected_version"],
         )
     except WorkshopAgentLifecycleError as exc:
         return _agent_lifecycle_error_response(exc)
-    return _json_response({"version": 1, "agent": _serialize_agent_definition(snapshot)}, status=200)
+    response: dict[str, object] = {"version": 1, "agent": _serialize_agent_definition(snapshot)}
+    if invalidate_agent_context is not None and prior.active_revision_id != snapshot.active_revision_id:
+        try:
+            applied, pending = await invalidate_agent_context(snapshot.agent_id)
+        except Exception:
+            # Preparation also compares the durable source digest, so an eager
+            # invalidation failure cannot leave the activated revision stale.
+            log.exception("Could not eagerly invalidate activated agent context for %s", snapshot.agent_id)
+            response["context_invalidation"] = {"state": "failed", "applied": 0, "pending": 0}
+        else:
+            response["context_invalidation"] = {
+                "state": "pending" if pending else "applied",
+                "applied": applied,
+                "pending": pending,
+            }
+    return _json_response(response, status=200)
 
 
 async def _handle_agent_archival(
@@ -8291,6 +8339,7 @@ def register_workshop_read_routes(
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
     standing_participation: WorkshopStandingParticipationService | None = None,
+    invalidate_agent_context: Callable[[AgentId], Awaitable[tuple[int, int]]] | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
     if event_poll_interval <= 0 or event_heartbeat_interval <= 0 or event_authentication_recheck_interval <= 0:
@@ -8505,6 +8554,7 @@ def register_workshop_read_routes(
                 request,
                 authenticator=authenticator,
                 service=agent_lifecycle,
+                invalidate_agent_context=invalidate_agent_context,
             )
 
     async def handle_agent_archival(request: web.Request) -> web.Response:

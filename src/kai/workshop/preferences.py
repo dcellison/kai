@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
 import stat
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +35,7 @@ _MISSING_REVISION = f"pref_v1_{hashlib.sha256(b'').hexdigest()[:32]}_{'0' * 32}"
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+log = logging.getLogger(__name__)
 
 
 class WorkshopPreferenceError(RuntimeError):
@@ -90,6 +93,13 @@ class PreferenceRevision:
 class PreferenceRevisionHistory:
     revisions: tuple[PreferenceRevision, ...]
     limit: int = MAX_PREFERENCE_REVISIONS
+
+
+@dataclass(frozen=True, slots=True)
+class PreferenceContextInvalidation:
+    state: str
+    applied: int
+    pending: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,12 +487,18 @@ class WorkshopPreferenceService:
         principal_storage: WorkshopPrincipalStorageRegistry,
         *,
         privileged_helper: Path = PREFERENCE_MANAGER,
+        on_content_changed: Callable[[PrincipalId], Awaitable[tuple[int, int]]] | None = None,
     ) -> None:
         self._data_dir = data_dir
         self._principal_storage = principal_storage
         self._local = _FilesystemPreferenceStore(data_dir)
         self._privileged_helper = privileged_helper
+        self._on_content_changed = on_content_changed
         self._locks: dict[PrincipalId, asyncio.Lock] = {}
+        self._last_context_invalidation: dict[
+            PrincipalId,
+            tuple[str, PreferenceContextInvalidation],
+        ] = {}
 
     def authority_for_principal(self, principal_id: str | PrincipalId) -> PreferenceAuthority:
         try:
@@ -518,12 +534,19 @@ class WorkshopPreferenceService:
         _normalize_content(content)
         _validate_revision(expected_revision)
         async with self._lock(authority.principal_id):
-            return await self._operation(
+            current = await self._operation("snapshot", principal)
+            document = await self._operation(
                 "write",
                 principal,
                 expected_revision,
                 input_text=content,
             )
+            invalidation = await self._notify_content_changed(
+                authority.principal_id,
+                changed=document.content != current.content,
+            )
+            self._last_context_invalidation[authority.principal_id] = (document.revision, invalidation)
+        return document
 
     async def history(self, authority: PreferenceAuthority) -> PreferenceRevisionHistory:
         principal = self._validate_authority(authority)
@@ -540,12 +563,53 @@ class WorkshopPreferenceService:
         _validate_revision(target_revision)
         _validate_revision(expected_revision)
         async with self._lock(authority.principal_id):
-            return await self._operation(
+            current = await self._operation("snapshot", principal)
+            document = await self._operation(
                 "restore",
                 principal,
                 target_revision,
                 expected_revision,
             )
+            invalidation = await self._notify_content_changed(
+                authority.principal_id,
+                changed=document.content != current.content,
+            )
+            self._last_context_invalidation[authority.principal_id] = (document.revision, invalidation)
+        return document
+
+    def context_invalidation(
+        self,
+        authority: PreferenceAuthority,
+        revision: str,
+    ) -> PreferenceContextInvalidation | None:
+        """Return the eager invalidation result for this exact mutation."""
+        self._validate_authority(authority)
+        latest = self._last_context_invalidation.get(authority.principal_id)
+        return latest[1] if latest is not None and latest[0] == revision else None
+
+    async def _notify_content_changed(
+        self,
+        principal_id: PrincipalId,
+        *,
+        changed: bool,
+    ) -> PreferenceContextInvalidation:
+        if not changed:
+            return PreferenceContextInvalidation("unchanged", 0, 0)
+        if self._on_content_changed is None:
+            return PreferenceContextInvalidation("deferred", 0, 0)
+        try:
+            applied, pending = await self._on_content_changed(principal_id)
+        except Exception:
+            # The next execution independently compares durable revisions, so
+            # notification failure cannot make stale context persistent or
+            # turn a successful document write into an ambiguous client error.
+            log.exception("Could not eagerly invalidate changed preference context for %s", principal_id)
+            return PreferenceContextInvalidation("failed", 0, 0)
+        return PreferenceContextInvalidation(
+            "pending" if pending else "applied",
+            applied,
+            pending,
+        )
 
     async def _operation(
         self,

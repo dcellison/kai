@@ -1357,6 +1357,34 @@ async def get_canonical_workspace_config_settings(
     return {str(row["field"]): str(row["value"]) for row in rows}
 
 
+async def read_canonical_workspace_config(
+    db_path: Path,
+    yaml_config: WorkspaceConfig | None,
+    workspace_path: Path,
+    namespace: WorkshopExecutionStateNamespace,
+) -> WorkspaceConfig | None:
+    """Build canonical workspace policy without the process-global DB handle."""
+    if not db_path.is_file():
+        return yaml_config
+    connection = await aiosqlite.connect(str(db_path))
+    connection.row_factory = aiosqlite.Row
+    try:
+        async with connection.execute(
+            "SELECT field, value FROM channel_agent_workspace_settings "
+            "WHERE channel_id = ? AND agent_id = ? AND workspace_path = ? ORDER BY field",
+            (namespace.channel_id, namespace.agent_id, str(workspace_path)),
+        ) as cursor:
+            rows = await cursor.fetchall()
+    finally:
+        await connection.close()
+    return _build_workspace_config_from_settings(
+        yaml_config,
+        workspace_path,
+        {str(row["field"]): str(row["value"]) for row in rows},
+        owner_label=f"runtime profile {namespace.runtime_profile_id}",
+    )
+
+
 async def set_canonical_workspace_config_setting(
     namespace: WorkshopExecutionStateNamespace,
     workspace_path: str,

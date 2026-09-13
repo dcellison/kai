@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 77
+WORKSHOP_SCHEMA_VERSION = 78
 
 
 @dataclass(frozen=True, slots=True)
@@ -3469,6 +3469,20 @@ _CANONICAL_CONTEXT_MANIFEST_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_RETAINED_CONTEXT_REVISION_SCHEMA = SchemaMigration(
+    version=78,
+    name="retained_context_revision_continuity",
+    statements=(
+        "ALTER TABLE channel_agent_runtime_sessions "
+        "ADD COLUMN retained_context_revision TEXT NOT NULL "
+        "DEFAULT '0000000000000000000000000000000000000000000000000000000000000000' CHECK ("
+        "("
+        "length(retained_context_revision) = 64 "
+        "AND retained_context_revision NOT GLOB '*[^0-9a-f]*'))",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3547,6 +3561,7 @@ _MIGRATIONS = (
     _RUN_KIND_SCOPED_IDENTITY_SCHEMA,
     _REPLAY_SAFE_AGENT_PROVISIONING_SCHEMA,
     _CANONICAL_CONTEXT_MANIFEST_SCHEMA,
+    _RETAINED_CONTEXT_REVISION_SCHEMA,
 )
 
 

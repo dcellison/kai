@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp import web
@@ -295,6 +295,80 @@ async def test_validation_and_unknown_revisions_fail_closed(preferences: _Prefer
 
 
 @pytest.mark.asyncio
+async def test_changed_preferences_invalidate_live_principal_context(preferences: _PreferenceFixture) -> None:
+    invalidate = AsyncMock(return_value=(2, 1))
+    service = WorkshopPreferenceService(
+        preferences.data_dir,
+        preferences.registry,
+        privileged_helper=preferences.data_dir / "missing-helper",
+        on_content_changed=invalidate,
+    )
+    authority = service.authority_for_principal(preferences.alice)
+    original = await service.read(authority)
+
+    saved = await service.save(
+        authority,
+        expected_revision=original.revision,
+        content="Changed context.\n",
+    )
+
+    invalidate.assert_awaited_once_with(preferences.alice)
+    outcome = service.context_invalidation(authority, saved.revision)
+    assert outcome is not None
+    assert (outcome.state, outcome.applied, outcome.pending) == ("pending", 2, 1)
+
+
+@pytest.mark.asyncio
+async def test_unchanged_preferences_do_not_restart_live_context(preferences: _PreferenceFixture) -> None:
+    invalidate = AsyncMock(return_value=(1, 0))
+    service = WorkshopPreferenceService(
+        preferences.data_dir,
+        preferences.registry,
+        privileged_helper=preferences.data_dir / "missing-helper",
+        on_content_changed=invalidate,
+    )
+    authority = service.authority_for_principal(preferences.alice)
+    original = await service.read(authority)
+
+    saved = await service.save(
+        authority,
+        expected_revision=original.revision,
+        content=original.content,
+    )
+
+    invalidate.assert_not_awaited()
+    outcome = service.context_invalidation(authority, saved.revision)
+    assert outcome is not None
+    assert (outcome.state, outcome.applied, outcome.pending) == ("unchanged", 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_invalidation_failure_does_not_make_saved_preferences_ambiguous(
+    preferences: _PreferenceFixture,
+) -> None:
+    invalidate = AsyncMock(side_effect=RuntimeError("invalidation unavailable"))
+    service = WorkshopPreferenceService(
+        preferences.data_dir,
+        preferences.registry,
+        privileged_helper=preferences.data_dir / "missing-helper",
+        on_content_changed=invalidate,
+    )
+    authority = service.authority_for_principal(preferences.alice)
+    original = await service.read(authority)
+
+    saved = await service.save(
+        authority,
+        expected_revision=original.revision,
+        content="Durably saved despite eager invalidation failure.\n",
+    )
+
+    assert (await service.read(authority)).revision == saved.revision
+    outcome = service.context_invalidation(authority, saved.revision)
+    assert outcome is not None
+    assert (outcome.state, outcome.applied, outcome.pending) == ("failed", 0, 0)
+
+
+@pytest.mark.asyncio
 async def test_principal_authority_and_documents_are_isolated(preferences: _PreferenceFixture) -> None:
     alice = preferences.service.authority_for_principal(preferences.alice)
     bob = preferences.service.authority_for_principal(preferences.bob)
@@ -541,6 +615,11 @@ async def test_preference_api_is_authenticated_revision_checked_and_principal_sc
         )
         assert updated.status == 200
         updated_payload = await updated.json()
+        assert updated_payload["context_invalidation"] == {
+            "state": "deferred",
+            "applied": 0,
+            "pending": 0,
+        }
         stale = await client.put(
             "/v1/preferences",
             headers={"Authorization": "Bearer alice-token"},
@@ -565,7 +644,9 @@ async def test_preference_api_is_authenticated_revision_checked_and_principal_sc
             json={"revision": updated_payload["document"]["revision"]},
         )
         assert restored.status == 200
-        assert (await restored.json())["document"]["content"].startswith("# Preferences")
+        restored_payload = await restored.json()
+        assert restored_payload["document"]["content"].startswith("# Preferences")
+        assert restored_payload["context_invalidation"]["state"] == "deferred"
     finally:
         await client.close()
         await store.close()

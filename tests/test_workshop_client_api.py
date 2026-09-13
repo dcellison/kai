@@ -1092,6 +1092,7 @@ async def _open_client(
     human_avatars=None,
     collaboration_policy=None,
     standing_participation=None,
+    invalidate_agent_context=None,
 ) -> TestClient:
     app = web.Application()
     register_workshop_read_routes(
@@ -1119,6 +1120,7 @@ async def _open_client(
         human_avatars=human_avatars,
         collaboration_policy=collaboration_policy,
         standing_participation=standing_participation,
+        invalidate_agent_context=invalidate_agent_context,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -2443,9 +2445,16 @@ class TestWorkshopAgentLifecycleHTTPContract:
         tmp_path: Path,
     ) -> None:
         store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        invalidated_agents: list[AgentId] = []
+
+        async def invalidate_agent_context(agent_id: AgentId) -> tuple[int, int]:
+            invalidated_agents.append(agent_id)
+            return 2, 0
+
         client = await _open_client(
             store,
             _Authenticator({"alice": alice_id, "bob": bob_id}),
+            invalidate_agent_context=invalidate_agent_context,
         )
         try:
             response = await client.post(
@@ -2536,9 +2545,16 @@ class TestWorkshopAgentLifecycleHTTPContract:
                 },
             )
             assert activation.status == 200
-            active = (await activation.json())["agent"]
+            activation_payload = await activation.json()
+            active = activation_payload["agent"]
             assert active["lifecycle_state"] == "active"
             assert active["active_revision_id"] == revision_two_id
+            assert invalidated_agents == [AgentId(active["agent_id"])]
+            assert activation_payload["context_invalidation"] == {
+                "state": "applied",
+                "applied": 2,
+                "pending": 0,
+            }
             member_detail = await client.get(
                 f"/v1/client/agents/{definition_id}",
                 headers={"Authorization": "Bearer bob"},

@@ -16,6 +16,8 @@ selected by protected runtime policy (or compatibility config outside it).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -28,6 +30,7 @@ from kai.backend import (
     AgentBackend,
     ContextAssemblyObserver,
     StreamEvent,
+    get_workspace_system_prompt,
     require_backend_name,
     resolve_home_workspace,
 )
@@ -50,6 +53,7 @@ from kai.config import (
 )
 from kai.goose import GooseBackend
 from kai.internal_api_auth import InternalAPIAuth
+from kai.principal_documents import PrincipalDocumentKind, load_principal_document
 from kai.workshop.domain import AgentId, ChannelId, RuntimeProfileId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workspace_utils import is_workspace_allowed
@@ -362,6 +366,8 @@ class SubprocessPool:
         # user's stored model/timeout into the new subprocess.
         self._pending_workspace_restore: set[RuntimePoolKey] = set()
         self._pending_settings_restore: set[RuntimePoolKey] = set()
+        self._pending_context_invalidation: set[RuntimePoolKey] = set()
+        self._retained_context_revisions: dict[RuntimePoolKey, str] = {}
         self._in_flight: set[RuntimeInstanceKey] = set()
         # Canonical backend selection is hydrated from execution state at
         # startup and updated only by the settings authority.  The protected
@@ -590,6 +596,146 @@ class SubprocessPool:
                     )
             self._pending_workspace_restore.discard(key)
             self._pending_settings_restore.discard(key)
+
+    async def retained_context_revision(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+        *,
+        agent_definition_context: str,
+    ) -> str:
+        """Digest every source whose content persists in a provider session."""
+        if not isinstance(agent_definition_context, str) or not agent_definition_context:
+            raise ValueError("agent_definition_context must be non-empty text")
+        _runtime_key, _, profile = self._resolve_runtime(context)
+        if profile is None:
+            raise RuntimeError("Retained context revisions require protected runtime policy")
+        workspace = await self.get_effective_workspace(context)
+        namespace = self._canonical_workspace_namespace(context)
+        assert namespace is not None
+        workspace_config = await sessions.read_canonical_workspace_config(
+            Path(self._config.session_db_path),
+            self._config.get_workspace_config(workspace),
+            workspace,
+            namespace,
+        )
+        workspace_config = self._workspace_config_for_runtime(context, workspace_config)
+        workspace_prompt = get_workspace_system_prompt(workspace_config) or ""
+        data_dir = Path(self._config.session_db_path).parent
+        private = context.private_context
+
+        async def document_revision(kind: PrincipalDocumentKind, path: Path) -> dict[str, str | None]:
+            document = await asyncio.to_thread(
+                load_principal_document,
+                principal_id=str(context.principal_id),
+                kind=kind,
+                path=path,
+                protected=self._config.protected_install,
+            )
+            return {"state": document.state.value, "revision": document.revision, "reason": document.reason}
+
+        omitted = {"state": "omitted", "revision": None, "reason": "shared_or_disabled"}
+        policy = (
+            await document_revision(PrincipalDocumentKind.POLICY, self.get_home_workspace(context) / "AGENTS.md")
+            if private
+            else omitted
+        )
+        preferences = (
+            await document_revision(
+                PrincipalDocumentKind.PREFERENCES,
+                data_dir / "preferences" / str(context.principal_id) / "PREFERENCES.md",
+            )
+            if private
+            else omitted
+        )
+        file_memory = (
+            await document_revision(
+                PrincipalDocumentKind.FILE_MEMORY,
+                data_dir / "memory" / str(context.principal_id) / "MEMORY.md",
+            )
+            if private and not self._config.memory_enabled
+            else omitted
+        )
+        payload = {
+            "version": 1,
+            "lane": {
+                "channel_id": str(context.channel_id),
+                "agent_id": str(context.agent_id),
+                "principal_id": str(context.principal_id),
+                "runtime_profile_id": str(context.runtime_profile_id),
+            },
+            "principal_policy": policy,
+            "personal_preferences": preferences,
+            "file_memory": file_memory,
+            "agent_definition": hashlib.sha256(agent_definition_context.encode("utf-8")).hexdigest(),
+            "workspace": str(workspace.resolve()),
+            "workspace_prompt": hashlib.sha256(workspace_prompt.encode("utf-8")).hexdigest(),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    async def invalidate_retained_context(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+    ) -> bool:
+        """Discard one idle lane, returning false rather than interrupting work."""
+        runtime_key, _, _ = self._resolve_runtime(context)
+        async with self._backend_transition_lock(runtime_key):
+            if self._profile_has_in_flight(runtime_key):
+                self._pending_context_invalidation.add(runtime_key)
+                return False
+            await self._apply_retained_context_invalidation(runtime_key)
+            return True
+
+    async def invalidate_principal_retained_context(self, principal_id: str) -> tuple[int, int]:
+        """Invalidate only live private lanes whose context belongs to a principal."""
+        contexts = {
+            context
+            for key, context in self._contexts_by_runtime.items()
+            if isinstance(key, _CanonicalRuntimeLaneKey)
+            and context.private_context
+            and str(context.principal_id) == principal_id
+        }
+        results = [await self.invalidate_retained_context(context) for context in contexts]
+        return results.count(True), results.count(False)
+
+    async def invalidate_agent_retained_context(self, agent_id: AgentId) -> tuple[int, int]:
+        """Invalidate every live lane for one newly activated agent revision."""
+        contexts = {
+            context
+            for key, context in self._contexts_by_runtime.items()
+            if isinstance(key, _CanonicalRuntimeLaneKey) and context.agent_id == agent_id
+        }
+        results = [await self.invalidate_retained_context(context) for context in contexts]
+        return results.count(True), results.count(False)
+
+    async def _apply_retained_context_invalidation(self, runtime_key: RuntimePoolKey) -> None:
+        instance_keys = tuple(
+            key
+            for key in self._pool
+            if key == runtime_key or (isinstance(key, _RoutedRuntimeKey) and key.runtime_key == runtime_key)
+        )
+        for key in instance_keys:
+            instance = self._pool.get(key)
+            if instance is not None:
+                await self._shutdown_instance(key, instance, reason="retained context changed")
+        self._pending_context_invalidation.discard(runtime_key)
+        self._retained_context_revisions.pop(runtime_key, None)
+
+    async def _bind_retained_context_revision(
+        self,
+        runtime_key: RuntimePoolKey,
+        revision: str,
+    ) -> None:
+        """Bind a prepared lane to its exact fresh-session context digest."""
+        if len(revision) != 64 or any(character not in "0123456789abcdef" for character in revision):
+            raise ValueError("retained_context_revision must be a lowercase SHA-256 digest")
+        current = self._retained_context_revisions.get(runtime_key)
+        if current == revision:
+            return
+        if self._profile_has_in_flight(runtime_key):
+            self._pending_context_invalidation.add(runtime_key)
+            raise RuntimeError("Retained context changed while the runtime was in flight")
+        await self._apply_retained_context_invalidation(runtime_key)
+        self._retained_context_revisions[runtime_key] = revision
 
     def _protected_profile(self, runtime: RuntimeSelector):
         """Resolve protected policy while preserving the negative-group bridge."""
@@ -1199,10 +1345,21 @@ class SubprocessPool:
             self._pending_settings_restore.discard(runtime_key)
         return instance
 
-    async def prepare_execution(self, runtime: RuntimeSelector) -> PreparedBackendExecution:
+    async def prepare_execution(
+        self,
+        runtime: RuntimeSelector,
+        *,
+        retained_context_revision: str | None = None,
+    ) -> PreparedBackendExecution:
         """Bind the effective selection to the exact runtime that may dispatch later."""
         runtime_key, _, _ = self._resolve_runtime(runtime)
         async with self._backend_transition_lock(runtime_key):
+            if runtime_key in self._pending_context_invalidation:
+                if self._profile_has_in_flight(runtime_key):
+                    raise RuntimeError("Retained context invalidation is pending")
+                await self._apply_retained_context_invalidation(runtime_key)
+            if retained_context_revision is not None:
+                await self._bind_retained_context_revision(runtime_key, retained_context_revision)
             prepared = PreparedBackendExecution(
                 self,
                 runtime,
@@ -1222,6 +1379,8 @@ class SubprocessPool:
         runtime: RuntimeSelector,
         backend_option_id: str,
         model: str,
+        *,
+        retained_context_revision: str | None = None,
     ) -> PreparedBackendExecution:
         """Bind an alternate authorized option without changing the selected route."""
         runtime_key, _, profile = self._resolve_runtime(runtime)
@@ -1231,7 +1390,10 @@ class SubprocessPool:
         selected = self._backend_option(runtime)
         assert selected is not None
         if option.option_id == selected.option_id:
-            return await self.prepare_execution(runtime)
+            return await self.prepare_execution(
+                runtime,
+                retained_context_revision=retained_context_revision,
+            )
         if not validate_model_for_backend_policy(
             model,
             option.backend,
@@ -1242,6 +1404,12 @@ class SubprocessPool:
 
         instance_key = _RoutedRuntimeKey(runtime_key, option.option_id)
         async with self._backend_transition_lock(runtime_key):
+            if runtime_key in self._pending_context_invalidation:
+                if self._profile_has_in_flight(runtime_key):
+                    raise RuntimeError("Retained context invalidation is pending")
+                await self._apply_retained_context_invalidation(runtime_key)
+            if retained_context_revision is not None:
+                await self._bind_retained_context_revision(runtime_key, retained_context_revision)
             workspace = await self.get_effective_workspace(runtime)
             instance = self._pool.get(instance_key)
             if instance is not None:
@@ -1370,6 +1538,11 @@ class SubprocessPool:
             instance.discard_context_assembly_observer()
             self._in_flight.discard(instance_key)
             self._last_activity[instance_key] = time.monotonic()
+            runtime_key = instance_key.runtime_key if isinstance(instance_key, _RoutedRuntimeKey) else instance_key
+            if runtime_key in self._pending_context_invalidation and not self._profile_has_in_flight(runtime_key):
+                async with self._backend_transition_lock(runtime_key):
+                    if not self._profile_has_in_flight(runtime_key):
+                        await self._apply_retained_context_invalidation(runtime_key)
 
     def _validate_prepared(self, prepared: PreparedBackendExecution) -> None:
         instance_key = prepared._instance_key
