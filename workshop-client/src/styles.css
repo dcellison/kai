@@ -15,6 +15,144 @@
   font-size: 150%;
 }
 
+.context-stack-panel {
+  margin-top: 0.65rem;
+}
+
+.context-stack-panel > summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.context-stack-inspector {
+  margin-top: 0.65rem;
+}
+
+.context-stack-summary {
+  border-bottom: 1px solid var(--color-border);
+  display: grid;
+  gap: 0.25rem;
+  padding-bottom: 0.65rem;
+}
+
+.context-stack-summary p {
+  margin: 0;
+}
+
+.context-stack-summary code {
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+}
+
+.context-source-list {
+  display: grid;
+  gap: 0.55rem;
+  list-style: none;
+  margin: 0.65rem 0 0;
+  padding: 0;
+}
+
+.context-source-card {
+  background: color-mix(in srgb, var(--color-surface-raised) 76%, transparent);
+  border: 1px solid var(--color-border);
+  border-radius: 0.45rem;
+  padding: 0.65rem;
+}
+
+.context-source-card.changed {
+  border-color: var(--color-warning);
+}
+
+.context-source-card > header {
+  align-items: flex-start;
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+}
+
+.context-source-card h4,
+.context-source-card header p {
+  margin: 0;
+}
+
+.context-source-card header p,
+.context-source-note,
+.context-source-effect {
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+}
+
+.context-source-facts {
+  display: grid;
+  gap: 0.28rem;
+  grid-template-columns: 1fr;
+  margin: 0.55rem 0;
+}
+
+.context-source-facts div {
+  min-width: 0;
+}
+
+.context-source-facts dt {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+}
+
+.context-source-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.context-source-preview summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.context-source-preview pre {
+  background: var(--color-canvas-inset);
+  border-radius: 0.35rem;
+  max-height: 18rem;
+  overflow: auto;
+  padding: 0.6rem;
+  white-space: pre-wrap;
+}
+
+.context-native-sources {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  margin: 0.5rem 0;
+  padding-left: 1.1rem;
+}
+
+.context-source-editor textarea {
+  box-sizing: border-box;
+  margin-top: 0.5rem;
+  resize: vertical;
+  width: 100%;
+}
+
+.context-source-editor-actions {
+  align-items: center;
+  display: flex;
+  gap: 0.3rem;
+  justify-content: flex-end;
+  margin-top: 0.35rem;
+}
+
+.context-source-editor-actions span {
+  color: var(--color-text-muted);
+  font-size: 0.72rem;
+  margin-right: auto;
+}
+
+.context-source-update {
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+  margin: 0.55rem 0 0;
+}
+
 * {
   box-sizing: border-box;
 }

@@ -126,6 +126,7 @@ from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionConte
 from kai.workshop.memory_queries import WorkshopMemoryQueryService
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.preferences import WorkshopPreferenceService
+from kai.workshop.principal_policies import WorkshopPrincipalPolicyService
 from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
     ProactivePublicationResult,
@@ -2205,6 +2206,7 @@ async def _register_workshop_client_api(
     routing_eligibility: WorkshopRoutingEligibilityService | None = None,
     routing_policy: WorkshopRoutingPolicyService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
+    principal_policies: WorkshopPrincipalPolicyService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
@@ -2254,6 +2256,7 @@ async def _register_workshop_client_api(
             routing_eligibility=routing_eligibility,
             routing_policy=routing_policy,
             memory_queries=memory_queries,
+            principal_policies=principal_policies,
             preference_documents=preference_documents,
             github_settings=github_settings,
             notification_preferences=notification_preferences,
@@ -2280,6 +2283,9 @@ async def _register_workshop_client_api(
                 artifact_service=artifact_service,
                 routing_policy=routing_policy,
                 collaboration_policy=collaboration_policy,
+                principal_policies=principal_policies,
+                preference_documents=preference_documents,
+                settings_workspaces=settings_workspaces,
             )
         register_workshop_shell_routes(target)
 
@@ -2350,6 +2356,7 @@ async def start(
             routing_eligibility=getattr(core_services, "routing_eligibility", None),
             routing_policy=getattr(core_services, "routing_policy", None),
             memory_queries=core_services.memory_queries,
+            principal_policies=getattr(core_services, "principal_policies", None),
             preference_documents=core_services.preference_documents,
             github_settings=getattr(core_services, "github_settings", None),
             notification_preferences=getattr(core_services, "notification_preferences", None),

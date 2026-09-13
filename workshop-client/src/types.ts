@@ -700,12 +700,28 @@ export interface WorkshopWorkspaceConfig {
 }
 
 export interface WorkshopPreferenceDocument {
+  contextInvalidation?: WorkshopContextInvalidation;
   content: string;
   editable: boolean;
   maxBytes: number;
   revision: string;
   sizeBytes: number;
   updatedAt: string | null;
+}
+
+export interface WorkshopPrincipalPolicyDocument {
+  contextInvalidation?: WorkshopContextInvalidation;
+  content: string;
+  editable: boolean;
+  maxBytes: number;
+  revision: string;
+  sizeBytes: number;
+}
+
+export interface WorkshopContextInvalidation {
+  applied: number;
+  pending: number;
+  state: "applied" | "pending" | "failed" | "unchanged";
 }
 
 export interface WorkshopPreferenceRevision {
@@ -1203,6 +1219,70 @@ export interface WorkshopRunTracePage {
   collaborationActivity: WorkshopCollaborationActivity[];
   entries: WorkshopRunTraceEntry[];
   hasMore: boolean;
+}
+
+export interface WorkshopContextSourceInspection {
+  changeEffect: "next_turn" | "provider_session_refresh" | null;
+  currentRevision: string | null;
+  description: string;
+  editable: boolean;
+  editTarget: "principal_policy" | "personal_preferences" | "agent_definition" | "workspace_policy" | null;
+  editTargetId: string | null;
+  freshness: "current" | "changed" | "not_checked";
+  preview: string | null;
+  previewReason: string | null;
+  previewState: "exact" | "redacted" | "unavailable";
+  sourceReference: string;
+  title: string;
+}
+
+export interface WorkshopContextSource {
+  authorityClass: string;
+  authorizationOperations: string[] | null;
+  budgetBytes: number | null;
+  deliveryRole: string;
+  deliveryShape: string;
+  historyBoundary: number | null;
+  inspection: WorkshopContextSourceInspection;
+  kind: string;
+  nativeInstructionSources: Array<{
+    contentSha256: string | null;
+    filename: string;
+    pathSha256: string;
+    scope: string;
+  }>;
+  ownerId: string | null;
+  ownerKind: string;
+  reason: string;
+  refreshClass: string;
+  renderedBytes: number;
+  revision: string | null;
+  scope: string;
+  state: string;
+  trustClass: string;
+}
+
+export interface WorkshopContextManifest {
+  agentId: string;
+  attemptId: string;
+  backend: string;
+  channelId: string;
+  createdAt: string;
+  manifestSha256: string;
+  model: string;
+  provider: string | null;
+  providerSessionRevision: string | null;
+  runId: string;
+  runtimeProfileId: string;
+  sources: WorkshopContextSource[];
+  workspaceDigest: string | null;
+  workspaceKind: string;
+}
+
+export interface WorkshopContextManifestSnapshot {
+  channelId: string;
+  manifests: WorkshopContextManifest[];
+  runId: string;
 }
 
 export interface WorkshopCollaborationActivity {

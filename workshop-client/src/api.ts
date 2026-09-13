@@ -28,6 +28,9 @@ import type {
   WorkshopWorkspaceConfig,
   WorkshopPreferenceDocument,
   WorkshopPreferenceHistory,
+  WorkshopPrincipalPolicyDocument,
+  WorkshopContextManifestSnapshot,
+  WorkshopContextSource,
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
   WorkshopNotificationPreferences,
@@ -118,6 +121,14 @@ export class ChannelReadPositionConflictError extends Error {}
 export class ThreadUnreadConflictError extends Error {}
 export class ResynchronizationRequired extends Error {}
 export class PreferenceRevisionConflictError extends Error {
+  constructor(
+    message: string,
+    public readonly currentRevision: string,
+  ) {
+    super(message);
+  }
+}
+export class PrincipalPolicyRevisionConflictError extends Error {
   constructor(
     message: string,
     public readonly currentRevision: string,
@@ -3427,6 +3438,30 @@ function parseWorkspaceConfig(payload: unknown): WorkshopWorkspaceConfig {
   };
 }
 
+function parseContextInvalidation(
+  payload: Record<string, unknown>,
+): WorkshopPreferenceDocument["contextInvalidation"] {
+  if (payload.context_invalidation === undefined || payload.context_invalidation === null) {
+    return undefined;
+  }
+  const value = payload.context_invalidation;
+  if (
+    !isRecord(value) ||
+    !["applied", "pending", "failed", "unchanged"].includes(String(value.state)) ||
+    !Number.isSafeInteger(value.applied) ||
+    (value.applied as number) < 0 ||
+    !Number.isSafeInteger(value.pending) ||
+    (value.pending as number) < 0
+  ) {
+    throw new Error("Kai returned unsupported context-invalidation state.");
+  }
+  return {
+    applied: value.applied as number,
+    pending: value.pending as number,
+    state: value.state as "applied" | "pending" | "failed" | "unchanged",
+  };
+}
+
 function parsePreferenceDocument(payload: unknown): WorkshopPreferenceDocument {
   if (
     !isRecord(payload) ||
@@ -3442,13 +3477,40 @@ function parsePreferenceDocument(payload: unknown): WorkshopPreferenceDocument {
   ) {
     throw new Error("Kai returned unsupported preference state.");
   }
+  const contextInvalidation = parseContextInvalidation(payload);
   return {
+    ...(contextInvalidation ? { contextInvalidation } : {}),
     content: payload.document.content,
     editable: payload.document.editable,
     maxBytes: payload.document.max_bytes as number,
     revision: payload.document.revision,
     sizeBytes: payload.document.size_bytes as number,
     updatedAt: payload.document.updated_at as string | null,
+  };
+}
+
+function parsePrincipalPolicyDocument(payload: unknown): WorkshopPrincipalPolicyDocument {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.document) ||
+    typeof payload.document.content !== "string" ||
+    typeof payload.document.revision !== "string" ||
+    !/^[0-9a-f]{64}$/.test(payload.document.revision) ||
+    !Number.isSafeInteger(payload.document.size_bytes) ||
+    !Number.isSafeInteger(payload.document.max_bytes) ||
+    typeof payload.document.editable !== "boolean"
+  ) {
+    throw new Error("Kai returned unsupported principal-policy state.");
+  }
+  const contextInvalidation = parseContextInvalidation(payload);
+  return {
+    ...(contextInvalidation ? { contextInvalidation } : {}),
+    content: payload.document.content,
+    editable: payload.document.editable,
+    maxBytes: payload.document.max_bytes as number,
+    revision: payload.document.revision,
+    sizeBytes: payload.document.size_bytes as number,
   };
 }
 
@@ -4739,6 +4801,44 @@ export async function loadPreferenceDocument(
   return parsePreferenceDocument(payload);
 }
 
+export async function loadPrincipalPolicyDocument(
+  session: WorkshopSession,
+): Promise<WorkshopPrincipalPolicyDocument> {
+  const response = await authorizedFetch(session, "/v1/principal-policy");
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load principal policy."));
+  }
+  return parsePrincipalPolicyDocument(payload);
+}
+
+export async function savePrincipalPolicyDocument(
+  session: WorkshopSession,
+  content: string,
+  revision: string,
+): Promise<WorkshopPrincipalPolicyDocument> {
+  const response = await authorizedFetch(session, "/v1/principal-policy", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content, revision }),
+  });
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    const currentRevision = isRecord(payload) && isRecord(payload.error) &&
+      typeof payload.error.current_revision === "string"
+      ? payload.error.current_revision
+      : "";
+    throw new PrincipalPolicyRevisionConflictError(
+      safeErrorMessage(payload, "Principal policy changed since it was opened."),
+      currentRevision,
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not save principal policy."));
+  }
+  return parsePrincipalPolicyDocument(payload);
+}
+
 export async function savePreferenceDocument(
   session: WorkshopSession,
   content: string,
@@ -5127,6 +5227,179 @@ export async function loadRunTrace(
     });
   }
   return { collaborationActivity, entries, hasMore: payload.has_more };
+}
+
+function parseContextSource(value: unknown): WorkshopContextSource | null {
+  if (
+    !isRecord(value) ||
+    typeof value.kind !== "string" ||
+    typeof value.owner_kind !== "string" ||
+    (value.owner_id !== null && typeof value.owner_id !== "string") ||
+    typeof value.scope !== "string" ||
+    typeof value.trust_class !== "string" ||
+    typeof value.authority_class !== "string" ||
+    typeof value.refresh_class !== "string" ||
+    typeof value.delivery_role !== "string" ||
+    typeof value.state !== "string" ||
+    typeof value.reason !== "string" ||
+    (value.revision !== null && typeof value.revision !== "string") ||
+    (value.history_boundary !== null && !Number.isSafeInteger(value.history_boundary)) ||
+    typeof value.delivery_shape !== "string" ||
+    !Number.isSafeInteger(value.rendered_bytes) ||
+    (value.budget_bytes !== null && !Number.isSafeInteger(value.budget_bytes)) ||
+    !isRecord(value.inspection)
+  ) {
+    return null;
+  }
+  const inspection = value.inspection;
+  if (
+    typeof inspection.title !== "string" ||
+    typeof inspection.description !== "string" ||
+    typeof inspection.source_reference !== "string" ||
+    (inspection.preview !== null && typeof inspection.preview !== "string") ||
+    !["exact", "redacted", "unavailable"].includes(String(inspection.preview_state)) ||
+    (inspection.preview_reason !== null && typeof inspection.preview_reason !== "string") ||
+    typeof inspection.editable !== "boolean" ||
+    (inspection.edit_target !== null && ![
+      "principal_policy",
+      "personal_preferences",
+      "agent_definition",
+      "workspace_policy",
+    ].includes(String(inspection.edit_target))) ||
+    (inspection.edit_target_id !== undefined && inspection.edit_target_id !== null &&
+      typeof inspection.edit_target_id !== "string") ||
+    (inspection.current_revision !== null && typeof inspection.current_revision !== "string") ||
+    !["current", "changed", "not_checked"].includes(String(inspection.freshness)) ||
+    (inspection.change_effect !== null && ![
+      "next_turn",
+      "provider_session_refresh",
+    ].includes(String(inspection.change_effect)))
+  ) {
+    return null;
+  }
+  const rawNative = value.native_instruction_sources ?? [];
+  if (!Array.isArray(rawNative)) return null;
+  const nativeInstructionSources = rawNative.map((source) => {
+    if (
+      !isRecord(source) ||
+      typeof source.scope !== "string" ||
+      typeof source.filename !== "string" ||
+      typeof source.path_sha256 !== "string" ||
+      (source.content_sha256 !== null && typeof source.content_sha256 !== "string")
+    ) return null;
+    return {
+      contentSha256: source.content_sha256 as string | null,
+      filename: source.filename,
+      pathSha256: source.path_sha256,
+      scope: source.scope,
+    };
+  });
+  if (nativeInstructionSources.some((source) => source === null)) return null;
+  const operations = value.authorization_operations ?? null;
+  if (operations !== null && (!Array.isArray(operations) || operations.some((item) => typeof item !== "string"))) {
+    return null;
+  }
+  return {
+    authorityClass: value.authority_class,
+    authorizationOperations: operations as string[] | null,
+    budgetBytes: value.budget_bytes as number | null,
+    deliveryRole: value.delivery_role,
+    deliveryShape: value.delivery_shape,
+    historyBoundary: value.history_boundary as number | null,
+    inspection: {
+      changeEffect: inspection.change_effect as "next_turn" | "provider_session_refresh" | null,
+      currentRevision: inspection.current_revision as string | null,
+      description: inspection.description,
+      editable: inspection.editable,
+      editTarget: inspection.edit_target as WorkshopContextSource["inspection"]["editTarget"],
+      editTargetId: (inspection.edit_target_id ?? null) as string | null,
+      freshness: inspection.freshness as "current" | "changed" | "not_checked",
+      preview: inspection.preview as string | null,
+      previewReason: inspection.preview_reason as string | null,
+      previewState: inspection.preview_state as "exact" | "redacted" | "unavailable",
+      sourceReference: inspection.source_reference,
+      title: inspection.title,
+    },
+    kind: value.kind,
+    nativeInstructionSources: nativeInstructionSources as WorkshopContextSource["nativeInstructionSources"],
+    ownerId: value.owner_id,
+    ownerKind: value.owner_kind,
+    reason: value.reason,
+    refreshClass: value.refresh_class,
+    renderedBytes: value.rendered_bytes as number,
+    revision: value.revision,
+    scope: value.scope,
+    state: value.state,
+    trustClass: value.trust_class,
+  };
+}
+
+export async function loadRunContextManifests(
+  session: WorkshopSession,
+  runId: string,
+): Promise<WorkshopContextManifestSnapshot> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/runs/${encodeURIComponent(runId)}/context-manifests`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load this run's context stack."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.channel_id !== session.channelId ||
+    payload.run_id !== runId ||
+    !Array.isArray(payload.manifests)
+  ) {
+    throw new Error("Kai returned an unsupported context stack.");
+  }
+  const manifests = payload.manifests.map((manifest) => {
+    if (
+      !isRecord(manifest) ||
+      typeof manifest.attempt_id !== "string" ||
+      manifest.run_id !== runId ||
+      manifest.channel_id !== session.channelId ||
+      typeof manifest.agent_id !== "string" ||
+      typeof manifest.runtime_profile_id !== "string" ||
+      typeof manifest.backend !== "string" ||
+      (manifest.provider !== null && typeof manifest.provider !== "string") ||
+      typeof manifest.model !== "string" ||
+      typeof manifest.workspace_kind !== "string" ||
+      (manifest.workspace_digest !== null && typeof manifest.workspace_digest !== "string") ||
+      (manifest.provider_session_revision !== null && typeof manifest.provider_session_revision !== "string") ||
+      typeof manifest.manifest_sha256 !== "string" ||
+      typeof manifest.created_at !== "string" ||
+      !Array.isArray(manifest.sources)
+    ) return null;
+    const sources = manifest.sources.map(parseContextSource);
+    if (sources.some((source) => source === null)) return null;
+    return {
+      agentId: manifest.agent_id,
+      attemptId: manifest.attempt_id,
+      backend: manifest.backend,
+      channelId: manifest.channel_id,
+      createdAt: manifest.created_at,
+      manifestSha256: manifest.manifest_sha256,
+      model: manifest.model,
+      provider: manifest.provider as string | null,
+      providerSessionRevision: manifest.provider_session_revision as string | null,
+      runId,
+      runtimeProfileId: manifest.runtime_profile_id,
+      sources: sources as WorkshopContextSource[],
+      workspaceDigest: manifest.workspace_digest as string | null,
+      workspaceKind: manifest.workspace_kind,
+    };
+  });
+  if (manifests.some((manifest) => manifest === null)) {
+    throw new Error("Kai returned an unsupported context stack.");
+  }
+  return {
+    channelId: session.channelId,
+    manifests: manifests as WorkshopContextManifestSnapshot["manifests"],
+    runId,
+  };
 }
 
 export async function cancelRun(

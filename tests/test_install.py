@@ -66,6 +66,7 @@ from kai.install import (
     _generate_launcher_script,
     _generate_principal_document_reader,
     _generate_principal_memory_reader,
+    _generate_principal_policy_manager,
     _generate_principal_preference_manager,
     _generate_principal_workspace_provisioner,
     _generate_sponsored_workspace_provisioner,
@@ -468,9 +469,14 @@ class TestGenerateSudoers:
         assert rule not in _generate_sudoers("kai", ["kai"])
 
     def test_principal_document_reader_rule_is_explicitly_gated(self):
-        rule = "kai ALL=(root) NOPASSWD: /etc/kai/read-principal-document *"
-        assert rule in _generate_sudoers("kai", principal_document_reader=True)
-        assert rule not in _generate_sudoers("kai")
+        reader_rule = "kai ALL=(root) NOPASSWD: /etc/kai/read-principal-document *"
+        policy_rule = "kai ALL=(root) NOPASSWD: /etc/kai/manage-principal-policy *"
+        enabled = _generate_sudoers("kai", principal_document_reader=True)
+        disabled = _generate_sudoers("kai")
+        assert reader_rule in enabled
+        assert policy_rule in enabled
+        assert reader_rule not in disabled
+        assert policy_rule not in disabled
 
 
 class TestGeneratePrincipalDocumentReader:
@@ -501,6 +507,38 @@ class TestGeneratePrincipalDocumentReader:
         assert "alice" in script
         assert str(home / "AGENTS.md") in script
         compile(script, "<principal-document-reader>", "exec")
+
+
+class TestGeneratePrincipalPolicyManager:
+    def test_embeds_only_fixed_owner_and_policy_path(self, tmp_path):
+        principal_id = "prn_" + "a" * 32
+        home = tmp_path / "home" / principal_id
+        script = _generate_principal_policy_manager(
+            {
+                principal_id: (
+                    "alice",
+                    {
+                        "principal_policy": home / "AGENTS.md",
+                        "personal_preferences": tmp_path / "preferences" / principal_id / "PREFERENCES.md",
+                        "file_memory": tmp_path / "memory" / principal_id / "MEMORY.md",
+                    },
+                )
+            },
+            "/srv/kai",
+        )
+
+        assert script.startswith("#!/usr/bin/python3\n")
+        assert "PYTHON = '/srv/kai/venv/bin/python'" in script
+        assert '"kai.workshop.principal_policies"' in script
+        assert '"--helper"' in script
+        assert principal_id in script
+        assert "alice" in script
+        assert str(home / "AGENTS.md") in script
+        assert "PREFERENCES.md" not in script
+        assert "MEMORY.md" not in script
+        assert "os.execve(" in script
+        assert "environ" not in script
+        compile(script, "<principal-policy-manager>", "exec")
 
 
 class TestGeneratePrincipalPreferenceManager:
