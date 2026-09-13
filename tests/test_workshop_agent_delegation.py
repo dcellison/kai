@@ -53,8 +53,8 @@ class _CompletingExecution:
         self._store = authority.event_store
         self.executed: list[RunId] = []
 
-    async def authorize_collaboration(self, proof, operation, **kwargs):
-        return await self.collaboration_authority.authorize(proof, operation, **kwargs)
+    async def authorize_collaboration(self, operation, **kwargs):
+        return await self.collaboration_authority.authorize(operation, **kwargs)
 
     async def execute(self, run_id: RunId) -> CanonicalExecutionResult:
         self.executed.append(run_id)
@@ -112,8 +112,8 @@ class _CancellableExecution:
         self.started = asyncio.Event()
         self.cancelled = asyncio.Event()
 
-    async def authorize_collaboration(self, proof, operation, **kwargs):
-        return await self.collaboration_authority.authorize(proof, operation, **kwargs)
+    async def authorize_collaboration(self, operation, **kwargs):
+        return await self.collaboration_authority.authorize(operation, **kwargs)
 
     async def execute(self, run_id: RunId) -> CanonicalExecutionResult:
         self.started.set()
@@ -185,12 +185,12 @@ async def _running_parent(path: Path):
         store,
         authority,
         CollaborationBaseIdentity(
-            principal_id=parent.requested_by_principal_id,
+            principal_id=None,
             channel_id=channel_id,
             agent_id=caller_agent_id,
             runtime_profile_id=RuntimeProfileId(str(row[1])),
         ),
-        invocation.token,
+        invocation,
         collaboration_authority,
         parent,
         target_agent_id,
@@ -200,7 +200,7 @@ async def _running_parent(path: Path):
 async def test_explicit_delegation_is_visible_durable_bounded_and_idempotent(
     tmp_path: Path,
 ) -> None:
-    store, authority, caller, proof, collaboration_authority, parent, target_agent_id = await _running_parent(
+    store, authority, caller, _invocation, collaboration_authority, parent, target_agent_id = await _running_parent(
         tmp_path / "kai.db"
     )
     execution = _CompletingExecution(authority, collaboration_authority)
@@ -213,7 +213,6 @@ async def test_explicit_delegation_is_visible_durable_bounded_and_idempotent(
         before_position = int(before_row[0])
         result = await service.delegate(
             caller,
-            proof=proof,
             target_handle="nova",
             task="Return a bounded qualification result.",
             context={"summary": "Only shared channel context."},
@@ -221,7 +220,6 @@ async def test_explicit_delegation_is_visible_durable_bounded_and_idempotent(
         )
         replay = await service.delegate(
             caller,
-            proof=proof,
             target_handle="NOVA",
             task="Return a bounded qualification result.",
             context={"summary": "Only shared channel context."},
@@ -304,7 +302,7 @@ async def test_explicit_delegation_is_visible_durable_bounded_and_idempotent(
 async def test_delegation_rejects_cycles_before_creating_any_child_state(
     tmp_path: Path,
 ) -> None:
-    store, authority, caller, proof, collaboration_authority, _parent, _target_agent_id = await _running_parent(
+    store, authority, caller, _invocation, collaboration_authority, _parent, _target_agent_id = await _running_parent(
         tmp_path / "kai.db"
     )
     service = WorkshopAgentDelegationService(
@@ -316,7 +314,6 @@ async def test_delegation_rejects_cycles_before_creating_any_child_state(
         with pytest.raises(AgentDelegationDenied) as denied:
             await service.delegate(
                 caller,
-                proof=proof,
                 target_handle="kai",
                 task="Delegate back to the caller.",
                 idempotency_key="cycle",
@@ -329,25 +326,25 @@ async def test_delegation_rejects_cycles_before_creating_any_child_state(
         await store.close()
 
 
-async def test_delegation_rejects_base_identity_without_exact_attempt_proof(tmp_path: Path) -> None:
-    store, authority, caller, _proof, collaboration_authority, _parent, _target_agent_id = await _running_parent(
+async def test_delegation_rejects_base_identity_without_live_attempt_binding(tmp_path: Path) -> None:
+    store, authority, caller, _invocation, _collaboration_authority, _parent, _target_agent_id = await _running_parent(
         tmp_path / "kai.db"
     )
+    unbound_authority = WorkshopCollaborationAuthority(store)
     service = WorkshopAgentDelegationService(
         store,
-        _CompletingExecution(authority, collaboration_authority),  # type: ignore[arg-type]
+        _CompletingExecution(authority, unbound_authority),  # type: ignore[arg-type]
     )
     await service.start()
     try:
         with pytest.raises(AgentDelegationDenied) as denied:
             await service.delegate(
                 caller,
-                proof="",
                 target_handle="nova",
                 task="This must not run.",
-                idempotency_key="missing-proof",
+                idempotency_key="missing-binding",
             )
-        assert denied.value.code == "invalid_proof"
+        assert denied.value.code == "attempt_not_bound"
         async with store.connection.execute("SELECT COUNT(*) FROM agent_delegations") as cursor:
             assert int((await cursor.fetchone())[0]) == 0
         async with store.connection.execute("SELECT COUNT(*) FROM collaboration_operation_decisions") as cursor:
@@ -358,7 +355,7 @@ async def test_delegation_rejects_base_identity_without_exact_attempt_proof(tmp_
 
 
 async def test_requested_delegation_resumes_after_service_restart(tmp_path: Path) -> None:
-    store, authority, caller, proof, collaboration_authority, _parent, _target_agent_id = await _running_parent(
+    store, authority, caller, _invocation, collaboration_authority, _parent, _target_agent_id = await _running_parent(
         tmp_path / "kai.db"
     )
     execution = _CompletingExecution(authority, collaboration_authority)
@@ -366,9 +363,8 @@ async def test_requested_delegation_resumes_after_service_restart(tmp_path: Path
     # Call the acceptance seam directly to simulate a crash after its durable commit.
     delegation = await seed._accept(
         await collaboration_authority.authenticate(
-            proof,
+            caller,
             CollaborationOperation.AGENT_DELEGATION,
-            base_identity=caller,
             occurred_at=datetime.now(UTC),
         ),
         target_handle="nova",
@@ -394,7 +390,7 @@ async def test_requested_delegation_resumes_after_service_restart(tmp_path: Path
 
 
 async def test_service_shutdown_cancels_the_delegated_child_tree(tmp_path: Path) -> None:
-    store, authority, caller, proof, collaboration_authority, _parent, _target_agent_id = await _running_parent(
+    store, authority, caller, _invocation, collaboration_authority, _parent, _target_agent_id = await _running_parent(
         tmp_path / "kai.db"
     )
     execution = _CancellableExecution(authority, collaboration_authority)
@@ -402,9 +398,8 @@ async def test_service_shutdown_cancels_the_delegated_child_tree(tmp_path: Path)
     # Seed the durable pre-dispatch boundary before the worker starts.
     delegation = await service._accept(
         await collaboration_authority.authenticate(
-            proof,
+            caller,
             CollaborationOperation.AGENT_DELEGATION,
-            base_identity=caller,
             occurred_at=datetime.now(UTC),
         ),
         target_handle="nova",

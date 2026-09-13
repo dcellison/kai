@@ -218,7 +218,6 @@ class WorkshopCanonicalExecutionCoordinator:
 
     async def authorize_collaboration(
         self,
-        proof: str,
         operation: CollaborationOperation,
         *,
         base_identity: CollaborationBaseIdentity,
@@ -229,7 +228,6 @@ class WorkshopCanonicalExecutionCoordinator:
         """Serialize collaboration authorization with run-state transactions."""
         async with self._database_lock:
             return await self._collaboration_authority.authorize(
-                proof,
                 operation,
                 base_identity=base_identity,
                 idempotency_key=idempotency_key,
@@ -700,8 +698,8 @@ class WorkshopCanonicalExecutionCoordinator:
                             occurred_at=self._now(),
                         )
                 except Exception:
-                    # The transient proof is dropped before the durable event is
-                    # attempted, so failure remains fail-closed. Recovery and
+                    # The live server binding is dropped before the durable event
+                    # is attempted, so failure remains fail-closed. Recovery and
                     # diagnostics can reconcile the immutable grant later.
                     log.exception("Workshop collaboration-grant revocation could not be recorded")
 
@@ -752,6 +750,7 @@ class WorkshopCanonicalExecutionCoordinator:
                 current_input_digest=content_digest(str(input_row[0])),
                 attempt_id=claim.attempt_id,
                 attempt_authority_revision=None,
+                attempt_authority_operations=(),
                 observation=ContextAssemblyObservation(
                     provider_dispatch_reached=False,
                     session_context_delivered=False,
@@ -809,6 +808,7 @@ class WorkshopCanonicalExecutionCoordinator:
             current_input_digest=content_digest(str(input_row[0])),
             attempt_id=claim.attempt_id,
             attempt_authority_revision=None,
+            attempt_authority_operations=(),
             observation=ContextAssemblyObservation(
                 provider_dispatch_reached=dispatch_reached,
                 session_context_delivered=False,
@@ -1006,6 +1006,9 @@ class WorkshopCanonicalExecutionCoordinator:
                 current_input_digest=content_digest(prompt),
                 attempt_id=claim.attempt_id,
                 attempt_authority_revision=attempt_authority_revision,
+                attempt_authority_operations=tuple(
+                    sorted(operation.value for operation in active.collaboration_operations)
+                ),
                 observation=observation,
             )
             async with self._database_lock:
@@ -1022,8 +1025,6 @@ class WorkshopCanonicalExecutionCoordinator:
         traces_truncated = False
         try:
             async for event in prepared.stream(prompt):
-                if active.collaboration_invocation is not None:
-                    event = _redact_collaboration_event(event, active.collaboration_invocation)
                 if event.done:
                     response = event.response
                     break
@@ -1188,37 +1189,3 @@ class WorkshopCanonicalExecutionCoordinator:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
-
-
-def _redact_collaboration_event(
-    event: StreamEvent,
-    invocation: CollaborationInvocation,
-) -> StreamEvent:
-    """Fail closed if a backend echoes its short-lived proof."""
-    response = event.response
-    if response is not None:
-        response = AgentResponse(
-            success=response.success,
-            text=invocation.redact(response.text),
-            session_id=response.session_id,
-            duration_ms=response.duration_ms,
-            error=invocation.redact(response.error) if response.error is not None else None,
-            failure_kind=response.failure_kind,
-        )
-    trace = event.trace
-    if trace is not None:
-        trace = type(trace)(
-            kind=trace.kind,
-            tool_use_id=trace.tool_use_id,
-            summary=invocation.redact(trace.summary),
-            detail=invocation.redact(trace.detail),
-            tool_name=trace.tool_name,
-            is_diff=trace.is_diff,
-            is_error=trace.is_error,
-        )
-    return StreamEvent(
-        text_so_far=invocation.redact(event.text_so_far),
-        done=event.done,
-        response=response,
-        trace=trace,
-    )

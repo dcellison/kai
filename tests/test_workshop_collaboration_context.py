@@ -9,10 +9,10 @@ import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.collaboration_authority import (
+    CollaborationAttemptBindingError,
     CollaborationBaseIdentity,
     CollaborationOperation,
     CollaborationOwnerPolicy,
-    CollaborationProofError,
     WorkshopCollaborationAuthority,
 )
 from kai.workshop.collaboration_context import WorkshopCollaborationContextService
@@ -102,7 +102,6 @@ async def _running_context(path: Path):
             version=1,
             allowed_operations=frozenset({CollaborationOperation.CONTEXT_READ}),
         ),
-        token_factory=lambda: "context-proof-000000000000000000000000000001",
     )
     await set_message_reaction(
         store,
@@ -140,7 +139,7 @@ async def _running_context(path: Path):
 
 
 async def test_context_read_is_bounded_to_grant_snapshot_and_pages_stably(tmp_path: Path) -> None:
-    store, started, grant, invocation, identity, service, _authority = await _running_context(tmp_path / "kai.db")
+    store, started, grant, _invocation, identity, service, _authority = await _running_context(tmp_path / "kai.db")
     try:
         await record_inbound_message(
             store,
@@ -165,7 +164,6 @@ async def test_context_read_is_bounded_to_grant_snapshot_and_pages_stably(tmp_pa
         )
         first = await service.read(
             identity,
-            proof=invocation.token,
             cursor=None,
             limit=10,
             idempotency_key="context-page-1",
@@ -173,7 +171,7 @@ async def test_context_read_is_bounded_to_grant_snapshot_and_pages_stably(tmp_pa
         assert first.payload["content_trust"] == "untrusted"
         assert first.payload["context_kind"] == "channel"
         assert first.payload["roster"]
-        assert invocation.token not in str(first.payload)
+        assert "X-Kai-Collaboration-Proof" not in str(first.payload)
         assert first.payload["snapshot_through_event_position"] == await _issued_position(store, grant.grant_id)
         messages = first.payload["messages"]
         assert isinstance(messages, list)
@@ -189,7 +187,6 @@ async def test_context_read_is_bounded_to_grant_snapshot_and_pages_stably(tmp_pa
 
         second = await service.read(
             identity,
-            proof=invocation.token,
             cursor=cursor,
             limit=10,
             idempotency_key="context-page-2",
@@ -210,7 +207,6 @@ async def test_context_read_is_bounded_to_grant_snapshot_and_pages_stably(tmp_pa
         await store.connection.commit()
         replay = await service.read(
             identity,
-            proof=invocation.token,
             cursor=None,
             limit=10,
             idempotency_key="context-page-1",
@@ -218,7 +214,6 @@ async def test_context_read_is_bounded_to_grant_snapshot_and_pages_stably(tmp_pa
         assert replay.payload == first.payload
         replay_again = await service.read(
             identity,
-            proof=invocation.token,
             cursor=None,
             limit=10,
             idempotency_key="context-page-1",
@@ -235,17 +230,16 @@ async def test_context_read_is_bounded_to_grant_snapshot_and_pages_stably(tmp_pa
             "Read bounded Workshop context",
         ]
         assert all(str(grant.grant_id) in str(row[1]) for row in trace_rows)
-        assert all(invocation.token not in str(row[1]) for row in trace_rows)
+        assert all("X-Kai-Collaboration-Proof" not in str(row[1]) for row in trace_rows)
     finally:
         await store.close()
 
 
 async def test_context_read_rejects_cursor_from_another_snapshot(tmp_path: Path) -> None:
-    store, _started, _grant, invocation, identity, service, _authority = await _running_context(tmp_path / "kai.db")
+    store, _started, _grant, _invocation, identity, service, _authority = await _running_context(tmp_path / "kai.db")
     try:
         first = await service.read(
             identity,
-            proof=invocation.token,
             cursor=None,
             limit=5,
             idempotency_key="context-cursor-source",
@@ -257,7 +251,6 @@ async def test_context_read_rejects_cursor_from_another_snapshot(tmp_path: Path)
         with pytest.raises(TimelineCursorError, match="cursor"):
             await service.read(
                 identity,
-                proof=invocation.token,
                 cursor=cursor[:-1] + ("A" if cursor[-1] != "A" else "B"),
                 limit=5,
                 idempotency_key="context-cursor-forged",
@@ -311,15 +304,14 @@ async def test_thread_context_returns_only_root_and_bounded_replies(tmp_path: Pa
                 version=1,
                 allowed_operations=frozenset({CollaborationOperation.CONTEXT_READ}),
             ),
-            token_factory=lambda: "thread-context-proof-00000000000000000000000001",
         )
-        _grant, invocation = await authority.issue(
+        await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=4),
         )
         assert started.run.runtime_profile_id is not None
         identity = CollaborationBaseIdentity(
-            human_id,
+            None,
             group_id,
             agent_ids[0],
             started.run.runtime_profile_id,
@@ -330,7 +322,6 @@ async def test_thread_context_returns_only_root_and_bounded_replies(tmp_path: Pa
             clock=lambda: _NOW + timedelta(seconds=5),
         ).read(
             identity,
-            proof=invocation.token,
             cursor=None,
             limit=10,
             idempotency_key="thread-context-page",
@@ -353,7 +344,6 @@ async def test_authorized_idempotent_read_cannot_replay_after_revocation(tmp_pat
     try:
         await service.read(
             identity,
-            proof=invocation.token,
             cursor=None,
             limit=5,
             idempotency_key="context-before-revoke",
@@ -363,10 +353,9 @@ async def test_authorized_idempotent_read_cannot_replay_after_revocation(tmp_pat
             revocation_code="qualification_cancelled",
             occurred_at=_NOW + timedelta(seconds=40),
         )
-        with pytest.raises(CollaborationProofError, match="proof"):
+        with pytest.raises(CollaborationAttemptBindingError, match="No active collaboration attempt"):
             await service.read(
                 identity,
-                proof=invocation.token,
                 cursor=None,
                 limit=5,
                 idempotency_key="context-before-revoke",

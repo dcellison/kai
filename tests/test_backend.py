@@ -326,7 +326,8 @@ class TestBuildSessionContext:
         assert "Workshop collaboration context API" in result
         assert "Workshop collaboration reaction API" in result
         assert "Workshop collaboration publication APIs" in result
-        assert "X-Kai-Collaboration-Proof" in result
+        assert "exact attempt is active" in result
+        assert "X-Kai-Collaboration-Proof" not in result
 
     def test_memory_exists(self, tmp_path):
         """Memory content included when file exists and is non-empty."""

@@ -1269,39 +1269,37 @@ async def _apply_collaboration_grant_event(
     if (
         not isinstance(envelope.aggregate_id, CollaborationGrantId)
         or envelope.aggregate_type != "collaboration_grant"
-        or envelope.event_version != 1
+        or envelope.event_version not in {1, 2}
     ):
-        raise ValueError("Workshop collaboration-grant events require a typed v1 grant aggregate")
+        raise ValueError("Workshop collaboration-grant events require a typed v1 or v2 grant aggregate")
     payload = envelope.payload
     occurred_at = envelope.occurred_at
 
     if envelope.event_type == WorkshopEventType.COLLABORATION_GRANT_ISSUED:
-        _require_exact_payload(
-            payload,
-            {
-                "attempt_id",
-                "run_id",
-                "execution_owner_id",
-                "fence_token",
-                "requested_by_principal_id",
-                "agent_principal_id",
-                "agent_id",
-                "agent_definition_revision_id",
-                "sponsor_principal_id",
-                "runtime_profile_id",
-                "channel_id",
-                "thread_root_id",
-                "requested_operations",
-                "owner_allowed_operations",
-                "host_allowed_operations",
-                "effective_operations",
-                "owner_policy_version",
-                "host_policy_version",
-                "quotas",
-                "proof_fingerprint",
-                "initial_lease_expires_at",
-            },
-        )
+        expected_payload = {
+            "attempt_id",
+            "run_id",
+            "execution_owner_id",
+            "fence_token",
+            "requested_by_principal_id",
+            "agent_principal_id",
+            "agent_id",
+            "agent_definition_revision_id",
+            "sponsor_principal_id",
+            "runtime_profile_id",
+            "channel_id",
+            "thread_root_id",
+            "requested_operations",
+            "owner_allowed_operations",
+            "host_allowed_operations",
+            "effective_operations",
+            "owner_policy_version",
+            "host_policy_version",
+            "quotas",
+            "initial_lease_expires_at",
+        }
+        expected_payload.add("authority_binding_digest" if envelope.event_version == 2 else "proof_fingerprint")
+        _require_exact_payload(payload, expected_payload)
         attempt_id = RunAttemptId(_required_text(payload, "attempt_id"))
         run_id = RunId(_required_text(payload, "run_id"))
         execution_owner_id = RunExecutionOwnerId(_required_text(payload, "execution_owner_id"))
@@ -1345,9 +1343,12 @@ async def _apply_collaboration_grant_event(
             )
         ):
             raise ValueError("Workshop collaboration quotas are invalid")
-        proof_fingerprint = _required_text(payload, "proof_fingerprint")
-        if not _SHA256_PATTERN.fullmatch(proof_fingerprint):
-            raise ValueError("Workshop collaboration proof fingerprint must be SHA-256")
+        authority_binding_digest = _required_text(
+            payload,
+            "authority_binding_digest" if envelope.event_version == 2 else "proof_fingerprint",
+        )
+        if not _SHA256_PATTERN.fullmatch(authority_binding_digest):
+            raise ValueError("Workshop collaboration authority binding digest must be SHA-256")
         initial_expiry = _parse_projection_timestamp(payload.get("initial_lease_expires_at"))
         async with connection.execute(
             "SELECT ra.run_id, ra.owner_id, ra.fence_token, ra.status, ra.lease_expires_at, "
@@ -1420,7 +1421,7 @@ async def _apply_collaboration_grant_event(
                 owner_policy_version,
                 host_policy_version,
                 json.dumps(quotas, separators=(",", ":"), sort_keys=True),
-                proof_fingerprint,
+                authority_binding_digest,
                 occurred_at.isoformat(),
                 initial_expiry.isoformat(),
                 event.position,

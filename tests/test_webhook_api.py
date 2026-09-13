@@ -273,10 +273,7 @@ class TestAgentDelegation:
             ),
             response="Bounded result.",
         )
-        mock_request.headers = {
-            "X-Webhook-Secret": "test-secret",
-            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
-        }
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(
             return_value={
                 "target_handle": "nova",
@@ -297,7 +294,7 @@ class TestAgentDelegation:
         assert authority.channel_id == _internal_api_context(123).channel_id
         assert authority.agent_id == _internal_api_context(123).agent_id
         assert authority.runtime_profile_id == _internal_api_context(123).runtime_profile_id
-        assert service.delegate.await_args.kwargs["proof"] == mock_request.headers["X-Kai-Collaboration-Proof"]
+        assert "proof" not in service.delegate.await_args.kwargs
 
     async def test_rejects_caller_selected_run_identity_before_delegating(self, mock_request):
         service = mock_request.app[CORE_HOST_KEY].services.agent_delegation
@@ -324,10 +321,7 @@ class TestCollaborationContext:
         service.read.return_value = SimpleNamespace(
             payload={"version": 1, "content_trust": "untrusted", "messages": []}
         )
-        mock_request.headers = {
-            "X-Webhook-Secret": "test-secret",
-            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
-        }
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(
             return_value={"limit": 7, "cursor": "opaque-cursor", "idempotency_key": "context-one"}
         )
@@ -343,7 +337,6 @@ class TestCollaborationContext:
         assert authority.agent_id == _internal_api_context(123).agent_id
         assert authority.runtime_profile_id == _internal_api_context(123).runtime_profile_id
         assert service.read.await_args.kwargs == {
-            "proof": mock_request.headers["X-Kai-Collaboration-Proof"],
             "cursor": "opaque-cursor",
             "limit": 7,
             "idempotency_key": "context-one",
@@ -377,10 +370,7 @@ class TestCollaborationReaction:
             event_position=77,
             replayed=False,
         )
-        mock_request.headers = {
-            "X-Webhook-Secret": "test-secret",
-            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
-        }
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(
             return_value={
                 "message_id": str(message_id),
@@ -408,7 +398,6 @@ class TestCollaborationReaction:
         assert identity.agent_id == _internal_api_context(123).agent_id
         assert identity.runtime_profile_id == _internal_api_context(123).runtime_profile_id
         assert service.react.await_args.kwargs == {
-            "proof": mock_request.headers["X-Kai-Collaboration-Proof"],
             "message_id": str(message_id),
             "reaction": "eyes",
             "active": True,
@@ -445,10 +434,7 @@ class TestCollaborationPublication:
             event_position=81,
             replayed=False,
         )
-        mock_request.headers = {
-            "X-Webhook-Secret": "test-secret",
-            "X-Kai-Collaboration-Proof": "attempt-proof-000000000000000000000000000001",
-        }
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
         mock_request.json = AsyncMock(
             return_value={
                 "kind": "progress",
@@ -470,7 +456,6 @@ class TestCollaborationPublication:
         assert identity.principal_id == _internal_api_context(123).principal_id
         assert identity.channel_id == _internal_api_context(123).channel_id
         assert service.publish_message.await_args.kwargs == {
-            "proof": mock_request.headers["X-Kai-Collaboration-Proof"],
             "kind": "progress",
             "body": "Working on it",
             "idempotency_key": "progress-one",
@@ -485,6 +470,31 @@ class TestCollaborationPublication:
             response = await _handle_collaboration_message(mock_request)
             assert response.status == 400
         service.publish_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "handler",
+    (
+        _handle_agent_delegation,
+        _handle_collaboration_context,
+        _handle_collaboration_reaction,
+        _handle_collaboration_message,
+        _handle_collaboration_artifact,
+    ),
+)
+async def test_collaboration_endpoints_reject_retired_client_authority_header(mock_request, handler):
+    mock_request.headers = {
+        "X-Webhook-Secret": "test-secret",
+        "X-Kai-Collaboration-Proof": "transformed-or-replayed-client-value",
+    }
+
+    response = await handler(mock_request)
+
+    assert response.status == 403
+    assert json.loads(response.body.decode()) == {
+        "error": "Client-supplied collaboration authority is not accepted",
+        "code": "client_authority_rejected",
+    }
 
 
 # ── POST /api/schedule ────────────────────────────────────────────────

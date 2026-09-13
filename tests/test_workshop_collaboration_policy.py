@@ -10,9 +10,9 @@ import pytest
 
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.collaboration_authority import (
+    CollaborationAttemptBindingError,
     CollaborationBaseIdentity,
     CollaborationOperation,
-    CollaborationProofError,
     WorkshopCollaborationAuthority,
 )
 from kai.workshop.collaboration_policy import (
@@ -243,21 +243,12 @@ async def test_policy_reports_detached_agent_without_exposing_owner_runtime_deta
         await store.close()
 
 
-async def test_policy_changes_only_future_grants_and_emergency_revoke_fences_live_proof(
+async def test_policy_changes_only_future_grants_and_emergency_revoke_fences_live_binding(
     tmp_path: Path,
 ) -> None:
     store, alice_id, _bob_id, commands, execution, started, definition_id = await _started_attempt(tmp_path / "kai.db")
     try:
-        tokens = iter(
-            (
-                "policy-proof-000000000000000000000000000001",
-                "policy-proof-000000000000000000000000000002",
-            )
-        )
-        authority = WorkshopCollaborationAuthority(
-            store,
-            token_factory=lambda: next(tokens),
-        )
+        authority = WorkshopCollaborationAuthority(store)
         service = WorkshopCollaborationPolicyService(
             store,
             cast(Any, _PrivateExecution(authority)),
@@ -277,7 +268,6 @@ async def test_policy_changes_only_future_grants_and_emergency_revoke_fences_liv
         )
         assert updated.snapshot.policy_version == 1
         authorized = await authority.authorize(
-            invocation.token,
             CollaborationOperation.AGENT_DELEGATION,
             base_identity=_base_identity(started),
             idempotency_key="existing-attempt-operation",
@@ -289,9 +279,9 @@ async def test_policy_changes_only_future_grants_and_emergency_revoke_fences_liv
         revoked_snapshot, revoked_count = await service.revoke_active(alice_id, definition_id)
         assert revoked_count == 1
         assert revoked_snapshot.active_grants == 0
-        with pytest.raises(CollaborationProofError):
+        with pytest.raises(CollaborationAttemptBindingError):
             await authority.authenticate(
-                invocation.token,
+                invocation.base_identity,
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=5),
             )

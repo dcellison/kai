@@ -37,14 +37,12 @@ async def test_status_reports_activity_and_clean_projection_integrity(tmp_path: 
                 allowed_operations=frozenset({CollaborationOperation.AGENT_DELEGATION}),
                 quotas={CollaborationOperation.AGENT_DELEGATION: 1},
             ),
-            token_factory=lambda: "diagnostic-proof-0000000000000000000000000001",
         )
         _grant, invocation = await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
         await authority.authorize(
-            invocation.token,
             CollaborationOperation.AGENT_DELEGATION,
             base_identity=_base_identity(started),
             idempotency_key="diagnostic-authorized",
@@ -53,7 +51,6 @@ async def test_status_reports_activity_and_clean_projection_integrity(tmp_path: 
         )
         with pytest.raises(CollaborationDenied, match="exhausted"):
             await authority.authorize(
-                invocation.token,
                 CollaborationOperation.AGENT_DELEGATION,
                 base_identity=_base_identity(started),
                 idempotency_key="diagnostic-denied",
@@ -88,14 +85,12 @@ async def test_status_fails_closed_on_quota_projection_drift(tmp_path: Path) -> 
                 allowed_operations=frozenset({CollaborationOperation.AGENT_DELEGATION}),
                 quotas={CollaborationOperation.AGENT_DELEGATION: 1},
             ),
-            token_factory=lambda: "diagnostic-proof-0000000000000000000000000002",
         )
-        _grant, invocation = await authority.issue(
+        _grant, _invocation = await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
         await authority.authorize(
-            invocation.token,
             CollaborationOperation.AGENT_DELEGATION,
             base_identity=_base_identity(started),
             idempotency_key="diagnostic-drift",

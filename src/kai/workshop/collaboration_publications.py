@@ -74,7 +74,6 @@ class CollaborationPublicationResult:
 class _ExecutionService(Protocol):
     async def authorize_collaboration(
         self,
-        proof: str,
         operation: CollaborationOperation,
         *,
         base_identity: CollaborationBaseIdentity,
@@ -149,7 +148,6 @@ class WorkshopCollaborationPublicationService:
         self,
         base_identity: CollaborationBaseIdentity,
         *,
-        proof: str,
         kind: object,
         body: object,
         idempotency_key: object,
@@ -166,7 +164,6 @@ class WorkshopCollaborationPublicationService:
         now = self._clock()
         async with asyncio.timeout(_MUTATION_TIMEOUT_SECONDS):
             authorization = await self._execution.authorize_collaboration(
-                proof,
                 operation,
                 base_identity=base_identity,
                 idempotency_key=key,
@@ -186,7 +183,6 @@ class WorkshopCollaborationPublicationService:
         self,
         base_identity: CollaborationBaseIdentity,
         *,
-        proof: str,
         path: Path,
         caption: object,
         idempotency_key: object,
@@ -209,7 +205,6 @@ class WorkshopCollaborationPublicationService:
         now = self._clock()
         async with asyncio.timeout(_MUTATION_TIMEOUT_SECONDS):
             authorization = await self._execution.authorize_collaboration(
-                proof,
                 CollaborationOperation.ARTIFACT_PUBLISH,
                 base_identity=base_identity,
                 idempotency_key=key,

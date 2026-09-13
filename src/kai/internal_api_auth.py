@@ -163,7 +163,7 @@ class InternalAPIAuth:
             # A group-channel process is shared by every human who wakes the
             # same agent in that channel.  Its persistent credential therefore
             # cannot carry whichever human happened to start the process.
-            # Stateful collaboration is authorized by the exact-attempt proof;
+            # Stateful collaboration is authorized by an exact live server binding;
             # principal-owned memory, jobs, and legacy proactive publication
             # fail closed instead of being attributed to the first requester.
             scopes = {InternalAPIScope.COLLABORATION_INVOKE}

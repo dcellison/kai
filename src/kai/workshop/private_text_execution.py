@@ -170,7 +170,6 @@ class WorkshopPrivateTextExecutionService:
 
     async def authorize_collaboration(
         self,
-        proof: str,
         operation: CollaborationOperation,
         *,
         base_identity: CollaborationBaseIdentity,
@@ -182,7 +181,6 @@ class WorkshopPrivateTextExecutionService:
         if self._closed:
             raise RuntimeError("Workshop private-text execution service is closed")
         return await self._coordinator.authorize_collaboration(
-            proof,
             operation,
             base_identity=base_identity,
             idempotency_key=idempotency_key,

@@ -341,7 +341,12 @@ class TestCanonicalExecutionCoordinator:
             assert manifest.draft.sources[10].reason == "accepted_input"
             assert manifest.draft.sources[11].reason == "not_observable"
             assert manifest.draft.sources[11].delivery_shape == "provider_managed_unknown"
-            assert prepared.collaboration_invocations[0].token not in repr(manifest)
+            authority_source = manifest.draft.sources[9]
+            assert authority_source.state.value == "server_attached"
+            assert authority_source.reason == "server_binding_active"
+            assert authority_source.delivery_shape == "server_attached_no_bearer"
+            assert authority_source.authorization_operations == ("agent_delegation",)
+            assert "X-Kai-Collaboration-Proof" not in repr(manifest)
             assert workshop_context_manifest_status(tmp_path / "kai.db").startswith(
                 "Workshop context manifests: active; post-cutover attempts=1, manifests=1, missing=0, malformed=0"
             )
@@ -912,53 +917,54 @@ class TestCanonicalExecutionCoordinator:
         finally:
             await store.close()
 
-    async def test_attempt_proof_is_redacted_from_preview_trace_and_terminal_message(self, tmp_path: Path):
+    async def test_attempt_authority_contains_no_model_visible_bearer_material(self, tmp_path: Path):
         store, run = await _accepted(tmp_path / "kai.db")
         prepared = _Prepared(run)
         observed: list[StreamEvent] = []
 
-        async def stream_with_proof(prompt: str) -> AsyncIterator[StreamEvent]:
-            proof = prepared.collaboration_invocations[-1].token
-            yield StreamEvent(text_so_far=f"preview {proof}")
+        async def stream_without_bearer(prompt: str) -> AsyncIterator[StreamEvent]:
+            invocation = prepared.collaboration_invocations[-1]
+            assert not hasattr(invocation, "token")
+            assert "X-Kai-Collaboration-Proof" not in invocation.render_context()
+            assert "X-Kai-Collaboration-Proof" not in prompt
+            yield StreamEvent(text_so_far="preview safe")
             yield StreamEvent(
                 text_so_far="",
                 trace=TraceEntry(
                     kind="tool_call",
-                    tool_use_id="proof-tool",
-                    summary=f"curl {proof}",
-                    detail=f"header={proof}",
+                    tool_use_id="authority-tool",
+                    summary="curl collaboration endpoint",
+                    detail="ordinary typed arguments",
                     tool_name="curl",
                 ),
             )
             yield StreamEvent(
-                text_so_far=f"answer {proof}",
+                text_so_far="answer safe",
                 done=True,
-                response=AgentResponse(success=True, text=f"answer {proof}"),
+                response=AgentResponse(success=True, text="answer safe"),
             )
 
         async def observe(event: StreamEvent) -> None:
             observed.append(event)
 
-        prepared.stream = stream_with_proof  # type: ignore[method-assign]
+        prepared.stream = stream_without_bearer  # type: ignore[method-assign]
         try:
             result = await _coordinator(store, _Preparation(prepared)).execute(
                 run.run_id,
                 stream_observer=observe,
             )
-            proof = prepared.collaboration_invocations[-1].token
             assert result.disposition == CanonicalExecutionDisposition.COMPLETED
-            assert proof not in "".join(event.text_so_far for event in observed)
+            assert "X-Kai-Collaboration-Proof" not in "".join(event.text_so_far for event in observed)
             async with store.connection.execute(
                 "SELECT summary, detail FROM run_traces WHERE run_id = ?",
                 (run.run_id,),
             ) as cursor:
                 trace_row = tuple(await cursor.fetchone())
-            assert proof not in "".join(trace_row)
             assert trace_row == (
-                "curl [redacted collaboration proof]",
-                "header=[redacted collaboration proof]",
+                "curl collaboration endpoint",
+                "ordinary typed arguments",
             )
-            assert (await _terminal_bodies(store))[-1] == "answer [redacted collaboration proof]"
+            assert (await _terminal_bodies(store))[-1] == "answer safe"
         finally:
             await store.close()
 

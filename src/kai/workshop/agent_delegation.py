@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING, Protocol
 
 from kai.workshop.agent_definitions import normalize_agent_handle
 from kai.workshop.collaboration_authority import (
+    CollaborationAttemptBindingError,
     CollaborationAuthorization,
     CollaborationBaseIdentity,
     CollaborationDenied,
     CollaborationOperation,
-    CollaborationProofError,
 )
 from kai.workshop.domain import (
     AgentDefinitionRevisionId,
@@ -163,7 +163,6 @@ class _TargetAuthority:
 class _ExecutionService(Protocol):
     async def authorize_collaboration(
         self,
-        proof: str,
         operation: CollaborationOperation,
         *,
         base_identity: CollaborationBaseIdentity,
@@ -318,7 +317,6 @@ class WorkshopAgentDelegationService:
         self,
         base_identity: CollaborationBaseIdentity,
         *,
-        proof: str,
         target_handle: object,
         task: object,
         context: object = None,
@@ -336,15 +334,14 @@ class WorkshopAgentDelegationService:
         fingerprint = _request_hash(handle, normalized_task, normalized_context)
         try:
             authorization = await self._execution.authorize_collaboration(
-                proof,
                 CollaborationOperation.AGENT_DELEGATION,
                 base_identity=base_identity,
                 idempotency_key=key,
                 request_hash=fingerprint,
                 occurred_at=datetime.now(UTC),
             )
-        except CollaborationProofError as exc:
-            raise AgentDelegationDenied("invalid_proof", str(exc)) from exc
+        except CollaborationAttemptBindingError as exc:
+            raise AgentDelegationDenied("attempt_not_bound", str(exc)) from exc
         except CollaborationDenied as exc:
             raise AgentDelegationDenied(exc.code, str(exc)) from exc
         async with self._lock:

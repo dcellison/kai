@@ -60,7 +60,6 @@ class CollaborationReactionResult:
 class _ExecutionService(Protocol):
     async def authorize_collaboration(
         self,
-        proof: str,
         operation: CollaborationOperation,
         *,
         base_identity: CollaborationBaseIdentity,
@@ -126,7 +125,6 @@ class WorkshopCollaborationReactionService:
         self,
         base_identity: CollaborationBaseIdentity,
         *,
-        proof: str,
         message_id: object,
         reaction: object,
         active: object,
@@ -143,7 +141,6 @@ class WorkshopCollaborationReactionService:
         now = self._clock()
         async with asyncio.timeout(_MUTATION_TIMEOUT_SECONDS):
             authorization = await self._execution.authorize_collaboration(
-                proof,
                 CollaborationOperation.REACTION,
                 base_identity=base_identity,
                 idempotency_key=key,

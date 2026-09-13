@@ -53,7 +53,7 @@ class _Runtime:
         self.cancelled = False
         self.canonical_histories: list[str] = []
         self.agent_definition_contexts: list[str] = []
-        self.collaboration_proof: str | None = None
+        self.collaboration_context: str | None = None
         self.context_observer = None
 
     def stage_canonical_history(self, history: str, **_kwargs: object) -> None:
@@ -65,12 +65,11 @@ class _Runtime:
     def stage_context_assembly_observer(self, observer) -> None:
         self.context_observer = observer
 
-    def stage_collaboration_invocation(self, _context: str, proof: str) -> None:
-        self.collaboration_proof = proof
+    def stage_collaboration_invocation(self, context: str) -> None:
+        self.collaboration_context = context
 
-    def discard_collaboration_invocation(self, proof: str) -> None:
-        assert proof == self.collaboration_proof
-        self.collaboration_proof = None
+    def discard_collaboration_invocation(self) -> None:
+        self.collaboration_context = None
 
     def validate_current(self) -> None:
         self.validated = True

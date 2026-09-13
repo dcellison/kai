@@ -8,22 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from kai.internal_api_auth import InternalAPIAuth
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.collaboration_authority import (
+    CollaborationAttemptBindingError,
     CollaborationBaseIdentity,
     CollaborationDenied,
     CollaborationHostPolicy,
     CollaborationOperation,
     CollaborationOwnerPolicy,
-    CollaborationProofError,
     WorkshopCollaborationAuthority,
 )
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
 from kai.workshop.domain import ChannelId, RunExecutionOwnerId, RuntimeProfileId
 from kai.workshop.inbound import InboundMessage
-from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.run_execution_authority import (
     RunExecutionSelection,
@@ -101,7 +99,6 @@ async def test_grant_snapshots_revision_owner_host_context_and_limits(tmp_path: 
                     }
                 ),
             ),
-            token_factory=lambda: "attempt-proof-000000000000000000000000000001",
         )
 
         grant, invocation = await authority.issue(
@@ -124,36 +121,32 @@ async def test_grant_snapshots_revision_owner_host_context_and_limits(tmp_path: 
         assert grant.owner_policy_version == 7
         assert grant.host_policy_version == 3
         assert grant.quotas[CollaborationOperation.AGENT_DELEGATION] == 12
-        assert grant.proof_fingerprint != invocation.token
-        assert invocation.token not in repr(invocation)
+        assert len(grant.authority_binding_digest) == 64
+        assert invocation.base_identity == _base_identity(started)
+        assert invocation.effective_operations == grant.effective_operations
+        assert not hasattr(invocation, "token")
+        rendered = invocation.render_context()
+        assert "agent_delegation" in rendered
+        assert "X-Kai-Collaboration-Proof" not in rendered
         async with store.connection.execute(
             "SELECT payload_json, metadata_json FROM event_log WHERE aggregate_id = ? ORDER BY position",
             (grant.grant_id,),
         ) as cursor:
             serialized_events = "".join(str(value) for row in await cursor.fetchall() for value in row)
-        assert invocation.token not in serialized_events
+        assert "server-bound:v1" not in serialized_events
+        assert '"proof_fingerprint"' not in serialized_events
+        assert '"authority_binding_digest"' in serialized_events
     finally:
         await store.close()
 
 
-async def test_persistent_internal_credential_cannot_authenticate_collaboration(tmp_path: Path) -> None:
+async def test_base_identity_without_live_server_binding_cannot_authenticate_collaboration(tmp_path: Path) -> None:
     store, _execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
         authority = WorkshopCollaborationAuthority(store)
-        await authority.issue(started.claim, occurred_at=_NOW + timedelta(seconds=3))
-        runtime_profile_id = started.run.runtime_profile_id
-        assert runtime_profile_id is not None
-        context = WorkshopInternalAPIExecutionContext(
-            principal_id=started.run.requested_by_principal_id,
-            channel_id=started.run.channel_id,
-            agent_id=started.run.agent_id,
-            runtime_profile_id=runtime_profile_id,
-        )
-        persistent_token = InternalAPIAuth.for_execution_contexts((context,)).agent_credential_for(context)
-
-        with pytest.raises(CollaborationProofError, match="Invalid collaboration proof"):
+        with pytest.raises(CollaborationAttemptBindingError, match="No active collaboration attempt"):
             await authority.authenticate(
-                persistent_token,
+                _base_identity(started),
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=4),
             )
@@ -161,19 +154,16 @@ async def test_persistent_internal_credential_cannot_authenticate_collaboration(
         await store.close()
 
 
-async def test_exact_attempt_proof_fails_after_terminal_state_and_revocation(tmp_path: Path) -> None:
+async def test_exact_attempt_binding_fails_after_terminal_state_and_revocation(tmp_path: Path) -> None:
     store, execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
-        authority = WorkshopCollaborationAuthority(
-            store,
-            token_factory=lambda: "attempt-proof-000000000000000000000000000002",
-        )
+        authority = WorkshopCollaborationAuthority(store)
         grant, invocation = await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
         authorized = await authority.authenticate(
-            invocation.token,
+            invocation.base_identity,
             CollaborationOperation.AGENT_DELEGATION,
             occurred_at=_NOW + timedelta(seconds=4),
         )
@@ -186,7 +176,7 @@ async def test_exact_attempt_proof_fails_after_terminal_state_and_revocation(tmp
         )
         with pytest.raises(CollaborationDenied, match="no longer active"):
             await authority.authenticate(
-                invocation.token,
+                invocation.base_identity,
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=6),
             )
@@ -198,9 +188,9 @@ async def test_exact_attempt_proof_fails_after_terminal_state_and_revocation(tmp
         )
         assert changed is True
         assert revoked.revocation_code == "attempt_terminal"
-        with pytest.raises(CollaborationProofError, match="Invalid collaboration proof"):
+        with pytest.raises(CollaborationAttemptBindingError, match="No active collaboration attempt"):
             await authority.authenticate(
-                invocation.token,
+                invocation.base_identity,
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=7),
             )
@@ -218,7 +208,6 @@ async def test_host_policy_can_deny_requested_operation_without_changing_revisio
                 allowed_operations=frozenset(),
                 quotas={},
             ),
-            token_factory=lambda: "attempt-proof-000000000000000000000000000003",
         )
         grant, invocation = await authority.issue(
             started.claim,
@@ -230,7 +219,7 @@ async def test_host_policy_can_deny_requested_operation_without_changing_revisio
         assert grant.quotas == {}
         with pytest.raises(CollaborationDenied) as denied:
             await authority.authenticate(
-                invocation.token,
+                invocation.base_identity,
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=4),
             )
@@ -239,22 +228,19 @@ async def test_host_policy_can_deny_requested_operation_without_changing_revisio
         await store.close()
 
 
-async def test_restart_does_not_recover_transient_proof_but_projection_recovers_snapshot(tmp_path: Path) -> None:
+async def test_restart_does_not_recover_server_binding_but_projection_recovers_snapshot(tmp_path: Path) -> None:
     store, _execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
-        first = WorkshopCollaborationAuthority(
-            store,
-            token_factory=lambda: "attempt-proof-000000000000000000000000000004",
-        )
+        first = WorkshopCollaborationAuthority(store)
         grant, invocation = await first.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
 
         restarted = WorkshopCollaborationAuthority(store)
-        with pytest.raises(CollaborationProofError, match="Invalid collaboration proof"):
+        with pytest.raises(CollaborationAttemptBindingError, match="No active collaboration attempt"):
             await restarted.authenticate(
-                invocation.token,
+                invocation.base_identity,
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=4),
             )
@@ -270,18 +256,12 @@ async def test_restart_does_not_recover_transient_proof_but_projection_recovers_
         await store.close()
 
 
-async def test_old_attempt_proof_cannot_act_during_later_attempt_on_same_runtime(
+async def test_revoked_binding_is_replaced_by_later_attempt_on_same_runtime(
     tmp_path: Path,
 ) -> None:
     store, execution, first_started = await _running_attempt(tmp_path / "kai.db")
     try:
-        tokens = iter(
-            (
-                "attempt-proof-000000000000000000000000000006",
-                "attempt-proof-000000000000000000000000000007",
-            )
-        )
-        authority = WorkshopCollaborationAuthority(store, token_factory=lambda: next(tokens))
+        authority = WorkshopCollaborationAuthority(store)
         _first_grant, first_invocation = await authority.issue(
             first_started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
@@ -323,14 +303,9 @@ async def test_old_attempt_proof_cannot_act_during_later_attempt_on_same_runtime
             occurred_at=_NOW + timedelta(seconds=9),
         )
 
-        with pytest.raises(CollaborationProofError, match="Invalid collaboration proof"):
-            await authority.authenticate(
-                first_invocation.token,
-                CollaborationOperation.AGENT_DELEGATION,
-                occurred_at=_NOW + timedelta(seconds=10),
-            )
+        assert first_invocation.attempt_id != second_invocation.attempt_id
         authorized = await authority.authenticate(
-            second_invocation.token,
+            second_invocation.base_identity,
             CollaborationOperation.AGENT_DELEGATION,
             occurred_at=_NOW + timedelta(seconds=10),
         )
@@ -357,10 +332,7 @@ async def test_agent_lifecycle_and_attempt_boundaries_immediately_fence_live_gra
 ) -> None:
     store, _execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
-        authority = WorkshopCollaborationAuthority(
-            store,
-            token_factory=lambda: "attempt-proof-000000000000000000000000000005",
-        )
+        authority = WorkshopCollaborationAuthority(store)
         grant, invocation = await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
@@ -401,7 +373,7 @@ async def test_agent_lifecycle_and_attempt_boundaries_immediately_fence_live_gra
 
         with pytest.raises(CollaborationDenied) as denied:
             await authority.authenticate(
-                invocation.token,
+                invocation.base_identity,
                 CollaborationOperation.AGENT_DELEGATION,
                 occurred_at=_NOW + timedelta(seconds=4),
             )
@@ -479,15 +451,13 @@ async def test_operation_authorization_is_durable_idempotent_and_quota_bounded(t
                 allowed_operations=frozenset({CollaborationOperation.AGENT_DELEGATION}),
                 quotas={CollaborationOperation.AGENT_DELEGATION: 1},
             ),
-            token_factory=lambda: "attempt-proof-000000000000000000000000000008",
         )
-        _grant, invocation = await authority.issue(
+        _grant, _invocation = await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
         request_hash = "a" * 64
         first = await authority.authorize(
-            invocation.token,
             CollaborationOperation.AGENT_DELEGATION,
             base_identity=_base_identity(started),
             idempotency_key="operation-one",
@@ -495,7 +465,6 @@ async def test_operation_authorization_is_durable_idempotent_and_quota_bounded(t
             occurred_at=_NOW + timedelta(seconds=4),
         )
         replay = await authority.authorize(
-            invocation.token,
             CollaborationOperation.AGENT_DELEGATION,
             base_identity=_base_identity(started),
             idempotency_key="operation-one",
@@ -509,7 +478,6 @@ async def test_operation_authorization_is_durable_idempotent_and_quota_bounded(t
 
         with pytest.raises(CollaborationDenied) as denied:
             await authority.authorize(
-                invocation.token,
                 CollaborationOperation.AGENT_DELEGATION,
                 base_identity=_base_identity(started),
                 idempotency_key="operation-two",
@@ -536,16 +504,12 @@ async def test_operation_authorization_is_durable_idempotent_and_quota_bounded(t
 async def test_authorized_idempotency_replay_does_not_resurrect_fenced_attempt(tmp_path: Path) -> None:
     store, _execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
-        authority = WorkshopCollaborationAuthority(
-            store,
-            token_factory=lambda: "attempt-proof-000000000000000000000000000009",
-        )
-        _grant, invocation = await authority.issue(
+        authority = WorkshopCollaborationAuthority(store)
+        _grant, _invocation = await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
         await authority.authorize(
-            invocation.token,
             CollaborationOperation.AGENT_DELEGATION,
             base_identity=_base_identity(started),
             idempotency_key="authorized-before-fence",
@@ -564,7 +528,6 @@ async def test_authorized_idempotency_replay_does_not_resurrect_fenced_attempt(t
 
         with pytest.raises(CollaborationDenied) as denied:
             await authority.authorize(
-                invocation.token,
                 CollaborationOperation.AGENT_DELEGATION,
                 base_identity=_base_identity(started),
                 idempotency_key="authorized-before-fence",
@@ -576,14 +539,11 @@ async def test_authorized_idempotency_replay_does_not_resurrect_fenced_attempt(t
         await store.close()
 
 
-async def test_mismatched_base_identity_is_denied_and_audited(tmp_path: Path) -> None:
+async def test_mismatched_base_identity_is_denied_before_operation_audit(tmp_path: Path) -> None:
     store, _execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
-        authority = WorkshopCollaborationAuthority(
-            store,
-            token_factory=lambda: "attempt-proof-000000000000000000000000000009",
-        )
-        _grant, invocation = await authority.issue(
+        authority = WorkshopCollaborationAuthority(store)
+        await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
@@ -594,34 +554,29 @@ async def test_mismatched_base_identity_is_denied_and_audited(tmp_path: Path) ->
             agent_id=correct.agent_id,
             runtime_profile_id=RuntimeProfileId.new(),
         )
-        with pytest.raises(CollaborationDenied) as denied:
+        with pytest.raises(CollaborationAttemptBindingError, match="No active collaboration attempt"):
             await authority.authorize(
-                invocation.token,
                 CollaborationOperation.AGENT_DELEGATION,
                 base_identity=mismatched,
                 idempotency_key="wrong-runtime",
                 request_hash="c" * 64,
                 occurred_at=_NOW + timedelta(seconds=4),
             )
-        assert denied.value.code == "base_identity_mismatch"
         async with store.connection.execute(
             "SELECT decision, denial_code FROM collaboration_operation_decisions"
         ) as cursor:
-            assert tuple(await cursor.fetchone()) == ("denied", "base_identity_mismatch")
+            assert await cursor.fetchone() is None
     finally:
         await store.close()
 
 
-async def test_requester_neutral_base_identity_uses_proof_principal_but_still_fences_lane(
+async def test_direct_lane_requires_principal_bound_base_identity(
     tmp_path: Path,
 ) -> None:
     store, _execution, started = await _running_attempt(tmp_path / "kai.db")
     try:
-        authority = WorkshopCollaborationAuthority(
-            store,
-            token_factory=lambda: "attempt-proof-000000000000000000000000000010",
-        )
-        _grant, invocation = await authority.issue(
+        authority = WorkshopCollaborationAuthority(store)
+        await authority.issue(
             started.claim,
             occurred_at=_NOW + timedelta(seconds=3),
         )
@@ -633,15 +588,14 @@ async def test_requester_neutral_base_identity_uses_proof_principal_but_still_fe
             runtime_profile_id=correct.runtime_profile_id,
         )
 
-        authorized = await authority.authorize(
-            invocation.token,
-            CollaborationOperation.AGENT_DELEGATION,
-            base_identity=neutral,
-            idempotency_key="requester-neutral-lane",
-            request_hash="d" * 64,
-            occurred_at=_NOW + timedelta(seconds=4),
-        )
-        assert authorized.grant.requested_by_principal_id == started.run.requested_by_principal_id
+        with pytest.raises(CollaborationAttemptBindingError, match="No active collaboration attempt"):
+            await authority.authorize(
+                CollaborationOperation.AGENT_DELEGATION,
+                base_identity=neutral,
+                idempotency_key="requester-neutral-lane",
+                request_hash="d" * 64,
+                occurred_at=_NOW + timedelta(seconds=4),
+            )
 
         wrong_lane = CollaborationBaseIdentity(
             principal_id=None,
@@ -649,13 +603,11 @@ async def test_requester_neutral_base_identity_uses_proof_principal_but_still_fe
             agent_id=correct.agent_id,
             runtime_profile_id=correct.runtime_profile_id,
         )
-        with pytest.raises(CollaborationDenied) as denied:
+        with pytest.raises(CollaborationAttemptBindingError, match="No active collaboration attempt"):
             await authority.authenticate(
-                invocation.token,
+                wrong_lane,
                 CollaborationOperation.AGENT_DELEGATION,
-                base_identity=wrong_lane,
                 occurred_at=_NOW + timedelta(seconds=5),
             )
-        assert denied.value.code == "base_identity_mismatch"
     finally:
         await store.close()
