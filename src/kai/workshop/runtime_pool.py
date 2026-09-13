@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from kai.backend import StreamEvent
 from kai.config import ModelRole, WorkspaceConfig
-from kai.workshop.domain import RuntimeProfileId
+from kai.workshop.domain import AgentId, RuntimeProfileId
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.runtime_profiles import (
     ProtectedRuntimeBackend,
@@ -79,6 +79,29 @@ class WorkshopRuntimePool:
     ) -> None:
         await self._pool.invalidate_requester_workspace_lanes(context)
 
+    async def retained_context_revision(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+        *,
+        agent_definition_context: str,
+    ) -> str:
+        return await self._pool.retained_context_revision(
+            context,
+            agent_definition_context=agent_definition_context,
+        )
+
+    async def invalidate_retained_context(
+        self,
+        context: WorkshopInternalAPIExecutionContext,
+    ) -> bool:
+        return await self._pool.invalidate_retained_context(context)
+
+    async def invalidate_principal_retained_context(self, principal_id: str) -> tuple[int, int]:
+        return await self._pool.invalidate_principal_retained_context(principal_id)
+
+    async def invalidate_agent_retained_context(self, agent_id: AgentId) -> tuple[int, int]:
+        return await self._pool.invalidate_agent_retained_context(agent_id)
+
     def legacy_runtime_key(self, runtime_profile_id: str | RuntimeProfileId) -> int | None:
         """Return migration-only state for the temporary cutover coordinator."""
         return self._profiles.legacy_runtime_key(runtime_profile_id)
@@ -86,20 +109,31 @@ class WorkshopRuntimePool:
     async def prepare_execution(
         self,
         runtime_profile_id: RuntimeAuthority,
+        *,
+        retained_context_revision: str | None = None,
     ) -> PreparedBackendExecution:
-        return await self._pool.prepare_execution(self._selector(runtime_profile_id))
+        selector = self._selector(runtime_profile_id)
+        if retained_context_revision is None:
+            return await self._pool.prepare_execution(selector)
+        return await self._pool.prepare_execution(selector, retained_context_revision=retained_context_revision)
 
     async def prepare_routed_execution(
         self,
         runtime_profile_id: RuntimeAuthority,
         backend_option_id: str,
         model: str,
+        *,
+        retained_context_revision: str | None = None,
     ) -> PreparedBackendExecution:
         """Prepare an authorized per-option runtime without changing the default."""
+        selector = self._selector(runtime_profile_id)
+        if retained_context_revision is None:
+            return await self._pool.prepare_routed_execution(selector, backend_option_id, model)
         return await self._pool.prepare_routed_execution(
-            self._selector(runtime_profile_id),
+            selector,
             backend_option_id,
             model,
+            retained_context_revision=retained_context_revision,
         )
 
     def get_model(self, runtime_profile_id: RuntimeAuthority) -> str:

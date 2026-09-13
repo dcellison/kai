@@ -1477,6 +1477,19 @@ def workshop_runtime_session_status(db_path: Path) -> str:
                 connection,
                 "SELECT COUNT(*) FROM channel_agent_runtime_sessions WHERE provider_session_id IS NOT NULL",
             )
+            revision_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(channel_agent_runtime_sessions)").fetchall()
+            }
+            pending_context_refresh = (
+                _scalar(
+                    connection,
+                    "SELECT COUNT(*) FROM channel_agent_runtime_sessions WHERE retained_context_revision = ?",
+                    ("0" * 64,),
+                )
+                if "retained_context_revision" in revision_columns
+                else sessions
+            )
             missing = _scalar(
                 connection,
                 f"SELECT COUNT(*) FROM ({_CURRENT_AUTHORITY_COMPLETED_LANES_SQL}) lanes "
@@ -1514,7 +1527,8 @@ def workshop_runtime_session_status(db_path: Path) -> str:
     state = "active" if missing == 0 and stale == 0 else "INCOMPLETE"
     return (
         f"{prefix} {state}; successful lanes={successful_lanes}, sessions={sessions}, "
-        f"provider sessions={provider_sessions}, missing={missing}, stale={stale}; "
+        f"provider sessions={provider_sessions}, context refresh pending={pending_context_refresh}, "
+        f"missing={missing}, stale={stale}; "
         "cold-start context=canonical timeline"
     )
 

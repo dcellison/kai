@@ -68,14 +68,27 @@ class _RuntimePool:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.context = None
+        self.invalidated = False
+        self.can_invalidate = True
+
+    async def retained_context_revision(self, _context, *, agent_definition_context: str) -> str:
+        assert agent_definition_context
+        return "c" * 64
+
+    async def invalidate_retained_context(self, _context) -> bool:
+        self.invalidated = True
+        return self.can_invalidate
 
     async def prepare_routed_execution(
         self,
         context,
         _backend_option_id,
         _model,
+        *,
+        retained_context_revision=None,
     ):
         self.context = context
+        assert retained_context_revision == "c" * 64
         return _PreparedRuntime(self.workspace)
 
     def runtime_profile(self, _runtime_profile_id):
@@ -144,6 +157,81 @@ async def _accepted_run(path: Path, home: Path):
 
 
 class TestProtectedExecutionPreparation:
+    @staticmethod
+    async def _seed_runtime_session(store, run, retained_context_revision: str) -> None:
+        async with store.connection.execute(
+            "SELECT inbound_message_id FROM runs WHERE id = ?",
+            (run.run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        await store.connection.execute(
+            "INSERT INTO channel_agent_runtime_sessions ("
+            "channel_id, agent_id, runtime_profile_id, backend, provider, model, workspace, "
+            "provider_session_id, last_run_id, last_result_message_id, context_through_event_position, "
+            "created_at, updated_at, retained_context_revision"
+            ") VALUES (?, ?, ?, 'codex', 'openai', 'gpt-5.6-sol', '/tmp/workspace', "
+            "'provider-session', ?, ?, 1, ?, ?, ?)",
+            (
+                run.channel_id,
+                run.agent_id,
+                run.runtime_profile_id,
+                run.run_id,
+                str(row[0]),
+                _NOW.isoformat(),
+                _NOW.isoformat(),
+                retained_context_revision,
+            ),
+        )
+        await store.connection.commit()
+
+    async def test_changed_retained_context_invalidates_only_the_prepared_lane(self, tmp_path: Path) -> None:
+        store, run, pool, _profiles = await _accepted_run(tmp_path / "kai.db", tmp_path / "home")
+        runtime_pool = _RuntimePool(tmp_path / "owner-home")
+        try:
+            await self._seed_runtime_session(store, run, "a" * 64)
+            prepared = await WorkshopProtectedExecutionPreparationService(
+                store,
+                runtime_pool,  # type: ignore[arg-type]
+                _RoutingPolicy(),  # type: ignore[arg-type]
+                registered_backend_ids=frozenset({"codex"}),
+            ).prepare(run.run_id)
+
+            assert prepared.retained_context_revision == "c" * 64
+            assert runtime_pool.invalidated is True
+            async with store.connection.execute(
+                "SELECT 1 FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+                (run.channel_id, run.agent_id),
+            ) as cursor:
+                assert await cursor.fetchone() is None
+        finally:
+            await pool.shutdown()
+            await store.close()
+
+    async def test_in_flight_context_change_defers_without_deleting_continuity(self, tmp_path: Path) -> None:
+        store, run, pool, _profiles = await _accepted_run(tmp_path / "kai.db", tmp_path / "home")
+        runtime_pool = _RuntimePool(tmp_path / "owner-home")
+        runtime_pool.can_invalidate = False
+        try:
+            await self._seed_runtime_session(store, run, "a" * 64)
+            with pytest.raises(ProtectedExecutionPreparationError, match="in flight"):
+                await WorkshopProtectedExecutionPreparationService(
+                    store,
+                    runtime_pool,  # type: ignore[arg-type]
+                    _RoutingPolicy(),  # type: ignore[arg-type]
+                    registered_backend_ids=frozenset({"codex"}),
+                ).prepare(run.run_id)
+            async with store.connection.execute(
+                "SELECT retained_context_revision FROM channel_agent_runtime_sessions "
+                "WHERE channel_id = ? AND agent_id = ?",
+                (run.channel_id, run.agent_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None and str(row[0]) == "a" * 64
+        finally:
+            await pool.shutdown()
+            await store.close()
+
     async def test_shared_agent_keeps_requester_identity_and_uses_owner_runtime(
         self,
         tmp_path: Path,

@@ -644,6 +644,8 @@ async def test_agent_firing_completes_through_real_canonical_coordinator(
     await WorkshopConversationDeliveryAuthority(source_store).activate()
     runtime = _CanonicalRuntime(tmp_path)
     pool = SimpleNamespace(
+        retained_context_revision=AsyncMock(return_value="a" * 64),
+        invalidate_retained_context=AsyncMock(return_value=True),
         prepare_execution=AsyncMock(return_value=runtime),
         prepare_routed_execution=AsyncMock(return_value=runtime),
     )
