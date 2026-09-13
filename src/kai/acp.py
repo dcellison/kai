@@ -876,6 +876,9 @@ class AcpBackend(AgentBackend):
         """
         return ("KAI_WEBHOOK_SECRET", "TMPDIR")
 
+    def enforce_context_discovery_policy(self, env: dict[str, str]) -> None:
+        """Reassert backend-native discovery controls after workspace env."""
+
     def build_initialize_params(self) -> dict:
         """
         Return the params for the initialize JSON-RPC call.
@@ -1161,6 +1164,9 @@ class AcpBackend(AgentBackend):
             if self.workspace_config.env:
                 env.update(self.workspace_config.env)
         env = sanitize_agent_environment(env)
+        # Workspace-owned environment values must never relax the host's
+        # native-instruction allowlist.
+        self.enforce_context_discovery_policy(env)
         if self._api_context.webhook_secret:
             env["KAI_WEBHOOK_SECRET"] = self._api_context.webhook_secret
         if effective_os_user:
@@ -1435,6 +1441,7 @@ class AcpBackend(AgentBackend):
                     defer_user_file_reads=self.defer_user_file_reads,
                     canonical_history=(canonical_delivery.snapshot if canonical_delivery is not None else None),
                     principal_document_observer=capture_principal_documents,
+                    workspace_policy_observer=self.capture_session_workspace_policy,
                 )
             except PrincipalPolicyUnavailable:
                 await observe_context_preparation_failure(
@@ -1445,6 +1452,7 @@ class AcpBackend(AgentBackend):
             self._fresh_session = False
 
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
+        native_policy, native_sources, workspace_policy_revision = self.context_authority_facts()
 
         # Normalize user blocks to the ACP content shape before
         # per-turn assembly. Text blocks pass through; image blocks
@@ -1507,6 +1515,11 @@ class AcpBackend(AgentBackend):
             job_type="interactive",
             context_observer=context_observer,
             principal_documents=principal_documents,
+            ambient_context_discovery_enabled=False,
+            native_instruction_policy=native_policy,
+            native_instruction_sources=native_sources,
+            workspace_policy_delivered=fresh_session and workspace_policy_revision is not None,
+            workspace_policy_revision=workspace_policy_revision,
             canonical_conversation_context=(
                 canonical_delivery.delta if canonical_delivery is not None and not fresh_session else ""
             ),

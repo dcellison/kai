@@ -38,6 +38,12 @@ from kai.config import (
     get_user_backend_and_provider,
     validate_model_for_backend,
 )
+from kai.context_authority import (
+    CONTEXT_AUTHORITY_CONTRACT,
+    NativeInstructionPolicy,
+    NativeInstructionSource,
+    backend_context_contract,
+)
 from kai.history import get_recent_history, history_search_directories
 from kai.principal_documents import (
     PrincipalDocument,
@@ -86,8 +92,13 @@ class ContextAssemblyObservation:
     semantic_recall_revision: str | None
     workspace_reminder_delivered: bool
     workspace_reminder_revision: str | None = None
+    workspace_policy_delivered: bool = False
+    workspace_policy_revision: str | None = None
+    principal_workspace_precedence_applied: bool = False
     principal_documents: PrincipalDocumentReport | None = None
     ambient_context_discovery_enabled: bool | None = None
+    native_instruction_policy: NativeInstructionPolicy | None = None
+    native_instruction_sources: tuple[NativeInstructionSource, ...] = ()
     canonical_conversation_delivered: bool = False
     canonical_conversation_mode: str | None = None
     canonical_conversation_revision: str | None = None
@@ -634,6 +645,22 @@ class AgentBackend(ABC):
             raise TypeError("context assembly observer must be callable")
         self._context_assembly_observer = observer
 
+    def capture_session_workspace_policy(self, revision: str | None) -> None:
+        """Retain the explicit workspace-policy revision for this session."""
+        self._workspace_policy_revision = revision
+
+    def context_authority_facts(
+        self,
+    ) -> tuple[NativeInstructionPolicy, tuple[NativeInstructionSource, ...], str | None]:
+        """Return native-discovery policy, admitted sources, and workspace revision."""
+        contract = backend_context_contract(self.backend_name)
+        sources = getattr(self, "_native_instruction_sources", ())
+        return (
+            contract.native_instruction_policy,
+            sources,
+            getattr(self, "_workspace_policy_revision", None),
+        )
+
     def consume_context_assembly_observer(self) -> ContextAssemblyObserver | None:
         """Consume the protected execution's one-shot context observer."""
         observer = getattr(self, "_context_assembly_observer", None)
@@ -756,6 +783,7 @@ def build_session_context(
     defer_user_file_reads: bool = False,
     canonical_history: str | None = None,
     principal_document_observer: Callable[[PrincipalDocumentReport], None] | None = None,
+    workspace_policy_observer: Callable[[str | None], None] | None = None,
 ) -> str:
     """
     Build the context prefix for the first message of a new session.
@@ -788,8 +816,10 @@ def build_session_context(
         defer_user_file_reads: When True, read principal documents through
             the installed document-owner helper. The daemon never opens the
             private files and the backend never receives filesystem pointers.
+        workspace_policy_observer: Receives the content digest of an explicit
+            workspace policy, or ``None`` when the workspace has no policy.
     """
-    parts: list[str] = []
+    parts: list[str] = [CONTEXT_AUTHORITY_CONTRACT]
     policy_document: PrincipalDocument | None = None
     preferences_document: PrincipalDocument | None = None
     memory_document: PrincipalDocument | None = None
@@ -980,6 +1010,8 @@ def build_session_context(
     # between the identity/memory block and conversation history,
     # so it acts as workspace-specific instructions.
     ws_prompt = get_workspace_system_prompt(workspace_config)
+    if workspace_policy_observer is not None:
+        workspace_policy_observer(hashlib.sha256(ws_prompt.encode("utf-8")).hexdigest() if ws_prompt else None)
     if ws_prompt:
         parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
@@ -1798,6 +1830,10 @@ async def assemble_turn_context(
     context_observer: ContextAssemblyObserver | None = None,
     principal_documents: PrincipalDocumentReport | None = None,
     ambient_context_discovery_enabled: bool | None = None,
+    native_instruction_policy: NativeInstructionPolicy | None = None,
+    native_instruction_sources: tuple[NativeInstructionSource, ...] = (),
+    workspace_policy_delivered: bool = False,
+    workspace_policy_revision: str | None = None,
     canonical_conversation_context: str = "",
     canonical_conversation_revision: str | None = None,
     canonical_conversation_mode: str | None = None,
@@ -1856,6 +1892,11 @@ async def assemble_turn_context(
     ambient context files or equivalent native resources. ``None`` means the
     adapter does not make that behavior observable to Kai.
 
+    ``native_instruction_policy`` and ``native_instruction_sources`` record
+    the backend allowlist decision without exposing source paths or contents.
+    Workspace policy facts distinguish an explicit canonical policy from the
+    separate foreign-workspace safety reminder.
+
     Returns the assembled prompt in the same type family as the
     input (`str | list`). Backends do their own protocol-specific
     coercion afterwards (Claude stream-json content blocks, Codex
@@ -1873,8 +1914,9 @@ async def assemble_turn_context(
     prompt = prepend_to_prompt(prompt, USER_MESSAGE_MARKER)
 
     # A run-bound agent definition applies on every turn, including a live
-    # provider session. It is deliberately below host/workspace session
-    # context and never carries authority of its own.
+    # provider session. Its logical authority is below principal policy and
+    # above workspace policy, as declared by CONTEXT_AUTHORITY_CONTRACT; its
+    # physical position in this single protocol role does not change that.
     if agent_definition_context:
         prompt = prepend_to_prompt(prompt, agent_definition_context)
 
@@ -1971,8 +2013,18 @@ async def assemble_turn_context(
                 workspace_reminder_revision=(
                     hashlib.sha256(workspace_reminder.encode("utf-8")).hexdigest() if workspace_reminder else None
                 ),
+                workspace_policy_delivered=workspace_policy_delivered,
+                workspace_policy_revision=workspace_policy_revision,
+                principal_workspace_precedence_applied=(
+                    workspace_policy_revision is not None
+                    and principal_documents is not None
+                    and principal_documents.policy is not None
+                    and principal_documents.policy.delivered
+                ),
                 principal_documents=principal_documents,
                 ambient_context_discovery_enabled=ambient_context_discovery_enabled,
+                native_instruction_policy=native_instruction_policy,
+                native_instruction_sources=native_instruction_sources,
                 canonical_conversation_delivered=canonical_conversation_mode is not None,
                 canonical_conversation_mode=canonical_conversation_mode,
                 canonical_conversation_revision=canonical_conversation_revision,

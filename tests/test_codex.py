@@ -36,7 +36,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.backend import USER_MESSAGE_MARKER, StreamEvent
-from kai.codex import CodexBackend, write_turn_image_file
+from kai.codex import CodexBackend, _codex_native_instruction_sources, write_turn_image_file
 from kai.config import DATA_DIR, WorkspaceConfig
 
 # ── Shared helpers ──────────────────────────────────────────────────
@@ -390,6 +390,35 @@ class TestHandshake:
         # variants are kebab-case at thread/start.
         assert thread_msg["params"]["approvalPolicy"] == "never"
         assert thread_msg["params"]["sandbox"] == "danger-full-access"
+        assert thread_msg["params"]["config"] == {
+            "project_doc_max_bytes": 0,
+            "project_doc_fallback_filenames": [],
+        }
+
+    def test_provider_global_instruction_source_is_redacted(self):
+        source = _codex_native_instruction_sources(
+            {"instructionSources": [{"path": "/Users/daniel/.codex/AGENTS.md"}]},
+            codex_home=Path("/Users/daniel/.codex"),
+        )
+        assert len(source) == 1
+        assert source[0].scope == "provider_global"
+        assert source[0].filename == "AGENTS.md"
+        assert "/Users/daniel" not in repr(source[0])
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/tmp/workspace/AGENTS.md",
+            "/Users/daniel/.codex/nested/AGENTS.md",
+            "/Users/daniel/.codex/CLAUDE.md",
+        ],
+    )
+    def test_unapproved_instruction_source_fails_closed(self, path):
+        with pytest.raises(RuntimeError, match="outside Kai's provider-global allowlist"):
+            _codex_native_instruction_sources(
+                {"instructionSources": [{"path": path}]},
+                codex_home=Path("/Users/daniel/.codex"),
+            )
 
     @pytest.mark.asyncio
     async def test_argv_invokes_codex_app_server(self):

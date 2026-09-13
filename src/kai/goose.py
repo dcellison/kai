@@ -153,10 +153,9 @@ class GooseBackend(AcpBackend):
             base_env["GOOSE_MODEL"] = mapped
         if self.provider:
             base_env["GOOSE_PROVIDER"] = goose_provider_id(self.provider)
-        # Kai provisions one canonical backend-neutral instruction file.
-        # Restrict Goose's context discovery to that surface so it cannot
-        # consume a stale Claude compatibility file after a backend switch.
-        base_env["CONTEXT_FILE_NAMES"] = json.dumps(["AGENTS.md"])
+        # Canonical policy is delivered explicitly by Kai. Disable Goose's
+        # ambient workspace-file discovery to prevent duplicate instructions.
+        base_env["CONTEXT_FILE_NAMES"] = json.dumps([])
         return base_env
 
     def preserved_env_vars(self) -> tuple[str, ...]:
@@ -197,6 +196,9 @@ class GooseBackend(AcpBackend):
             "KAI_WEBHOOK_SECRET",
             "TMPDIR",
         )
+
+    def enforce_context_discovery_policy(self, env: dict[str, str]) -> None:
+        env["CONTEXT_FILE_NAMES"] = json.dumps([])
 
     def build_session_new_params(self) -> dict:
         """

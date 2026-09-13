@@ -381,14 +381,27 @@ class TestHandshake:
         assert call_kwargs["env"]["GOOSE_MODEL"] == "claude-opus-4-8"
 
     @pytest.mark.asyncio
-    async def test_native_context_discovery_is_agents_only(self):
+    async def test_native_context_discovery_is_disabled(self):
         g = _make_goose()
         proc = _make_mock_proc(_handshake_lines())
 
         with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
             await g._ensure_started()
 
-        assert json.loads(mock_exec.call_args[1]["env"]["CONTEXT_FILE_NAMES"]) == ["AGENTS.md"]
+        assert json.loads(mock_exec.call_args[1]["env"]["CONTEXT_FILE_NAMES"]) == []
+
+    @pytest.mark.asyncio
+    async def test_workspace_env_cannot_reenable_native_context_discovery(self):
+        g = _make_goose(
+            workspace_config=WorkspaceConfig(
+                path=Path("/tmp/test-workspace"),
+                env={"CONTEXT_FILE_NAMES": '["AGENTS.md"]'},
+            )
+        )
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await g._ensure_started()
+        assert json.loads(mock_exec.call_args[1]["env"]["CONTEXT_FILE_NAMES"]) == []
 
     @pytest.mark.asyncio
     async def test_model_passthrough_for_non_anthropic(self):

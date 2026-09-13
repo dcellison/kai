@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.backend import StreamEvent
+from kai.config import WorkspaceConfig
 from kai.opencode import OpenCodeBackend
 
 
@@ -194,6 +195,8 @@ class TestBuildEnv:
     def test_claude_prompt_fallback_is_disabled(self):
         env = _make_opencode().build_env({})
         assert env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] == "1"
+        assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+        assert env["OPENCODE_CONFIG_DIR"].endswith("/opencode-context-disabled")
 
 
 # ── build_initialize_params ─────────────────────────────────────────
@@ -847,6 +850,8 @@ class TestPreservedEnvVars:
         assert b.preserved_env_vars() == (
             "OPENCODE_CONFIG_CONTENT",
             "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "OPENCODE_CONFIG_DIR",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",
@@ -855,6 +860,24 @@ class TestPreservedEnvVars:
             "KAI_WEBHOOK_SECRET",
             "TMPDIR",
         )
+
+    @pytest.mark.asyncio
+    async def test_workspace_env_cannot_reenable_native_context_discovery(self):
+        b = _make_opencode(
+            workspace_config=WorkspaceConfig(
+                path=Path("/tmp/test-workspace"),
+                env={
+                    "OPENCODE_DISABLE_PROJECT_CONFIG": "0",
+                    "OPENCODE_CONFIG_DIR": "/tmp/untrusted-config",
+                },
+            )
+        )
+        proc = _make_mock_proc(_handshake_lines())
+        with patch("kai.acp.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
+            await b._ensure_started()
+        env = spawn.call_args.kwargs["env"]
+        assert env["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1"
+        assert env["OPENCODE_CONFIG_DIR"].endswith("/opencode-context-disabled")
 
     @pytest.mark.asyncio
     async def test_wrap_argv_carries_opencode_preserve_list(self, monkeypatch):
@@ -877,7 +900,8 @@ class TestPreservedEnvVars:
         argv = list(captured["argv"])
         assert argv[:6] == ["sudo", "-H", "-D", "/tmp/test-workspace", "-u", "oc-user"]
         assert argv[6] == (
-            "--preserve-env=OPENCODE_CONFIG_CONTENT,OPENCODE_DISABLE_CLAUDE_CODE_PROMPT,ANTHROPIC_API_KEY,"
+            "--preserve-env=OPENCODE_CONFIG_CONTENT,OPENCODE_DISABLE_CLAUDE_CODE_PROMPT,"
+            "OPENCODE_DISABLE_PROJECT_CONFIG,OPENCODE_CONFIG_DIR,ANTHROPIC_API_KEY,"
             "OPENAI_API_KEY,GOOGLE_API_KEY,OPENROUTER_API_KEY,DEEPSEEK_API_KEY,"
             "KAI_WEBHOOK_SECRET,TMPDIR"
         )
