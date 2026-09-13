@@ -148,6 +148,7 @@ class TestCommandConstruction:
             args = mock_exec.call_args
             cmd = args[0]
             assert cmd[0] == "claude"
+            assert "--bare" in cmd
             assert "sudo" not in cmd
             # Should NOT use start_new_session when running as same user
             assert args[1].get("start_new_session") is False

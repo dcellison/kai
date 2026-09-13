@@ -44,6 +44,7 @@ from typing import Literal
 
 from kai.acp import AcpBackend
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
+from kai.config import DATA_DIR
 
 log = logging.getLogger(__name__)
 
@@ -296,6 +297,12 @@ class OpenCodeBackend(AcpBackend):
         # AGENTS.md is absent. Kai's identity contract is explicit: OpenCode
         # receives AGENTS.md only.
         base_env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] = "1"
+        base_env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+        # Relocate provider-global instruction discovery to a dedicated empty,
+        # service-owned directory. OpenCode otherwise admits AGENTS.md from its
+        # normal global config directory even with project config disabled.
+        context_dir = DATA_DIR / "opencode-context-disabled"
+        base_env["OPENCODE_CONFIG_DIR"] = str(context_dir)
         if self.model:
             base_env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"model": self.model})
         return base_env
@@ -327,6 +334,8 @@ class OpenCodeBackend(AcpBackend):
         return (
             "OPENCODE_CONFIG_CONTENT",
             "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "OPENCODE_CONFIG_DIR",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GOOGLE_API_KEY",
@@ -335,6 +344,11 @@ class OpenCodeBackend(AcpBackend):
             "KAI_WEBHOOK_SECRET",
             "TMPDIR",
         )
+
+    def enforce_context_discovery_policy(self, env: dict[str, str]) -> None:
+        env["OPENCODE_DISABLE_CLAUDE_CODE_PROMPT"] = "1"
+        env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+        env["OPENCODE_CONFIG_DIR"] = str(DATA_DIR / "opencode-context-disabled")
 
     def build_initialize_params(self) -> dict:
         """

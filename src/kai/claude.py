@@ -265,6 +265,11 @@ class ClaudeCodeBackend(AgentBackend):
         # Build the Claude command arguments.
         claude_cmd = [
             claude_bin,
+            # Kai supplies every canonical instruction source explicitly.
+            # `--bare` disables CLAUDE.md, skills, hooks, plugins, MCP, and
+            # auto-memory discovery so provider-native files cannot duplicate
+            # or silently outrank that context.
+            "--bare",
             "--input-format",
             "stream-json",
             "--output-format",
@@ -855,6 +860,7 @@ class ClaudeCodeBackend(AgentBackend):
                     defer_user_file_reads=self.defer_user_file_reads,
                     canonical_history=(canonical_delivery.snapshot if canonical_delivery is not None else None),
                     principal_document_observer=capture_principal_documents,
+                    workspace_policy_observer=self.capture_session_workspace_policy,
                 )
             except PrincipalPolicyUnavailable:
                 await observe_context_preparation_failure(
@@ -872,6 +878,7 @@ class ClaudeCodeBackend(AgentBackend):
         # empty string, so coerce the None to "" rather than threading
         # the optional through the helper signature.
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
+        native_policy, native_sources, workspace_policy_revision = self.context_authority_facts()
 
         prompt = await assemble_turn_context(
             prompt,
@@ -886,6 +893,11 @@ class ClaudeCodeBackend(AgentBackend):
             job_type="interactive",
             context_observer=context_observer,
             principal_documents=principal_documents,
+            ambient_context_discovery_enabled=False,
+            native_instruction_policy=native_policy,
+            native_instruction_sources=native_sources,
+            workspace_policy_delivered=fresh_session and workspace_policy_revision is not None,
+            workspace_policy_revision=workspace_policy_revision,
             canonical_conversation_context=(
                 canonical_delivery.delta if canonical_delivery is not None and not fresh_session else ""
             ),

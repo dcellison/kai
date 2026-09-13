@@ -42,6 +42,7 @@ import base64
 import json
 import logging
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -75,10 +76,40 @@ from kai.backend import (
 )
 from kai.backend_registry import BackendRegistryError, backend_registry_is_authoritative, resolve_backend_command
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
+from kai.context_authority import NativeInstructionSource
 from kai.principal_documents import PrincipalDocumentReport, PrincipalPolicyUnavailable
 from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
 log = logging.getLogger(__name__)
+
+_CODEX_NATIVE_INSTRUCTION_FILENAMES = frozenset({"AGENTS.md", "AGENTS.override.md"})
+
+
+def _codex_native_instruction_sources(
+    result: dict,
+    *,
+    codex_home: Path,
+) -> tuple[NativeInstructionSource, ...]:
+    """Validate and redact Codex's reported provider-global instructions."""
+    thread = result.get("thread")
+    raw = result.get("instructionSources")
+    if raw is None and isinstance(thread, dict):
+        raw = thread.get("instructionSources")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise RuntimeError("Codex thread/start returned malformed instructionSources")
+    allowed_root = codex_home.resolve(strict=False)
+    sources: list[NativeInstructionSource] = []
+    for item in raw:
+        value = item if isinstance(item, str) else item.get("path") if isinstance(item, dict) else None
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("Codex thread/start returned malformed instruction source")
+        path = Path(value).resolve(strict=False)
+        if path.name not in _CODEX_NATIVE_INSTRUCTION_FILENAMES or path.parent != allowed_root:
+            raise RuntimeError("Codex admitted an instruction source outside Kai's provider-global allowlist")
+        sources.append(NativeInstructionSource.redacted(path, scope="provider_global"))
+    return tuple(dict.fromkeys(sources))
 
 
 # Codex is openai-only in v1. Pool.py resolves self.model through the
@@ -684,11 +715,36 @@ class CodexBackend(AgentBackend):
             "cwd": str(self.workspace),
             "approvalPolicy": "never",
             "sandbox": "danger-full-access",
+            # Canonical workspace and principal instructions are delivered by
+            # Kai. A zero project-document budget disables workspace/nested
+            # AGENTS.md scanning; provider-global sources are separately
+            # allowlisted from the server's instructionSources report below.
+            "config": {
+                "project_doc_max_bytes": 0,
+                "project_doc_fallback_filenames": [],
+            },
         }
         if self.model:
             thread_params["model"] = self.model
         await self._write_rpc("thread/start", thread_params)
         result = await self._read_result(expected_id=2)
+
+        if effective_codex_user:
+            try:
+                target_home = Path(pwd.getpwnam(effective_codex_user).pw_dir)
+            except KeyError:
+                # Unit fixtures use deliberately nonexistent users. No native
+                # sources are admitted in that case, but keep the handshake
+                # deterministic rather than consulting the caller's HOME.
+                target_home = Path("/Users") / effective_codex_user
+            codex_home = target_home / ".codex"
+        else:
+            configured_codex_home = os.environ.get("CODEX_HOME")
+            codex_home = Path(configured_codex_home) if configured_codex_home else Path.home() / ".codex"
+        self._native_instruction_sources = _codex_native_instruction_sources(
+            result,
+            codex_home=codex_home,
+        )
 
         # The thread.id is the conversational handle for all
         # subsequent turn/start calls. We reuse the existing
@@ -911,6 +967,7 @@ class CodexBackend(AgentBackend):
                     defer_user_file_reads=self.defer_user_file_reads,
                     canonical_history=(canonical_delivery.snapshot if canonical_delivery is not None else None),
                     principal_document_observer=capture_principal_documents,
+                    workspace_policy_observer=self.capture_session_workspace_policy,
                 )
             except PrincipalPolicyUnavailable:
                 await observe_context_preparation_failure(
@@ -927,6 +984,7 @@ class CodexBackend(AgentBackend):
         # coerce the None to "" rather than threading the optional
         # through the helper signature.
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
+        native_policy, native_sources, workspace_policy_revision = self.context_authority_facts()
 
         # Normalize user blocks to the app-server `UserInput` shape
         # before per-turn assembly. Text blocks pass through; image
@@ -993,6 +1051,11 @@ class CodexBackend(AgentBackend):
             job_type="interactive",
             context_observer=context_observer,
             principal_documents=principal_documents,
+            ambient_context_discovery_enabled=bool(native_sources),
+            native_instruction_policy=native_policy,
+            native_instruction_sources=native_sources,
+            workspace_policy_delivered=fresh_session and workspace_policy_revision is not None,
+            workspace_policy_revision=workspace_policy_revision,
             canonical_conversation_context=(
                 canonical_delivery.delta if canonical_delivery is not None and not fresh_session else ""
             ),

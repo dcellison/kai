@@ -430,6 +430,7 @@ class PiBackend(AgentBackend):
                     defer_user_file_reads=self.defer_user_file_reads,
                     canonical_history=(canonical_delivery.snapshot if canonical_delivery is not None else None),
                     principal_document_observer=capture_principal_documents,
+                    workspace_policy_observer=self.capture_session_workspace_policy,
                 )
             except PrincipalPolicyUnavailable:
                 await observe_context_preparation_failure(
@@ -439,6 +440,7 @@ class PiBackend(AgentBackend):
                 raise
             self._fresh_session = False
         reminder = build_foreign_workspace_reminder(self.workspace, self.home_workspace) or ""
+        native_policy, native_sources, workspace_policy_revision = self.context_authority_facts()
 
         images: list[dict[str, str]] = []
         dropped_images = 0
@@ -479,6 +481,10 @@ class PiBackend(AgentBackend):
             context_observer=context_observer,
             principal_documents=principal_documents,
             ambient_context_discovery_enabled=False,
+            native_instruction_policy=native_policy,
+            native_instruction_sources=native_sources,
+            workspace_policy_delivered=fresh_session and workspace_policy_revision is not None,
+            workspace_policy_revision=workspace_policy_revision,
             canonical_conversation_context=(
                 canonical_delivery.delta if canonical_delivery is not None and not fresh_session else ""
             ),

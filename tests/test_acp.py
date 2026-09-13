@@ -55,6 +55,7 @@ import pytest
 from kai.acp import AcpBackend, convert_image_block, drain_late_text
 from kai.backend import USER_MESSAGE_MARKER, StreamEvent
 from kai.config import WorkspaceConfig
+from kai.context_authority import NativeInstructionPolicy, NativeInstructionSource
 
 # ── Fake concrete subclass ───────────────────────────────────────────
 
@@ -72,6 +73,16 @@ class _FakeAcp(AcpBackend):
 
     backend_name = "fake"
     backend_label = "FakeAcp"
+
+    def context_authority_facts(
+        self,
+    ) -> tuple[NativeInstructionPolicy, tuple[NativeInstructionSource, ...], str | None]:
+        """Declare the test double's intentionally empty native context."""
+        return (
+            NativeInstructionPolicy.DISABLED,
+            (),
+            getattr(self, "_workspace_policy_revision", None),
+        )
 
     def build_argv(self) -> list[str]:
         return ["fake_acp_binary"]

@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
+from kai.context_authority import NativeInstructionPolicy, NativeInstructionSource
 from kai.principal_documents import PrincipalDocument, PrincipalDocumentState
 from kai.workshop.domain import (
     AgentId,
@@ -132,6 +133,7 @@ class ContextSourceDescriptor:
     revision: str | None = None
     history_boundary: int | None = None
     delivery_shape: str = "metadata"
+    native_instruction_sources: tuple[NativeInstructionSource, ...] = ()
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -153,9 +155,11 @@ class ContextSourceDescriptor:
             or self.history_boundary < 0
         ):
             raise ValueError("history_boundary must be a non-negative integer")
+        if self.native_instruction_sources and self.kind is not ContextSourceKind.PROVIDER_NATIVE:
+            raise ValueError("native instruction sources belong only to provider_native")
 
     def payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "kind": self.kind.value,
             "owner_kind": self.owner_kind.value,
             "owner_id": self.owner_id,
@@ -170,10 +174,13 @@ class ContextSourceDescriptor:
             "history_boundary": self.history_boundary,
             "delivery_shape": self.delivery_shape,
         }
+        if self.native_instruction_sources:
+            payload["native_instruction_sources"] = [source.payload() for source in self.native_instruction_sources]
+        return payload
 
     @classmethod
     def from_payload(cls, value: object) -> ContextSourceDescriptor:
-        if not isinstance(value, dict) or set(value) != {
+        expected = {
             "kind",
             "owner_kind",
             "owner_id",
@@ -187,7 +194,11 @@ class ContextSourceDescriptor:
             "revision",
             "history_boundary",
             "delivery_shape",
-        }:
+        }
+        if not isinstance(value, dict):
+            raise ValueError("Context source descriptor has an invalid shape")
+        keys = frozenset(value)
+        if keys not in {frozenset(expected), frozenset((*expected, "native_instruction_sources"))}:
             raise ValueError("Context source descriptor has an invalid shape")
         owner_id = value["owner_id"]
         revision = value["revision"]
@@ -206,6 +217,9 @@ class ContextSourceDescriptor:
             revision=None if revision is None else str(revision),
             history_boundary=None if boundary is None else int(boundary),
             delivery_shape=str(value["delivery_shape"]),
+            native_instruction_sources=tuple(
+                NativeInstructionSource.from_payload(item) for item in value.get("native_instruction_sources", [])
+            ),
         )
 
 
@@ -391,18 +405,22 @@ def build_context_manifest_draft(
         "bootstrap_source_not_individually_observable" if observation.session_context_delivered else session_reason
     )
     workspace_policy_state = (
-        ContextSourceState.NEWLY_DELIVERED
-        if dispatch_reached and observation.workspace_reminder_delivered
-        else ContextSourceState.UNAVAILABLE
-        if not dispatch_reached or observation.session_context_delivered
+        ContextSourceState.UNAVAILABLE
+        if not dispatch_reached
+        else ContextSourceState.OMITTED
+        if observation.workspace_policy_revision is None
+        else ContextSourceState.NEWLY_DELIVERED
+        if observation.workspace_policy_delivered
         else ContextSourceState.RETAINED
     )
     workspace_policy_reason = (
         dispatch_reason
         if not dispatch_reached
-        else "foreign_workspace_reminder"
-        if observation.workspace_reminder_delivered
-        else granular_session_reason
+        else "no_explicit_workspace_policy"
+        if observation.workspace_policy_revision is None
+        else "principal_precedence_applied"
+        if observation.principal_workspace_precedence_applied
+        else "explicit_workspace_policy"
     )
     semantic_state = (
         ContextSourceState.NEWLY_DELIVERED if observation.semantic_recall_delivered else ContextSourceState.OMITTED
@@ -495,7 +513,7 @@ def build_context_manifest_draft(
             ContextDeliveryRole.TURN_CONTEXT,
             ContextSourceState.NEWLY_DELIVERED if dispatch_reached else ContextSourceState.UNAVAILABLE,
             "host_turn_contract" if dispatch_reached else dispatch_reason,
-            revision="context_contract_v1",
+            revision="context_contract_v2",
             delivery_shape="inline_host_marker",
         ),
         ContextSourceDescriptor(
@@ -537,8 +555,8 @@ def build_context_manifest_draft(
             ContextDeliveryRole.SESSION_CONTEXT,
             workspace_policy_state,
             workspace_policy_reason,
-            revision=observation.workspace_reminder_revision or session_revision,
-            delivery_shape="bootstrap_or_reminder",
+            revision=observation.workspace_policy_revision,
+            delivery_shape="inline_explicit_policy",
         ),
         ContextSourceDescriptor(
             ContextSourceKind.PERSONAL_PREFERENCES,
@@ -660,17 +678,37 @@ def build_context_manifest_draft(
             (
                 "dispatch_not_reached"
                 if observation.provider_dispatch_reached is False
+                else "provider_global_sources_admitted"
+                if observation.native_instruction_sources
+                else "provider_global_allowlist_empty"
+                if observation.native_instruction_policy is NativeInstructionPolicy.PROVIDER_GLOBAL_ONLY
                 else "ambient_discovery_disabled"
-                if observation.ambient_context_discovery_enabled is False
+                if observation.native_instruction_policy is NativeInstructionPolicy.DISABLED
+                or (
+                    observation.native_instruction_policy is None
+                    and observation.ambient_context_discovery_enabled is False
+                )
                 else "ambient_discovery_enabled"
                 if observation.ambient_context_discovery_enabled is True
                 else "not_observable"
             ),
+            revision=(
+                content_digest([source.payload() for source in observation.native_instruction_sources])
+                if observation.native_instruction_sources
+                else None
+            ),
             delivery_shape=(
-                "provider_managed_ambient_disabled"
-                if observation.ambient_context_discovery_enabled is False
+                "allowlisted_provider_global"
+                if observation.native_instruction_policy is NativeInstructionPolicy.PROVIDER_GLOBAL_ONLY
+                else "provider_managed_ambient_disabled"
+                if observation.native_instruction_policy is NativeInstructionPolicy.DISABLED
+                or (
+                    observation.native_instruction_policy is None
+                    and observation.ambient_context_discovery_enabled is False
+                )
                 else "provider_managed_unknown"
             ),
+            native_instruction_sources=observation.native_instruction_sources,
         ),
     )
     return ContextManifestDraft(
