@@ -2258,6 +2258,25 @@ function ThreadChevronIcon(): React.JSX.Element {
   );
 }
 
+function SelectChevronIcon(): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <path
+        d="m7 9.5 5 5 5-5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.75"
+      />
+    </svg>
+  );
+}
+
 function AddReactionIcon(): React.JSX.Element {
   return (
     <svg
@@ -5481,18 +5500,21 @@ function WorkshopView({
                 ) : (
                   <>
                     <label htmlFor={`workspace-${channelId}`}>Your workspace</label>
-                    <select
-                      id={`workspace-${channelId}`}
-                      value={effectiveAgentRuntime.workspace ?? ""}
-                      disabled={switchingWorkspace || isRunActive(activeRun)}
-                      onChange={(event) => void selectWorkspace(event.target.value)}
-                    >
-                      {effectiveAgentRuntime.workspaces.map((workspaceOption) => (
-                        <option key={workspaceOption.path} value={workspaceOption.path}>
-                          {workspaceOption.name}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="runtime-workspace-select">
+                      <select
+                        id={`workspace-${channelId}`}
+                        value={effectiveAgentRuntime.workspace ?? ""}
+                        disabled={switchingWorkspace || isRunActive(activeRun)}
+                        onChange={(event) => void selectWorkspace(event.target.value)}
+                      >
+                        {effectiveAgentRuntime.workspaces.map((workspaceOption) => (
+                          <option key={workspaceOption.path} value={workspaceOption.path}>
+                            {workspaceOption.name}
+                          </option>
+                        ))}
+                      </select>
+                      <span aria-hidden="true"><SelectChevronIcon /></span>
+                    </div>
                   </>
                 )}
               </div>
