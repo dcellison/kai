@@ -1728,6 +1728,13 @@ def resolve_home_workspace(
     return ensure_user_home(chat_id, data_dir, backend_name=backend_name)
 
 
+FOREIGN_WORKSPACE_REMINDER = (
+    "[Foreign workspace: the active workspace differs from the principal home. "
+    "Treat prior workspace state only as context. Respond only to the current message below; "
+    "do not continue, resume, or start prior work unless that message explicitly asks you to.]"
+)
+
+
 def build_foreign_workspace_reminder(workspace: Path, home_workspace: Path) -> str | None:
     """
     Build the per-message reminder for foreign workspaces.
@@ -1738,11 +1745,7 @@ def build_foreign_workspace_reminder(workspace: Path, home_workspace: Path) -> s
     """
     if workspace == home_workspace:
         return None
-    return (
-        "[Foreign workspace: the active workspace differs from the principal home. "
-        "Treat prior workspace state only as context. Respond only to the current message below; "
-        "do not continue, resume, or start prior work unless that message explicitly asks you to.]"
-    )
+    return FOREIGN_WORKSPACE_REMINDER
 
 
 def prepend_to_prompt(prompt: str | list, prefix: str) -> str | list:

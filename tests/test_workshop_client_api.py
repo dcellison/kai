@@ -138,6 +138,7 @@ from kai.workshop.model_catalogue import (
     ModelCatalogueSnapshot,
 )
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
+from kai.workshop.principal_policies import WorkshopPrincipalPolicyService
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.routing_eligibility import (
     CapabilityAssessment,
@@ -1082,6 +1083,8 @@ async def _open_client(
     routing_eligibility=None,
     routing_policy=None,
     memory_queries=None,
+    principal_policies=None,
+    preference_documents=None,
     github_settings=None,
     notification_preferences=None,
     client_preferences=None,
@@ -1110,6 +1113,8 @@ async def _open_client(
         routing_eligibility=routing_eligibility,
         routing_policy=routing_policy,
         memory_queries=memory_queries,
+        principal_policies=principal_policies,
+        preference_documents=preference_documents,
         github_settings=github_settings,
         notification_preferences=notification_preferences,
         client_preferences=client_preferences,
@@ -1132,6 +1137,9 @@ async def _open_command_client(
     authenticator: _Authenticator,
     submitter: _CommandSubmitter,
     artifact_service: WorkshopArtifactService | None = None,
+    principal_policies=None,
+    preference_documents=None,
+    settings_workspaces=None,
 ) -> TestClient:
     app = web.Application(client_max_size=21 * 1024 * 1024)
     register_workshop_command_routes(
@@ -1141,6 +1149,9 @@ async def _open_command_client(
         submitter=submitter,
         request_lock=asyncio.Lock(),
         artifact_service=artifact_service,
+        principal_policies=principal_policies,
+        preference_documents=preference_documents,
+        settings_workspaces=settings_workspaces,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
@@ -6131,6 +6142,61 @@ async def _insert_trace_rows(store: WorkshopEventStore, run_id: str, count: int,
             ),
         )
     await store.connection.commit()
+
+
+@pytest.mark.asyncio
+async def test_principal_policy_api_is_owner_scoped_and_revision_checked(tmp_path: Path) -> None:
+    store, alice_id, _alice_channel, bob_id, _bob_channel = await _open_store(tmp_path / "kai.db")
+    storage = await WorkshopPrincipalStorageRegistry.from_store(store, profile_registry(101, 202))
+    for namespace in storage.namespaces:
+        home = namespace.home_directory(tmp_path)
+        home.mkdir(parents=True, mode=0o700)
+        home.chmod(0o700)
+        policy = home / "AGENTS.md"
+        policy.write_text(f"# Principal Policy\n\nPrivate to {namespace.principal_id}.\n", encoding="utf-8")
+        policy.chmod(0o600)
+    service = WorkshopPrincipalPolicyService(
+        tmp_path,
+        storage,
+        manager=tmp_path / "missing-manager",
+        reader=tmp_path / "missing-reader",
+    )
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        principal_policies=service,
+    )
+    try:
+        alice = await client.get("/v1/principal-policy", headers={"Authorization": "Bearer alice-token"})
+        bob = await client.get("/v1/principal-policy", headers={"Authorization": "Bearer bob-token"})
+        alice_payload = await alice.json()
+        assert alice.status == 200
+        assert bob.status == 200
+        assert str(alice_id) in alice_payload["document"]["content"]
+        assert str(bob_id) in (await bob.json())["document"]["content"]
+
+        changed = await client.put(
+            "/v1/principal-policy",
+            headers={"Authorization": "Bearer alice-token"},
+            json={
+                "content": "# Principal Policy\n\nUpdated by Alice.\n",
+                "revision": alice_payload["document"]["revision"],
+            },
+        )
+        stale = await client.put(
+            "/v1/principal-policy",
+            headers={"Authorization": "Bearer alice-token"},
+            json={
+                "content": "# Principal Policy\n\nStale overwrite.\n",
+                "revision": alice_payload["document"]["revision"],
+            },
+        )
+        assert changed.status == 200
+        assert stale.status == 409
+        assert (await stale.json())["error"]["code"] == "revision_conflict"
+    finally:
+        await client.close()
+        await store.close()
 
 
 class TestWorkshopRunTraceHTTPContract:

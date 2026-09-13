@@ -59,6 +59,7 @@ from kai.workshop.opencode_model_discovery import OpenCodeModelDiscoveryAdapter
 from kai.workshop.pi_model_discovery import PiModelDiscoveryAdapter
 from kai.workshop.post_run_effects import WorkshopPostRunEffectService
 from kai.workshop.preferences import WorkshopPreferenceService
+from kai.workshop.principal_policies import WorkshopPrincipalPolicyService
 from kai.workshop.private_text_execution import WorkshopPrivateTextExecutionService
 from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
@@ -206,6 +207,7 @@ class KaiCoreServices:
     settings_workspaces: WorkshopSettingsWorkspaceService
     memory_queries: WorkshopMemoryQueryService
     preference_documents: WorkshopPreferenceService
+    principal_policies: WorkshopPrincipalPolicyService
     github_settings: WorkshopGitHubSettingsService
     notification_preferences: WorkshopNotificationPreferenceService
     channel_notification_policy: WorkshopChannelNotificationPolicyService
@@ -463,6 +465,13 @@ class KaiApplicationHost:
                     str(principal_id)
                 ),
             )
+            principal_policies = WorkshopPrincipalPolicyService(
+                Path(self._config.session_db_path).parent,
+                self._principal_storage,
+                on_content_changed=lambda principal_id: runtime_pool.invalidate_principal_retained_context(
+                    str(principal_id)
+                ),
+            )
             github_settings = await WorkshopGitHubSettingsService.open(
                 Path(self._config.session_db_path),
                 self._execution_state,
@@ -554,6 +563,7 @@ class KaiApplicationHost:
                 settings_workspaces=settings_workspaces,
                 memory_queries=memory_queries,
                 preference_documents=preference_documents,
+                principal_policies=principal_policies,
                 github_settings=github_settings,
                 notification_preferences=notification_preferences,
                 channel_notification_policy=channel_notification_policy,

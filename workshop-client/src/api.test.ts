@@ -53,6 +53,7 @@ import {
   loadRoutingEligibility,
   loadRoutingPolicy,
   loadRun,
+  loadRunContextManifests,
   loadRunTrace,
   loadStandingParticipation,
   loadTimeline,
@@ -2611,6 +2612,82 @@ describe("Workshop client API", () => {
       ],
       entries: [],
       hasMore: false,
+    });
+  });
+
+  it("loads the typed context-stack inspection for a run", async () => {
+    const runId = "run_00000000000000000000000000000001";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({
+      channel_id: channelId,
+      manifests: [{
+        agent_id: "agt_00000000000000000000000000000001",
+        attempt_id: "rat_00000000000000000000000000000001",
+        backend: "codex",
+        channel_id: channelId,
+        created_at: "2026-09-13T10:00:00Z",
+        manifest_sha256: "a".repeat(64),
+        model: "gpt-5.6-sol",
+        provider: "openai",
+        provider_session_revision: "b".repeat(64),
+        run_id: runId,
+        runtime_profile_id: "rtp_00000000000000000000000000000001",
+        sources: [{
+          authority_class: "principal",
+          authorization_operations: null,
+          budget_bytes: 131072,
+          delivery_role: "session_context",
+          delivery_shape: "protected_document_pointer",
+          history_boundary: null,
+          inspection: {
+            change_effect: "provider_session_refresh",
+            current_revision: "c".repeat(64),
+            description: "Principal-owned behavioral policy.",
+            edit_target: "principal_policy",
+            edit_target_id: null,
+            editable: true,
+            freshness: "current",
+            preview: "# Working agreement",
+            preview_reason: null,
+            preview_state: "exact",
+            source_reference: "principal-owned AGENTS.md",
+            title: "Principal policy",
+          },
+          kind: "principal_policy",
+          native_instruction_sources: [],
+          owner_id: "prn_00000000000000000000000000000001",
+          owner_kind: "principal",
+          reason: "live_provider_session",
+          refresh_class: "provider_session",
+          rendered_bytes: 19,
+          revision: "c".repeat(64),
+          scope: "principal",
+          state: "retained",
+          trust_class: "principal_policy",
+        }],
+        workspace_digest: "d".repeat(64),
+        workspace_kind: "foreign",
+      }],
+      run_id: runId,
+      version: 1,
+    })));
+
+    await expect(loadRunContextManifests(session, runId)).resolves.toMatchObject({
+      channelId,
+      runId,
+      manifests: [{
+        backend: "codex",
+        model: "gpt-5.6-sol",
+        provider: "openai",
+        sources: [{
+          inspection: {
+            editTarget: "principal_policy",
+            editable: true,
+            preview: "# Working agreement",
+            previewState: "exact",
+          },
+          kind: "principal_policy",
+        }],
+      }],
     });
   });
 

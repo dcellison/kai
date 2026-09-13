@@ -96,6 +96,7 @@ import {
   MESSAGE_PATTERN,
 } from "./types";
 import { RunTraceCard } from "./RunTraceCard";
+import { ContextStackInspector } from "./ContextStackInspector";
 import { useRunTrace } from "./useRunTrace";
 import { useWorkshopTimeline } from "./useWorkshopTimeline";
 import type { EarlierHistoryState, LaterHistoryState } from "./useWorkshopTimeline";
@@ -5540,6 +5541,25 @@ function WorkshopView({
               loaded={traceLoaded}
               runId={inspectedRunId}
             />
+            <details className="context-stack-panel">
+              <summary>Context stack</summary>
+              <ContextStackInspector
+                session={{ channelId, token: memoryToken }}
+                runId={inspectedRunId}
+                onNavigate={(source) => {
+                  if (
+                    source.inspection.editTargetId &&
+                    (source.inspection.editTarget === "agent_definition" ||
+                      source.inspection.editTarget === "workspace_policy")
+                  ) {
+                    onSelectAgent(
+                      source.inspection.editTargetId,
+                      source.inspection.editTarget === "workspace_policy" ? "runtime" : null,
+                    );
+                  }
+                }}
+              />
+            </details>
           </section>}
 
         </div>

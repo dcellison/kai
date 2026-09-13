@@ -154,6 +154,7 @@ _DEPLOYED_ENV_FILE = Path("/etc/kai/env")
 # hardcodes the same path; keep them in sync.
 PRINCIPAL_MEMORY_READER = Path("/etc/kai/read-principal-memory")
 PRINCIPAL_DOCUMENT_READER = Path("/etc/kai/read-principal-document")
+PRINCIPAL_POLICY_MANAGER = Path("/etc/kai/manage-principal-policy")
 PRINCIPAL_PREFERENCE_MANAGER = Path("/etc/kai/manage-principal-preferences")
 PRINCIPAL_WORKSPACE_PROVISIONER = Path("/etc/kai/provision-principal-workspace")
 SPONSORED_WORKSPACE_PROVISIONER = Path("/etc/kai/provision-sponsored-workspace")
@@ -4542,6 +4543,49 @@ def _generate_principal_preference_manager(
     """)
 
 
+def _generate_principal_policy_manager(
+    documents: dict[str, tuple[str, dict[str, Path]]],
+    install_dir: str = "/opt/kai",
+) -> str:
+    """Generate the fixed root wrapper for owner-scoped AGENTS.md writes."""
+    mapping = {
+        principal_id: {
+            "os_user": os_user,
+            "path": str(paths["principal_policy"].parent.resolve() / paths["principal_policy"].name),
+        }
+        for principal_id, (os_user, paths) in sorted(documents.items())
+    }
+    python = repr(str(Path(install_dir) / "venv" / "bin" / "python"))
+    encoded = repr(json.dumps(mapping, sort_keys=True, separators=(",", ":")))
+    return textwrap.dedent(f"""\
+        #!/usr/bin/python3
+        # Kai - manage one allowlisted canonical per-principal AGENTS.md.
+        # Managed by 'python -m kai install apply'. Do not edit manually.
+        import os
+        import sys
+
+        PYTHON = {python}
+        DOCUMENTS = {encoded}
+
+
+        def main() -> int:
+            argv = [
+                PYTHON,
+                "-I",
+                "-m",
+                "kai.workshop.principal_policies",
+                "--helper",
+                DOCUMENTS,
+                *sys.argv[1:],
+            ]
+            os.execve(PYTHON, argv, {{"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}})
+            return 1
+
+
+        sys.exit(main())
+    """)
+
+
 def _generate_principal_workspace_provisioner(install_dir: str = "/opt/kai") -> str:
     """Generate the fixed root wrapper for bounded workspace provisioning."""
     python = repr(str(Path(install_dir) / "venv" / "bin" / "python"))
@@ -4706,6 +4750,7 @@ def _generate_sudoers(
         rules += f"{service_user} ALL=(root) NOPASSWD: {SPONSORED_WORKSPACE_PROVISIONER} *\n"
     if principal_document_reader:
         rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_DOCUMENT_READER} *\n"
+        rules += f"{service_user} ALL=(root) NOPASSWD: {PRINCIPAL_POLICY_MANAGER} *\n"
 
     if target_users:
         # In protected installs, these arguments come from
@@ -9465,6 +9510,7 @@ def _apply_sudoers(
             print(f"[DRY RUN] Would write: {SPONSORED_WORKSPACE_PROVISIONER} (mode 0755)")
         if install_document_reader:
             print(f"[DRY RUN] Would write: {PRINCIPAL_DOCUMENT_READER} (mode 0755)")
+            print(f"[DRY RUN] Would write: {PRINCIPAL_POLICY_MANAGER} (mode 0755)")
         print(f"[DRY RUN] Would write: {sudoers_path} (mode 0440)")
         print("[DRY RUN] Would validate with visudo -cf")
         return
@@ -9550,6 +9596,21 @@ def _apply_sudoers(
         os.chmod(PRINCIPAL_DOCUMENT_READER, 0o755)
         os.chown(PRINCIPAL_DOCUMENT_READER, 0, 0)
         print(f"  Wrote {PRINCIPAL_DOCUMENT_READER}")
+
+        fd, tmp_name = tempfile.mkstemp(prefix="kai-policy-manager-", suffix=".tmp")
+        try:
+            os.write(
+                fd,
+                _generate_principal_policy_manager(principal_documents, install_dir).encode(),
+            )
+            os.close(fd)
+            shutil.move(tmp_name, str(PRINCIPAL_POLICY_MANAGER))
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        os.chmod(PRINCIPAL_POLICY_MANAGER, 0o755)
+        os.chown(PRINCIPAL_POLICY_MANAGER, 0, 0)
+        print(f"  Wrote {PRINCIPAL_POLICY_MANAGER}")
 
     # Write to a secure temp file first, validate, then move into place.
     # Uses mkstemp (random name, restrictive permissions) instead of a

@@ -20,11 +20,14 @@ from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
 
+from kai.backend import FOREIGN_WORKSPACE_REMINDER, USER_MESSAGE_MARKER
+from kai.context_authority import CONTEXT_AUTHORITY_CONTRACT
 from kai.workshop.agent_creation_options import (
     AgentCreationBlocker,
     AgentCreationOptions,
     WorkshopAgentCreationOptionsService,
 )
+from kai.workshop.agent_definitions import load_agent_definition_revision, render_agent_definition_context
 from kai.workshop.agent_enablement import (
     PrincipalAgentEnablement,
     WorkshopAgentEnablementAccessDenied,
@@ -137,7 +140,13 @@ from kai.workshop.collaboration_policy import (
     WorkshopCollaborationPolicyStorageError,
     WorkshopCollaborationPolicyValidationError,
 )
-from kai.workshop.context_manifests import RunContextManifest, WorkshopContextManifestService
+from kai.workshop.context_manifests import (
+    ContextSourceDescriptor,
+    ContextSourceKind,
+    RunContextManifest,
+    WorkshopContextManifestService,
+    content_digest,
+)
 from kai.workshop.conversation_commands import ConversationCommandAcceptanceError
 from kai.workshop.direct_message_archives import (
     WorkshopDirectMessageArchiveAccessDenied,
@@ -270,6 +279,17 @@ from kai.workshop.preferences import (
     WorkshopPreferenceStorageError,
     WorkshopPreferenceValidationError,
 )
+from kai.workshop.principal_policies import (
+    MAX_PRINCIPAL_DOCUMENT_BYTES,
+    PrincipalPolicyAuthority,
+    PrincipalPolicyDocument,
+    WorkshopPrincipalPolicyAccessDenied,
+    WorkshopPrincipalPolicyConflict,
+    WorkshopPrincipalPolicyError,
+    WorkshopPrincipalPolicyService,
+    WorkshopPrincipalPolicyStorageError,
+    WorkshopPrincipalPolicyValidationError,
+)
 from kai.workshop.routing_eligibility import (
     RoutingEligibilityAccessDenied,
     RoutingEligibilityAuthority,
@@ -394,6 +414,7 @@ _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
 _WORKSPACE_COLLECTION_PATH = "/v1/channels/{channel_id}/workspaces"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
 _PREFERENCES_PATH = "/v1/preferences"
+_PRINCIPAL_POLICY_PATH = "/v1/principal-policy"
 _PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
 _PREFERENCE_RESTORE_PATH = "/v1/preferences/revisions/{preference_revision}/restore"
 _GITHUB_SETTINGS_PATH = "/v1/settings/github"
@@ -451,6 +472,7 @@ _MAX_WORKSPACE_CREATION_BODY_BYTES = 2_048
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
 _PREFERENCE_UPDATE_FIELDS = frozenset({"content", "revision"})
+_PRINCIPAL_POLICY_UPDATE_FIELDS = frozenset({"content", "revision"})
 _PREFERENCE_RESTORE_FIELDS = frozenset({"revision"})
 _GITHUB_SETTINGS_REQUEST_FIELDS = frozenset({"revision", "repository", "reset_repositories", "toggle", "token"})
 _GITHUB_REPOSITORY_FIELDS = frozenset({"name", "subscribed"})
@@ -696,6 +718,36 @@ def _serialize_preference_context_invalidation(
     service: WorkshopPreferenceService,
     authority: PreferenceAuthority,
     document: PreferenceDocument,
+) -> dict[str, object] | None:
+    invalidation = service.context_invalidation(authority, document.revision)
+    if invalidation is None:
+        return None
+    return {
+        "state": invalidation.state,
+        "applied": invalidation.applied,
+        "pending": invalidation.pending,
+    }
+
+
+def _serialize_principal_policy_document(
+    document: PrincipalPolicyDocument,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "document": {
+            "content": document.content,
+            "revision": document.revision,
+            "size_bytes": document.size_bytes,
+            "max_bytes": document.max_bytes,
+            "editable": document.editable,
+        },
+    }
+
+
+def _serialize_principal_policy_context_invalidation(
+    service: WorkshopPrincipalPolicyService,
+    authority: PrincipalPolicyAuthority,
+    document: PrincipalPolicyDocument,
 ) -> dict[str, object] | None:
     invalidation = service.context_invalidation(authority, document.revision)
     if invalidation is None:
@@ -2129,6 +2181,122 @@ async def _authenticate_preference_authority(
             code="access_denied",
             message="Access denied",
         )
+
+
+async def _authenticate_principal_policy_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPrincipalPolicyService,
+) -> tuple[PrincipalPolicyAuthority | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return None, response
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopPrincipalPolicyAccessDenied:
+        return None, _error_response(status=403, code="access_denied", message="Access denied")
+
+
+def _principal_policy_error_response(exc: WorkshopPrincipalPolicyError) -> web.Response:
+    if isinstance(exc, WorkshopPrincipalPolicyConflict):
+        return _json_response(
+            {
+                "error": {
+                    "code": "revision_conflict",
+                    "message": str(exc),
+                    "current_revision": exc.current_revision,
+                }
+            },
+            status=409,
+        )
+    if isinstance(exc, WorkshopPrincipalPolicyValidationError):
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    if isinstance(exc, WorkshopPrincipalPolicyAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, WorkshopPrincipalPolicyStorageError):
+        return _error_response(
+            status=503,
+            code="principal_policy_unavailable",
+            message="Principal policy is temporarily unavailable",
+        )
+    return _error_response(
+        status=503,
+        code="principal_policy_unavailable",
+        message="Principal policy is temporarily unavailable",
+    )
+
+
+async def _principal_policy_json_object(request: web.Request) -> dict[str, object]:
+    if request.content_type != "application/json":
+        raise WorkshopPrincipalPolicyValidationError("Content-Type must be application/json")
+    raw = await request.content.read(MAX_PRINCIPAL_DOCUMENT_BYTES + 4097)
+    if len(raw) > MAX_PRINCIPAL_DOCUMENT_BYTES + 4096:
+        raise WorkshopPrincipalPolicyValidationError("Principal-policy request is too large")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise WorkshopPrincipalPolicyValidationError("Invalid JSON request") from exc
+    if not isinstance(payload, dict):
+        raise WorkshopPrincipalPolicyValidationError("Invalid principal-policy request")
+    return payload
+
+
+async def _handle_principal_policy_document(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPrincipalPolicyService,
+) -> web.Response:
+    authority, error = await _authenticate_principal_policy_authority(
+        request, authenticator=authenticator, service=service
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid principal-policy request")
+    try:
+        document = await service.read(authority)
+    except WorkshopPrincipalPolicyError as exc:
+        return _principal_policy_error_response(exc)
+    return _json_response(_serialize_principal_policy_document(document), status=200)
+
+
+async def _handle_principal_policy_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopPrincipalPolicyService,
+) -> web.Response:
+    authority, error = await _authenticate_principal_policy_authority(
+        request, authenticator=authenticator, service=service
+    )
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid principal-policy request")
+    try:
+        payload = await _principal_policy_json_object(request)
+        if set(payload) != _PRINCIPAL_POLICY_UPDATE_FIELDS:
+            raise WorkshopPrincipalPolicyValidationError("Invalid principal-policy request")
+        content = payload.get("content")
+        revision = payload.get("revision")
+        if not isinstance(content, str) or not isinstance(revision, str):
+            raise WorkshopPrincipalPolicyValidationError("Invalid principal-policy request")
+        document = await service.save(authority, expected_revision=revision, content=content)
+    except WorkshopPrincipalPolicyError as exc:
+        return _principal_policy_error_response(exc)
+    response = _serialize_principal_policy_document(document)
+    response["context_invalidation"] = _serialize_principal_policy_context_invalidation(service, authority, document)
+    return _json_response(response, status=200)
 
 
 def _preference_error_response(exc: WorkshopPreferenceError) -> web.Response:
@@ -8084,7 +8252,278 @@ async def _handle_run_state(
     )
 
 
-def _serialize_context_manifest(manifest: RunContextManifest) -> dict[str, object]:
+_CONTEXT_SOURCE_PRESENTATION: dict[ContextSourceKind, tuple[str, str]] = {
+    ContextSourceKind.HOST_POLICY: ("Host policy", "Service-wide context authority and safety contract."),
+    ContextSourceKind.PRINCIPAL_POLICY: ("Principal policy", "Your durable AGENTS.md policy."),
+    ContextSourceKind.AGENT_DEFINITION: ("Agent definition", "The immutable agent revision bound to this run."),
+    ContextSourceKind.WORKSPACE_POLICY: ("Workspace policy", "Instructions owned by the selected workspace."),
+    ContextSourceKind.PERSONAL_PREFERENCES: ("Personal preferences", "Your durable PREFERENCES.md document."),
+    ContextSourceKind.FILE_MEMORY: ("File memory", "The legacy principal-owned MEMORY.md context surface."),
+    ContextSourceKind.SEMANTIC_RECALL: ("Semantic recall", "Scoped memory matches selected for this turn."),
+    ContextSourceKind.CANONICAL_CONVERSATION: ("Conversation", "Bounded canonical channel or thread history."),
+    ContextSourceKind.CAPABILITY_GUIDANCE: (
+        "Capability guidance",
+        "Generated guidance for available Kai capabilities.",
+    ),
+    ContextSourceKind.ATTEMPT_AUTHORITY: (
+        "Attempt authority",
+        "Server-attached operations granted only to this attempt.",
+    ),
+    ContextSourceKind.CURRENT_INPUT: ("Current input", "The native user input that requested this run."),
+    ContextSourceKind.PROVIDER_NATIVE: (
+        "Provider-owned context",
+        "Additional context controlled by the selected provider.",
+    ),
+}
+
+
+def _context_preview(
+    *,
+    source: ContextSourceDescriptor,
+    exact: str | None,
+    redacted_reason: str | None = None,
+) -> dict[str, object]:
+    title, description = _CONTEXT_SOURCE_PRESENTATION[source.kind]
+    references = {
+        ContextSourceKind.HOST_POLICY: "Kai host context contract",
+        ContextSourceKind.PRINCIPAL_POLICY: "principal-owned AGENTS.md",
+        ContextSourceKind.AGENT_DEFINITION: "canonical agent definition revision",
+        ContextSourceKind.WORKSPACE_POLICY: "canonical workspace settings",
+        ContextSourceKind.PERSONAL_PREFERENCES: "principal-owned PREFERENCES.md",
+        ContextSourceKind.FILE_MEMORY: "principal-owned MEMORY.md",
+        ContextSourceKind.SEMANTIC_RECALL: "canonical semantic-memory query",
+        ContextSourceKind.CANONICAL_CONVERSATION: "canonical message timeline",
+        ContextSourceKind.CAPABILITY_GUIDANCE: "generated Kai capability contract",
+        ContextSourceKind.ATTEMPT_AUTHORITY: "canonical run-attempt grant",
+        ContextSourceKind.CURRENT_INPUT: "canonical inbound message",
+        ContextSourceKind.PROVIDER_NATIVE: "provider-managed context",
+    }
+    return {
+        "title": title,
+        "description": description,
+        "source_reference": references[source.kind],
+        "preview": exact,
+        "preview_state": "exact" if exact is not None else "redacted" if redacted_reason else "unavailable",
+        "preview_reason": redacted_reason,
+        "editable": False,
+        "edit_target": None,
+        "current_revision": None,
+        "freshness": "not_checked",
+        "change_effect": None,
+    }
+
+
+async def _context_source_inspections(
+    *,
+    store: WorkshopEventStore,
+    manifest: RunContextManifest,
+    run: DurableRun,
+    principal_id: PrincipalId,
+    principal_policies: WorkshopPrincipalPolicyService | None,
+    preference_documents: WorkshopPreferenceService | None,
+    settings_workspaces: WorkshopSettingsWorkspaceService | None,
+) -> list[dict[str, object]]:
+    inspections = [
+        _context_preview(source=source, exact=None, redacted_reason="Historical rendered content is not retained")
+        for source in manifest.draft.sources
+    ]
+    by_kind = {source.kind: (index, source) for index, source in enumerate(manifest.draft.sources)}
+
+    host_index, host_source = by_kind[ContextSourceKind.HOST_POLICY]
+    host_is_current = host_source.revision == "context_contract_v2"
+    inspections[host_index] = _context_preview(
+        source=host_source,
+        exact=CONTEXT_AUTHORITY_CONTRACT if host_source.rendered_bytes and host_is_current else None,
+        redacted_reason=(
+            None
+            if host_source.rendered_bytes and host_is_current
+            else "This source was not rendered"
+            if not host_source.rendered_bytes
+            else "The historical host-policy text is not retained"
+        ),
+    )
+    inspections[host_index]["current_revision"] = "context_contract_v2"
+    inspections[host_index]["freshness"] = "current" if host_is_current else "changed"
+
+    if principal_policies is not None:
+        policy_index, policy_source = by_kind[ContextSourceKind.PRINCIPAL_POLICY]
+        try:
+            authority = principal_policies.authority_for_principal(principal_id)
+            document = await principal_policies.read(authority)
+            policy_is_current = policy_source.revision == document.revision
+            exact = None
+            if policy_is_current:
+                exact = (
+                    "[Your principal policy and instructions "
+                    f"(verified revision {document.revision}):]\n{document.content.strip()}"
+                )
+            inspections[policy_index] = _context_preview(
+                source=policy_source,
+                exact=exact,
+                redacted_reason=None if policy_is_current else "The historical principal-policy text is not retained",
+            )
+            inspections[policy_index].update(
+                {
+                    "editable": True,
+                    "edit_target": "principal_policy",
+                    "current_revision": document.revision,
+                    "freshness": "current" if policy_is_current else "changed",
+                    "change_effect": "provider_session_refresh",
+                }
+            )
+        except WorkshopPrincipalPolicyError:
+            inspections[policy_index]["preview_reason"] = "Current principal policy is unavailable"
+
+    if preference_documents is not None:
+        preference_index, preference_source = by_kind[ContextSourceKind.PERSONAL_PREFERENCES]
+        try:
+            authority = preference_documents.authority_for_principal(principal_id)
+            document = await preference_documents.read(authority)
+            content_revision = hashlib.sha256(document.content.encode("utf-8")).hexdigest()
+            preferences_are_current = preference_source.revision == content_revision
+            exact = None
+            if preferences_are_current:
+                exact = (
+                    f"[Your personal preferences (verified revision {content_revision}):]\n"
+                    f"{document.content.strip() or '(currently empty)'}"
+                )
+            inspections[preference_index] = _context_preview(
+                source=preference_source,
+                exact=exact,
+                redacted_reason=(
+                    None if preferences_are_current else "The historical personal-preferences text is not retained"
+                ),
+            )
+            inspections[preference_index].update(
+                {
+                    "editable": True,
+                    "edit_target": "personal_preferences",
+                    "current_revision": content_revision,
+                    "freshness": "current" if preferences_are_current else "changed",
+                    "change_effect": "provider_session_refresh",
+                }
+            )
+        except WorkshopPreferenceError:
+            inspections[preference_index]["preview_reason"] = "Current personal preferences are unavailable"
+
+    agent_index, agent_source = by_kind[ContextSourceKind.AGENT_DEFINITION]
+    agent_definition_id: str | None = None
+    if run.agent_definition_revision_id is not None:
+        revision = await load_agent_definition_revision(store, run.agent_definition_revision_id)
+        async with store.connection.execute(
+            "SELECT owner_principal_id, active_revision_id FROM agent_definitions WHERE agent_id = ?",
+            (run.agent_id,),
+        ) as cursor:
+            owner_row = await cursor.fetchone()
+        if revision is not None and owner_row is not None:
+            agent_definition_id = str(revision.definition_id)
+            active_revision = (
+                await load_agent_definition_revision(store, AgentDefinitionRevisionId(str(owner_row[1])))
+                if owner_row[1] is not None
+                else None
+            )
+            current_agent_revision = (
+                f"{active_revision.revision_id}:{content_digest(render_agent_definition_context(active_revision))}"
+                if active_revision is not None
+                else None
+            )
+            exact = render_agent_definition_context(revision) if str(owner_row[0]) == str(principal_id) else None
+            inspections[agent_index] = _context_preview(
+                source=agent_source,
+                exact=exact,
+                redacted_reason=None if exact is not None else "Private to the agent owner",
+            )
+            inspections[agent_index].update(
+                {
+                    "editable": str(owner_row[0]) == str(principal_id),
+                    "edit_target": "agent_definition" if str(owner_row[0]) == str(principal_id) else None,
+                    "edit_target_id": str(revision.definition_id) if str(owner_row[0]) == str(principal_id) else None,
+                    "current_revision": current_agent_revision,
+                    "freshness": "current" if agent_source.revision == current_agent_revision else "changed",
+                    "change_effect": "next_turn",
+                }
+            )
+
+    workspace_index, workspace_source = by_kind[ContextSourceKind.WORKSPACE_POLICY]
+    if settings_workspaces is not None:
+        try:
+            authority = settings_workspaces.authority_for_principal_channel(principal_id, run.channel_id)
+            runtime = await settings_workspaces.inspect(authority)
+            workspace = await settings_workspaces.workspace_config(authority, runtime.workspace)
+            foreign_reminder = workspace_source.delivery_shape == "inline_foreign_workspace_reminder"
+            current_rendered = (
+                FOREIGN_WORKSPACE_REMINDER
+                if foreign_reminder
+                else f"## Workspace Instructions\n\n{workspace.prompt}"
+                if workspace.prompt
+                else None
+            )
+            current_revision = (
+                hashlib.sha256(current_rendered.encode("utf-8")).hexdigest() if current_rendered is not None else None
+            )
+            workspace_is_current = workspace_source.revision == current_revision
+            exact = current_rendered if workspace_is_current else None
+            inspections[workspace_index] = _context_preview(
+                source=workspace_source,
+                exact=exact,
+                redacted_reason=(
+                    None
+                    if exact is not None
+                    else "No explicit workspace policy was rendered"
+                    if current_rendered is None
+                    else "The historical workspace-policy text is not retained"
+                ),
+            )
+            inspections[workspace_index].update(
+                {
+                    "editable": True,
+                    "edit_target": "workspace_policy",
+                    "edit_target_id": agent_definition_id,
+                    "current_revision": current_revision,
+                    "freshness": "current" if workspace_is_current else "changed",
+                    "change_effect": "next_turn",
+                }
+            )
+        except (WorkshopSettingsWorkspaceAccessDenied, WorkshopSettingsWorkspaceError):
+            inspections[workspace_index]["preview_reason"] = "Private to the runtime owner"
+
+    input_index, input_source = by_kind[ContextSourceKind.CURRENT_INPUT]
+    async with store.connection.execute(
+        "SELECT body FROM messages WHERE id = ? AND channel_id = ? AND author_principal_id = ?",
+        (run.inbound_message_id, run.channel_id, principal_id),
+    ) as cursor:
+        input_row = await cursor.fetchone()
+    if input_row is not None:
+        body = str(input_row[0])
+        inspections[input_index] = _context_preview(
+            source=input_source,
+            exact=f"{USER_MESSAGE_MARKER}\n{body}",
+        )
+        inspections[input_index]["current_revision"] = content_digest(body)
+        inspections[input_index]["freshness"] = (
+            "current" if input_source.revision == content_digest(body) else "changed"
+        )
+
+    semantic_index, _semantic_source = by_kind[ContextSourceKind.SEMANTIC_RECALL]
+    inspections[semantic_index]["preview_reason"] = "Recall content is private and not retained in the manifest"
+    conversation_index, _conversation_source = by_kind[ContextSourceKind.CANONICAL_CONVERSATION]
+    inspections[conversation_index]["preview_reason"] = "Read the canonical timeline through the recorded boundary"
+    authority_index, authority_source = by_kind[ContextSourceKind.ATTEMPT_AUTHORITY]
+    operations = authority_source.authorization_operations or ()
+    inspections[authority_index]["preview"] = (
+        "Authorized operations: " + ", ".join(operations) if operations else "No collaboration operations granted"
+    )
+    inspections[authority_index]["preview_state"] = "redacted"
+    inspections[authority_index]["preview_reason"] = "Bearer proofs and credentials are never exposed"
+    provider_index, _provider_source = by_kind[ContextSourceKind.PROVIDER_NATIVE]
+    inspections[provider_index]["preview_reason"] = "Provider prompts are not observable by Kai"
+    return inspections
+
+
+def _serialize_context_manifest(
+    manifest: RunContextManifest,
+    inspections: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     return {
         "attempt_id": str(manifest.attempt_id),
         "run_id": str(manifest.run_id),
@@ -8100,7 +8539,13 @@ def _serialize_context_manifest(manifest: RunContextManifest) -> dict[str, objec
         "manifest_sha256": manifest.manifest_sha256,
         "created_at": manifest.created_at.isoformat().replace("+00:00", "Z"),
         "created_event_position": manifest.created_event_position,
-        "sources": [source.payload() for source in manifest.draft.sources],
+        "sources": [
+            {
+                **source.payload(),
+                **({"inspection": inspections[index]} if inspections is not None else {}),
+            }
+            for index, source in enumerate(manifest.draft.sources)
+        ],
     }
 
 
@@ -8111,6 +8556,9 @@ async def _handle_run_context_manifests(
     authenticator: WorkshopClientAuthenticator,
     submitter: WorkshopClientCommandSubmitter,
     request_lock: asyncio.Lock,
+    principal_policies: WorkshopPrincipalPolicyService | None = None,
+    preference_documents: WorkshopPreferenceService | None = None,
+    settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
 ) -> web.Response:
     if request.query:
         return _error_response(status=400, code="invalid_request", message="Invalid context-manifest request")
@@ -8125,14 +8573,28 @@ async def _handle_run_context_manifests(
     principal_id, channel_id, run = authorized
     async with request_lock:
         manifests = await WorkshopContextManifestService(store).load_run(run.run_id)
-    if any(item.requested_by_principal_id != principal_id or item.channel_id != channel_id for item in manifests):
-        return _error_response(status=403, code="access_denied", message="Access denied")
+        if any(item.requested_by_principal_id != principal_id or item.channel_id != channel_id for item in manifests):
+            return _error_response(status=403, code="access_denied", message="Access denied")
+        inspections = [
+            await _context_source_inspections(
+                store=store,
+                manifest=item,
+                run=run,
+                principal_id=principal_id,
+                principal_policies=principal_policies,
+                preference_documents=preference_documents,
+                settings_workspaces=settings_workspaces,
+            )
+            for item in manifests
+        ]
     return _json_response(
         {
             "version": 1,
             "channel_id": str(channel_id),
             "run_id": str(run.run_id),
-            "manifests": [_serialize_context_manifest(item) for item in manifests],
+            "manifests": [
+                _serialize_context_manifest(item, inspections[index]) for index, item in enumerate(manifests)
+            ],
         },
         status=200,
     )
@@ -8327,6 +8789,7 @@ def register_workshop_read_routes(
     routing_eligibility: WorkshopRoutingEligibilityService | None = None,
     routing_policy: WorkshopRoutingPolicyService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
+    principal_policies: WorkshopPrincipalPolicyService | None = None,
     preference_documents: WorkshopPreferenceService | None = None,
     github_settings: WorkshopGitHubSettingsService | None = None,
     notification_preferences: WorkshopNotificationPreferenceService | None = None,
@@ -8994,6 +9457,26 @@ def register_workshop_read_routes(
         app.router.add_put(_PREFERENCES_PATH, handle_preference_update)
         app.router.add_get(_PREFERENCE_REVISIONS_PATH, handle_preference_history)
         app.router.add_post(_PREFERENCE_RESTORE_PATH, handle_preference_restore)
+    if principal_policies is not None:
+
+        async def handle_principal_policy_document(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_principal_policy_document(
+                    request,
+                    authenticator=authenticator,
+                    service=principal_policies,
+                )
+
+        async def handle_principal_policy_update(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_principal_policy_update(
+                    request,
+                    authenticator=authenticator,
+                    service=principal_policies,
+                )
+
+        app.router.add_get(_PRINCIPAL_POLICY_PATH, handle_principal_policy_document)
+        app.router.add_put(_PRINCIPAL_POLICY_PATH, handle_principal_policy_update)
     if github_settings is not None:
 
         async def handle_github_settings(request: web.Request) -> web.Response:
@@ -9427,6 +9910,9 @@ def register_workshop_command_routes(
     artifact_service: WorkshopArtifactService | None = None,
     routing_policy: WorkshopRoutingPolicyService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
+    principal_policies: WorkshopPrincipalPolicyService | None = None,
+    preference_documents: WorkshopPreferenceService | None = None,
+    settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
 ) -> None:
     """Register the authenticated command boundary on a supplied application."""
 
@@ -9466,6 +9952,9 @@ def register_workshop_command_routes(
             authenticator=authenticator,
             submitter=submitter,
             request_lock=request_lock,
+            principal_policies=principal_policies,
+            preference_documents=preference_documents,
+            settings_workspaces=settings_workspaces,
         )
 
     async def handle_run_cancellation(request: web.Request) -> web.Response:
