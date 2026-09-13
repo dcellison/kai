@@ -22,7 +22,11 @@ from kai.workshop.channel_lifecycle import WorkshopChannelLifecycleService
 from kai.workshop.context_manifests import CONTEXT_SOURCE_ORDER, WorkshopContextManifestService
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.delivery_authority import WorkshopConversationDeliveryAuthority
-from kai.workshop.diagnostics import workshop_context_manifest_status, workshop_runtime_session_status
+from kai.workshop.diagnostics import (
+    workshop_context_manifest_status,
+    workshop_conversation_observation_status,
+    workshop_runtime_session_status,
+)
 from kai.workshop.domain import ChannelId, PrincipalId, RunExecutionOwnerId, RuntimeProfileId
 from kai.workshop.execution_coordinator import (
     CanonicalCancellationDisposition,
@@ -75,6 +79,7 @@ class _Prepared:
         self.cancelled = False
         self.reject_validation = False
         self.canonical_histories: list[str] = []
+        self.canonical_history_options: list[dict[str, object]] = []
         self.agent_definition_contexts: list[str] = []
         self.collaboration_invocations = []
         self.discarded_collaboration_invocations = []
@@ -82,8 +87,9 @@ class _Prepared:
         self.ambient_context_discovery_enabled = ambient_context_discovery_enabled
         self.retained_context_revision = "c" * 64
 
-    def stage_canonical_history(self, history: str) -> None:
+    def stage_canonical_history(self, history: str, **_kwargs: object) -> None:
         self.canonical_histories.append(history)
+        self.canonical_history_options.append(dict(_kwargs))
 
     def stage_agent_definition_context(self, context: str) -> None:
         self.agent_definition_contexts.append(context)
@@ -139,6 +145,9 @@ class _Prepared:
                         ),
                     ),
                     ambient_context_discovery_enabled=self.ambient_context_discovery_enabled,
+                    canonical_conversation_delivered=True,
+                    canonical_conversation_mode="snapshot",
+                    canonical_conversation_revision=str(self.canonical_history_options[-1].get("snapshot_revision")),
                 )
             )
         if self.on_stream is not None:
@@ -420,6 +429,94 @@ class TestCanonicalExecutionCoordinator:
         finally:
             await store.close()
 
+    async def test_live_delta_contains_only_intervening_canonical_messages(self, tmp_path: Path) -> None:
+        store, first_run, second_run = await _accepted_group_pair(tmp_path / "kai.db")
+        first = _Prepared(first_run)
+        second = _Prepared(second_run)
+        coordinator = _coordinator(store, _PreparationByRun((first, second)))
+        try:
+            assert (await coordinator.execute(first_run.run_id)).disposition == CanonicalExecutionDisposition.COMPLETED
+            assert (await coordinator.execute(second_run.run_id)).disposition == CanonicalExecutionDisposition.COMPLETED
+            async with store.connection.execute(
+                "SELECT requested_by_principal_id FROM runs WHERE id = ?",
+                (second_run.run_id,),
+            ) as cursor:
+                scott_row = await cursor.fetchone()
+            assert scott_row is not None
+            scott_id = PrincipalId(str(scott_row[0]))
+            commands = WorkshopConversationCommandService(store)
+            intervening = await commands.accept_client(
+                ClientInboundMessage(
+                    scott_id,
+                    second_run.channel_id,
+                    "shared-lane-intervening",
+                    "INTERVENING_CANONICAL_MESSAGE",
+                    _NOW + timedelta(seconds=2),
+                )
+            )
+            # Accepted but not dispatched: an accepted run must not advance
+            # the observation boundary or hide its source message.
+            assert len(intervening.command.runs) == 1
+            third_acceptance = await commands.accept_client(
+                ClientInboundMessage(
+                    scott_id,
+                    second_run.channel_id,
+                    "shared-lane-third",
+                    "@Kai third",
+                    _NOW + timedelta(seconds=3),
+                )
+            )
+            third_run = third_acceptance.command.runs[0]
+            third = _Prepared(third_run)
+            coordinator = _coordinator(store, _Preparation(third))
+
+            assert (await coordinator.execute(third_run.run_id)).disposition == CanonicalExecutionDisposition.COMPLETED
+            delta = str(third.canonical_history_options[0]["live_delta"])
+            assert '"mode":"delta"' in delta
+            assert '"body":"INTERVENING_CANONICAL_MESSAGE"' in delta
+            assert '"body":"@Kai third"' not in delta
+            assert '"body":"Canonical answer"' not in delta
+        finally:
+            await store.close()
+
+    async def test_thread_context_and_cursor_are_exactly_thread_scoped(self, tmp_path: Path) -> None:
+        store, first_run, second_run = await _accepted_group_pair(tmp_path / "kai.db")
+        first = _Prepared(first_run)
+        second = _Prepared(second_run)
+        coordinator = _coordinator(store, _PreparationByRun((first, second)))
+        try:
+            assert (await coordinator.execute(first_run.run_id)).disposition == CanonicalExecutionDisposition.COMPLETED
+            assert (await coordinator.execute(second_run.run_id)).disposition == CanonicalExecutionDisposition.COMPLETED
+            thread_acceptance = await WorkshopConversationCommandService(store).accept_client(
+                ClientInboundMessage(
+                    second_run.requested_by_principal_id,
+                    second_run.channel_id,
+                    "shared-lane-thread",
+                    "@Kai thread request",
+                    _NOW + timedelta(seconds=2),
+                    thread_root_id=first_run.inbound_message_id,
+                )
+            )
+            thread_run = thread_acceptance.command.runs[0]
+            prepared = _Prepared(thread_run)
+
+            assert (
+                await _coordinator(store, _Preparation(prepared)).execute(thread_run.run_id)
+            ).disposition == CanonicalExecutionDisposition.COMPLETED
+            snapshot = prepared.canonical_histories[0]
+            assert '"scope_kind":"thread"' in snapshot
+            assert f'"scope_id":"{first_run.inbound_message_id}"' in snapshot
+            assert '"body":"@Kai first"' in snapshot
+            assert '"body":"@Kai second"' not in snapshot
+            assert '"body":"@Kai thread request"' not in snapshot
+            async with store.connection.execute(
+                "SELECT scope_kind, scope_id FROM channel_agent_conversation_observations WHERE last_run_id = ?",
+                (thread_run.run_id,),
+            ) as cursor:
+                assert tuple(await cursor.fetchone()) == ("thread", first_run.inbound_message_id)
+        finally:
+            await store.close()
+
     async def test_foreign_workspace_manifest_records_only_redacted_workspace_identity(
         self,
         tmp_path: Path,
@@ -502,6 +599,27 @@ class TestCanonicalExecutionCoordinator:
             assert session.last_run_id == run.run_id
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
             assert session.retained_context_revision == "c" * 64
+            async with store.connection.execute(
+                "SELECT observed_through_event_position, last_run_id, last_inbound_message_id, scope_kind "
+                "FROM channel_agent_conversation_observations WHERE channel_id = ? AND agent_id = ?",
+                (run.channel_id, run.agent_id),
+            ) as cursor:
+                observation = await cursor.fetchone()
+            assert observation is not None
+            async with store.connection.execute(
+                "SELECT created_event_position FROM messages WHERE id = ?",
+                (run.inbound_message_id,),
+            ) as cursor:
+                source_position = int((await cursor.fetchone())[0])
+            assert tuple(observation) == (
+                source_position,
+                run.run_id,
+                run.inbound_message_id,
+                "channel",
+            )
+            assert workshop_conversation_observation_status(tmp_path / "kai.db").startswith(
+                "Workshop conversation observation: active; cursors=1 (channel=1, thread=0), integrity gaps=0"
+            )
             await store.rebuild_projection(CanonicalConversationProjection())
             assert await load_runtime_session(store, run.channel_id, run.agent_id) == session
             assert workshop_runtime_session_status(tmp_path / "kai.db").startswith(
@@ -573,7 +691,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 78
+            assert await upgraded.schema_version() == 79
             assert await load_runtime_session(upgraded, run.channel_id, run.agent_id) is None
             after = workshop_runtime_session_status(path)
             assert after.startswith("Workshop conversation continuity: active; successful lanes=0, sessions=0")
@@ -601,7 +719,7 @@ class TestCanonicalExecutionCoordinator:
 
         upgraded = await WorkshopEventStore.open(path)
         try:
-            assert await upgraded.schema_version() == 78
+            assert await upgraded.schema_version() == 79
             session = await load_runtime_session(upgraded, run.channel_id, run.agent_id)
             assert session is not None
             assert session.runtime_profile_id == _RUNTIME_PROFILE_ID
@@ -609,6 +727,27 @@ class TestCanonicalExecutionCoordinator:
             assert status.startswith("Workshop conversation continuity: active; successful lanes=1, sessions=1")
             assert "context refresh pending=1" in status
             assert "missing=0, stale=0" in status
+            async with upgraded.connection.execute(
+                "SELECT observed_through_event_position, last_run_id, last_inbound_message_id "
+                "FROM channel_agent_conversation_observations WHERE channel_id = ? AND agent_id = ?",
+                (run.channel_id, run.agent_id),
+            ) as cursor:
+                observation = await cursor.fetchone()
+            assert observation is not None
+            async with upgraded.connection.execute(
+                "SELECT created_event_position FROM messages WHERE id = ?",
+                (run.inbound_message_id,),
+            ) as cursor:
+                source = await cursor.fetchone()
+            assert source is not None
+            assert tuple(observation) == (
+                int(source[0]),
+                run.run_id,
+                run.inbound_message_id,
+            )
+            assert workshop_conversation_observation_status(path).startswith(
+                "Workshop conversation observation: active; cursors=1 (channel=1, thread=0), integrity gaps=0"
+            )
         finally:
             await upgraded.close()
 
@@ -654,7 +793,9 @@ class TestCanonicalExecutionCoordinator:
         try:
             first_result = await _coordinator(store, _Preparation(first)).execute(first_run.run_id)
             assert first_result.disposition == CanonicalExecutionDisposition.COMPLETED
-            assert first.canonical_histories == [""]
+            assert len(first.canonical_histories) == 1
+            assert '"record_type":"canonical_conversation_window"' in first.canonical_histories[0]
+            assert '"selected_message_count":0' in first.canonical_histories[0]
             assert len(first.agent_definition_contexts) == 1
             assert "Handle: @kai" in first.agent_definition_contexts[0]
             assert "Definition revision: 2" in first.agent_definition_contexts[0]
@@ -684,8 +825,10 @@ class TestCanonicalExecutionCoordinator:
             assert second_result.disposition == CanonicalExecutionDisposition.COMPLETED
             assert len(second.canonical_histories) == 1
             history = second.canonical_histories[0]
-            assert "Workshop Human:\nCanonical prompt 1" in history
-            assert "Kai:\nCanonical answer" in history
+            assert '"author_display_name":"Workshop Human"' in history
+            assert '"body":"Canonical prompt 1"' in history
+            assert '"author_display_name":"Kai"' in history
+            assert '"body":"Canonical answer"' in history
             assert "Canonical prompt 2" not in history
             session = await load_runtime_session(store, second_run.channel_id, second_run.agent_id)
             assert session is not None
@@ -702,7 +845,9 @@ class TestCanonicalExecutionCoordinator:
             result = await _coordinator(store, _Preparation(prepared)).execute(run.run_id)
 
             assert result.disposition == CanonicalExecutionDisposition.COMPLETED
-            assert prepared.canonical_histories == [""]
+            assert len(prepared.canonical_histories) == 1
+            assert '"selected_message_count":0' in prepared.canonical_histories[0]
+            assert prepared.canonical_history_options[0]["live_delta"] == ""
             assert prepared.prompts == ["Canonical prompt 1"]
         finally:
             await store.close()
@@ -858,6 +1003,10 @@ class TestCanonicalExecutionCoordinator:
                 bodies[-1] == "Authentication for the configured agent is required. Kai did not complete this request."
             )
             assert "native" not in bodies[-1]
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM channel_agent_conversation_observations"
+            ) as cursor:
+                assert int((await cursor.fetchone())[0]) == 0
         finally:
             await store.close()
 

@@ -435,6 +435,20 @@ def build_context_manifest_draft(
         else provider_session_revision
     )
     session_revision = observation.session_context_revision or effective_provider_session_revision
+    conversation_state = (
+        ContextSourceState.UNAVAILABLE
+        if not dispatch_reached
+        else ContextSourceState.NEWLY_DELIVERED
+        if observation.canonical_conversation_delivered
+        else ContextSourceState.OMITTED
+    )
+    conversation_reason = (
+        dispatch_reason
+        if not dispatch_reached
+        else f"structured_{observation.canonical_conversation_mode}"
+        if observation.canonical_conversation_delivered and observation.canonical_conversation_mode is not None
+        else "no_unseen_messages"
+    )
 
     def principal_document_facts(
         document: PrincipalDocument | None,
@@ -575,13 +589,17 @@ def build_context_manifest_draft(
             "channel",
             ContextTrustClass.UNTRUSTED_DATA,
             ContextAuthorityClass.CANONICAL_DATA,
-            ContextRefreshClass.PROVIDER_SESSION,
+            ContextRefreshClass.PER_TURN,
             ContextDeliveryRole.UNTRUSTED_CONTEXT,
-            session_state,
-            session_reason,
-            revision=history_digest,
+            conversation_state,
+            conversation_reason,
+            revision=observation.canonical_conversation_revision or history_digest,
             history_boundary=history_boundary,
-            delivery_shape="bounded_canonical_timeline",
+            delivery_shape=(
+                f"randomized_structured_{observation.canonical_conversation_mode}"
+                if observation.canonical_conversation_mode is not None
+                else "randomized_structured_delta"
+            ),
         ),
         ContextSourceDescriptor(
             ContextSourceKind.CAPABILITY_GUIDANCE,

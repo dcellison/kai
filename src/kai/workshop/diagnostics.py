@@ -1587,6 +1587,47 @@ def workshop_context_manifest_status(db_path: Path) -> str:
     )
 
 
+def workshop_conversation_observation_status(db_path: Path) -> str:
+    """Describe durable ordinary-run canonical observation boundaries."""
+    prefix = "Workshop conversation observation:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical observation schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if "channel_agent_conversation_observations" not in tables:
+                return f"{prefix} pending; canonical observation schema unavailable"
+            cursors = _scalar(connection, "SELECT COUNT(*) FROM channel_agent_conversation_observations")
+            channel_scopes = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_conversation_observations WHERE scope_kind = 'channel'",
+            )
+            thread_scopes = cursors - channel_scopes
+            gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_conversation_observations o "
+                "WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = o.last_inbound_message_id "
+                "AND m.channel_id = o.channel_id AND m.created_event_position = o.observed_through_event_position) "
+                "OR NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = o.last_run_id AND r.channel_id = o.channel_id "
+                "AND r.agent_id = o.agent_id AND r.inbound_message_id = o.last_inbound_message_id "
+                "AND r.status = 'completed')",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; cursors={cursors} (channel={channel_scopes}, thread={thread_scopes}), "
+        f"integrity gaps={gaps}; authority=canonical/bounded"
+    )
+
+
 def workshop_execution_state_status(db_path: Path) -> str:
     """Describe canonical mutable execution-state authority and backfill."""
     prefix = "Workshop execution state:"

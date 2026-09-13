@@ -408,7 +408,9 @@ class PiBackend(AgentBackend):
             nonlocal principal_documents
             principal_documents = report
 
-        if self._fresh_session:
+        canonical_delivery = self.consume_canonical_history()
+        fresh_session = self._fresh_session
+        if fresh_session:
             ensure_user_context_files(
                 chat_id,
                 DATA_DIR,
@@ -426,7 +428,7 @@ class PiBackend(AgentBackend):
                     backend_name=self.backend_name,
                     memory_enabled=self.memory_enabled,
                     defer_user_file_reads=self.defer_user_file_reads,
-                    canonical_history=self.consume_canonical_history(),
+                    canonical_history=(canonical_delivery.snapshot if canonical_delivery is not None else None),
                     principal_document_observer=capture_principal_documents,
                 )
             except PrincipalPolicyUnavailable:
@@ -477,6 +479,23 @@ class PiBackend(AgentBackend):
             context_observer=context_observer,
             principal_documents=principal_documents,
             ambient_context_discovery_enabled=False,
+            canonical_conversation_context=(
+                canonical_delivery.delta if canonical_delivery is not None and not fresh_session else ""
+            ),
+            canonical_conversation_revision=(
+                canonical_delivery.snapshot_revision
+                if canonical_delivery is not None and fresh_session
+                else canonical_delivery.delta_revision
+                if canonical_delivery is not None and canonical_delivery.delta
+                else None
+            ),
+            canonical_conversation_mode=(
+                "snapshot"
+                if canonical_delivery is not None and fresh_session
+                else "delta"
+                if canonical_delivery is not None and canonical_delivery.delta
+                else None
+            ),
         )
         if isinstance(prompt, str):
             message_text = prompt

@@ -456,6 +456,9 @@ async def test_observe_prompt_contains_only_the_immutable_channel_scope(tmp_path
         assert "chat_id" not in prompt
         assert "credential" not in prompt.casefold()
         assert "untrusted conversation data" in prompt
+        assert "[Untrusted data - JSON Lines]" in prompt
+        assert '"record_type":"canonical_message"' in prompt
+        assert '"author_kind":"human"' in prompt
     finally:
         await store.close()
 

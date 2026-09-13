@@ -59,8 +59,20 @@ class PreparedWorkshopExecution:
         async for event in self._runtime.stream(prompt):
             yield event
 
-    def stage_canonical_history(self, history: str) -> None:
-        self._runtime.stage_canonical_history(history)
+    def stage_canonical_history(
+        self,
+        history: str,
+        *,
+        live_delta: str = "",
+        snapshot_revision: str | None = None,
+        delta_revision: str | None = None,
+    ) -> None:
+        self._runtime.stage_canonical_history(
+            history,
+            live_delta=live_delta,
+            snapshot_revision=snapshot_revision,
+            delta_revision=delta_revision,
+        )
 
     def stage_agent_definition_context(self, context: str) -> None:
         self._runtime.stage_canonical_agent_context(context)

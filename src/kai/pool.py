@@ -168,10 +168,22 @@ class PreparedBackendExecution:
     def home_workspace(self) -> Path:
         return self._instance.home_workspace
 
-    def stage_canonical_history(self, history: str) -> None:
+    def stage_canonical_history(
+        self,
+        history: str,
+        *,
+        live_delta: str = "",
+        snapshot_revision: str | None = None,
+        delta_revision: str | None = None,
+    ) -> None:
         """Stage restart context on this exact protected runtime."""
         self._pool._validate_prepared(self)
-        self._instance.stage_canonical_history(history)
+        self._instance.stage_canonical_history(
+            history,
+            live_delta=live_delta,
+            snapshot_revision=snapshot_revision,
+            delta_revision=delta_revision,
+        )
 
     def stage_canonical_agent_context(self, context: str) -> None:
         """Stage the run-bound agent revision on this exact runtime."""

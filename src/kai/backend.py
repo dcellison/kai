@@ -88,6 +88,19 @@ class ContextAssemblyObservation:
     workspace_reminder_revision: str | None = None
     principal_documents: PrincipalDocumentReport | None = None
     ambient_context_discovery_enabled: bool | None = None
+    canonical_conversation_delivered: bool = False
+    canonical_conversation_mode: str | None = None
+    canonical_conversation_revision: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalHistoryDelivery:
+    """Structured canonical context staged for one protected turn."""
+
+    snapshot: str
+    delta: str
+    snapshot_revision: str | None = None
+    delta_revision: str | None = None
 
 
 type ContextAssemblyObserver = Callable[[ContextAssemblyObservation], Awaitable[None]]
@@ -569,19 +582,25 @@ class AgentBackend(ABC):
         }
     )
 
-    def stage_canonical_history(self, history: str) -> None:
-        """Stage canonical restart context for the next fresh subprocess.
+    def stage_canonical_history(
+        self,
+        history: str,
+        *,
+        live_delta: str = "",
+        snapshot_revision: str | None = None,
+        delta_revision: str | None = None,
+    ) -> None:
+        """Stage structured snapshot and live delta for one protected turn."""
+        if not isinstance(history, str) or not isinstance(live_delta, str):
+            raise TypeError("history and live_delta must be strings")
+        self._canonical_history = CanonicalHistoryDelivery(
+            history,
+            live_delta,
+            snapshot_revision,
+            delta_revision,
+        )
 
-        The protected Workshop coordinator refreshes this before every turn.
-        A live subprocess ignores it, while a fresh or age-recycled process
-        consumes the latest value through ``build_session_context``. Keeping
-        it out of the prompt preserves the raw user text used for recall.
-        """
-        if not isinstance(history, str):
-            raise TypeError("history must be a string")
-        self._canonical_history = history
-
-    def consume_canonical_history(self) -> str | None:
+    def consume_canonical_history(self) -> CanonicalHistoryDelivery | None:
         """Consume a staged canonical-history override exactly once."""
         history = getattr(self, "_canonical_history", None)
         self.discard_canonical_history()
@@ -1779,6 +1798,9 @@ async def assemble_turn_context(
     context_observer: ContextAssemblyObserver | None = None,
     principal_documents: PrincipalDocumentReport | None = None,
     ambient_context_discovery_enabled: bool | None = None,
+    canonical_conversation_context: str = "",
+    canonical_conversation_revision: str | None = None,
+    canonical_conversation_mode: str | None = None,
 ) -> str | list:
     """
     Assemble the per-turn prompt context for an interactive backend.
@@ -1861,6 +1883,12 @@ async def assemble_turn_context(
     # immutable definition and below general session context.
     if collaboration_context:
         prompt = prepend_to_prompt(prompt, collaboration_context)
+
+    # A live provider session receives only the canonical delta it has not
+    # accepted before. The data is already enclosed by a randomized,
+    # explicitly untrusted structured boundary.
+    if canonical_conversation_context:
+        prompt = prepend_to_prompt(prompt, canonical_conversation_context)
 
     # First-session context (AGENTS.md + PREFERENCES.md + recent
     # history + API context) is built by the caller because the
@@ -1945,6 +1973,9 @@ async def assemble_turn_context(
                 ),
                 principal_documents=principal_documents,
                 ambient_context_discovery_enabled=ambient_context_discovery_enabled,
+                canonical_conversation_delivered=canonical_conversation_mode is not None,
+                canonical_conversation_mode=canonical_conversation_mode,
+                canonical_conversation_revision=canonical_conversation_revision,
             )
         )
 
