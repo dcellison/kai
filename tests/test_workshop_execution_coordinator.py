@@ -333,11 +333,14 @@ class TestCanonicalExecutionCoordinator:
             assert manifest.draft.workspace_kind == "home"
             assert manifest.draft.selection == prepared.selection
             assert manifest.draft.sources[2].reason == "run_bound_revision"
+            assert manifest.draft.sources[0].refresh_class.value == "provider_session"
+            assert manifest.draft.sources[0].state.value == "newly_delivered"
             assert manifest.draft.sources[1].delivery_shape == "inline_verified_document"
             assert manifest.draft.sources[1].revision == "1" * 64
             assert manifest.draft.sources[4].reason == "missing"
             assert manifest.draft.sources[5].reason == "semantic_memory_enabled_or_shared"
             assert manifest.draft.sources[7].history_boundary == 0
+            assert manifest.draft.sources[8].state.value == "newly_delivered"
             assert manifest.draft.sources[10].reason == "accepted_input"
             assert manifest.draft.sources[11].reason == "not_observable"
             assert manifest.draft.sources[11].delivery_shape == "provider_managed_unknown"
@@ -348,7 +351,8 @@ class TestCanonicalExecutionCoordinator:
             assert authority_source.authorization_operations == ("agent_delegation",)
             assert "X-Kai-Collaboration-Proof" not in repr(manifest)
             assert workshop_context_manifest_status(tmp_path / "kai.db").startswith(
-                "Workshop context manifests: active; post-cutover attempts=1, manifests=1, missing=0, malformed=0"
+                "Workshop context manifests: active; post-cutover attempts=1, manifests=1, missing=0, malformed=0, "
+                "budget violations=0"
             )
 
             digest = manifest.manifest_sha256
@@ -925,7 +929,6 @@ class TestCanonicalExecutionCoordinator:
         async def stream_without_bearer(prompt: str) -> AsyncIterator[StreamEvent]:
             invocation = prepared.collaboration_invocations[-1]
             assert not hasattr(invocation, "token")
-            assert "X-Kai-Collaboration-Proof" not in invocation.render_context()
             assert "X-Kai-Collaboration-Proof" not in prompt
             yield StreamEvent(text_so_far="preview safe")
             yield StreamEvent(

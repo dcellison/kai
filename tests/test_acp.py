@@ -1134,9 +1134,9 @@ class TestContextInjection:
         """USER_MESSAGE_MARKER must sit immediately above the user text.
 
         Mirrors the regression guard already in test_goose.py and
-        test_claude.py: workspace reminder, semantic memory, and
-        session_context stack ABOVE the marker; the marker is the
-        last prefix before the user text.
+        test_claude.py: semantic memory and session context stack above
+        the marker, while the foreign-workspace reminder stays inside
+        the current-input boundary below it.
         """
         b = _make_fake(
             workspace=Path("/tmp/foreign"),
@@ -1159,15 +1159,16 @@ class TestContextInjection:
         from kai.memory import ScopedRecallResult
 
         fake_recall = ScopedRecallResult(rendered_context=memory_block, recall_payload={"reason": "ok", "hits": []})
+        recall_spy = AsyncMock(return_value=fake_recall)
         with (
             patch("kai.acp.build_session_context", return_value="[CONTEXT]"),
-            patch(
-                "kai.memory.format_scoped_context_with_recall_payload",
-                new=AsyncMock(return_value=fake_recall),
-            ),
+            patch("kai.memory.format_scoped_context_with_recall_payload", new=recall_spy),
         ):
             async for _event in b._send_locked("ACTUAL_USER_TEXT", chat_id=42):
                 pass
+
+        assert recall_spy.call_args.kwargs["job_type"] == "interactive"
+        assert recall_spy.call_args.kwargs["session_id"] == "sess-1"
 
         write_calls = b._proc.stdin.write.call_args_list
         prompt_msg = json.loads(write_calls[-1][0][0].decode())
@@ -1179,12 +1180,10 @@ class TestContextInjection:
         assert prompt_text.count(USER_MESSAGE_MARKER) == 1
         assert memory_block in prompt_text
         assert "ACTUAL_USER_TEXT" in prompt_text
-        assert "This is the user's current message" in prompt_text
+        assert "Foreign workspace:" in prompt_text
         assert "Telegram" not in prompt_text
-        # Marker sits between any injected layer and the user text. Per
-        # assemble_turn_context's documented stacking, the final reading
-        # order from top to bottom is: workspace_reminder, semantic
-        # memory, session_context, USER_MESSAGE_MARKER, user prompt.
+        # Session and recall context precede the current-input boundary;
+        # the workspace reminder is inside that boundary.
         marker_pos = prompt_text.index(USER_MESSAGE_MARKER)
         user_pos = prompt_text.index("ACTUAL_USER_TEXT")
         memory_pos = prompt_text.index(memory_block)

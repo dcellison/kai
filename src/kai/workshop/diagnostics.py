@@ -1576,14 +1576,22 @@ def workshop_context_manifest_status(db_path: Path) -> str:
                 "SELECT COUNT(*) FROM run_context_manifests WHERE json_valid(sources_json) = 0 "
                 "OR json_array_length(sources_json) != 12",
             )
+            budget_violations = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM run_context_manifests m, json_each(m.sources_json) source "
+                "WHERE json_type(source.value, '$.budget_bytes') = 'integer' "
+                "AND CAST(json_extract(source.value, '$.rendered_bytes') AS INTEGER) "
+                "> CAST(json_extract(source.value, '$.budget_bytes') AS INTEGER)",
+            )
         finally:
             connection.close()
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
-    state = "active" if missing == 0 and malformed == 0 else "INCOMPLETE"
+    state = "active" if missing == 0 and malformed == 0 and budget_violations == 0 else "INCOMPLETE"
     return (
         f"{prefix} {state}; post-cutover attempts={attempts}, manifests={manifests}, "
-        f"missing={missing}, malformed={malformed}; authority=immutable/redacted"
+        f"missing={missing}, malformed={malformed}, budget violations={budget_violations}; "
+        "authority=immutable/redacted"
     )
 
 

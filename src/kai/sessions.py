@@ -8,7 +8,7 @@ into four tables:
    One row per chat_id, upserted on each response.
 
 2. **jobs** - Scheduled tasks (reminders, agent jobs, conditional monitors).
-   Created via the scheduling API (POST /api/schedule) or the inner agent's curl.
+   Created through the canonical scheduler or an authorized internal API call.
    Jobs have a schedule_type (once/daily/interval) and can be deactivated
    without deletion to preserve history.
 

@@ -290,6 +290,8 @@ class TestPiCanonicalContext:
         assert second["agent_definition_context"] == "CUSTOM AGENT IDENTITY SECOND"
         assert first["ambient_context_discovery_enabled"] is False
         assert second["ambient_context_discovery_enabled"] is False
+        assert first["job_type"] == second["job_type"] == "interactive"
+        assert first["session_id"] == second["session_id"] == "session-1"
         assert first["principal_documents"].policy.content == (
             "DURABLE OPERATOR RULE\nKeep this principal policy active.\n"
         )
@@ -377,7 +379,7 @@ class TestPiTurns:
 
         await collect(backend)
 
-        assert "This is the user's current message" in captured["workspace_reminder"]
+        assert "Foreign workspace:" in captured["workspace_reminder"]
         assert "Telegram" not in captured["workspace_reminder"]
 
     @pytest.mark.asyncio

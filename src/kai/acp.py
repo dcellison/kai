@@ -53,6 +53,7 @@ from kai.backend import (
     AgentResponse,
     AgentRuntimeIdentity,
     ApiContext,
+    ContextLayerMeasurement,
     StreamEvent,
     TraceEntry,
     apply_workspace_model,
@@ -66,6 +67,7 @@ from kai.backend import (
     trace_secret_values,
 )
 from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file, resolve_claude_user
+from kai.internal_api_scopes import PERSISTENT_AGENT_BASE_SCOPES, InternalAPIScope
 from kai.principal_documents import PrincipalDocumentReport, PrincipalPolicyUnavailable
 from kai.subprocess_identity import subprocess_spawn_cwd, wrap_command_for_target_user
 
@@ -704,6 +706,7 @@ class AcpBackend(AgentBackend):
         home_workspace: Path | None = None,
         webhook_port: int = 8080,
         webhook_secret: str = "",
+        api_scopes: frozenset[InternalAPIScope] = PERSISTENT_AGENT_BASE_SCOPES,
         timeout_seconds: int = 120,
         services_info: list[dict] | None = None,
         workspace_config: WorkspaceConfig | None = None,
@@ -759,6 +762,7 @@ class AcpBackend(AgentBackend):
             webhook_port=webhook_port,
             webhook_secret=webhook_secret,
             services_info=services_info or [],
+            scopes=api_scopes,
         )
 
         # Global defaults, preserved so we can restore them when
@@ -1413,11 +1417,17 @@ class AcpBackend(AgentBackend):
         # make install has already provisioned the user-owned files.
         session_ctx = ""
         context_observer = self.consume_context_assembly_observer()
+        execution_kind = self.consume_execution_context()
         principal_documents: PrincipalDocumentReport | None = None
+        session_layer_measurements: tuple[ContextLayerMeasurement, ...] = ()
 
         def capture_principal_documents(report: PrincipalDocumentReport) -> None:
             nonlocal principal_documents
             principal_documents = report
+
+        def capture_layer_measurements(values: tuple[ContextLayerMeasurement, ...]) -> None:
+            nonlocal session_layer_measurements
+            session_layer_measurements = values
 
         canonical_delivery = self.consume_canonical_history()
         fresh_session = self._fresh_session
@@ -1442,6 +1452,7 @@ class AcpBackend(AgentBackend):
                     canonical_history=(canonical_delivery.snapshot if canonical_delivery is not None else None),
                     principal_document_observer=capture_principal_documents,
                     workspace_policy_observer=self.capture_session_workspace_policy,
+                    layer_measurement_observer=capture_layer_measurements,
                 )
             except PrincipalPolicyUnavailable:
                 await observe_context_preparation_failure(
@@ -1512,7 +1523,8 @@ class AcpBackend(AgentBackend):
             workspace_reminder=reminder,
             workspace=self.workspace,
             backend_name=self.backend_name,
-            job_type="interactive",
+            job_type=execution_kind,
+            session_id=self._session_id,
             context_observer=context_observer,
             principal_documents=principal_documents,
             ambient_context_discovery_enabled=False,
@@ -1537,6 +1549,7 @@ class AcpBackend(AgentBackend):
                 if canonical_delivery is not None and canonical_delivery.delta
                 else None
             ),
+            session_layer_measurements=session_layer_measurements,
         )
 
         # Coerce to the ACP content-block shape. `prompt` is either a

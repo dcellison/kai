@@ -1152,9 +1152,9 @@ class TestContextInjection:
     @pytest.mark.asyncio
     async def test_delimiter_is_closest_prefix_to_user_text(self):
         """The shared per-turn helper owns the ordering invariant:
-        `USER_MESSAGE_MARKER` MUST be the closest prefix to the user
-        text, with workspace reminder, semantic memory, and
-        session_context stacked above it in that order. The bug this
+        `USER_MESSAGE_MARKER` MUST identify the current-input boundary,
+        with semantic memory and session context above it and the
+        foreign-workspace reminder inside it. The bug this
         guards against is the marker landing at the TOP of the
         assembled prompt instead of immediately above the user text,
         which makes the structural delimiter useless. The Claude
@@ -1206,21 +1206,20 @@ class TestContextInjection:
         assert prompt_text.count(USER_MESSAGE_MARKER) == 1
         # All three other context blocks fired.
         assert memory_block in prompt_text
-        assert "This is the user's current message" in prompt_text
-        assert "Respond ONLY" in prompt_text  # foreign-workspace reminder
+        assert "Foreign workspace:" in prompt_text
         assert "Telegram" not in prompt_text
         assert "[CONTEXT]" in prompt_text  # session_ctx
 
         marker_idx = prompt_text.index(USER_MESSAGE_MARKER)
-        # (b) Every other block sits ABOVE the marker.
+        # (b) Session and recall sit above the current-input boundary.
         assert prompt_text.index(memory_block) < marker_idx
-        assert prompt_text.index("Respond ONLY") < marker_idx
         assert prompt_text.index("[CONTEXT]") < marker_idx
+        assert marker_idx < prompt_text.index("Foreign workspace:")
 
-        # (c) Nothing but whitespace between the marker and the user text.
+        # (c) The one workspace note is the only content between marker and input.
         user_idx = prompt_text.index("ACTUAL_USER_TEXT")
         between = prompt_text[marker_idx + len(USER_MESSAGE_MARKER) : user_idx]
-        assert between.strip() == "", f"non-whitespace between marker and user text: {between!r}"
+        assert between.strip().startswith("[Foreign workspace:")
 
 
 # ── Prompt coercion ────────────────────────────────────────────────
@@ -1351,7 +1350,9 @@ class TestPromptCoercion:
 
         write_calls = c._proc.stdin.write.call_args_list
         sent_blocks = json.loads(write_calls[-1][0][0].decode())["params"]["input"]
-        marker_positions = [i for i, b in enumerate(sent_blocks) if b.get("text") == USER_MESSAGE_MARKER]
+        marker_positions = [
+            i for i, b in enumerate(sent_blocks) if str(b.get("text", "")).startswith(USER_MESSAGE_MARKER)
+        ]
         assert len(marker_positions) == 1, sent_blocks
         marker_idx = marker_positions[0]
         assert sent_blocks[marker_idx + 1] == {"type": "text", "text": "(empty prompt)"}
@@ -1407,6 +1408,8 @@ class TestPromptCoercion:
         # real user text, not the codex-synthetic placeholder.
         call = recall_spy.call_args
         assert call.args[0] == "real user text" or call.kwargs.get("query") == "real user text"
+        assert call.kwargs["job_type"] == "interactive"
+        assert call.kwargs["session_id"] == "test-session"
 
 
 # ── Image input ────────────────────────────────────────────────────

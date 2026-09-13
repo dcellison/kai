@@ -29,6 +29,7 @@ from kai import sessions
 from kai.backend import (
     AgentBackend,
     ContextAssemblyObserver,
+    ExecutionContextKind,
     StreamEvent,
     get_workspace_system_prompt,
     require_backend_name,
@@ -195,14 +196,19 @@ class PreparedBackendExecution:
         self._pool._validate_prepared(self)
         self._instance.stage_context_assembly_observer(observer)
 
-    def stage_collaboration_invocation(self, context: str) -> None:
+    def stage_collaboration_invocation(self, operations: tuple[str, ...]) -> None:
         """Stage exact-attempt collaboration authority on this runtime."""
         self._pool._validate_prepared(self)
-        self._instance.stage_collaboration_invocation(context)
+        self._instance.stage_collaboration_invocation(operations)
 
     def discard_collaboration_invocation(self) -> None:
         """Drop exact-attempt collaboration context after dispatch."""
         self._instance.discard_collaboration_invocation()
+
+    def stage_execution_context(self, kind: ExecutionContextKind) -> None:
+        """Stage the canonical execution kind on this exact runtime."""
+        self._pool._validate_prepared(self)
+        self._instance.stage_execution_context(kind)
 
     def validate_current(self) -> None:
         """Fail before dispatch if the protected runtime selection drifted."""
@@ -1235,6 +1241,7 @@ class SubprocessPool:
             )
             self._contexts_by_runtime[runtime_key] = internal_api_context
         internal_api_credential = self._internal_api_auth.agent_credential_for(internal_api_context)
+        internal_api_scopes = self._internal_api_auth.principal_for_agent_context(internal_api_context).scopes
         services_info = self._services_info_by_runtime.get(runtime_key, [])
 
         if backend == "goose":
@@ -1244,6 +1251,7 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
+                api_scopes=internal_api_scopes,
                 timeout_seconds=timeout,
                 services_info=services_info,
                 workspace_config=ws_config,
@@ -1267,6 +1275,7 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
+                api_scopes=internal_api_scopes,
                 timeout_seconds=timeout,
                 services_info=services_info,
                 workspace_config=ws_config,
@@ -1291,6 +1300,7 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
+                api_scopes=internal_api_scopes,
                 timeout_seconds=timeout,
                 services_info=services_info,
                 workspace_config=ws_config,
@@ -1312,6 +1322,7 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
+                api_scopes=internal_api_scopes,
                 timeout_seconds=timeout,
                 services_info=services_info,
                 workspace_config=ws_config,
@@ -1330,6 +1341,7 @@ class SubprocessPool:
                 home_workspace=home_ws,
                 webhook_port=self._config.webhook_port,
                 webhook_secret=internal_api_credential,
+                api_scopes=internal_api_scopes,
                 timeout_seconds=timeout,
                 services_info=services_info,
                 claude_user=os_user,

@@ -27,6 +27,7 @@ import pytest
 from kai.backend import StreamEvent
 from kai.claude import ClaudeCodeBackend
 from kai.config import DATA_DIR, WorkspaceConfig
+from kai.internal_api_scopes import PERSISTENT_AGENT_BASE_SCOPES, InternalAPIScope
 
 # ── Shared helpers ───────────────────────────────────────────────────
 
@@ -1961,8 +1962,7 @@ class TestContextInjection:
         # it natively from cwd; bot-side reads risk PermissionError on Linux)
         assert "Foreign workspace memory" not in prompt
         # Per-message reminder should be present
-        assert "This is the user's current message" in prompt
-        assert "Respond ONLY" in prompt
+        assert "Foreign workspace:" in prompt
         assert "Telegram" not in prompt
 
     @pytest.mark.asyncio
@@ -2002,8 +2002,8 @@ class TestContextInjection:
             await _collect_events(claude, "Test")
 
         prompt = self._extract_prompt(proc)
-        assert "Scheduling API" in prompt
-        assert "File API" in prompt
+        assert "job_create" in prompt
+        assert "file_send" in prompt
         assert "8080" in prompt
 
     @pytest.mark.asyncio
@@ -2041,6 +2041,7 @@ class TestContextInjection:
                     "notes": "Use sonar model",
                 }
             ],
+            api_scopes=PERSISTENT_AGENT_BASE_SCOPES | {InternalAPIScope.SERVICES_CALL},
         )
         claude._proc = proc
         claude._fresh_session = True
@@ -2065,6 +2066,7 @@ class TestContextInjection:
             services_info=[
                 {"name": "test-svc", "method": "POST", "description": "Test", "notes": ""},
             ],
+            api_scopes=PERSISTENT_AGENT_BASE_SCOPES | {InternalAPIScope.SERVICES_CALL},
         )
         claude._proc = proc
         claude._fresh_session = True
@@ -2073,8 +2075,8 @@ class TestContextInjection:
             await _collect_events(claude, "test message")
 
         prompt = self._extract_prompt(proc)
-        # All four API sections should mandate curl.
-        assert prompt.count("use curl (NEVER WebFetch)") >= 4
+        # One generated capability block owns the curl transport rule.
+        assert prompt.count("Use curl, never WebFetch") == 1
 
     @pytest.mark.asyncio
     async def test_prompt_contains_current_message_delimiter(self, home_workspace):
@@ -2164,25 +2166,22 @@ class TestContextInjection:
 
         # All three other context blocks fired and are present.
         assert memory_block in prompt
-        assert "Respond ONLY" in prompt  # foreign-workspace reminder
+        assert "Foreign workspace:" in prompt
         assert "Follow neutral principal policy" in prompt  # session_ctx (principal policy)
 
         marker_idx = prompt.index(USER_MESSAGE_MARKER)
 
-        # (b) Marker appears AFTER all three other blocks when reading
-        # top-to-bottom. Every other block must have a smaller index.
+        # (b) Session and recall sit above the current-input boundary;
+        # the workspace note sits inside that boundary below the marker.
         assert prompt.index(memory_block) < marker_idx
-        assert prompt.index("Respond ONLY") < marker_idx
         assert prompt.index("Follow neutral principal policy") < marker_idx
+        assert marker_idx < prompt.index("Foreign workspace:")
 
-        # (c) User's actual text immediately follows the marker, with
-        # nothing but whitespace between them. We compute the substring
-        # from the end of the marker up to the start of the user text
-        # and assert it is whitespace-only — that proves no other
-        # context block was injected adjacent to the user region.
+        # (c) The one workspace note is the only content between the
+        # marker and the user's actual text.
         user_idx = prompt.index("ACTUAL_USER_TEXT")
         between = prompt[marker_idx + len(USER_MESSAGE_MARKER) : user_idx]
-        assert between.strip() == "", f"non-whitespace between marker and user text: {between!r}"
+        assert between.strip().startswith("[Foreign workspace:")
 
     @pytest.mark.asyncio
     async def test_memory_query_captured_before_session_context_pollution(self, home_workspace, foreign_workspace):
@@ -2207,6 +2206,9 @@ class TestContextInjection:
         )
         claude._proc = proc
         claude._fresh_session = True
+        # Exercise propagation when the provider session is already known.
+        # A brand-new Claude process reports its ID only after first dispatch.
+        claude._session_id = "sess-123"
 
         captured: dict = {}
 
@@ -2215,6 +2217,8 @@ class TestContextInjection:
 
             captured["query"] = query
             captured["user_id"] = user_id
+            captured["job_type"] = kwargs["job_type"]
+            captured["session_id"] = kwargs["session_id"]
             return ScopedRecallResult(rendered_context="", recall_payload={"reason": "ok", "hits": []})
 
         with (
@@ -2227,6 +2231,8 @@ class TestContextInjection:
 
         assert captured["query"] == "What do I prefer?"
         assert captured["user_id"] == "42"
+        assert captured["job_type"] == "interactive"
+        assert captured["session_id"] == "sess-123"
 
 
 # ── _send_locked: multi-modal prompt ─────────────────────────────────

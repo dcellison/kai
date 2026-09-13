@@ -65,7 +65,8 @@ from kai.config import (
     DATA_DIR,
     Config,
 )
-from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal, InternalAPIScope
+from kai.internal_api_auth import InternalAPIAuth, InternalAPIPrincipal
+from kai.internal_api_contracts import InternalAPIOperation, contract
 from kai.job_types import CANONICAL_JOB_TYPES, normalize_job_type
 from kai.workshop.agent_creation_options import WorkshopAgentCreationOptionsService
 from kai.workshop.agent_delegation import (
@@ -250,8 +251,10 @@ def _require_generic_webhook_secret(handler):
     return wrapper
 
 
-def _require_internal_api(scope: InternalAPIScope):
-    """Require a principal-bound internal API credential with one scope."""
+def _require_internal_api(operation: InternalAPIOperation):
+    """Require the scope declared by one authoritative API contract."""
+
+    api_contract = contract(operation)
 
     def decorator(handler):
         @functools.wraps(handler)
@@ -261,7 +264,7 @@ def _require_internal_api(scope: InternalAPIScope):
             if principal is None:
                 log.warning("Internal API auth failure on %s from %s", request.path, request.remote)
                 return web.Response(status=401, text="Invalid credential")
-            if not principal.allows(scope):
+            if not principal.allows(api_contract.scope):
                 log.warning(
                     "Internal API scope denial on %s for principal %s",
                     request.path,
@@ -270,6 +273,7 @@ def _require_internal_api(scope: InternalAPIScope):
                 return web.Response(status=403, text="Credential is not authorized for this operation")
             return await handler(request, principal)
 
+        wrapper.__kai_internal_api_operation__ = operation
         return wrapper
 
     return decorator
@@ -798,7 +802,7 @@ def _validate_schedule_data(
     return json.dumps(parsed), None
 
 
-@_require_internal_api(InternalAPIScope.JOBS_WRITE)
+@_require_internal_api(InternalAPIOperation.JOB_CREATE)
 async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Create a new scheduled job via the HTTP API.
@@ -830,6 +834,7 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
         return web.json_response({"error": "Request body must be a JSON object"}, status=400)
 
     # Extract and validate required fields
+    schedule_contract = contract(InternalAPIOperation.JOB_CREATE)
     name = payload.get("name")
     prompt = payload.get("prompt")
     schedule_type = payload.get("schedule_type")
@@ -837,9 +842,9 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
 
     # Use `is None` checks so empty strings (e.g., prompt="") are not
     # rejected as missing. Truthiness would treat "" as absent.
-    if name is None or prompt is None or schedule_type is None or schedule_data is None:
+    if schedule_contract.missing_required(payload):
         return web.json_response(
-            {"error": "Missing required fields: name, prompt, schedule_type, schedule_data"},
+            {"error": f"Missing required fields: {', '.join(schedule_contract.required_fields)}"},
             status=400,
         )
 
@@ -899,7 +904,7 @@ async def _handle_schedule(request: web.Request, principal: InternalAPIPrincipal
 # ── Jobs API ─────────────────────────────────────────────────────────
 
 
-@_require_internal_api(InternalAPIScope.JOBS_READ)
+@_require_internal_api(InternalAPIOperation.JOB_LIST)
 async def _handle_get_jobs(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     List all active jobs for the configured chat.
@@ -916,7 +921,7 @@ async def _handle_get_jobs(request: web.Request, principal: InternalAPIPrincipal
     return web.json_response(jobs)
 
 
-@_require_internal_api(InternalAPIScope.JOBS_READ)
+@_require_internal_api(InternalAPIOperation.JOB_GET)
 async def _handle_get_job(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Get a single job by its database ID.
@@ -942,7 +947,7 @@ async def _handle_get_job(request: web.Request, principal: InternalAPIPrincipal)
     return web.json_response(job)
 
 
-@_require_internal_api(InternalAPIScope.JOBS_WRITE)
+@_require_internal_api(InternalAPIOperation.JOB_DELETE)
 async def _handle_delete_job(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Delete a scheduled job by ID via the HTTP API.
@@ -969,7 +974,7 @@ async def _handle_delete_job(request: web.Request, principal: InternalAPIPrincip
     return web.json_response({"deleted": job_id})
 
 
-@_require_internal_api(InternalAPIScope.JOBS_WRITE)
+@_require_internal_api(InternalAPIOperation.JOB_UPDATE)
 async def _handle_update_job(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Update a scheduled job's mutable fields via the HTTP API.
@@ -1078,13 +1083,13 @@ async def _handle_update_job(request: web.Request, principal: InternalAPIPrincip
 # ── Service proxy ────────────────────────────────────────────────────
 
 
-@_require_internal_api(InternalAPIScope.SERVICES_CALL)
+@_require_internal_api(InternalAPIOperation.SERVICE_CALL)
 async def _handle_service_call(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Proxy an authenticated request to an external service.
 
-    This is how the inner Claude process calls external APIs without ever
-    seeing API keys. Claude POSTs to /api/services/{name} with an optional
+    This is how an authorized agent runtime calls external APIs without ever
+    seeing API keys. The runtime POSTs to /api/services/{name} with an optional
     JSON body containing `body`, `params`, and/or `path_suffix`. This handler
     resolves the service definition, injects auth from .env, makes the HTTP
     call, and returns the response.
@@ -1166,12 +1171,12 @@ def _proactive_response(result: ProactivePublicationResult, **extra: object) -> 
     )
 
 
-@_require_internal_api(InternalAPIScope.MESSAGES_SEND)
+@_require_internal_api(InternalAPIOperation.MESSAGE_SEND)
 async def _handle_send_message(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Publish a proactive agent message to the credential's canonical channel.
 
-    Called by the inner Claude process to proactively notify the user - e.g.,
+    Called by an authorized agent runtime to proactively notify the user - e.g.,
     when a background task completes, or a scheduled job wants to report
     results without going through the full Claude prompt cycle.
 
@@ -1227,7 +1232,7 @@ async def _handle_send_message(request: web.Request, principal: InternalAPIPrinc
     return _proactive_response(result)
 
 
-@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+@_require_internal_api(InternalAPIOperation.AGENT_DELEGATE)
 async def _handle_agent_delegation(
     request: web.Request,
     principal: InternalAPIPrincipal,
@@ -1246,18 +1251,14 @@ async def _handle_agent_delegation(
         _reject_internal_identity_selectors(payload)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
-    unsupported = set(payload) - {
-        "target_handle",
-        "task",
-        "context",
-        "idempotency_key",
-    }
+    delegation_contract = contract(InternalAPIOperation.AGENT_DELEGATE)
+    unsupported = set(payload) - delegation_contract.accepted_fields
     if unsupported:
         return web.json_response(
             {"error": f"Unsupported field: {sorted(unsupported)[0]}"},
             status=400,
         )
-    missing = [key for key in ("target_handle", "task", "idempotency_key") if key not in payload]
+    missing = delegation_contract.missing_required(payload)
     if missing:
         return web.json_response({"error": f"Missing required field: {missing[0]}"}, status=400)
     try:
@@ -1313,7 +1314,7 @@ async def _handle_agent_delegation(
     )
 
 
-@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+@_require_internal_api(InternalAPIOperation.CONTEXT_READ)
 async def _handle_collaboration_context(
     request: web.Request,
     principal: InternalAPIPrincipal,
@@ -1328,13 +1329,14 @@ async def _handle_collaboration_context(
         return web.json_response({"error": "Invalid JSON"}, status=400)
     if not isinstance(payload, dict):
         return web.json_response({"error": "Request body must be a JSON object"}, status=400)
-    unsupported = set(payload) - {"cursor", "limit", "idempotency_key"}
+    context_contract = contract(InternalAPIOperation.CONTEXT_READ)
+    unsupported = set(payload) - context_contract.accepted_fields
     if unsupported:
         return web.json_response(
             {"error": f"Unsupported field: {sorted(unsupported)[0]}"},
             status=400,
         )
-    if "idempotency_key" not in payload:
+    if context_contract.missing_required(payload):
         return web.json_response({"error": "Missing required field: idempotency_key"}, status=400)
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_context.read(
@@ -1367,7 +1369,7 @@ async def _handle_collaboration_context(
     return web.json_response(result.payload)
 
 
-@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+@_require_internal_api(InternalAPIOperation.REACTION_SET)
 async def _handle_collaboration_reaction(
     request: web.Request,
     principal: InternalAPIPrincipal,
@@ -1380,8 +1382,8 @@ async def _handle_collaboration_reaction(
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
-    required = {"message_id", "reaction", "active", "idempotency_key"}
-    if not isinstance(payload, dict) or set(payload) != required:
+    reaction_contract = contract(InternalAPIOperation.REACTION_SET)
+    if not isinstance(payload, dict) or set(payload) != reaction_contract.accepted_fields:
         return web.json_response({"error": "Invalid collaboration reaction request"}, status=400)
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_reactions.react(
@@ -1464,7 +1466,7 @@ def _collaboration_publication_error(exc: Exception) -> web.Response:
     raise exc
 
 
-@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+@_require_internal_api(InternalAPIOperation.COLLABORATION_MESSAGE)
 async def _handle_collaboration_message(
     request: web.Request,
     principal: InternalAPIPrincipal,
@@ -1477,8 +1479,8 @@ async def _handle_collaboration_message(
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
-    required = {"kind", "body", "idempotency_key"}
-    if not isinstance(payload, dict) or set(payload) != required:
+    message_contract = contract(InternalAPIOperation.COLLABORATION_MESSAGE)
+    if not isinstance(payload, dict) or set(payload) != message_contract.accepted_fields:
         return web.json_response({"error": "Invalid collaboration message request"}, status=400)
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_publications.publish_message(
@@ -1508,7 +1510,7 @@ async def _handle_collaboration_message(
     )
 
 
-@_require_internal_api(InternalAPIScope.COLLABORATION_INVOKE)
+@_require_internal_api(InternalAPIOperation.COLLABORATION_ARTIFACT)
 async def _handle_collaboration_artifact(
     request: web.Request,
     principal: InternalAPIPrincipal,
@@ -1521,7 +1523,8 @@ async def _handle_collaboration_artifact(
         payload = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
-    if not isinstance(payload, dict) or set(payload) != {"path", "caption", "idempotency_key"}:
+    artifact_contract = contract(InternalAPIOperation.COLLABORATION_ARTIFACT)
+    if not isinstance(payload, dict) or set(payload) != artifact_contract.accepted_fields:
         return web.json_response({"error": "Invalid collaboration artifact request"}, status=400)
     raw_path = payload.get("path")
     if not isinstance(raw_path, str):
@@ -1577,12 +1580,12 @@ async def _handle_collaboration_artifact(
 # ── File exchange ────────────────────────────────────────────────────
 
 
-@_require_internal_api(InternalAPIScope.FILES_SEND)
+@_require_internal_api(InternalAPIOperation.FILE_SEND)
 async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Publish a file from the filesystem as a canonical channel artifact.
 
-    Called by the inner Claude process to deliver files back to the user.
+    Called by an authorized agent runtime to deliver files back to the user.
     Accepts a JSON body with a required "path" field (absolute path) and
     optional "caption" and "idempotency_key". Optional adapters deliver the
     artifact later through durable channel-binding workers.
@@ -1694,7 +1697,7 @@ async def _handle_send_file(request: web.Request, principal: InternalAPIPrincipa
 #     when memory is off, even on read endpoints whose primitives degrade
 #     gracefully (search returns [], get_stats returns zeroed). Returning
 #     the degraded value at the API would conflate "memory off" with
-#     "no data" and inner Claude could not pick a retry policy from the
+#     "no data" and an agent runtime could not pick a retry policy from the
 #     status code alone.
 #
 #   - Memory primitives take user_id as a string. Every handler passes the
@@ -1728,14 +1731,13 @@ def _memory_disabled_response() -> web.Response:
     return web.json_response({"error": "Memory system disabled"}, status=503)
 
 
-@_require_internal_api(InternalAPIScope.MEMORY_ADD)
+@_require_internal_api(InternalAPIOperation.MEMORY_ADD)
 async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Store a structured memory via memory.add_structured().
 
-    Wraps the existing add_structured() primitive used by the Haiku
-    extraction path. Lets inner Claude (and other localhost clients)
-    deliberately store facts without waiting for the extractor to pass
+    Wraps the existing add_structured() primitive used by the extraction
+    path. Lets authorized agent runtimes deliberately store facts without waiting for the extractor to pass
     over a conversation. The primitive itself is unchanged; this handler
     only adds the HTTP surface.
 
@@ -1916,7 +1918,7 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
     return web.json_response({"id": memory_id})
 
 
-@_require_internal_api(InternalAPIScope.MEMORY_READ)
+@_require_internal_api(InternalAPIOperation.MEMORY_SEARCH)
 async def _handle_memory_search(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Search memories via memory.search().
@@ -1973,7 +1975,7 @@ async def _handle_memory_search(request: web.Request, principal: InternalAPIPrin
 
     # search() degrades to [] when memory is disabled, but returning []
     # at the API layer would be indistinguishable from "no matches".
-    # Inner Claude needs to pick "log no relevant memories and continue"
+    # Agent runtimes need to pick "log no relevant memories and continue"
     # vs "memory is off, surface to operator" - the only distinguishing
     # signal is the status code, so the precheck is required.
     if not memory.is_enabled():
@@ -2007,7 +2009,7 @@ async def _handle_memory_search(request: web.Request, principal: InternalAPIPrin
         return web.json_response({"error": "Memory search failed"}, status=500)
 
 
-@_require_internal_api(InternalAPIScope.MEMORY_READ)
+@_require_internal_api(InternalAPIOperation.MEMORY_STATS)
 async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Return memory statistics via memory.get_stats().
@@ -2057,8 +2059,7 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
             runtime_profile_id=str(principal.runtime_profile_id),
         )
         # asdict() preserves None for the optional confidence_* fields,
-        # which become JSON null on the wire. The CLAUDE.md
-        # "Memory System" section documents this so inner Claude does
+        # which become JSON null on the wire. Runtime capability guidance does
         # not misread null as a store failure.
         return web.json_response(asdict(stats))
     except Exception:
@@ -2066,7 +2067,7 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
         return web.json_response({"error": "Memory stats failed"}, status=500)
 
 
-@_require_internal_api(InternalAPIScope.MEMORY_DELETE_ALL)
+@_require_internal_api(InternalAPIOperation.MEMORY_DELETE_ALL)
 async def _handle_memory_delete_all(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
     Delete all memories for a user via memory.delete_all().
@@ -2169,23 +2170,28 @@ def _register_routes(
 
     # These routes authenticate through INTERNAL_API_AUTH_KEY. Their
     # availability must not be coupled to any public ingress configuration.
-    app.router.add_get("/api/jobs", _handle_get_jobs)
-    app.router.add_get("/api/jobs/{id}", _handle_get_job)
-    app.router.add_post("/api/services/{name}", _handle_service_call)
-    app.router.add_post("/api/memory/add", _handle_memory_add)
-    app.router.add_post("/api/memory/search", _handle_memory_search)
-    app.router.add_get("/api/memory/stats", _handle_memory_stats)
-    app.router.add_delete("/api/memory/all", _handle_memory_delete_all)
-    app.router.add_post("/api/schedule", _handle_schedule)
-    app.router.add_delete("/api/jobs/{id}", _handle_delete_job)
-    app.router.add_patch("/api/jobs/{id}", _handle_update_job)
-    app.router.add_post("/api/send-message", _handle_send_message)
-    app.router.add_post("/api/send-file", _handle_send_file)
-    app.router.add_post("/api/agent-delegations", _handle_agent_delegation)
-    app.router.add_post("/api/collaboration/context", _handle_collaboration_context)
-    app.router.add_post("/api/collaboration/reactions", _handle_collaboration_reaction)
-    app.router.add_post("/api/collaboration/messages", _handle_collaboration_message)
-    app.router.add_post("/api/collaboration/artifacts", _handle_collaboration_artifact)
+    internal_routes = (
+        (InternalAPIOperation.JOB_LIST, _handle_get_jobs),
+        (InternalAPIOperation.JOB_GET, _handle_get_job),
+        (InternalAPIOperation.SERVICE_CALL, _handle_service_call),
+        (InternalAPIOperation.MEMORY_ADD, _handle_memory_add),
+        (InternalAPIOperation.MEMORY_SEARCH, _handle_memory_search),
+        (InternalAPIOperation.MEMORY_STATS, _handle_memory_stats),
+        (InternalAPIOperation.MEMORY_DELETE_ALL, _handle_memory_delete_all),
+        (InternalAPIOperation.JOB_CREATE, _handle_schedule),
+        (InternalAPIOperation.JOB_DELETE, _handle_delete_job),
+        (InternalAPIOperation.JOB_UPDATE, _handle_update_job),
+        (InternalAPIOperation.MESSAGE_SEND, _handle_send_message),
+        (InternalAPIOperation.FILE_SEND, _handle_send_file),
+        (InternalAPIOperation.AGENT_DELEGATE, _handle_agent_delegation),
+        (InternalAPIOperation.CONTEXT_READ, _handle_collaboration_context),
+        (InternalAPIOperation.REACTION_SET, _handle_collaboration_reaction),
+        (InternalAPIOperation.COLLABORATION_MESSAGE, _handle_collaboration_message),
+        (InternalAPIOperation.COLLABORATION_ARTIFACT, _handle_collaboration_artifact),
+    )
+    for operation, handler in internal_routes:
+        api_contract = contract(operation)
+        app.router.add_route(api_contract.method, api_contract.path, handler)
 
 
 async def _register_workshop_client_api(

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kai.backend import ContextAssemblyObserver, StreamEvent
+from kai.backend import ContextAssemblyObserver, ExecutionContextKind, StreamEvent
 from kai.config import VALID_BACKENDS, validate_model_for_backend
 from kai.workshop.agent_definitions import load_agent_definition_revision, render_agent_definition_context
 from kai.workshop.collaboration_authority import CollaborationInvocation
@@ -27,6 +28,17 @@ if TYPE_CHECKING:
     from kai.pool import PreparedBackendExecution
 
 type AgentPrompt = str | list[dict[str, str]]
+
+
+def execution_context_kind(run: DurableRun, inbound_metadata: object) -> ExecutionContextKind:
+    """Classify memory diagnostics from canonical run and inbound facts."""
+    if run.kind.value == "observe":
+        return "standing_observe"
+    if run.delegation_id is not None:
+        return "delegated"
+    if isinstance(inbound_metadata, dict) and inbound_metadata.get("source") == "scheduled_job":
+        return "scheduled"
+    return "interactive"
 
 
 class ProtectedExecutionPreparationError(RuntimeError):
@@ -52,10 +64,12 @@ class PreparedWorkshopExecution:
     history_reader_user: str | None
     routing_decision: RunRoutingDecision
     retained_context_revision: str
+    execution_context_kind: ExecutionContextKind
     _runtime: PreparedBackendExecution = field(repr=False, compare=False)
 
     async def stream(self, prompt: AgentPrompt) -> AsyncIterator[StreamEvent]:
         """Dispatch once through the exact runtime bound during preparation."""
+        self._runtime.stage_execution_context(self.execution_context_kind)
         async for event in self._runtime.stream(prompt):
             yield event
 
@@ -81,7 +95,9 @@ class PreparedWorkshopExecution:
         self._runtime.stage_context_assembly_observer(observer)
 
     def stage_collaboration_invocation(self, invocation: CollaborationInvocation) -> None:
-        self._runtime.stage_collaboration_invocation(invocation.render_context())
+        self._runtime.stage_collaboration_invocation(
+            tuple(sorted(operation.value for operation in invocation.effective_operations))
+        )
 
     def discard_collaboration_invocation(self, invocation: CollaborationInvocation) -> None:
         self._runtime.discard_collaboration_invocation()
@@ -208,6 +224,15 @@ class WorkshopProtectedExecutionPreparationService:
             await runtime.cancel()
             raise ProtectedExecutionPreparationError("Prepared runtime does not match the durable routing decision")
         profile = self._pool.runtime_profile(run.runtime_profile_id)
+        inbound_metadata: object = {}
+        if run.kind.value != "observe" and run.delegation_id is None:
+            async with self._store.connection.execute(
+                "SELECT metadata_json FROM event_log WHERE aggregate_type = 'message' AND aggregate_id = ? "
+                "ORDER BY position DESC LIMIT 1",
+                (run.inbound_message_id,),
+            ) as cursor:
+                inbound_row = await cursor.fetchone()
+            inbound_metadata = json.loads(str(inbound_row[0])) if inbound_row is not None else {}
         return PreparedWorkshopExecution(
             run=run,
             runtime_profile_id=run.runtime_profile_id,
@@ -217,5 +242,6 @@ class WorkshopProtectedExecutionPreparationService:
             history_reader_user=profile.os_user,
             routing_decision=decision,
             retained_context_revision=retained_context_revision,
+            execution_context_kind=execution_context_kind(run, inbound_metadata),
             _runtime=runtime,
         )
