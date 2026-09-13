@@ -19,6 +19,33 @@
   margin-top: 0.65rem;
 }
 
+.context-pane details > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  list-style: none;
+}
+
+.context-pane details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.context-pane details > summary::before {
+  box-sizing: border-box;
+  width: 0.38rem;
+  height: 0.38rem;
+  flex: 0 0 auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: "";
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+}
+
+.context-pane details[open] > summary::before {
+  transform: rotate(45deg);
+}
+
 .context-stack-panel > summary {
   cursor: pointer;
   color: var(--color-text-strong);
@@ -3545,6 +3572,7 @@ button:disabled {
 }
 
 .agent-editor > label,
+.agent-creation-stage > label,
 .agent-editor-grid > label,
 .agent-revision-editor > label {
   display: grid;
@@ -3715,10 +3743,6 @@ button:disabled {
   border-color: var(--color-accent);
   background: color-mix(in srgb, var(--color-accent) 18%, transparent);
   color: var(--color-accent);
-}
-
-.agent-creation-stage {
-  min-height: 20rem;
 }
 
 .agent-creation-stage-heading {
