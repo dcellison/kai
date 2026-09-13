@@ -2206,6 +2206,19 @@ function SendIcon(): React.JSX.Element {
   );
 }
 
+function StopIcon(): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="currentColor"
+      focusable="false"
+      viewBox="0 0 24 24"
+    >
+      <rect x="6" y="6" width="12" height="12" rx="1" />
+    </svg>
+  );
+}
+
 function ReplyIcon(): React.JSX.Element {
   return (
     <svg
@@ -4957,6 +4970,7 @@ function WorkshopView({
               <textarea
                 ref={composerRef}
                 aria-label={`Message ${channelName}`}
+                disabled={submitting || isRunActive(activeRun)}
                 value={draft}
                 onChange={(event) => {
                   const nextDraft = event.target.value;
@@ -5044,28 +5058,28 @@ function WorkshopView({
                   ))}
                 </div>
               )}
-              <button
-                className="send-button composer-icon-button"
-                type="submit"
-                aria-busy={submitting}
-                aria-label={submitting ? "Sending…" : "Send"}
-                title={submitting ? "Sending…" : "Send"}
-                disabled={
-                  submitting ||
-                  isRunActive(activeRun) ||
-                  (!draft.trim() && !selectedArtifact)
-                }
-              >
-                <SendIcon />
-              </button>
-              {isRunActive(activeRun) && (
+              {isRunActive(activeRun) ? (
                 <button
-                  className="stop-button"
+                  className="stop-button composer-icon-button"
                   type="button"
+                  aria-busy={stopping}
+                  aria-label={stopping ? "Stopping agent run…" : "Stop agent run"}
+                  title={stopping ? "Stopping agent run…" : "Stop agent run"}
                   disabled={stopping}
                   onClick={() => void stopRun()}
                 >
-                  {stopping ? "Stopping…" : "Stop"}
+                  <StopIcon />
+                </button>
+              ) : (
+                <button
+                  className="send-button composer-icon-button"
+                  type="submit"
+                  aria-busy={submitting}
+                  aria-label={submitting ? "Sending…" : "Send"}
+                  title={submitting ? "Sending…" : "Send"}
+                  disabled={submitting || (!draft.trim() && !selectedArtifact)}
+                >
+                  <SendIcon />
                 </button>
               )}
             </form>

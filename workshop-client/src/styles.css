@@ -21,7 +21,10 @@
 
 .context-stack-panel > summary {
   cursor: pointer;
-  font-weight: 650;
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+  font-size: 0.82rem;
+  font-weight: 540;
 }
 
 .context-stack-inspector {
@@ -37,6 +40,7 @@
 
 .context-stack-summary p {
   margin: 0;
+  font-size: 0.72rem;
 }
 
 .context-stack-summary code {
@@ -54,7 +58,7 @@
 }
 
 .context-source-card {
-  background: color-mix(in srgb, var(--color-surface-raised) 76%, transparent);
+  background: var(--color-panel);
   border: 1px solid var(--color-border);
   border-radius: 0.45rem;
   padding: 0.65rem;
@@ -76,11 +80,18 @@
   margin: 0;
 }
 
+.context-source-card h4 {
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+  font-size: 0.82rem;
+  font-weight: 540;
+}
+
 .context-source-card header p,
 .context-source-note,
 .context-source-effect {
   color: var(--color-text-muted);
-  font-size: 0.8rem;
+  font-size: 0.72rem;
 }
 
 .context-source-facts {
@@ -102,6 +113,8 @@
 
 .context-source-facts dd {
   margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.4;
   overflow-wrap: anywhere;
 }
 
@@ -113,6 +126,7 @@
 .context-source-preview pre {
   background: var(--color-canvas-inset);
   border-radius: 0.35rem;
+  font: 0.64rem/1.5 var(--mono);
   max-height: 18rem;
   overflow: auto;
   padding: 0.6rem;
@@ -982,7 +996,7 @@ button:disabled {
   border: 1px solid var(--color-border-strong);
   border-radius: 0.45rem;
   padding: 0.45rem;
-  background: var(--color-surface-raised);
+  background: var(--color-panel);
   box-shadow: 0 18px 42px color-mix(in srgb, var(--color-shadow-base) 45%, transparent);
 }
 
@@ -1472,7 +1486,7 @@ button:disabled {
   padding: 0.55rem 0.65rem;
   border: 1px solid var(--color-border-strong);
   border-radius: 0.55rem;
-  background: var(--color-surface-raised);
+  background: var(--color-panel);
   color: var(--color-text);
   box-shadow: 0 0.45rem 1rem color-mix(in srgb, var(--color-shadow-base) 35%, transparent);
   font: 500 0.68rem var(--sans);
@@ -2085,7 +2099,7 @@ button:disabled {
   border: 1px solid var(--color-border-strong);
   border-radius: 0.4rem;
   padding: 0.3rem;
-  background: var(--color-surface-raised);
+  background: var(--color-panel);
   box-shadow: 0 0.8rem 2rem color-mix(in srgb, var(--color-shadow-base) 40%, transparent);
 }
 
@@ -2227,6 +2241,11 @@ button:disabled {
   border-color: color-mix(in srgb, var(--color-danger) 50%, transparent);
   background: color-mix(in srgb, var(--color-danger) 12%, transparent);
   color: var(--color-danger);
+}
+
+.composer-form .stop-button:hover:not(:disabled) {
+  border-color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 20%, transparent);
 }
 
 .composer-error {
@@ -2623,7 +2642,7 @@ button:disabled {
   border: 1px solid var(--color-border-strong);
   border-radius: 0.55rem;
   padding: 1.3rem;
-  background: var(--color-surface-raised);
+  background: var(--color-panel);
   box-shadow: 0 1.4rem 4rem color-mix(in srgb, var(--color-shadow-base) 55%, transparent);
 }
 
@@ -2631,6 +2650,8 @@ button:disabled {
   margin: 0.35rem 0 0.55rem;
   color: var(--color-text-strong);
   font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: 540;
 }
 
 .channel-creation-dialog form,
@@ -5657,7 +5678,7 @@ button:disabled {
   border: 1px solid var(--color-border-strong);
   border-radius: 0.55rem;
   padding: 1.2rem;
-  background: var(--color-surface);
+  background: var(--color-panel);
   box-shadow: 0 1rem 3rem color-mix(in srgb, var(--color-overlay-shadow) 45%, transparent);
 }
 
@@ -5665,7 +5686,8 @@ button:disabled {
   margin: 0.25rem 0 0.65rem;
   color: var(--color-text-strong);
   font-family: var(--serif);
-  font-size: 1.2rem;
+  font-size: 1.05rem;
+  font-weight: 540;
 }
 
 .confirmation-dialog > p:not(.overline) {
@@ -5688,7 +5710,7 @@ button:disabled {
   border: 1px solid var(--color-border-strong);
   border-radius: 0.55rem;
   padding: 1.2rem;
-  background: var(--color-surface);
+  background: var(--color-panel);
   box-shadow: 0 1rem 3rem color-mix(in srgb, var(--color-overlay-shadow) 45%, transparent);
 }
 
@@ -5696,7 +5718,8 @@ button:disabled {
   margin: 0.25rem 0 0.65rem;
   color: var(--color-text-strong);
   font-family: var(--serif);
-  font-size: 1.2rem;
+  font-size: 1.05rem;
+  font-weight: 540;
 }
 
 .memory-confirm > p:not(.overline),
@@ -5729,7 +5752,7 @@ button:disabled {
   width: min(48rem, 100%);
   border: 1px solid var(--color-border-strong);
   border-radius: 0.6rem;
-  background: var(--color-surface);
+  background: var(--color-panel);
   box-shadow: 0 1.4rem 4rem color-mix(in srgb, var(--color-overlay-shadow) 50%, transparent);
 }
 
@@ -5746,7 +5769,7 @@ button:disabled {
   margin: 0;
   color: var(--color-text-strong);
   font-family: var(--serif);
-  font-size: 1.35rem;
+  font-size: 1.05rem;
   font-weight: 550;
 }
 
@@ -6196,6 +6219,10 @@ button:disabled {
 
 .collaboration-activity h4 {
   margin: 0 0 0.4rem;
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+  font-size: 0.82rem;
+  font-weight: 540;
 }
 
 .collaboration-activity ol {

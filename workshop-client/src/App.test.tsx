@@ -4979,9 +4979,18 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("accepted")).toBeVisible();
-    expect(screen.getByLabelText("Message Kai")).toHaveValue("");
-    await user.click(screen.getByRole("button", { name: "Stop" }));
+    const composer = screen.getByLabelText("Message Kai");
+    expect(composer).toHaveValue("");
+    expect(composer).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+    const stopButton = screen.getByRole("button", { name: "Stop agent run" });
+    expect(stopButton).toHaveClass("composer-icon-button", "stop-button");
+    expect(stopButton).toHaveTextContent("");
+    expect(stopButton.querySelector("svg rect")).not.toBeNull();
+    await user.click(stopButton);
     expect(await screen.findByText("cancelled")).toBeVisible();
+    expect(composer).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Send" })).toBeVisible();
     expect(cancelRun).toHaveBeenCalledWith(
       { channelId, token: "existing-session" },
       acceptedRun.runId,
@@ -5062,7 +5071,7 @@ describe("Workshop React client", () => {
     );
     expect(await screen.findByText("The agent completed this request.")).toBeVisible();
     expect(screen.queryByText(/Route: routed/)).toBeNull();
-    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop agent run" })).toBeNull();
     expect(loadRun).not.toHaveBeenCalled();
   });
 
@@ -5097,6 +5106,7 @@ describe("Workshop React client", () => {
     const sendingButton = screen.getByRole("button", { name: "Sending…" });
     expect(sendingButton).toBeDisabled();
     expect(sendingButton).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByLabelText("Message Kai")).toBeDisabled();
     act(() =>
       handlers?.onRunActivity(
         {
@@ -5118,6 +5128,7 @@ describe("Workshop React client", () => {
     await submitting;
 
     expect(await screen.findByText("The agent completed this request.")).toBeVisible();
+    expect(screen.getByLabelText("Message Kai")).toBeEnabled();
     expect(screen.queryByText("Queued for the configured agent.")).toBeNull();
   });
 });
