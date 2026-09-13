@@ -144,6 +144,7 @@ function SourceEditor({
   return (
     <div className="context-source-editor">
       <textarea
+        autoFocus
         aria-label={`Edit ${source.inspection.title}`}
         value={content}
         onChange={(event) => setContent(event.target.value)}
@@ -203,7 +204,7 @@ function SourceCard({
           <h4>{inspection.title}</h4>
           <p>{inspection.description}</p>
         </div>
-        {inspection.editable && (
+        {inspection.editable && (!inlineEditor || !editing) && (
           <button
             className="panel-icon-button"
             type="button"
@@ -215,44 +216,48 @@ function SourceCard({
           </button>
         )}
       </header>
-      <dl className="context-source-facts">
-        <div><dt>Owner</dt><dd>{readable(source.ownerKind)}{source.ownerId ? ` · ${abbreviatedRevision(source.ownerId)}` : ""}</dd></div>
-        <div><dt>Source</dt><dd>{inspection.sourceReference}</dd></div>
-        <div><dt>Scope</dt><dd>{readable(source.scope)}</dd></div>
-        <div><dt>Authority</dt><dd>{readable(source.authorityClass)}</dd></div>
-        <div><dt>Trust</dt><dd>{readable(source.trustClass)}</dd></div>
-        <div><dt>Delivery</dt><dd>{readable(source.deliveryRole)}</dd></div>
-        <div><dt>Refresh</dt><dd>{readable(source.refreshClass)}</dd></div>
-        <div><dt>State</dt><dd>{readable(source.state)} · {readable(source.reason)}</dd></div>
-        <div><dt>Run revision</dt><dd title={source.revision ?? undefined}>{abbreviatedRevision(source.revision)}</dd></div>
-        <div><dt>Current</dt><dd title={inspection.currentRevision ?? undefined}>{readable(inspection.freshness)}{inspection.currentRevision ? ` · ${abbreviatedRevision(inspection.currentRevision)}` : ""}</dd></div>
-        <div><dt>Rendered</dt><dd>{source.renderedBytes.toLocaleString()}{source.budgetBytes ? ` / ${source.budgetBytes.toLocaleString()}` : ""} bytes</dd></div>
-      </dl>
-      {source.historyBoundary !== null && <p className="context-source-note">Conversation boundary: event {source.historyBoundary}</p>}
-      {source.nativeInstructionSources.length > 0 && (
-        <ul className="context-native-sources">
-          {source.nativeInstructionSources.map((native) => (
-            <li key={`${native.filename}:${native.pathSha256}`}>
-              {native.filename} · {readable(native.scope)} · path {abbreviatedRevision(native.pathSha256)}
-            </li>
-          ))}
-        </ul>
-      )}
       {editing && inlineEditor ? (
         <SourceEditor session={session} source={source} onCancel={onEdit} onSaved={onReload} />
-      ) : inspection.preview !== null ? (
-        <details className="context-source-preview">
-          <summary>{inspection.previewState === "exact" ? "Rendered preview" : "Redacted preview"}</summary>
-          <pre>{inspection.preview}</pre>
-          {inspection.previewReason && <p>{inspection.previewReason}</p>}
-        </details>
       ) : (
-        <p className="context-source-note">{inspection.previewReason ?? "No rendered preview is available."}</p>
-      )}
-      {inspection.changeEffect && (
-        <p className="context-source-effect">
-          Changes apply on {inspection.changeEffect === "next_turn" ? "the next turn" : "provider-session refresh"}.
-        </p>
+        <>
+          <dl className="context-source-facts">
+            <div><dt>Owner</dt><dd>{readable(source.ownerKind)}{source.ownerId ? ` · ${abbreviatedRevision(source.ownerId)}` : ""}</dd></div>
+            <div><dt>Source</dt><dd>{inspection.sourceReference}</dd></div>
+            <div><dt>Scope</dt><dd>{readable(source.scope)}</dd></div>
+            <div><dt>Authority</dt><dd>{readable(source.authorityClass)}</dd></div>
+            <div><dt>Trust</dt><dd>{readable(source.trustClass)}</dd></div>
+            <div><dt>Delivery</dt><dd>{readable(source.deliveryRole)}</dd></div>
+            <div><dt>Refresh</dt><dd>{readable(source.refreshClass)}</dd></div>
+            <div><dt>State</dt><dd>{readable(source.state)} · {readable(source.reason)}</dd></div>
+            <div><dt>Run revision</dt><dd title={source.revision ?? undefined}>{abbreviatedRevision(source.revision)}</dd></div>
+            <div><dt>Current</dt><dd title={inspection.currentRevision ?? undefined}>{readable(inspection.freshness)}{inspection.currentRevision ? ` · ${abbreviatedRevision(inspection.currentRevision)}` : ""}</dd></div>
+            <div><dt>Rendered</dt><dd>{source.renderedBytes.toLocaleString()}{source.budgetBytes ? ` / ${source.budgetBytes.toLocaleString()}` : ""} bytes</dd></div>
+          </dl>
+          {source.historyBoundary !== null && <p className="context-source-note">Conversation boundary: event {source.historyBoundary}</p>}
+          {source.nativeInstructionSources.length > 0 && (
+            <ul className="context-native-sources">
+              {source.nativeInstructionSources.map((native) => (
+                <li key={`${native.filename}:${native.pathSha256}`}>
+                  {native.filename} · {readable(native.scope)} · path {abbreviatedRevision(native.pathSha256)}
+                </li>
+              ))}
+            </ul>
+          )}
+          {inspection.preview !== null ? (
+            <details className="context-source-preview">
+              <summary>{inspection.previewState === "exact" ? "Rendered preview" : "Redacted preview"}</summary>
+              <pre>{inspection.preview}</pre>
+              {inspection.previewReason && <p>{inspection.previewReason}</p>}
+            </details>
+          ) : (
+            <p className="context-source-note">{inspection.previewReason ?? "No rendered preview is available."}</p>
+          )}
+          {inspection.changeEffect && (
+            <p className="context-source-effect">
+              Changes apply on {inspection.changeEffect === "next_turn" ? "the next turn" : "provider-session refresh"}.
+            </p>
+          )}
+        </>
       )}
     </article>
   );
