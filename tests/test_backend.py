@@ -2336,6 +2336,34 @@ class TestAssembleTurnContext:
         user_start = result.index("ACTUAL_USER_TEXT")
         assert result[marker_end:user_start].strip() == "", repr(result[marker_end:user_start])
 
+    async def test_live_canonical_delta_is_per_turn_structured_context(self, monkeypatch):
+        from kai.backend import assemble_turn_context
+
+        _patch_scoped_recall(monkeypatch, rendered_context="")
+        observed = []
+
+        async def observe(value):
+            observed.append(value)
+
+        result = await assemble_turn_context(
+            "ACTUAL_USER_TEXT",
+            chat_id=42,
+            session_context="",
+            agent_definition_context="[AGENT DEFINITION]",
+            canonical_conversation_context="[STRUCTURED CANONICAL DELTA]",
+            canonical_conversation_revision="a" * 64,
+            canonical_conversation_mode="delta",
+            context_observer=observe,
+        )
+
+        assert isinstance(result, str)
+        assert result.index("[STRUCTURED CANONICAL DELTA]") < result.index("[AGENT DEFINITION]")
+        assert result.index("[AGENT DEFINITION]") < result.index("ACTUAL_USER_TEXT")
+        assert len(observed) == 1
+        assert observed[0].canonical_conversation_delivered is True
+        assert observed[0].canonical_conversation_mode == "delta"
+        assert observed[0].canonical_conversation_revision == "a" * 64
+
     async def test_shared_channel_never_calls_personal_semantic_recall(
         self,
         monkeypatch,

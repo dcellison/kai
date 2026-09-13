@@ -103,6 +103,33 @@ async def test_ready_batch_becomes_immutable_observe_run_and_exact_silence_advan
     assert "quota ledger=(inferences=1, publications=0)" in status
 
 
+async def test_successful_ordinary_run_reconciles_pending_standing_batch(tmp_path: Path) -> None:
+    store, human_id, channel_id, agent_id, standing = await _observation_authority(tmp_path / "kai.db")
+    policy = _host_policy()
+    observation = WorkshopStandingObservationService(store, policy)
+    try:
+        await observation.synchronize_host_policy()
+        await _append_message(store, channel_id, human_id, "ordinary-run-observed-delta", offset_seconds=1)
+        accepted = await WorkshopConversationCommandService(
+            store,
+            standing_participation=standing,
+        ).accept_client(_message(human_id, channel_id, "ordinary-run-anchor"))
+        run = accepted.command.runs[0]
+        prepared = _Prepared(run, response=AgentResponse(success=True, text="Ordinary response"))
+
+        result = await _coordinator(store, prepared, policy).execute(run.run_id)
+
+        assert result.disposition == CanonicalExecutionDisposition.COMPLETED
+        assert "ordinary-run-observed-delta" in str(prepared.canonical_history_options[0]["live_delta"])
+        states = await observation.inspect(channel_id, agent_id, current_at=_NOW + timedelta(seconds=4))
+        assert len(states) == 1
+        assert states[0].pending_message_count == 0
+        assert states[0].lifecycle_state == "idle"
+        assert await observation.accept_next_ready(occurred_at=_NOW + timedelta(seconds=4)) is None
+    finally:
+        await store.close()
+
+
 async def test_standing_publication_is_once_per_human_anchor_and_suppressed_text_is_protected(
     tmp_path: Path,
 ) -> None:

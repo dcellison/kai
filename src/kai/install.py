@@ -96,6 +96,7 @@ from kai.workshop.diagnostics import (
     workshop_client_preference_status,
     workshop_collaboration_authority_status,
     workshop_context_manifest_status,
+    workshop_conversation_observation_status,
     workshop_delivery_authority_status,
     workshop_execution_state_status,
     workshop_human_avatar_status,
@@ -9898,6 +9899,7 @@ def _cmd_status() -> None:
     print(_direct_message_archive_status(Path(data_dir) / "kai.db"))
     print(workshop_delivery_authority_status(Path(data_dir) / "kai.db"))
     print(workshop_context_manifest_status(Path(data_dir) / "kai.db"))
+    print(workshop_conversation_observation_status(Path(data_dir) / "kai.db"))
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
     print(_runtime_key_cutover_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
     print(workshop_execution_state_status(Path(data_dir) / "kai.db"))

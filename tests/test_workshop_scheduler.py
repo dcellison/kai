@@ -115,7 +115,7 @@ class _CanonicalRuntime:
         self.collaboration_proof: str | None = None
         self.context_observer = None
 
-    def stage_canonical_history(self, _history: str) -> None:
+    def stage_canonical_history(self, _history: str, **_kwargs: object) -> None:
         pass
 
     def stage_canonical_agent_context(self, _context: str) -> None:

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 78
+WORKSHOP_SCHEMA_VERSION = 79
 
 
 @dataclass(frozen=True, slots=True)
@@ -3483,6 +3483,49 @@ _RETAINED_CONTEXT_REVISION_SCHEMA = SchemaMigration(
     ),
 )
 
+_CANONICAL_CONVERSATION_OBSERVATION_SCHEMA = SchemaMigration(
+    version=79,
+    name="canonical_conversation_observation_cursor",
+    statements=(
+        """
+        CREATE TABLE channel_agent_conversation_observations (
+            -- Like runtime sessions, these continuity facts must survive a
+            -- deterministic rebuild of the event-derived projections.
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL,
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('channel', 'thread')),
+            scope_id TEXT NOT NULL,
+            observed_through_event_position INTEGER NOT NULL
+                CHECK (observed_through_event_position > 0),
+            last_run_id TEXT NOT NULL,
+            last_inbound_message_id TEXT NOT NULL,
+            state_version INTEGER NOT NULL CHECK (state_version >= 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (channel_id, agent_id, runtime_profile_id, scope_id)
+        )
+        """,
+        "CREATE INDEX channel_agent_conversation_observations_profile_idx "
+        "ON channel_agent_conversation_observations (runtime_profile_id)",
+        """
+        INSERT INTO channel_agent_conversation_observations (
+            channel_id, agent_id, runtime_profile_id, scope_kind, scope_id,
+            observed_through_event_position, last_run_id,
+            last_inbound_message_id, state_version, created_at, updated_at
+        )
+        SELECT s.channel_id, s.agent_id, s.runtime_profile_id,
+            CASE WHEN source.thread_root_id IS NULL THEN 'channel' ELSE 'thread' END,
+            COALESCE(source.thread_root_id, s.channel_id),
+            source.created_event_position, s.last_run_id,
+            run.inbound_message_id, 0, s.created_at, s.updated_at
+        FROM channel_agent_runtime_sessions s
+        JOIN runs run ON run.id = s.last_run_id AND run.status = 'completed'
+        JOIN messages source ON source.id = run.inbound_message_id
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3562,6 +3605,7 @@ _MIGRATIONS = (
     _REPLAY_SAFE_AGENT_PROVISIONING_SCHEMA,
     _CANONICAL_CONTEXT_MANIFEST_SCHEMA,
     _RETAINED_CONTEXT_REVISION_SCHEMA,
+    _CANONICAL_CONVERSATION_OBSERVATION_SCHEMA,
 )
 
 

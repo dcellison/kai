@@ -9,6 +9,12 @@ from enum import StrEnum
 
 import aiosqlite
 
+from kai.workshop.conversation_context import (
+    ConversationObservationSettlement,
+    ConversationObservationSettlementResult,
+    conversation_observation_available,
+    settle_conversation_observation_in_transaction,
+)
 from kai.workshop.delivery_policy import WorkshopDeliveryBindingPolicy
 from kai.workshop.domain import MessageId
 from kai.workshop.outbound import (
@@ -110,6 +116,7 @@ class TerminalTransactionResult:
     execution: RunExecutionResult
     changed: bool
     runtime_session: RuntimeSessionSettlementResult | None = None
+    conversation_observation: ConversationObservationSettlementResult | None = None
 
 
 class WorkshopRunTerminalTransactionCoordinator:
@@ -277,6 +284,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                 )
 
             runtime_session_result = None
+            observation_result = None
             post_run_effect_inserted = None
             if outcome == TerminalOutcome.COMPLETED and runtime_session is not None:
                 post_run_effect_inserted = await enqueue_post_run_effect_in_transaction(
@@ -307,6 +315,18 @@ class WorkshopRunTerminalTransactionCoordinator:
                     runtime_session_result = None
                 else:
                     await connection.execute("RELEASE SAVEPOINT runtime_session_settlement")
+                if await conversation_observation_available(self._store):
+                    observation_result = await settle_conversation_observation_in_transaction(
+                        self._store,
+                        ConversationObservationSettlement(
+                            channel_id=str(run.channel_id),
+                            agent_id=str(run.agent_id),
+                            runtime_profile_id=str(runtime_session.runtime_profile_id),
+                            run_id=str(run.run_id),
+                            inbound_message_id=str(run.inbound_message_id),
+                        ),
+                        occurred_at=occurred_at,
+                    )
 
             prior_states = {
                 finalization.message.inserted,
@@ -333,6 +353,7 @@ class WorkshopRunTerminalTransactionCoordinator:
                 execution=execution,
                 changed=changed,
                 runtime_session=runtime_session_result,
+                conversation_observation=observation_result,
             )
         except Exception:
             await connection.rollback()

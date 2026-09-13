@@ -56,7 +56,7 @@ class _Runtime:
         self.collaboration_proof: str | None = None
         self.context_observer = None
 
-    def stage_canonical_history(self, history: str) -> None:
+    def stage_canonical_history(self, history: str, **_kwargs: object) -> None:
         self.canonical_histories.append(history)
 
     def stage_canonical_agent_context(self, context: str) -> None:
@@ -279,7 +279,8 @@ async def test_owner_accepts_executes_and_atomically_enqueues_terminal_reply(tmp
         assert runtime.validated is True
         assert len(runtime.canonical_histories) == 1
         assert "canonical-transcript.ndjson" in runtime.canonical_histories[0]
-        assert "untrusted conversation data" in runtime.canonical_histories[0]
+        assert "[Untrusted data - JSON Lines]" in runtime.canonical_histories[0]
+        assert '"record_type":"canonical_transcript_pointer"' in runtime.canonical_histories[0]
         pool.prepare_routed_execution.assert_awaited_once_with(
             WorkshopInternalAPIExecutionContext(
                 accepted.run.requested_by_principal_id,
