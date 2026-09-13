@@ -93,9 +93,9 @@ from kai.workshop.client_sessions import (
 )
 from kai.workshop.client_shell import register_workshop_shell_routes
 from kai.workshop.collaboration_authority import (
+    CollaborationAttemptBindingError,
     CollaborationBaseIdentity,
     CollaborationDenied,
-    CollaborationProofError,
 )
 from kai.workshop.collaboration_context import (
     CollaborationContextValidationError,
@@ -1233,6 +1233,9 @@ async def _handle_agent_delegation(
     principal: InternalAPIPrincipal,
 ) -> web.Response:
     """Run one explicit delegation from the credential's active attempt."""
+    rejected_authority = _reject_client_collaboration_authority(request)
+    if rejected_authority is not None:
+        return rejected_authority
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -1258,10 +1261,8 @@ async def _handle_agent_delegation(
     if missing:
         return web.json_response({"error": f"Missing required field: {missing[0]}"}, status=400)
     try:
-        proof = request.headers.get("X-Kai-Collaboration-Proof", "")
         result = await request.app[CORE_HOST_KEY].services.agent_delegation.delegate(
             _collaboration_base_identity(principal),
-            proof=proof,
             target_handle=payload["target_handle"],
             task=payload["task"],
             context=payload.get("context"),
@@ -1272,7 +1273,7 @@ async def _handle_agent_delegation(
             403
             if exc.code
             in {
-                "invalid_proof",
+                "attempt_not_bound",
                 "base_identity_mismatch",
                 "operation_not_granted",
                 "grant_revoked",
@@ -1318,6 +1319,9 @@ async def _handle_collaboration_context(
     principal: InternalAPIPrincipal,
 ) -> web.Response:
     """Read only the current attempt's bounded canonical conversation context."""
+    rejected_authority = _reject_client_collaboration_authority(request)
+    if rejected_authority is not None:
+        return rejected_authority
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -1335,13 +1339,12 @@ async def _handle_collaboration_context(
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_context.read(
             _collaboration_base_identity(principal),
-            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
             cursor=payload.get("cursor"),
             limit=payload.get("limit", 20),
             idempotency_key=payload["idempotency_key"],
         )
-    except CollaborationProofError as exc:
-        return web.json_response({"error": str(exc), "code": "invalid_proof"}, status=403)
+    except CollaborationAttemptBindingError as exc:
+        return web.json_response({"error": str(exc), "code": "attempt_not_bound"}, status=403)
     except CollaborationDenied as exc:
         return web.json_response({"error": str(exc), "code": exc.code}, status=403)
     except TimelineCursorError as exc:
@@ -1370,6 +1373,9 @@ async def _handle_collaboration_reaction(
     principal: InternalAPIPrincipal,
 ) -> web.Response:
     """Set one agent reaction under the current attempt's exact authority."""
+    rejected_authority = _reject_client_collaboration_authority(request)
+    if rejected_authority is not None:
+        return rejected_authority
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -1380,14 +1386,13 @@ async def _handle_collaboration_reaction(
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_reactions.react(
             _collaboration_base_identity(principal),
-            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
             message_id=payload["message_id"],
             reaction=payload["reaction"],
             active=payload["active"],
             idempotency_key=payload["idempotency_key"],
         )
-    except CollaborationProofError as exc:
-        return web.json_response({"error": str(exc), "code": "invalid_proof"}, status=403)
+    except CollaborationAttemptBindingError as exc:
+        return web.json_response({"error": str(exc), "code": "attempt_not_bound"}, status=403)
     except CollaborationDenied as exc:
         return web.json_response({"error": str(exc), "code": exc.code}, status=403)
     except CollaborationReactionDenied as exc:
@@ -1424,6 +1429,19 @@ def _collaboration_base_identity(principal: InternalAPIPrincipal) -> Collaborati
     )
 
 
+def _reject_client_collaboration_authority(request: web.Request) -> web.Response | None:
+    """Reject the retired bearer surface instead of silently accepting it."""
+    if "X-Kai-Collaboration-Proof" not in request.headers:
+        return None
+    return web.json_response(
+        {
+            "error": "Client-supplied collaboration authority is not accepted",
+            "code": "client_authority_rejected",
+        },
+        status=403,
+    )
+
+
 def _bound_principal_id(principal: InternalAPIPrincipal) -> PrincipalId:
     """Return the human identity carried only by principal-bound credentials."""
     if principal.principal_id is None:
@@ -1432,8 +1450,8 @@ def _bound_principal_id(principal: InternalAPIPrincipal) -> PrincipalId:
 
 
 def _collaboration_publication_error(exc: Exception) -> web.Response:
-    if isinstance(exc, CollaborationProofError):
-        return web.json_response({"error": str(exc), "code": "invalid_proof"}, status=403)
+    if isinstance(exc, CollaborationAttemptBindingError):
+        return web.json_response({"error": str(exc), "code": "attempt_not_bound"}, status=403)
     if isinstance(exc, (CollaborationDenied, CollaborationPublicationDenied)):
         return web.json_response({"error": str(exc), "code": exc.code}, status=403)
     if isinstance(exc, CollaborationPublicationValidationError):
@@ -1451,7 +1469,10 @@ async def _handle_collaboration_message(
     request: web.Request,
     principal: InternalAPIPrincipal,
 ) -> web.Response:
-    """Publish one proof-bound progress update or current-thread reply."""
+    """Publish one server-authorized progress update or current-thread reply."""
+    rejected_authority = _reject_client_collaboration_authority(request)
+    if rejected_authority is not None:
+        return rejected_authority
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -1462,13 +1483,12 @@ async def _handle_collaboration_message(
     try:
         result = await request.app[CORE_HOST_KEY].services.collaboration_publications.publish_message(
             _collaboration_base_identity(principal),
-            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
             kind=payload["kind"],
             body=payload["body"],
             idempotency_key=payload["idempotency_key"],
         )
     except (
-        CollaborationProofError,
+        CollaborationAttemptBindingError,
         CollaborationDenied,
         CollaborationPublicationDenied,
         CollaborationPublicationValidationError,
@@ -1493,7 +1513,10 @@ async def _handle_collaboration_artifact(
     request: web.Request,
     principal: InternalAPIPrincipal,
 ) -> web.Response:
-    """Publish one proof-bound file into the exact current context."""
+    """Publish one server-authorized file into the exact current context."""
+    rejected_authority = _reject_client_collaboration_authority(request)
+    if rejected_authority is not None:
+        return rejected_authority
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -1525,13 +1548,12 @@ async def _handle_collaboration_artifact(
     try:
         result = await core_host.services.collaboration_publications.publish_artifact(
             _collaboration_base_identity(principal),
-            proof=request.headers.get("X-Kai-Collaboration-Proof", ""),
             path=path,
             caption=payload["caption"],
             idempotency_key=payload["idempotency_key"],
         )
     except (
-        CollaborationProofError,
+        CollaborationAttemptBindingError,
         CollaborationDenied,
         CollaborationPublicationDenied,
         CollaborationPublicationValidationError,

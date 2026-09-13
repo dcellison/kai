@@ -81,10 +81,10 @@ class PreparedWorkshopExecution:
         self._runtime.stage_context_assembly_observer(observer)
 
     def stage_collaboration_invocation(self, invocation: CollaborationInvocation) -> None:
-        self._runtime.stage_collaboration_invocation(invocation.render_context(), invocation.token)
+        self._runtime.stage_collaboration_invocation(invocation.render_context())
 
     def discard_collaboration_invocation(self, invocation: CollaborationInvocation) -> None:
-        self._runtime.discard_collaboration_invocation(invocation.token)
+        self._runtime.discard_collaboration_invocation()
 
     def validate_current(self) -> None:
         """Verify the exact runtime immediately before the started boundary."""

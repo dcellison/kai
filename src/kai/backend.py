@@ -15,7 +15,6 @@ prompt assembly that is identical across all backends.
 """
 
 import hashlib
-import hmac
 import logging
 import os
 import shutil
@@ -671,19 +670,15 @@ class AgentBackend(ABC):
         if hasattr(self, "_context_assembly_observer"):
             del self._context_assembly_observer
 
-    def stage_collaboration_invocation(self, context: str, proof: str) -> None:
+    def stage_collaboration_invocation(self, context: str) -> None:
         """Stage exact-attempt collaboration authority for one protected turn.
 
-        The proof is deliberately separate from the persistent subprocess
-        environment.  It is injected only into the turn that owns it and is
-        retained solely as a trace-redaction value until dispatch finishes.
+        Authorization remains attached to the active attempt in the server;
+        only non-secret operation guidance is delivered to the model.
         """
         if not isinstance(context, str) or not context:
             raise ValueError("collaboration context must be non-empty text")
-        if not isinstance(proof, str) or len(proof) < 32:
-            raise ValueError("collaboration proof must contain at least 32 characters")
         self._canonical_collaboration_context = context
-        self._collaboration_trace_secret = proof
 
     def consume_collaboration_context(self) -> str:
         """Consume the staged authority instructions without dropping redaction."""
@@ -692,17 +687,14 @@ class AgentBackend(ABC):
             del self._canonical_collaboration_context
         return context
 
-    def discard_collaboration_invocation(self, proof: str) -> None:
-        """Clear one turn's unconsumed context and transient redaction value."""
+    def discard_collaboration_invocation(self) -> None:
+        """Clear one turn's unconsumed collaboration context."""
         if hasattr(self, "_canonical_collaboration_context"):
             del self._canonical_collaboration_context
-        if hmac.compare_digest(getattr(self, "_collaboration_trace_secret", ""), proof):
-            del self._collaboration_trace_secret
 
     def active_trace_secrets(self, secrets: tuple[str, ...]) -> tuple[str, ...]:
-        """Include the current attempt proof in backend trace scrubbing."""
-        proof = getattr(self, "_collaboration_trace_secret", "")
-        return secrets + ((proof,) if proof else ())
+        """Return the backend's configured trace-scrubbing secrets."""
+        return secrets
 
     @abstractmethod
     async def send(
@@ -1155,8 +1147,8 @@ def build_session_context(
 
     # The persistent credential establishes only the backend's server-owned
     # base identity. Explicit identity selectors are rejected at the HTTP
-    # boundary, and collaboration additionally requires a proof injected into
-    # the exact active turn.
+    # boundary, and collaboration is attached server-side only while the exact
+    # attempt is active.
     if api.webhook_secret:
         parts.append(
             "[Internal API identity: $KAI_WEBHOOK_SECRET binds your persistent "
@@ -1168,10 +1160,9 @@ def build_session_context(
             "[Agent delegation API: In a shared channel, you may explicitly request "
             "work from another attached agent only when your immutable definition "
             "declares the agent_delegation capability. POST JSON to "
-            f"http://localhost:{api.webhook_port}/api/agent-delegations with headers "
-            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and the exact-attempt "
-            "'X-Kai-Collaboration-Proof' injected separately for the current turn. "
-            "If no proof is present, delegation is unavailable. Required fields are "
+            f"http://localhost:{api.webhook_port}/api/agent-delegations with header "
+            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET'. The server authorizes the "
+            "request only while this exact attempt is active. Required fields are "
             "target_handle, task, and idempotency_key. Optional context accepts only "
             "summary and canonical same-channel message_ids. The request waits for a "
             "bounded terminal response. Never include credentials, secrets, private "
@@ -1181,9 +1172,8 @@ def build_session_context(
         parts.append(
             "[Workshop collaboration context API: When your immutable definition and "
             "owner policy grant context_read for this exact attempt, POST JSON to "
-            f"http://localhost:{api.webhook_port}/api/collaboration/context with headers "
-            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and the separately injected "
-            "'X-Kai-Collaboration-Proof'. Required field: idempotency_key. Optional "
+            f"http://localhost:{api.webhook_port}/api/collaboration/context with header "
+            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET'. Required field: idempotency_key. Optional "
             "fields: limit (1-20) and the opaque next_cursor returned by a prior page. "
             "Never send a channel, thread, run, agent, principal, or other identity "
             "selector. The server derives the exact channel or thread and immutable "
@@ -1193,9 +1183,8 @@ def build_session_context(
         parts.append(
             "[Workshop collaboration reaction API: When your immutable definition and "
             "owner policy grant reaction for this exact attempt, POST JSON to "
-            f"http://localhost:{api.webhook_port}/api/collaboration/reactions with headers "
-            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and the separately injected "
-            "'X-Kai-Collaboration-Proof'. Required fields: message_id, reaction, active, "
+            f"http://localhost:{api.webhook_port}/api/collaboration/reactions with header "
+            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET'. Required fields: message_id, reaction, active, "
             "and idempotency_key. Use only canonical reaction names documented by the API. "
             "Never send a channel, thread, run, agent, principal, or other identity selector. "
             "A reaction is participation metadata only: it never wakes or delegates to an agent.]"
@@ -1203,9 +1192,8 @@ def build_session_context(
         parts.append(
             "[Workshop collaboration publication APIs: When your immutable definition and owner "
             "policy grant progress_publish or thread_reply for this exact attempt, POST JSON to "
-            f"http://localhost:{api.webhook_port}/api/collaboration/messages with headers "
-            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET' and the separately injected "
-            "'X-Kai-Collaboration-Proof'. Required fields: kind ('progress' or 'thread_reply'), "
+            f"http://localhost:{api.webhook_port}/api/collaboration/messages with header "
+            "'X-Webhook-Secret: $KAI_WEBHOOK_SECRET'. Required fields: kind ('progress' or 'thread_reply'), "
             "body, and idempotency_key. When artifact_publish is granted, POST JSON to "
             f"http://localhost:{api.webhook_port}/api/collaboration/artifacts with those headers "
             "and required fields path, caption, and idempotency_key. The server derives the exact "

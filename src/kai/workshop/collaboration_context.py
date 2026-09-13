@@ -56,7 +56,6 @@ class CollaborationContextResult:
 class _ExecutionService(Protocol):
     async def authorize_collaboration(
         self,
-        proof: str,
         operation: CollaborationOperation,
         *,
         base_identity: CollaborationBaseIdentity,
@@ -181,7 +180,6 @@ class WorkshopCollaborationContextService:
         self,
         base_identity: CollaborationBaseIdentity,
         *,
-        proof: str,
         cursor: object,
         limit: object,
         idempotency_key: object,
@@ -193,7 +191,6 @@ class WorkshopCollaborationContextService:
         now = self._clock()
         async with asyncio.timeout(_READ_TIMEOUT_SECONDS):
             authorization = await self._execution.authorize_collaboration(
-                proof,
                 CollaborationOperation.CONTEXT_READ,
                 base_identity=base_identity,
                 idempotency_key=normalized_key,
@@ -251,7 +248,6 @@ class WorkshopCollaborationContextService:
             # the bounded database read. An idempotent replay remains subject to
             # the current live-attempt check in the authority layer.
             await self._execution.authorize_collaboration(
-                proof,
                 CollaborationOperation.CONTEXT_READ,
                 base_identity=base_identity,
                 idempotency_key=normalized_key,

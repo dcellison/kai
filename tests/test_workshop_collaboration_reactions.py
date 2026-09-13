@@ -1,4 +1,4 @@
-"""Contracts for proof-bound agent-authored Workshop reactions."""
+"""Contracts for server-bound agent-authored Workshop reactions."""
 
 from __future__ import annotations
 
@@ -21,11 +21,7 @@ from kai.workshop.collaboration_reactions import (
 from kai.workshop.domain import WorkshopEventType
 from kai.workshop.inbound import InboundMessage, record_inbound_message
 from kai.workshop.message_reactions import load_message_reactors
-from tests.test_workshop_collaboration_authority import (
-    _NOW,
-    _base_identity,
-    _running_attempt,
-)
+from tests.test_workshop_collaboration_authority import _NOW, _running_attempt
 
 
 class _Execution:
@@ -56,7 +52,6 @@ async def _reaction_context(path: Path, *, quota: int = 64):
             version=1,
             allowed_operations=frozenset({CollaborationOperation.REACTION}),
         ),
-        token_factory=lambda: "reaction-proof-0000000000000000000000000001",
     )
     grant, invocation = await authority.issue(
         started.claim,
@@ -80,11 +75,10 @@ async def test_agent_reaction_is_attributed_idempotent_removable_and_rebuild_saf
 ) -> None:
     store, started, grant, invocation, service = await _reaction_context(tmp_path / "kai.db")
     target = started.run.inbound_message_id
-    identity = _base_identity(started)
+    identity = invocation.base_identity
     try:
         added = await service.react(
             identity,
-            proof=invocation.token,
             message_id=target,
             reaction="eyes",
             active=True,
@@ -125,7 +119,6 @@ async def test_agent_reaction_is_attributed_idempotent_removable_and_rebuild_saf
 
         replay = await service.react(
             identity,
-            proof=invocation.token,
             message_id=target,
             reaction="eyes",
             active=True,
@@ -135,7 +128,6 @@ async def test_agent_reaction_is_attributed_idempotent_removable_and_rebuild_saf
 
         unchanged = await service.react(
             identity,
-            proof=invocation.token,
             message_id=target,
             reaction="eyes",
             active=True,
@@ -146,7 +138,6 @@ async def test_agent_reaction_is_attributed_idempotent_removable_and_rebuild_saf
 
         removed = await service.react(
             identity,
-            proof=invocation.token,
             message_id=target,
             reaction="eyes",
             active=False,
@@ -179,7 +170,7 @@ async def test_agent_reaction_denies_messages_newer_than_attempt_snapshot_and_re
     tmp_path: Path,
 ) -> None:
     store, started, grant, invocation, service = await _reaction_context(tmp_path / "kai.db")
-    identity = _base_identity(started)
+    identity = invocation.base_identity
     try:
         future = await record_inbound_message(
             store,
@@ -196,7 +187,6 @@ async def test_agent_reaction_denies_messages_newer_than_attempt_snapshot_and_re
         with pytest.raises(CollaborationReactionDenied) as denied:
             await service.react(
                 identity,
-                proof=invocation.token,
                 message_id=future.event.envelope.aggregate_id,
                 reaction="question",
                 active=True,
@@ -229,7 +219,6 @@ async def test_agent_reaction_denies_messages_newer_than_attempt_snapshot_and_re
         with pytest.raises(CollaborationReactionDenied) as replayed_denial:
             await service.react(
                 identity,
-                proof=invocation.token,
                 message_id=future.event.envelope.aggregate_id,
                 reaction="question",
                 active=True,
@@ -251,11 +240,10 @@ async def test_agent_reaction_quota_is_enforced_before_a_second_mutation(tmp_pat
         quota=1,
     )
     target = started.run.inbound_message_id
-    identity = _base_identity(started)
+    identity = invocation.base_identity
     try:
         await service.react(
             identity,
-            proof=invocation.token,
             message_id=target,
             reaction="check",
             active=True,
@@ -264,7 +252,6 @@ async def test_agent_reaction_quota_is_enforced_before_a_second_mutation(tmp_pat
         with pytest.raises(CollaborationDenied) as denied:
             await service.react(
                 identity,
-                proof=invocation.token,
                 message_id=target,
                 reaction="check",
                 active=False,

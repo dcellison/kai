@@ -1,4 +1,4 @@
-"""Contracts for proof-bound agent-authored Workshop publications."""
+"""Contracts for server-bound agent-authored Workshop publications."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from kai.workshop.run_execution_authority import RunExecutionSelection, Workshop
 from kai.workshop.runtime_profiles import ProtectedRuntimeProfile, WorkshopRuntimeProfileRegistry
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
-from tests.test_workshop_collaboration_authority import _NOW, _base_identity
+from tests.test_workshop_collaboration_authority import _NOW
 from tests.test_workshop_wake_policy import (
     _accepted_message_id,
     _message,
@@ -149,7 +149,6 @@ async def _publication_context(path: Path):
             version=1,
             allowed_operations=operations,
         ),
-        token_factory=lambda: "publication-proof-00000000000000000000000001",
     )
     grant, invocation = await authority.issue(
         started.claim,
@@ -191,21 +190,19 @@ async def _publication_context(path: Path):
 
 
 async def test_progress_and_artifact_are_attributed_idempotent_and_rebuild_safe(tmp_path: Path) -> None:
-    store, started, grant, invocation, service = await _publication_context(tmp_path)
-    identity = _base_identity(started)
+    store, _started, grant, invocation, service = await _publication_context(tmp_path)
+    identity = invocation.base_identity
     source = tmp_path / "qualification.txt"
     source.write_text("bounded artifact\n")
     try:
         progress = await service.publish_message(
             identity,
-            proof=invocation.token,
             kind="progress",
             body="Bounded progress",
             idempotency_key="progress-1",
         )
         replay = await service.publish_message(
             identity,
-            proof=invocation.token,
             kind="progress",
             body="Bounded progress",
             idempotency_key="progress-1",
@@ -214,7 +211,6 @@ async def test_progress_and_artifact_are_attributed_idempotent_and_rebuild_safe(
 
         artifact = await service.publish_artifact(
             identity,
-            proof=invocation.token,
             path=source,
             caption="Qualification artifact",
             idempotency_key="artifact-1",
@@ -222,7 +218,6 @@ async def test_progress_and_artifact_are_attributed_idempotent_and_rebuild_safe(
         assert artifact.artifact_id is not None
         artifact_replay = await service.publish_artifact(
             identity,
-            proof=invocation.token,
             path=source,
             caption="Qualification artifact",
             idempotency_key="artifact-1",
@@ -277,8 +272,8 @@ async def test_progress_and_artifact_are_attributed_idempotent_and_rebuild_safe(
 
 
 async def test_detached_attempt_fails_closed_after_authorization_and_records_no_message(tmp_path: Path) -> None:
-    store, started, grant, invocation, service = await _publication_context(tmp_path)
-    identity = _base_identity(started)
+    store, _started, grant, invocation, service = await _publication_context(tmp_path)
+    identity = invocation.base_identity
     try:
         await store.connection.execute(
             "UPDATE channel_agents SET detached_at = ? WHERE channel_id = ? AND agent_id = ?",
@@ -288,7 +283,6 @@ async def test_detached_attempt_fails_closed_after_authorization_and_records_no_
         with pytest.raises(CollaborationDenied) as denied:
             await service.publish_message(
                 identity,
-                proof=invocation.token,
                 kind="progress",
                 body="Must not appear",
                 idempotency_key="detached-progress",
@@ -389,7 +383,6 @@ async def test_thread_reply_derives_root_notifies_human_and_never_wakes_mentione
                 quotas={CollaborationOperation.THREAD_REPLY: 2},
             ),
             owner_policy_resolver=lambda _revision: CollaborationOwnerPolicy(1, operations),
-            token_factory=lambda: "thread-publication-proof-000000000000000000001",
         )
         grant, invocation = await authority.issue(
             started.claim,
@@ -411,8 +404,7 @@ async def test_thread_reply_derives_root_notifies_human_and_never_wakes_mentione
             clock=lambda: _NOW + timedelta(seconds=5),
         )
         result = await service.publish_message(
-            _base_identity(started),
-            proof=invocation.token,
+            invocation.base_identity,
             kind="thread_reply",
             body="@Daniel bounded reply; @Nova is not activated.",
             idempotency_key="thread-reply-1",

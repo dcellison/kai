@@ -113,6 +113,7 @@ class ContextSourceState(StrEnum):
     RETAINED = "retained"
     OMITTED = "omitted"
     UNAVAILABLE = "unavailable"
+    SERVER_ATTACHED = "server_attached"
     PROVIDER_CONTROLLED = "provider_controlled"
 
 
@@ -134,6 +135,7 @@ class ContextSourceDescriptor:
     history_boundary: int | None = None
     delivery_shape: str = "metadata"
     native_instruction_sources: tuple[NativeInstructionSource, ...] = ()
+    authorization_operations: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -157,6 +159,16 @@ class ContextSourceDescriptor:
             raise ValueError("history_boundary must be a non-negative integer")
         if self.native_instruction_sources and self.kind is not ContextSourceKind.PROVIDER_NATIVE:
             raise ValueError("native instruction sources belong only to provider_native")
+        if self.authorization_operations is not None and self.kind is not ContextSourceKind.ATTEMPT_AUTHORITY:
+            raise ValueError("authorization operations belong only to attempt_authority")
+        if self.authorization_operations is not None and (
+            self.authorization_operations != tuple(sorted(set(self.authorization_operations)))
+            or any(
+                not isinstance(operation, str) or _CODE.fullmatch(operation) is None
+                for operation in self.authorization_operations
+            )
+        ):
+            raise ValueError("authorization operations must be unique sorted identifiers")
 
     def payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -176,6 +188,8 @@ class ContextSourceDescriptor:
         }
         if self.native_instruction_sources:
             payload["native_instruction_sources"] = [source.payload() for source in self.native_instruction_sources]
+        if self.authorization_operations is not None:
+            payload["authorization_operations"] = list(self.authorization_operations)
         return payload
 
     @classmethod
@@ -198,11 +212,22 @@ class ContextSourceDescriptor:
         if not isinstance(value, dict):
             raise ValueError("Context source descriptor has an invalid shape")
         keys = frozenset(value)
-        if keys not in {frozenset(expected), frozenset((*expected, "native_instruction_sources"))}:
+        extras = keys - expected
+        if not expected.issubset(keys) or extras not in {
+            frozenset(),
+            frozenset({"native_instruction_sources"}),
+            frozenset({"authorization_operations"}),
+        }:
             raise ValueError("Context source descriptor has an invalid shape")
         owner_id = value["owner_id"]
         revision = value["revision"]
         boundary = value["history_boundary"]
+        authorization_operations = value.get("authorization_operations")
+        if authorization_operations is not None and (
+            not isinstance(authorization_operations, list)
+            or any(not isinstance(item, str) for item in authorization_operations)
+        ):
+            raise ValueError("Context authorization operations have an invalid shape")
         return cls(
             kind=ContextSourceKind(str(value["kind"])),
             owner_kind=ContextOwnerKind(str(value["owner_kind"])),
@@ -219,6 +244,9 @@ class ContextSourceDescriptor:
             delivery_shape=str(value["delivery_shape"]),
             native_instruction_sources=tuple(
                 NativeInstructionSource.from_payload(item) for item in value.get("native_instruction_sources", [])
+            ),
+            authorization_operations=(
+                tuple(authorization_operations) if authorization_operations is not None else None
             ),
         )
 
@@ -375,9 +403,14 @@ def build_context_manifest_draft(
     current_input_digest: str,
     attempt_id: RunAttemptId,
     attempt_authority_revision: str | None,
+    attempt_authority_operations: tuple[str, ...],
     observation: ContextAssemblyObservation,
 ) -> ContextManifestDraft:
     """Build the fixed source vocabulary from facts observed at dispatch."""
+    if attempt_authority_operations != tuple(sorted(set(attempt_authority_operations))):
+        raise ValueError("attempt_authority_operations must be unique and sorted")
+    if attempt_authority_revision is None and attempt_authority_operations:
+        raise ValueError("attempt authority operations require an authority revision")
     dispatch_reached = observation.provider_dispatch_reached is True
     dispatch_reason = (
         "provider_dispatch_reached"
@@ -427,14 +460,14 @@ def build_context_manifest_draft(
     )
     semantic_reason = _safe_code(observation.semantic_recall_reason, fallback="no_matches")
     authority_state = (
-        ContextSourceState.NEWLY_DELIVERED
+        ContextSourceState.SERVER_ATTACHED
         if dispatch_reached and attempt_authority_revision is not None
         else ContextSourceState.UNAVAILABLE
         if not dispatch_reached and attempt_authority_revision is not None
         else ContextSourceState.OMITTED
     )
     authority_reason = (
-        "grant_delivered"
+        "server_binding_active"
         if dispatch_reached and attempt_authority_revision is not None
         else dispatch_reason
         if attempt_authority_revision is not None
@@ -645,7 +678,8 @@ def build_context_manifest_draft(
             authority_state,
             authority_reason,
             revision=attempt_authority_revision,
-            delivery_shape="proof_excluded",
+            delivery_shape="server_attached_no_bearer",
+            authorization_operations=attempt_authority_operations,
         ),
         ContextSourceDescriptor(
             ContextSourceKind.CURRENT_INPUT,

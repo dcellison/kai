@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import json
 import re
-import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -42,7 +41,6 @@ from kai.workshop.store import WorkshopEventStore
 _REVOCATION_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_PROOF_REDACTION = "[redacted collaboration proof]"
 
 
 class CollaborationOperation(StrEnum):
@@ -65,8 +63,8 @@ class CollaborationAuthorityError(RuntimeError):
     """Base error for collaboration-grant operations."""
 
 
-class CollaborationProofError(CollaborationAuthorityError):
-    """A transient invocation proof is absent, unknown, or no longer usable."""
+class CollaborationAttemptBindingError(CollaborationAuthorityError):
+    """No exact active attempt is attached to the authenticated runtime lane."""
 
 
 class CollaborationDenied(CollaborationAuthorityError):
@@ -83,12 +81,12 @@ class CollaborationGrantConflict(CollaborationAuthorityError):
 
 @dataclass(frozen=True, slots=True)
 class CollaborationBaseIdentity:
-    """Stable process identity that must agree with a transient proof."""
+    """Stable process identity used to resolve a live server binding."""
 
     # Shared group-channel processes are deliberately requester-neutral.  In
-    # that case the exact attempt proof supplies the requesting principal,
-    # while the persistent credential still has to match channel, agent, and
-    # runtime.  Direct-channel processes remain principal-bound.
+    # that case the server-held attempt binding supplies the requester, while
+    # the persistent credential still has to match channel, agent, and runtime.
+    # Direct-channel processes remain principal-bound.
     principal_id: PrincipalId | None
     channel_id: ChannelId
     agent_id: AgentId
@@ -216,7 +214,7 @@ class CollaborationGrantSnapshot:
     owner_policy_version: int
     host_policy_version: int
     quotas: Mapping[CollaborationOperation, int]
-    proof_fingerprint: str
+    authority_binding_digest: str
     issued_at: datetime
     initial_lease_expires_at: datetime
     revoked_at: datetime | None
@@ -226,31 +224,31 @@ class CollaborationGrantSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class CollaborationInvocation:
-    """Transient proof held only for one live attempt and never persisted."""
+    """Transient server binding held only for one live attempt."""
 
     grant_id: CollaborationGrantId
     attempt_id: RunAttemptId
-    token: str = field(repr=False)
-
-    def redact(self, text: str) -> str:
-        return text.replace(self.token, _PROOF_REDACTION)
+    base_identity: CollaborationBaseIdentity
+    effective_operations: frozenset[CollaborationOperation]
 
     def render_context(self) -> str:
-        """Render the proof only into its exact turn, never durable context."""
+        """Describe server-attached authority without exposing bearer material."""
+        operations = ", ".join(sorted(item.value for item in self.effective_operations)) or "none"
         return (
             "[Attempt-scoped collaboration authority: This turn alone may use "
             "the collaboration operations granted by your immutable agent revision. "
-            "Every collaboration request must include header "
-            f"'X-Kai-Collaboration-Proof: {self.token}'. "
-            "The persistent $KAI_WEBHOOK_SECRET identifies your backend process but "
-            "does not authorize collaboration. Never print, quote, persist, or pass "
-            "this proof to another agent. It expires when this exact attempt ends.]"
+            f"Effective operations: {operations}. The server has attached these "
+            "operations to the exact active attempt; send only the API's ordinary "
+            "typed arguments. Never send a collaboration proof, run ID, attempt ID, "
+            "principal ID, agent ID, runtime selector, or other authority selector. "
+            "The persistent $KAI_WEBHOOK_SECRET identifies the runtime lane but does "
+            "not grant collaboration outside this exact active attempt.]"
         )
 
 
 @dataclass(frozen=True, slots=True)
 class CollaborationAuthorization:
-    """Server-derived context returned after a proof and live-state check."""
+    """Server-derived context returned after a binding and live-state check."""
 
     grant: CollaborationGrantSnapshot
     operation: CollaborationOperation
@@ -295,7 +293,7 @@ def _decode_operations(value: object) -> frozenset[CollaborationOperation]:
 
 
 class WorkshopCollaborationAuthority:
-    """Issue durable grants and authenticate transient exact-attempt proofs."""
+    """Issue durable grants and authorize transient server-bound attempts."""
 
     def __init__(
         self,
@@ -303,13 +301,11 @@ class WorkshopCollaborationAuthority:
         *,
         host_policy: CollaborationHostPolicy | None = None,
         owner_policy_resolver: OwnerPolicyResolver | None = None,
-        token_factory: Callable[[], str] | None = None,
     ) -> None:
         self._store = store
         self._host_policy = host_policy or CollaborationHostPolicy()
         self._owner_policy_resolver = owner_policy_resolver or _default_owner_policy
-        self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
-        self._invocations_by_token: dict[str, CollaborationInvocation] = {}
+        self._invocations_by_identity: dict[CollaborationBaseIdentity, CollaborationInvocation] = {}
         self._invocations_by_attempt: dict[RunAttemptId, CollaborationInvocation] = {}
 
     async def available(self) -> bool:
@@ -353,7 +349,7 @@ class WorkshopCollaborationAuthority:
         *,
         occurred_at: datetime,
     ) -> tuple[CollaborationGrantSnapshot, CollaborationInvocation]:
-        """Snapshot effective policy for one exact started attempt and mint its proof."""
+        """Snapshot policy and attach one exact attempt to its runtime lane."""
         if not isinstance(claim, RunExecutionClaim):
             raise ValueError("claim must be a RunExecutionClaim")
         now = _timestamp(occurred_at, field_name="occurred_at")
@@ -362,8 +358,6 @@ class WorkshopCollaborationAuthority:
             return await self.snapshot(existing_invocation.grant_id), existing_invocation
 
         connection = self._store.connection
-        token = self._new_token()
-        fingerprint = hashlib.sha256(token.encode()).hexdigest()
         try:
             await connection.execute("BEGIN IMMEDIATE")
             projection = CanonicalConversationProjection()
@@ -372,10 +366,12 @@ class WorkshopCollaborationAuthority:
                 "SELECT ra.run_id, ra.owner_id, ra.fence_token, ra.status, ra.lease_expires_at, "
                 "r.workshop_id, r.requested_by_principal_id, r.agent_id, "
                 "r.agent_definition_revision_id, r.sponsor_principal_id, r.runtime_profile_id, "
-                "r.channel_id, r.status, r.cancellation_requested_at, m.thread_root_id, a.principal_id "
+                "r.channel_id, r.status, r.cancellation_requested_at, m.thread_root_id, "
+                "a.principal_id, c.kind "
                 "FROM run_attempts ra JOIN runs r ON r.id = ra.run_id "
                 "JOIN messages m ON m.id = r.inbound_message_id "
-                "JOIN agents a ON a.id = r.agent_id WHERE ra.id = ?",
+                "JOIN agents a ON a.id = r.agent_id "
+                "JOIN channels c ON c.id = r.channel_id WHERE ra.id = ?",
                 (claim.attempt_id,),
             ) as cursor:
                 row = await cursor.fetchone()
@@ -403,7 +399,7 @@ class WorkshopCollaborationAuthority:
             prior = await self._store.event_by_idempotency_key(key)
             if prior is not None:
                 await connection.rollback()
-                raise CollaborationGrantConflict("Durable collaboration grant exists without a live invocation proof")
+                raise CollaborationGrantConflict("Durable collaboration grant exists without a live server binding")
             workshop_id = WorkshopId(str(row[5]))
             requested_by = PrincipalId(str(row[6]))
             agent_id = AgentId(str(row[7]))
@@ -412,11 +408,27 @@ class WorkshopCollaborationAuthority:
             channel_id = ChannelId(str(row[11]))
             thread_root = MessageId(str(row[14])) if row[14] is not None else None
             agent_principal = PrincipalId(str(row[15]))
+            channel_kind = str(row[16])
+            if channel_kind not in {"direct", "group"}:
+                raise CollaborationGrantConflict("Collaboration channel kind is unavailable")
+            base_identity = CollaborationBaseIdentity(
+                principal_id=requested_by if channel_kind == "direct" else None,
+                channel_id=channel_id,
+                agent_id=agent_id,
+                runtime_profile_id=runtime_profile,
+            )
+            bound = self._invocations_by_identity.get(base_identity)
+            if bound is not None and bound.attempt_id != claim.attempt_id:
+                raise CollaborationGrantConflict("Runtime lane already has an active collaboration attempt")
             expiry = _parse_timestamp(row[4])
+            # The digest is an audit correlation value, never a credential.
+            binding_digest = hashlib.sha256(
+                f"server-bound:v1:{claim.attempt_id}:{claim.owner_id}:{claim.fence_token}".encode()
+            ).hexdigest()
             event = EventEnvelope.create(
                 event_id=EventId.derived(grant_id, "issued"),
                 event_type=WorkshopEventType.COLLABORATION_GRANT_ISSUED,
-                event_version=1,
+                event_version=2,
                 workshop_id=workshop_id,
                 aggregate_type="collaboration_grant",
                 aggregate_id=grant_id,
@@ -446,7 +458,7 @@ class WorkshopCollaborationAuthority:
                         operation.value: self._host_policy.quotas[operation]
                         for operation in sorted(effective, key=lambda item: item.value)
                     },
-                    "proof_fingerprint": fingerprint,
+                    "authority_binding_digest": binding_digest,
                     "initial_lease_expires_at": expiry.isoformat(),
                 },
                 metadata={"source": "workshop_collaboration_authority"},
@@ -458,31 +470,29 @@ class WorkshopCollaborationAuthority:
         except Exception:
             await connection.rollback()
             raise
-        invocation = CollaborationInvocation(grant_id, claim.attempt_id, token)
-        self._invocations_by_token[token] = invocation
+        invocation = CollaborationInvocation(grant_id, claim.attempt_id, base_identity, effective)
+        self._invocations_by_identity[base_identity] = invocation
         self._invocations_by_attempt[claim.attempt_id] = invocation
         return snapshot, invocation
 
     async def authenticate(
         self,
-        token: str,
+        base_identity: CollaborationBaseIdentity,
         operation: CollaborationOperation,
         *,
-        base_identity: CollaborationBaseIdentity | None = None,
         occurred_at: datetime,
     ) -> CollaborationAuthorization:
-        """Resolve an untrusted token through the exact live grant and attempt."""
+        """Resolve the runtime lane through its exact live server binding."""
+        if not isinstance(base_identity, CollaborationBaseIdentity):
+            raise ValueError("base_identity must be a CollaborationBaseIdentity")
         if not isinstance(operation, CollaborationOperation):
             raise ValueError("operation must be a CollaborationOperation")
-        invocation = self._match_token(token)
+        invocation = self._invocations_by_identity.get(base_identity)
         if invocation is None:
-            raise CollaborationProofError("Invalid collaboration proof")
+            raise CollaborationAttemptBindingError("No active collaboration attempt is attached to this runtime lane")
         now = _timestamp(occurred_at, field_name="occurred_at")
         grant = await self._live_grant(invocation.grant_id, occurred_at=now)
-        fingerprint = hashlib.sha256(token.encode()).hexdigest()
-        if not hmac.compare_digest(fingerprint, grant.proof_fingerprint):
-            raise CollaborationProofError("Invalid collaboration proof")
-        if base_identity is not None and (
+        if (
             (base_identity.principal_id is not None and base_identity.principal_id != grant.requested_by_principal_id)
             or base_identity.channel_id != grant.channel_id
             or base_identity.agent_id != grant.agent_id
@@ -501,7 +511,6 @@ class WorkshopCollaborationAuthority:
 
     async def authorize(
         self,
-        token: str,
         operation: CollaborationOperation,
         *,
         base_identity: CollaborationBaseIdentity,
@@ -518,14 +527,11 @@ class WorkshopCollaborationAuthority:
             raise ValueError("idempotency_key must be a bounded identifier")
         if not _SHA256_PATTERN.fullmatch(request_hash):
             raise ValueError("request_hash must be a SHA-256 fingerprint")
-        invocation = self._match_token(token)
+        invocation = self._invocations_by_identity.get(base_identity)
         if invocation is None:
-            raise CollaborationProofError("Invalid collaboration proof")
+            raise CollaborationAttemptBindingError("No active collaboration attempt is attached to this runtime lane")
         now = _timestamp(occurred_at, field_name="occurred_at")
         grant = await self._snapshot(invocation.grant_id)
-        fingerprint = hashlib.sha256(token.encode()).hexdigest()
-        if not hmac.compare_digest(fingerprint, grant.proof_fingerprint):
-            raise CollaborationProofError("Invalid collaboration proof")
 
         denial: CollaborationDenied | None = None
         try:
@@ -635,7 +641,7 @@ class WorkshopCollaborationAuthority:
         revocation_code: str,
         occurred_at: datetime,
     ) -> tuple[CollaborationGrantSnapshot, bool]:
-        """Fence one live proof first, then record durable revocation."""
+        """Fence one live server binding first, then record revocation."""
         if not isinstance(invocation, CollaborationInvocation):
             raise ValueError("invocation must be a CollaborationInvocation")
         if not _REVOCATION_CODE_PATTERN.fullmatch(revocation_code):
@@ -649,7 +655,7 @@ class WorkshopCollaborationAuthority:
         )
 
     async def reconcile_unbound(self, *, occurred_at: datetime) -> int:
-        """Durably revoke grants whose transient proof did not survive this host."""
+        """Durably revoke grants whose transient binding did not survive this host."""
         now = _timestamp(occurred_at, field_name="occurred_at")
         async with self._store.connection.execute(
             "SELECT id FROM collaboration_grants WHERE revoked_at IS NULL ORDER BY issued_event_position"
@@ -674,7 +680,7 @@ class WorkshopCollaborationAuthority:
         *,
         occurred_at: datetime,
     ) -> int:
-        """Fence every live grant for one definition, dropping proofs first."""
+        """Fence every live grant for one definition, dropping bindings first."""
         now = _timestamp(occurred_at, field_name="occurred_at")
         async with self._store.connection.execute(
             "SELECT g.id FROM collaboration_grants g JOIN agent_definition_revisions r "
@@ -744,31 +750,13 @@ class WorkshopCollaborationAuthority:
         snapshot = await self._snapshot(grant_id)
         return snapshot
 
-    def _new_token(self) -> str:
-        for _ in range(100):
-            token = self._token_factory()
-            if not isinstance(token, str) or len(token) < 32:
-                raise ValueError("collaboration token factory must return at least 32 characters")
-            if token not in self._invocations_by_token:
-                return token
-        raise RuntimeError("Could not allocate a unique collaboration proof")
-
-    def _match_token(self, token: str) -> CollaborationInvocation | None:
-        if not isinstance(token, str) or not token:
-            return None
-        matched = None
-        for expected, invocation in self._invocations_by_token.items():
-            if hmac.compare_digest(token, expected):
-                matched = invocation
-        return matched
-
     def _drop_invocation(self, invocation: CollaborationInvocation) -> None:
         current = self._invocations_by_attempt.get(invocation.attempt_id)
         if current == invocation:
             self._invocations_by_attempt.pop(invocation.attempt_id, None)
-        stored = self._invocations_by_token.get(invocation.token)
+        stored = self._invocations_by_identity.get(invocation.base_identity)
         if stored == invocation:
-            self._invocations_by_token.pop(invocation.token, None)
+            self._invocations_by_identity.pop(invocation.base_identity, None)
 
     async def _live_grant(
         self,
@@ -797,7 +785,7 @@ class WorkshopCollaborationAuthority:
         if snapshot.revoked_at is not None:
             raise CollaborationDenied("grant_revoked", "The collaboration grant was revoked")
         if row is None:
-            raise CollaborationProofError("Collaboration grant is unavailable")
+            raise CollaborationAttemptBindingError("Collaboration grant is unavailable")
         if str(row[0]) != "started" or str(row[2]) != "started" or row[3] is not None:
             raise CollaborationDenied("attempt_not_active", "The collaboration attempt is no longer active")
         if occurred_at >= _parse_timestamp(row[1]):
@@ -849,7 +837,7 @@ class WorkshopCollaborationAuthority:
             owner_policy_version=int(row[18]),
             host_policy_version=int(row[19]),
             quotas=quotas,
-            proof_fingerprint=str(row[21]),
+            authority_binding_digest=str(row[21]),
             issued_at=_parse_timestamp(row[22]),
             initial_lease_expires_at=_parse_timestamp(row[23]),
             revoked_at=_parse_timestamp(row[24]) if row[24] is not None else None,
