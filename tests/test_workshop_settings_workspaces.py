@@ -17,6 +17,7 @@ from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workshop.settings_workspaces import (
     EffectiveValue,
     WorkshopSettingsWorkspaceAccessDenied,
+    WorkshopSettingsWorkspaceBusy,
     WorkshopSettingsWorkspaceConflict,
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
@@ -46,6 +47,7 @@ class _RuntimePool:
             allowed_models=None,
             os_user=None,
             workspace_base=allowed.parent,
+            allowed_workspaces=(),
         )
         self.profile.backend_options = (
             SimpleNamespace(option_id="codex:openai", backend="codex", provider="openai"),
@@ -409,6 +411,150 @@ async def test_workspace_switch_rejects_paths_outside_runtime_grants(
     assert pool.events == []
 
 
+async def test_workspace_grant_snapshot_preserves_provenance_and_removability(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    added = tmp_path / "added"
+    profile_path = tmp_path / "profile"
+    operator_path = tmp_path / "operator"
+    for path in (added, profile_path, operator_path):
+        path.mkdir()
+    pool.workspace = added
+    pool.profile.allowed_workspaces = (profile_path,)
+    service._config.allowed_workspaces.append(operator_path)
+    monkeypatch.setattr(
+        sessions,
+        "get_canonical_workspace_grant_rows",
+        AsyncMock(
+            return_value=[
+                {
+                    "path": str(added),
+                    "provenance": "principal_added",
+                    "created_at": "2026-09-14T00:00:00Z",
+                }
+            ]
+        ),
+    )
+
+    snapshot = await service.inspect_workspace_grants(authority)
+
+    assert [(Path(item.path), item.provenance, item.removable, item.current) for item in snapshot.grants] == [
+        (added, "principal_added", True, True),
+        (profile_path, "profile", False, False),
+        (operator_path, "operator", False, False),
+    ]
+
+
+async def test_add_existing_workspace_uses_canonical_grant_service(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, _pool, authority, _, _ = _service(tmp_path)
+    target = tmp_path / "existing"
+    target.mkdir()
+    rows: list[dict[str, str]] = []
+
+    async def grant_rows(_namespace):
+        return list(rows)
+
+    async def add_grant(_namespace, path: str, *, provenance: str) -> bool:
+        assert provenance == "principal_added"
+        rows.append({"path": path, "provenance": provenance, "created_at": "now"})
+        return True
+
+    monkeypatch.setattr(sessions, "get_canonical_workspace_grant_rows", grant_rows)
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add_grant)
+
+    result = await service.add_existing_workspace(authority, str(target))
+    replay = await service.add_existing_workspace(authority, str(target))
+
+    assert result.changed is True
+    assert result.path == str(target)
+    assert replay.changed is False
+    assert result.snapshot.grants[0].provenance == "principal_added"
+
+
+async def test_add_existing_workspace_rejects_path_not_owned_by_runtime_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    target = tmp_path / "owned-by-someone-else"
+    target.mkdir()
+    pool.profile.os_user = "runtime-user"
+    monkeypatch.setattr(
+        "kai.workshop.settings_workspaces.pwd.getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=target.stat().st_uid + 1),
+    )
+    add = AsyncMock(return_value=True)
+    monkeypatch.setattr(sessions, "add_canonical_workspace_grant", add)
+
+    with pytest.raises(WorkshopSettingsWorkspaceAccessDenied, match="not accessible"):
+        await service.add_existing_workspace(authority, str(target))
+
+    add.assert_not_awaited()
+
+
+async def test_remove_existing_workspace_rejects_pinned_and_active_grants(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    pinned = tmp_path / "pinned"
+    active = tmp_path / "active"
+    pinned.mkdir()
+    active.mkdir()
+    pool.profile.allowed_workspaces = (pinned,)
+    pool.workspace = active
+    monkeypatch.setattr(
+        sessions,
+        "get_canonical_workspace_grant_rows",
+        AsyncMock(return_value=[{"path": str(active), "provenance": "principal_added", "created_at": "now"}]),
+    )
+    remove = AsyncMock(return_value=True)
+    monkeypatch.setattr(sessions, "remove_canonical_workspace_grant", remove)
+
+    with pytest.raises(WorkshopSettingsWorkspaceAccessDenied, match="Operator-pinned"):
+        await service.remove_existing_workspace(authority, str(pinned))
+    with pytest.raises(WorkshopSettingsWorkspaceBusy, match="Switch every active agent lane"):
+        await service.remove_existing_workspace(authority, str(active))
+
+    remove.assert_not_awaited()
+
+
+async def test_remove_existing_workspace_revokes_grant_and_history(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, _pool, authority, _, _ = _service(tmp_path)
+    target = tmp_path / "removable"
+    target.mkdir()
+    rows = [{"path": str(target), "provenance": "principal_added", "created_at": "now"}]
+    monkeypatch.setattr(
+        sessions,
+        "get_canonical_workspace_grant_rows",
+        AsyncMock(side_effect=lambda _namespace: list(rows)),
+    )
+    monkeypatch.setattr(sessions, "canonical_workspace_active_references", AsyncMock(return_value=0))
+    monkeypatch.setattr(sessions, "canonical_workspace_in_flight_references", AsyncMock(return_value=0))
+
+    async def remove(_namespace, _path: str) -> bool:
+        rows.clear()
+        return True
+
+    monkeypatch.setattr(sessions, "remove_canonical_workspace_grant", remove)
+    history = AsyncMock()
+    monkeypatch.setattr(sessions, "delete_canonical_workspace_history", history)
+
+    result = await service.remove_existing_workspace(authority, str(target))
+
+    assert result.changed is True
+    assert result.snapshot.grants == ()
+    history.assert_awaited_once()
+
+
 async def test_workspace_creation_uses_configured_base_and_is_idempotent(
     tmp_path: Path,
     monkeypatch,
@@ -422,7 +568,8 @@ async def test_workspace_creation_uses_configured_base_and_is_idempotent(
     async def resolve_workspace_access(_runtime):
         return pool.allowed.parent, [pool.allowed, *grants]
 
-    async def add_grant(namespace, path: str) -> bool:
+    async def add_grant(namespace, path: str, *, provenance: str) -> bool:
+        assert provenance == "principal_created"
         registered_for.append(namespace.principal_id)
         candidate = Path(path)
         if candidate in grants:

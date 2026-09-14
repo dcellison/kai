@@ -1386,8 +1386,8 @@ class UserConfig:
     workspace_base: Path | None = None
     # Per-user allowed workspaces from users.yaml. Distinct from the
     # global `Config.allowed_workspaces` (env var / workspaces.yaml)
-    # and from the per-chat DB `allowed_workspaces` table (set via
-    # `/workspace allow`): this list is admin-set in users.yaml for
+    # and from the archived per-chat DB `allowed_workspaces` table:
+    # this list is admin-set in users.yaml for
     # workspaces a specific user should access by name without having
     # to run `/workspace allow` first. Resolved at load time
     # (.expanduser().resolve()); paths that don't exist on the host

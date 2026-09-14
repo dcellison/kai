@@ -91,6 +91,12 @@ _EXECUTION_STATE_TABLES = {
     "principals",
     "workshop_execution_state_migrations",
 }
+_WORKSPACE_GRANT_AUTHORITY_TABLES = {
+    "allowed_workspaces",
+    "principal_workspace_grants",
+    "runtime_profile_owners",
+    "workshop_workspace_grant_migrations",
+}
 _PROTECTED_EXECUTION_STATE_LANES_SQL = (
     " FROM channel_agent_runtime_assignments a "
     "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
@@ -1724,6 +1730,70 @@ def workshop_execution_state_status(db_path: Path) -> str:
         f"workspace settings={workspace_settings}, history={history}, grants={grants}; "
         "protected legacy reads=disabled, rollback dual writes=disabled"
     )
+
+
+def workshop_workspace_grant_status(db_path: Path) -> str:
+    """Describe canonical principal/runtime workspace grant authority."""
+    prefix = "Workshop workspace grants:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical workspace-grant schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _WORKSPACE_GRANT_AUTHORITY_TABLES:
+                return f"{prefix} pending; canonical workspace-grant schema unavailable"
+            profiles = _scalar(connection, "SELECT COUNT(*) FROM runtime_profile_owners")
+            migrated = _scalar(connection, "SELECT COUNT(*) FROM workshop_workspace_grant_migrations")
+            missing = max(profiles - migrated, 0)
+            grants = _scalar(connection, "SELECT COUNT(*) FROM principal_workspace_grants")
+            principal_added = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_workspace_grants WHERE provenance = 'principal_added'",
+            )
+            principal_created = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_workspace_grants WHERE provenance = 'principal_created'",
+            )
+            legacy_migrated = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_workspace_grants WHERE provenance = 'legacy_migrated'",
+            )
+            invalid = _scalar(
+                connection,
+                "SELECT COALESCE(SUM(invalid_rows), 0) FROM workshop_workspace_grant_migrations",
+            )
+            orphaned = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_workspace_grants g WHERE g.runtime_profile_id IS NULL "
+                "OR g.provenance IS NULL OR NOT EXISTS (SELECT 1 FROM runtime_profile_owners o "
+                "WHERE o.runtime_profile_id = g.runtime_profile_id AND o.principal_id = g.principal_id)",
+            )
+            legacy_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM allowed_workspaces legacy "
+                "JOIN workshop_workspace_grant_migrations m ON m.legacy_runtime_key = legacy.chat_id "
+                "WHERE NOT EXISTS (SELECT 1 FROM principal_workspace_grants g "
+                "WHERE g.principal_id = m.principal_id AND g.runtime_profile_id = m.runtime_profile_id "
+                "AND g.path = legacy.path)",
+            )
+            active = missing == 0 and invalid == 0 and orphaned == 0 and legacy_gaps == 0
+            state = "active" if active else "INCOMPLETE"
+            return (
+                f"{prefix} {state}; profiles={profiles}, migrated={migrated}, missing={missing}, "
+                f"grants={grants} (added={principal_added}, created={principal_created}, "
+                f"legacy={legacy_migrated}), invalid={invalid}, orphaned={orphaned}, "
+                f"legacy gaps={legacy_gaps}; authority=canonical principal/runtime, "
+                "protected legacy writes=disabled"
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
 
 
 def workshop_memory_authority_status(db_path: Path, *, memory_enabled: bool | None) -> str:

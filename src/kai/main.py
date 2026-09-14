@@ -645,6 +645,19 @@ def _start() -> None:
             execution_migration.history,
             execution_migration.grants,
         )
+        workspace_grant_migration = await sessions.initialize_workshop_workspace_grant_authority(
+            execution_state,
+            runtime_profiles,
+        )
+        logging.info(
+            "Workshop canonical workspace grant authority ready "
+            "(profiles=%d, newly_migrated=%d, legacy_rows=%d, migrated_rows=%d, invalid_rows=%d)",
+            workspace_grant_migration.profiles,
+            workspace_grant_migration.newly_migrated,
+            workspace_grant_migration.legacy_rows,
+            workspace_grant_migration.migrated_rows,
+            workspace_grant_migration.invalid_rows,
+        )
         operational_migration = await sessions.initialize_workshop_operational_state(
             execution_state,
             config,
