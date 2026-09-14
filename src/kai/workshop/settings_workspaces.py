@@ -802,7 +802,7 @@ class WorkshopSettingsWorkspaceService:
         async with self._lock(authority):
             runtime = self._runtime_authority(authority)
             base, _allowed = await self._runtime_pool.resolve_workspace_access(runtime)
-            if base is not None and is_workspace_allowed(requested, base, ()):
+            if base is not None and is_workspace_allowed(requested, base, []):
                 raise WorkshopSettingsWorkspaceValidationError(
                     "Workspace is already covered by this runtime profile's workspace base"
                 )
