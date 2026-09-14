@@ -2503,6 +2503,17 @@ async def _handle_workspace_allow(
         await update.message.reply_text(f"Not a directory: {resolved}")
         return
 
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        service = _get_core_services(context).settings_workspaces
+        try:
+            result = await service.add_existing_workspace(authority, str(resolved))
+        except (WorkshopSettingsWorkspaceAccessDenied, WorkshopSettingsWorkspaceValidationError) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await update.message.reply_text(f"Added: {result.path}" if result.changed else "Already in your allowed list.")
+        return
+
     # Check for redundancy: already under workspace_base?
     base, allowed = await pool.resolve_workspace_access(chat_id)
     if base:
@@ -2550,6 +2561,23 @@ async def _handle_workspace_deny(
 
     resolved = Path(raw_path).resolve()
 
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        service = _get_core_services(context).settings_workspaces
+        try:
+            result = await service.remove_existing_workspace(authority, str(resolved))
+        except (
+            WorkshopSettingsWorkspaceAccessDenied,
+            WorkshopSettingsWorkspaceBusy,
+            WorkshopSettingsWorkspaceValidationError,
+        ) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await update.message.reply_text(
+            f"Removed: {result.path}" if result.changed else "Not in your allowed workspace list."
+        )
+        return
+
     # Check if this is a user-added path (in the database)
     removed = await sessions.remove_allowed_workspace(chat_id, str(resolved))
     if removed:
@@ -2580,6 +2608,37 @@ async def _handle_workspace_allowed(
     config: Config = context.bot_data["config"]
     pool = _get_pool(context)
     profile_base, static_paths, protected = pool.get_static_workspace_policy(chat_id)
+
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is not None:
+        snapshot = await _get_core_services(context).settings_workspaces.inspect_workspace_grants(authority)
+        lines = [
+            f"Workspace base: {snapshot.workspace_base}"
+            if snapshot.workspace_base is not None
+            else "Workspace base: not set"
+        ]
+        if snapshot.grants:
+            source_labels = {
+                "principal_added": "added by you",
+                "principal_created": "created by you",
+                "legacy_migrated": "migrated",
+                "profile": "profile",
+                "operator": "operator",
+            }
+            lines.extend(("", "Allowed workspaces:"))
+            for grant in snapshot.grants:
+                annotations = [source_labels[grant.provenance]]
+                if not grant.available:
+                    annotations.append("unavailable")
+                if grant.current:
+                    annotations.append("current")
+                lines.append(f"  {grant.path} ({', '.join(annotations)})")
+        elif snapshot.workspace_base is not None:
+            lines.append("\nNo additional allowed paths beyond workspace base.")
+        else:
+            lines.append("\nNo allowed workspaces configured.")
+        await update.message.reply_text("\n".join(lines))
+        return
 
     base = profile_base or config.workspace_base
 

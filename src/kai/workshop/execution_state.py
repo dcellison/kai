@@ -407,9 +407,11 @@ async def _backfill_namespace(
     )
     counts["history"] += cursor.rowcount
     cursor = await connection.execute(
-        "INSERT OR IGNORE INTO principal_workspace_grants (principal_id, path) "
-        "SELECT ?, path FROM allowed_workspaces WHERE chat_id = ?",
-        (namespace.principal_id, legacy_runtime_key),
+        "INSERT OR IGNORE INTO principal_workspace_grants "
+        "(principal_id, path, runtime_profile_id, provenance) "
+        "SELECT ?, path, ?, 'legacy_migrated' FROM allowed_workspaces "
+        "WHERE chat_id = ? AND path LIKE '/%' AND trim(path) = path",
+        (namespace.principal_id, namespace.runtime_profile_id, legacy_runtime_key),
     )
     counts["grants"] += cursor.rowcount
     return counts

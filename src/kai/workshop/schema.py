@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 79
+WORKSHOP_SCHEMA_VERSION = 80
 
 
 @dataclass(frozen=True, slots=True)
@@ -3526,6 +3526,47 @@ _CANONICAL_CONVERSATION_OBSERVATION_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_CANONICAL_WORKSPACE_GRANT_AUTHORITY_SCHEMA = SchemaMigration(
+    version=80,
+    name="canonical_workspace_grant_authority",
+    statements=(
+        "ALTER TABLE principal_workspace_grants RENAME TO principal_workspace_grants_v21",
+        """
+        CREATE TABLE principal_workspace_grants (
+            principal_id TEXT NOT NULL,
+            runtime_profile_id TEXT,
+            path TEXT NOT NULL CHECK (length(trim(path)) > 0),
+            provenance TEXT CHECK (
+                provenance IS NULL OR provenance IN (
+                    'principal_added', 'principal_created', 'legacy_migrated'
+                )
+            ),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            UNIQUE (principal_id, runtime_profile_id, path)
+        )
+        """,
+        "INSERT INTO principal_workspace_grants (principal_id, path, created_at) "
+        "SELECT principal_id, path, created_at FROM principal_workspace_grants_v21",
+        "DROP TABLE principal_workspace_grants_v21",
+        "CREATE INDEX principal_workspace_grants_owner_idx "
+        "ON principal_workspace_grants (principal_id, runtime_profile_id, created_at)",
+        """
+        CREATE TABLE workshop_workspace_grant_migrations (
+            runtime_profile_id TEXT PRIMARY KEY CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            legacy_runtime_key INTEGER NOT NULL UNIQUE CHECK (legacy_runtime_key > 0),
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            legacy_rows INTEGER NOT NULL CHECK (legacy_rows >= 0),
+            migrated_rows INTEGER NOT NULL CHECK (migrated_rows >= 0),
+            invalid_rows INTEGER NOT NULL CHECK (invalid_rows >= 0),
+            migrated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3606,6 +3647,7 @@ _MIGRATIONS = (
     _CANONICAL_CONTEXT_MANIFEST_SCHEMA,
     _RETAINED_CONTEXT_REVISION_SCHEMA,
     _CANONICAL_CONVERSATION_OBSERVATION_SCHEMA,
+    _CANONICAL_WORKSPACE_GRANT_AUTHORITY_SCHEMA,
 )
 
 

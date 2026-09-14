@@ -23,9 +23,9 @@ into four tables:
 5. **workspace_history** - Recently used workspace paths for the /workspaces
    inline keyboard. Sorted by last_used_at for recency ordering.
 
-6. **allowed_workspaces** - Per-user allowed workspace paths, managed via
-   /workspace allow and /workspace deny. Unioned with global ALLOWED_WORKSPACES
-   env var for the effective access list.
+6. **allowed_workspaces** - Compatibility archive for pre-cutover, chat-keyed
+   workspace grants. Protected adapters read and write principal/runtime-owned
+   ``principal_workspace_grants`` instead.
 
 Most functions use a module-level aiosqlite connection initialized by init_db()
 at startup. Explicitly database-scoped readers are provided for core runtime
@@ -99,6 +99,11 @@ from kai.workshop.outbound import (
     record_outbound_message,
     record_outbound_message_with_streaming_finalization,
 )
+from kai.workshop.runtime_key_cutover import (
+    WorkshopRuntimeKeyCutover,
+    reconcile_workshop_runtime_key_cutover,
+)
+from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.schema import migrate_workshop_schema
 from kai.workshop.storage_namespaces import (
     WorkshopChannelHistoryRegistry,
@@ -111,14 +116,13 @@ from kai.workshop.streaming_preview import (
     bind_confirmed_telegram_streaming_preview,
 )
 from kai.workshop.transport_linking import WorkshopTransportLinker
+from kai.workshop.workspace_grants import (
+    WorkshopWorkspaceGrantMigration,
+    reconcile_workspace_grant_authority,
+)
 
 if TYPE_CHECKING:
     from kai.config import Config, WorkspaceConfig
-from kai.workshop.runtime_key_cutover import (
-    WorkshopRuntimeKeyCutover,
-    reconcile_workshop_runtime_key_cutover,
-)
-from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 
 log = logging.getLogger(__name__)
 
@@ -529,6 +533,21 @@ async def initialize_workshop_execution_state(
         migration = await reconcile_legacy_execution_state(_get_db(), registry)
         _workshop_execution_state = registry
         return registry, migration
+
+
+async def initialize_workshop_workspace_grant_authority(
+    registry: WorkshopExecutionStateRegistry,
+    runtime_profiles: WorkshopRuntimeProfileRegistry,
+) -> WorkshopWorkspaceGrantMigration:
+    """Backfill and verify canonical principal/runtime workspace grants."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        return await reconcile_workspace_grant_authority(
+            _get_db(),
+            registry,
+            runtime_profiles,
+        )
 
 
 async def initialize_workshop_memory_authority(
@@ -2276,10 +2295,15 @@ async def get_allowed_workspaces(chat_id: int) -> list[Path]:
 async def add_canonical_workspace_grant(
     namespace: WorkshopExecutionStateNamespace,
     path: str,
+    *,
+    provenance: str = "principal_added",
 ) -> bool:
+    if provenance not in {"principal_added", "principal_created", "legacy_migrated"}:
+        raise ValueError("Invalid workspace grant provenance")
     cursor = await _get_db().execute(
-        "INSERT OR IGNORE INTO principal_workspace_grants (principal_id, path) VALUES (?, ?)",
-        (namespace.principal_id, path),
+        "INSERT OR IGNORE INTO principal_workspace_grants "
+        "(principal_id, path, runtime_profile_id, provenance) VALUES (?, ?, ?, ?)",
+        (namespace.principal_id, path, namespace.runtime_profile_id, provenance),
     )
     await _get_db().commit()
     return cursor.rowcount > 0
@@ -2290,8 +2314,8 @@ async def remove_canonical_workspace_grant(
     path: str,
 ) -> bool:
     cursor = await _get_db().execute(
-        "DELETE FROM principal_workspace_grants WHERE principal_id = ? AND path = ?",
-        (namespace.principal_id, path),
+        "DELETE FROM principal_workspace_grants WHERE principal_id = ? AND runtime_profile_id = ? AND path = ?",
+        (namespace.principal_id, namespace.runtime_profile_id, path),
     )
     await _get_db().commit()
     return cursor.rowcount > 0
@@ -2301,10 +2325,39 @@ async def get_canonical_workspace_grants(
     namespace: WorkshopExecutionStateNamespace,
 ) -> list[Path]:
     cursor = await _get_db().execute(
-        "SELECT path FROM principal_workspace_grants WHERE principal_id = ? ORDER BY created_at, rowid",
-        (namespace.principal_id,),
+        "SELECT path FROM principal_workspace_grants "
+        "WHERE principal_id = ? AND runtime_profile_id = ? ORDER BY created_at, rowid",
+        (namespace.principal_id, namespace.runtime_profile_id),
     )
     return [Path(row[0]) for row in await cursor.fetchall()]
+
+
+async def get_canonical_workspace_grant_rows(
+    namespace: WorkshopExecutionStateNamespace,
+) -> list[dict[str, str]]:
+    """Return mutable grants for one canonical principal/runtime owner."""
+    async with _get_db().execute(
+        "SELECT path, provenance, created_at FROM principal_workspace_grants "
+        "WHERE principal_id = ? AND runtime_profile_id = ? ORDER BY created_at, rowid",
+        (namespace.principal_id, namespace.runtime_profile_id),
+    ) as cursor:
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def canonical_workspace_active_references(
+    namespace: WorkshopExecutionStateNamespace,
+    path: str,
+) -> int:
+    """Count owned lanes whose selected workspace still requires one grant."""
+    async with _get_db().execute(
+        "SELECT COUNT(*) AS count FROM channel_agent_execution_settings s "
+        "JOIN runtime_profile_owners o ON o.runtime_profile_id = s.runtime_profile_id "
+        "WHERE o.principal_id = ? AND s.runtime_profile_id = ? "
+        "AND s.field = 'workspace' AND s.value = ?",
+        (namespace.principal_id, namespace.runtime_profile_id, path),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return int(row["count"]) if row is not None else 0
 
 
 async def resolve_workspace_access(
@@ -2320,8 +2373,7 @@ async def resolve_workspace_access(
 
     Returns (workspace_base, allowed_workspaces) with the selected static
     policy applied. The allowed list is the union of:
-      1. The per-chat DB `allowed_workspaces` table (set via
-         `/workspace allow` from Telegram).
+      1. The compatibility per-chat DB `allowed_workspaces` table.
       2. The selected per-runtime static `allowed_workspaces` baseline.
       3. The global `Config.allowed_workspaces` (env var
          ALLOWED_WORKSPACES + workspaces.yaml entries).
@@ -2332,7 +2384,7 @@ async def resolve_workspace_access(
         2. Global WORKSPACE_BASE env var
 
     Precedence for allowed_workspaces:
-        DB > per-runtime static > global. DB first so user-added
+        Compatibility DB > per-runtime static > global. DB first so user-added
         workspaces appear at the top of the /workspaces keyboard
         and /workspace allowed list; the runtime tier precedes global
         because the runtime-specific tier is more relevant to the

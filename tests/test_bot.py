@@ -2564,6 +2564,22 @@ class TestHandleWorkspaceCallback:
 
 class TestHandleWorkspaceAllow:
     @pytest.mark.asyncio
+    async def test_protected_allow_uses_canonical_service_not_adapter_state(self, tmp_path):
+        ws = tmp_path / "new-ws"
+        ws.mkdir()
+        update = _make_update()
+        ctx = _make_context(args=["allow", str(ws)])
+        service = MagicMock()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service.authority_for_principal_profile.return_value = authority
+        service.add_existing_workspace = AsyncMock(return_value=SimpleNamespace(changed=True, path=str(ws.resolve())))
+        ctx.application.core_services.settings_workspaces = service
+        with patch("kai.bot.sessions.add_allowed_workspace", new_callable=AsyncMock) as legacy_add:
+            await _handle_workspace_allow(update, ctx, f"allow {ws}")
+        service.add_existing_workspace.assert_awaited_once_with(authority, str(ws.resolve()))
+        legacy_add.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_allow_success(self, tmp_path):
         """Adding a valid directory path succeeds."""
         ws = tmp_path / "new-ws"
@@ -2634,6 +2650,24 @@ class TestHandleWorkspaceAllow:
 
 class TestHandleWorkspaceDeny:
     @pytest.mark.asyncio
+    async def test_protected_deny_uses_canonical_service_not_adapter_state(self, tmp_path):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        update = _make_update()
+        ctx = _make_context(args=["deny", str(ws)])
+        service = MagicMock()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service.authority_for_principal_profile.return_value = authority
+        service.remove_existing_workspace = AsyncMock(
+            return_value=SimpleNamespace(changed=True, path=str(ws.resolve()))
+        )
+        ctx.application.core_services.settings_workspaces = service
+        with patch("kai.bot.sessions.remove_allowed_workspace", new_callable=AsyncMock) as legacy_remove:
+            await _handle_workspace_deny(update, ctx, f"deny {ws}")
+        service.remove_existing_workspace.assert_awaited_once_with(authority, str(ws.resolve()))
+        legacy_remove.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_deny_success(self, tmp_path):
         """Removing a user-added path succeeds."""
         ws = tmp_path / "ws"
@@ -2700,6 +2734,41 @@ class TestHandleWorkspaceDeny:
 
 
 class TestHandleWorkspaceAllowed:
+    @pytest.mark.asyncio
+    async def test_protected_listing_uses_canonical_provenance(self):
+        update = _make_update()
+        ctx = _make_context()
+        service = MagicMock()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service.authority_for_principal_profile.return_value = authority
+        service.inspect_workspace_grants = AsyncMock(
+            return_value=SimpleNamespace(
+                workspace_base="/srv/work",
+                grants=(
+                    SimpleNamespace(
+                        path="/srv/existing",
+                        provenance="principal_added",
+                        available=True,
+                        current=False,
+                    ),
+                    SimpleNamespace(
+                        path="/srv/pinned",
+                        provenance="operator",
+                        available=False,
+                        current=False,
+                    ),
+                ),
+            )
+        )
+        ctx.application.core_services.settings_workspaces = service
+        with patch("kai.bot.sessions.get_allowed_workspaces", new_callable=AsyncMock) as legacy_get:
+            await _handle_workspace_allowed(update, ctx)
+        service.inspect_workspace_grants.assert_awaited_once_with(authority)
+        legacy_get.assert_not_awaited()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "/srv/existing (added by you)" in reply
+        assert "/srv/pinned (operator, unavailable)" in reply
+
     @pytest.mark.asyncio
     async def test_shows_list_with_sources(self, tmp_path):
         """Shows allowed workspaces with source attribution."""

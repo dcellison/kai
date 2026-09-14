@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import pwd
+import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +71,22 @@ class WorkshopSettingsWorkspaceConsistencyError(WorkshopSettingsWorkspaceError):
 MIN_SELF_SERVICE_TIMEOUT_SECONDS = 1
 MAX_SELF_SERVICE_PROMPT_CHARACTERS = 32_000
 MAX_SELF_SERVICE_WORKSPACE_NAME_CHARACTERS = 64
+
+
+def _runtime_can_self_grant_workspace(os_user: str | None, path: Path) -> bool:
+    """Require a self-added path to be owned and usable by its runtime identity."""
+    if os_user is None:
+        return os.access(path, os.R_OK | os.X_OK)
+    try:
+        account = pwd.getpwnam(os_user)
+        metadata = path.stat()
+    except (KeyError, OSError):
+        return False
+    return (
+        metadata.st_uid == account.pw_uid
+        and bool(metadata.st_mode & stat.S_IRUSR)
+        and bool(metadata.st_mode & stat.S_IXUSR)
+    )
 
 
 async def _register_workspace_memory_project(
@@ -148,6 +167,30 @@ class WorkspaceOption:
     current: bool
     home: bool
     deletable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceGrantOption:
+    path: str
+    provenance: str
+    available: bool
+    current: bool
+    removable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceGrantSnapshot:
+    principal_id: PrincipalId
+    runtime_profile_id: RuntimeProfileId
+    workspace_base: str | None
+    grants: tuple[WorkspaceGrantOption, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceGrantMutationResult:
+    snapshot: WorkspaceGrantSnapshot
+    path: str
+    changed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -682,6 +725,131 @@ class WorkshopSettingsWorkspaceService:
                 expected_revision=expected_revision,
             )
 
+    async def inspect_workspace_grants(
+        self,
+        authority: SettingsWorkspaceAuthority,
+    ) -> WorkspaceGrantSnapshot:
+        """List mutable and operator-pinned grants with canonical provenance."""
+        async with self._lock(authority):
+            return await self._inspect_workspace_grants_locked(authority)
+
+    async def _inspect_workspace_grants_locked(
+        self,
+        authority: SettingsWorkspaceAuthority,
+    ) -> WorkspaceGrantSnapshot:
+        namespace = self._namespace(authority)
+        runtime = self._runtime_authority(authority)
+        profile = self._runtime_pool.runtime_profile(runtime)
+        current = (await self._runtime_pool.get_effective_workspace(runtime)).resolve()
+        rows = await sessions.get_canonical_workspace_grant_rows(namespace)
+        profile_paths = tuple(getattr(profile, "allowed_workspaces", ()))
+        operator_paths = tuple(self._config.allowed_workspaces)
+        resolved_profile_paths = {path.resolve(strict=False) for path in profile_paths}
+        resolved_operator_paths = {path.resolve(strict=False) for path in operator_paths}
+        candidates: list[tuple[Path, str, bool]] = []
+        for row in rows:
+            path = Path(row["path"])
+            resolved = path.resolve(strict=False)
+            if resolved in resolved_profile_paths:
+                candidates.append((path, "profile", False))
+            elif resolved in resolved_operator_paths:
+                candidates.append((path, "operator", False))
+            else:
+                candidates.append((path, row["provenance"], True))
+        candidates.extend((path, "profile", False) for path in profile_paths)
+        candidates.extend((path, "operator", False) for path in operator_paths)
+        seen: set[Path] = set()
+        grants: list[WorkspaceGrantOption] = []
+        for path, provenance, removable in candidates:
+            resolved = path.resolve(strict=False)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            grants.append(
+                WorkspaceGrantOption(
+                    path=str(resolved),
+                    provenance=provenance,
+                    available=resolved.is_dir(),
+                    current=resolved == current,
+                    removable=removable,
+                )
+            )
+        return WorkspaceGrantSnapshot(
+            principal_id=authority.principal_id,
+            runtime_profile_id=authority.runtime_profile_id,
+            workspace_base=(str(profile.workspace_base.resolve()) if profile.workspace_base is not None else None),
+            grants=tuple(grants),
+        )
+
+    async def add_existing_workspace(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        workspace_path: str,
+    ) -> WorkspaceGrantMutationResult:
+        """Grant one existing directory through canonical runtime authority."""
+        raw_path = Path(workspace_path)
+        if not workspace_path or not raw_path.is_absolute():
+            raise WorkshopSettingsWorkspaceValidationError("Workspace path must be absolute")
+        try:
+            requested = raw_path.resolve(strict=True)
+        except OSError as exc:
+            raise WorkshopSettingsWorkspaceValidationError("Workspace directory is unavailable") from exc
+        if not requested.is_dir():
+            raise WorkshopSettingsWorkspaceValidationError("Workspace path is not a directory")
+        profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
+        if not _runtime_can_self_grant_workspace(profile.os_user, requested):
+            raise WorkshopSettingsWorkspaceAccessDenied("Workspace directory is not accessible to this runtime")
+        async with self._lock(authority):
+            runtime = self._runtime_authority(authority)
+            base, _allowed = await self._runtime_pool.resolve_workspace_access(runtime)
+            if base is not None and is_workspace_allowed(requested, base, []):
+                raise WorkshopSettingsWorkspaceValidationError(
+                    "Workspace is already covered by this runtime profile's workspace base"
+                )
+            before = await self._inspect_workspace_grants_locked(authority)
+            if any(Path(item.path) == requested for item in before.grants):
+                return WorkspaceGrantMutationResult(before, str(requested), False)
+            changed = await sessions.add_canonical_workspace_grant(
+                self._namespace(authority),
+                str(requested),
+                provenance="principal_added",
+            )
+            after = await self._inspect_workspace_grants_locked(authority)
+            return WorkspaceGrantMutationResult(after, str(requested), changed)
+
+    async def remove_existing_workspace(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        workspace_path: str,
+    ) -> WorkspaceGrantMutationResult:
+        """Revoke one mutable grant without stranding an active runtime."""
+        raw_path = Path(workspace_path)
+        if not workspace_path or not raw_path.is_absolute():
+            raise WorkshopSettingsWorkspaceValidationError("Workspace path must be absolute")
+        requested = raw_path.resolve(strict=False)
+        async with self._lock(authority):
+            before = await self._inspect_workspace_grants_locked(authority)
+            matching = next((item for item in before.grants if Path(item.path) == requested), None)
+            if matching is None:
+                raise WorkshopSettingsWorkspaceValidationError("Workspace is not in this runtime's grant list")
+            if not matching.removable:
+                raise WorkshopSettingsWorkspaceAccessDenied("Operator-pinned workspace grants cannot be removed")
+            namespace = self._namespace(authority)
+            if matching.current or await sessions.canonical_workspace_active_references(namespace, str(requested)):
+                raise WorkshopSettingsWorkspaceBusy(
+                    "Switch every active agent lane away from this workspace before removing its grant"
+                )
+            if await sessions.canonical_workspace_in_flight_references(
+                str(authority.principal_id),
+                str(requested),
+            ):
+                raise WorkshopSettingsWorkspaceBusy("Workspace grant cannot be removed during an active run")
+            changed = await sessions.remove_canonical_workspace_grant(namespace, str(requested))
+            if changed:
+                await sessions.delete_canonical_workspace_history(namespace, str(requested))
+            after = await self._inspect_workspace_grants_locked(authority)
+            return WorkspaceGrantMutationResult(after, str(requested), changed)
+
     async def _switch_workspace_locked(
         self,
         authority: SettingsWorkspaceAuthority,
@@ -801,6 +969,7 @@ class WorkshopSettingsWorkspaceService:
             grant_created = await sessions.add_canonical_workspace_grant(
                 self._namespace(authority),
                 str(target_resolved),
+                provenance="principal_created",
             )
             git_ready = provisioned.git_ready
             creator_runtime_key = self._runtime_pool.legacy_runtime_key(authority.runtime_profile_id)
