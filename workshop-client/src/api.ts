@@ -21,6 +21,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceCreation,
   WorkshopWorkspaceDeletion,
+  WorkshopWorkspaceGrants,
   WorkshopRoutingEligibility,
   WorkshopRoutingPolicy,
   WorkshopRunRoutingDecision,
@@ -2735,6 +2736,60 @@ function parseSettingsWorkspace(
   };
 }
 
+function parseWorkspaceGrants(payload: unknown): WorkshopWorkspaceGrants {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.principal_id !== "string" ||
+    !PRINCIPAL_PATTERN.test(payload.principal_id) ||
+    typeof payload.runtime_profile_id !== "string" ||
+    !(typeof payload.workspace_base === "string" || payload.workspace_base === null) ||
+    !Array.isArray(payload.grants) ||
+    !(payload.mutation === undefined || isRecord(payload.mutation))
+  ) {
+    throw new Error("Kai returned unsupported workspace grant state.");
+  }
+  const grants = payload.grants.map((rawGrant) => {
+    if (
+      !isRecord(rawGrant) ||
+      typeof rawGrant.path !== "string" ||
+      typeof rawGrant.name !== "string" ||
+      typeof rawGrant.provenance !== "string" ||
+      typeof rawGrant.available !== "boolean" ||
+      typeof rawGrant.current !== "boolean" ||
+      typeof rawGrant.removable !== "boolean"
+    ) {
+      throw new Error("Kai returned unsupported workspace grant state.");
+    }
+    return {
+      available: rawGrant.available,
+      current: rawGrant.current,
+      name: rawGrant.name,
+      path: rawGrant.path,
+      provenance: rawGrant.provenance,
+      removable: rawGrant.removable,
+    };
+  });
+  let mutation: WorkshopWorkspaceGrants["mutation"] = null;
+  if (payload.mutation !== undefined) {
+    if (
+      !isRecord(payload.mutation) ||
+      typeof payload.mutation.path !== "string" ||
+      typeof payload.mutation.changed !== "boolean"
+    ) {
+      throw new Error("Kai returned unsupported workspace grant mutation.");
+    }
+    mutation = { changed: payload.mutation.changed, path: payload.mutation.path };
+  }
+  return {
+    grants,
+    mutation,
+    principalId: payload.principal_id,
+    runtimeProfileId: payload.runtime_profile_id,
+    workspaceBase: payload.workspace_base,
+  };
+}
+
 function parseRoutingEligibility(payload: unknown): WorkshopRoutingEligibility {
   if (
     !isRecord(payload) ||
@@ -5018,6 +5073,60 @@ export async function deleteWorkspace(
     path: payload.deletion.path,
     settings: parseSettingsWorkspace(payload, session.channelId),
   };
+}
+
+export async function loadWorkspaceGrants(
+  session: WorkshopSession,
+): Promise<WorkshopWorkspaceGrants> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace-grants`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load workspace access."));
+  }
+  return parseWorkspaceGrants(payload);
+}
+
+export async function addExistingWorkspace(
+  session: WorkshopSession,
+  path: string,
+): Promise<WorkshopWorkspaceGrants> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace-grants`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not add workspace access."));
+  }
+  return parseWorkspaceGrants(payload);
+}
+
+export async function removeExistingWorkspace(
+  session: WorkshopSession,
+  path: string,
+): Promise<WorkshopWorkspaceGrants> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace-grants`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not remove workspace access."));
+  }
+  return parseWorkspaceGrants(payload);
 }
 
 export async function submitCommand(

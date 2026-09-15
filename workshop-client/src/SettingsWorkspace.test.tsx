@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ChannelAccessError,
+  addExistingWorkspace,
   createWorkspace,
   deleteWorkspace,
   deactivateOperatorModel,
@@ -19,11 +20,13 @@ import {
   loadPreferenceHistory,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
+  loadWorkspaceGrants,
   PreferenceRevisionConflictError,
   SettingsRevisionConflictError,
   refreshAllModelCatalogues,
   refreshModelCatalogue,
   restorePreferenceRevision,
+  removeExistingWorkspace,
   savePreferenceDocument,
   switchWorkspace,
   upsertOperatorModel,
@@ -53,6 +56,7 @@ import type {
   WorkshopHumanAvatar,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
+  WorkshopWorkspaceGrants,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -71,8 +75,11 @@ vi.mock("./api", async (importOriginal) => {
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
+    loadWorkspaceGrants: vi.fn(),
+    addExistingWorkspace: vi.fn(),
     createWorkspace: vi.fn(),
     deleteWorkspace: vi.fn(),
+    removeExistingWorkspace: vi.fn(),
     restorePreferenceRevision: vi.fn(),
     refreshAllModelCatalogues: vi.fn(),
     refreshModelCatalogue: vi.fn(),
@@ -293,6 +300,31 @@ const workspaceConfig: WorkshopWorkspaceConfig = {
   workspace: runtime.workspace,
 };
 
+const workspaceGrants: WorkshopWorkspaceGrants = {
+  grants: [
+    {
+      available: true,
+      current: true,
+      name: "Kai",
+      path: "/srv/kai",
+      provenance: "profile",
+      removable: false,
+    },
+    {
+      available: true,
+      current: false,
+      name: "notes",
+      path: "/srv/alice/notes",
+      provenance: "principal_added",
+      removable: true,
+    },
+  ],
+  mutation: null,
+  principalId: runtime.principalId,
+  runtimeProfileId: runtime.runtimeProfileId,
+  workspaceBase: "/srv/home",
+};
+
 const githubSettings: WorkshopGitHubSettings = {
   githubLogin: "dcellison",
   issueTriage: { enabled: false, resettable: true, source: "user" },
@@ -477,6 +509,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
     vi.mocked(loadAppearancePreferences).mockResolvedValue(appearancePreferences);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
+    vi.mocked(loadWorkspaceGrants).mockResolvedValue(workspaceGrants);
     vi.mocked(savePreferenceDocument).mockResolvedValue({
       ...preference,
       content: "# Preferences\n\nUse examples.\n",
@@ -540,6 +573,26 @@ describe("Settings workspace", () => {
           },
         ],
       },
+    });
+    vi.mocked(addExistingWorkspace).mockResolvedValue({
+      ...workspaceGrants,
+      grants: [
+        ...workspaceGrants.grants,
+        {
+          available: true,
+          current: false,
+          name: "existing-project",
+          path: "/srv/alice/existing-project",
+          provenance: "principal_added",
+          removable: true,
+        },
+      ],
+      mutation: { changed: true, path: "/srv/alice/existing-project" },
+    });
+    vi.mocked(removeExistingWorkspace).mockResolvedValue({
+      ...workspaceGrants,
+      grants: workspaceGrants.grants.filter((item) => item.path !== "/srv/alice/notes"),
+      mutation: { changed: true, path: "/srv/alice/notes" },
     });
     vi.mocked(deleteWorkspace).mockResolvedValue({
       directoryDeleted: true,
@@ -864,8 +917,8 @@ describe("Settings workspace", () => {
     expect(screen.queryByText("PROTECTED_KEY")).not.toBeInTheDocument();
     expect(screen.queryByText(runtime.principalId)).not.toBeInTheDocument();
     expect(screen.queryByText(runtime.runtimeProfileId)).not.toBeInTheDocument();
-    expect(screen.queryByText("/srv/kai")).not.toBeInTheDocument();
-    expect(document.body.innerHTML).not.toContain("/srv/");
+    expect(screen.getByText("/srv/kai")).toBeVisible();
+    expect(screen.getByText("/srv/alice/notes")).toBeVisible();
   });
 
   it("saves preference Markdown and reports dirty state", async () => {
@@ -1021,6 +1074,36 @@ describe("Settings workspace", () => {
     expect(screen.getByLabelText("Active workspace")).toHaveValue("2");
     expect(screen.getByRole("option", { name: "Research Notes" })).toBeVisible();
     expect(switchWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("adds and removes existing workspace access without presenting directory deletion", async () => {
+    const user = userEvent.setup();
+    renderAgentRuntime();
+
+    await user.click(await screen.findByRole("button", { name: "Add existing workspace" }));
+    const dialog = screen.getByRole("dialog", { name: "Add existing workspace" });
+    expect(within(dialog).getByText(/does not create, move, or delete any files/)).toBeVisible();
+    await user.type(
+      within(dialog).getByLabelText("Absolute directory path"),
+      "/srv/alice/existing-project",
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Add workspace access" }));
+
+    await waitFor(() => expect(addExistingWorkspace).toHaveBeenCalledWith(
+      session,
+      "/srv/alice/existing-project",
+    ));
+    expect(await screen.findByText("Existing workspace access added.")).toBeVisible();
+    expect(screen.getByText("existing-project")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Remove access to notes" }));
+    await acceptConfirmation(user, /The directory and its files will not be deleted/);
+    await waitFor(() => expect(removeExistingWorkspace).toHaveBeenCalledWith(
+      session,
+      "/srv/alice/notes",
+    ));
+    expect(await screen.findByText("Access to notes was removed. The directory was not deleted.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Remove access to Kai" })).not.toBeInTheDocument();
   });
 
   it("requires the exact workspace name before permanent deletion", async () => {

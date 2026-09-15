@@ -10,6 +10,7 @@ import {
 
 import {
   AuthenticationError,
+  addExistingWorkspace,
   ChannelAccessError,
   createWorkspace,
   deleteWorkspace,
@@ -27,9 +28,11 @@ import {
   loadModelCatalogue,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
+  loadWorkspaceGrants,
   PreferenceRevisionConflictError,
   refreshAllModelCatalogues,
   restorePreferenceRevision,
+  removeExistingWorkspace,
   refreshModelCatalogue,
   savePreferenceDocument,
   SettingsRevisionConflictError,
@@ -67,6 +70,7 @@ import type {
   WorkshopSettingsMutation,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
+  WorkshopWorkspaceGrants,
   WorkshopWorkspaceSettingChange,
 } from "./types";
 import { applyWorkshopTheme } from "./theme";
@@ -120,6 +124,15 @@ function WorkspaceDeleteIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24">
       <path d="M5 7h14M9 7V4h6v3m2 0-1 13H8L7 7m3 4v5m4-5v5" />
+    </svg>
+  );
+}
+
+function ExistingWorkspaceIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path d="M3.5 7.5h6l2 2h9v10h-17z" />
+      <path d="M12 12v5m-2.5-2.5h5" />
     </svg>
   );
 }
@@ -244,6 +257,17 @@ function errorText(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
 
+function workspaceProvenanceLabel(provenance: string): string {
+  const labels: Record<string, string> = {
+    legacy_migrated: "Migrated personal access",
+    operator: "Operator policy",
+    principal_added: "Added by you",
+    principal_created: "Created by Kai",
+    profile: "Runtime profile",
+  };
+  return labels[provenance] ?? provenance.replaceAll("_", " ");
+}
+
 type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
   executionProfileControl?: ReactNode;
@@ -333,6 +357,14 @@ function SettingsWorkspaceContent({
   const [workspaceDeletionConfirmation, setWorkspaceDeletionConfirmation] = useState("");
   const [workspaceDeletionBusy, setWorkspaceDeletionBusy] = useState(false);
   const [workspaceDeletionError, setWorkspaceDeletionError] = useState<string | null>(null);
+  const [workspaceGrants, setWorkspaceGrants] = useState<WorkshopWorkspaceGrants | null>(null);
+  const [workspaceGrantsLoading, setWorkspaceGrantsLoading] = useState(true);
+  const [workspaceGrantsBusy, setWorkspaceGrantsBusy] = useState(false);
+  const [workspaceGrantsError, setWorkspaceGrantsError] = useState<string | null>(null);
+  const [workspaceGrantsNotice, setWorkspaceGrantsNotice] = useState<string | null>(null);
+  const [workspaceGrantOpen, setWorkspaceGrantOpen] = useState(false);
+  const [workspaceGrantPath, setWorkspaceGrantPath] = useState("");
+  const [workspaceGrantFormError, setWorkspaceGrantFormError] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -518,8 +550,10 @@ function SettingsWorkspaceContent({
 
   const refreshRuntime = useCallback(async (): Promise<void> => {
     setRuntimeLoading(true);
+    setWorkspaceGrantsLoading(true);
     setRuntimeError(null);
     setWorkspaceError(null);
+    setWorkspaceGrantsError(null);
     try {
       const settings = await loadSettingsWorkspace(session);
       adoptRuntime(settings);
@@ -529,7 +563,9 @@ function SettingsWorkspaceContent({
       }
       setRuntime(null);
       setWorkspaceConfig(null);
+      setWorkspaceGrants(null);
       setRuntimeLoading(false);
+      setWorkspaceGrantsLoading(false);
       return;
     }
     try {
@@ -547,6 +583,16 @@ function SettingsWorkspaceContent({
       }
     } finally {
       setRuntimeLoading(false);
+    }
+    try {
+      setWorkspaceGrants(await loadWorkspaceGrants(session));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setWorkspaceGrantsError(errorText(caught, "Could not load workspace access."));
+      }
+      setWorkspaceGrants(null);
+    } finally {
+      setWorkspaceGrantsLoading(false);
     }
   }, [adoptRuntime, adoptWorkspace, handleAccessFailure, onAuthenticationFailure, session]);
 
@@ -1318,6 +1364,62 @@ function SettingsWorkspaceContent({
     }
   };
 
+  const grantExistingWorkspace = async (): Promise<void> => {
+    const path = workspaceGrantPath.trim();
+    if (!path || workspaceGrantsBusy) {
+      return;
+    }
+    setWorkspaceGrantsBusy(true);
+    setWorkspaceGrantFormError(null);
+    setWorkspaceGrantsError(null);
+    setWorkspaceGrantsNotice(null);
+    try {
+      const changed = await addExistingWorkspace(session, path);
+      setWorkspaceGrants(changed);
+      adoptRuntime(await loadSettingsWorkspace(session));
+      setWorkspaceGrantsNotice(
+        changed.mutation?.changed
+          ? "Existing workspace access added."
+          : "That workspace was already available.",
+      );
+      setWorkspaceGrantPath("");
+      setWorkspaceGrantOpen(false);
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setWorkspaceGrantFormError(errorText(caught, "Could not add workspace access."));
+      }
+    } finally {
+      setWorkspaceGrantsBusy(false);
+    }
+  };
+
+  const revokeWorkspaceGrant = async (path: string, name: string): Promise<void> => {
+    if (workspaceGrantsBusy || !await confirm(
+      `Remove access to ${name}? The directory and its files will not be deleted.`,
+    )) {
+      return;
+    }
+    setWorkspaceGrantsBusy(true);
+    setWorkspaceGrantsError(null);
+    setWorkspaceGrantsNotice(null);
+    try {
+      const changed = await removeExistingWorkspace(session, path);
+      setWorkspaceGrants(changed);
+      adoptRuntime(await loadSettingsWorkspace(session));
+      setWorkspaceGrantsNotice(
+        changed.mutation?.changed
+          ? `Access to ${name} was removed. The directory was not deleted.`
+          : `Access to ${name} was already absent.`,
+      );
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setWorkspaceGrantsError(errorText(caught, "Could not remove workspace access."));
+      }
+    } finally {
+      setWorkspaceGrantsBusy(false);
+    }
+  };
+
   const runtimeBackendCapability = runtime
     ? capability(runtime.capabilities, "backend")
     : null;
@@ -1905,19 +2007,90 @@ function SettingsWorkspaceContent({
                   <option key={item.path} value={String(index)}>{item.name}</option>
                 ))}
               </select>
-              <button
-                className="panel-icon-button"
-                type="button"
-                aria-label="Create workspace"
-                title="Create workspace"
-                disabled={runtimeBusy}
-                onClick={() => {
-                  setWorkspaceCreationError(null);
-                  setWorkspaceCreationOpen(true);
-                }}
-              >
-                <WorkspaceAddIcon />
-              </button>
+              <div className="workspace-settings-actions">
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label="Create workspace"
+                  title="Create private workspace"
+                  disabled={runtimeBusy}
+                  onClick={() => {
+                    setWorkspaceCreationError(null);
+                    setWorkspaceCreationOpen(true);
+                  }}
+                >
+                  <WorkspaceAddIcon />
+                </button>
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label="Add existing workspace"
+                  title="Add existing workspace"
+                  disabled={runtimeBusy || workspaceGrantsBusy}
+                  onClick={() => {
+                    setWorkspaceGrantFormError(null);
+                    setWorkspaceGrantOpen(true);
+                  }}
+                >
+                  <ExistingWorkspaceIcon />
+                </button>
+              </div>
+            </div>
+            <div className="workspace-grant-list">
+              <div className="workspace-grant-list-heading">
+                <p>Workspace access</p>
+                {workspaceGrants?.workspaceBase && (
+                  <small>Base: {workspaceGrants.workspaceBase}</small>
+                )}
+              </div>
+              {workspaceGrantsLoading ? (
+                <p role="status">Loading workspace access…</p>
+              ) : workspaceGrants ? (
+                workspaceGrants.grants.length > 0 ? (
+                  <ul>
+                    {workspaceGrants.grants.map((item) => (
+                      <li key={item.path}>
+                        <span>
+                          <strong>{item.name}</strong>
+                          <small>{item.path}</small>
+                          <small>
+                            {workspaceProvenanceLabel(item.provenance)}
+                            {item.current ? " · current" : ""}
+                            {!item.available ? " · unavailable" : ""}
+                          </small>
+                        </span>
+                        {item.removable && (
+                          <button
+                            className="panel-icon-button"
+                            type="button"
+                            aria-label={`Remove access to ${item.name}`}
+                            title={`Remove access to ${item.name}`}
+                            disabled={workspaceGrantsBusy}
+                            onClick={() => void revokeWorkspaceGrant(item.path, item.name)}
+                          >
+                            <WorkspaceDeleteIcon />
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>No individually authorized workspaces.</p>
+                )
+              ) : (
+                <div className="settings-failure">
+                  <p role="alert">{workspaceGrantsError ?? "Workspace access is unavailable."}</p>
+                  <button className="quiet-button" type="button" onClick={() => void refreshRuntime()}>
+                    Retry
+                  </button>
+                </div>
+              )}
+              {workspaceGrantsNotice && (
+                <p className="settings-notice" role="status">{workspaceGrantsNotice}</p>
+              )}
+              {workspaceGrantsError && workspaceGrants && (
+                <p className="settings-error" role="alert">{workspaceGrantsError}</p>
+              )}
             </div>
             {runtime.workspaces.some((item) => item.deletable) && (
               <div className="workspace-deletion-list">
@@ -2033,6 +2206,67 @@ function SettingsWorkspaceContent({
                     disabled={workspaceCreationBusy || !workspaceName.trim()}
                   >
                     {workspaceCreationBusy ? "Creating…" : "Create workspace"}
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
+        {workspaceGrantOpen && runtime && (
+          <div className="modal-backdrop" role="presentation">
+            <section
+              className="channel-creation-dialog workspace-creation-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="add-existing-workspace-title"
+            >
+              <header className="workspace-creation-header">
+                <div>
+                  <p className="overline">Existing directory</p>
+                  <h2 id="add-existing-workspace-title">Add existing workspace</h2>
+                </div>
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label="Close existing workspace"
+                  title="Close existing workspace"
+                  disabled={workspaceGrantsBusy}
+                  onClick={() => {
+                    setWorkspaceGrantOpen(false);
+                    setWorkspaceGrantFormError(null);
+                    setWorkspaceGrantPath("");
+                  }}
+                >
+                  <span aria-hidden="true">×</span>
+                </button>
+              </header>
+              <p>
+                This grants Kai access to a directory that already exists. It does not create,
+                move, or delete any files.
+              </p>
+              <form onSubmit={(event) => { event.preventDefault(); void grantExistingWorkspace(); }}>
+                <label htmlFor="workspace-existing-path">Absolute directory path</label>
+                <input
+                  id="workspace-existing-path"
+                  type="text"
+                  autoFocus
+                  value={workspaceGrantPath}
+                  disabled={workspaceGrantsBusy}
+                  placeholder="/Users/you/projects/example"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  onChange={(event) => setWorkspaceGrantPath(event.target.value)}
+                />
+                {workspaceGrantFormError && (
+                  <p className="form-error" role="alert">{workspaceGrantFormError}</p>
+                )}
+                <div className="form-actions">
+                  <button
+                    className="primary-button"
+                    type="submit"
+                    disabled={workspaceGrantsBusy || !workspaceGrantPath.trim()}
+                  >
+                    {workspaceGrantsBusy ? "Adding…" : "Add workspace access"}
                   </button>
                 </div>
               </form>

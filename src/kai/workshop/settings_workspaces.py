@@ -64,6 +64,14 @@ class WorkshopSettingsWorkspaceBusy(WorkshopSettingsWorkspaceConflict):
     """The principal-local runtime is actively executing and cannot cut over."""
 
 
+class WorkshopWorkspaceGrantActive(WorkshopSettingsWorkspaceBusy):
+    """A workspace grant is still selected by an active execution lane."""
+
+
+class WorkshopWorkspaceGrantRunBusy(WorkshopSettingsWorkspaceBusy):
+    """A workspace grant is referenced by a nonterminal run."""
+
+
 class WorkshopSettingsWorkspaceConsistencyError(WorkshopSettingsWorkspaceError):
     """A failed mutation could not restore persistent and live state."""
 
@@ -172,6 +180,7 @@ class WorkspaceOption:
 @dataclass(frozen=True, slots=True)
 class WorkspaceGrantOption:
     path: str
+    name: str
     provenance: str
     available: bool
     current: bool
@@ -741,6 +750,8 @@ class WorkshopSettingsWorkspaceService:
         runtime = self._runtime_authority(authority)
         profile = self._runtime_pool.runtime_profile(runtime)
         current = (await self._runtime_pool.get_effective_workspace(runtime)).resolve()
+        home = self._runtime_pool.get_home_workspace(runtime).resolve()
+        base = profile.workspace_base.resolve() if profile.workspace_base is not None else None
         rows = await sessions.get_canonical_workspace_grant_rows(namespace)
         profile_paths = tuple(getattr(profile, "allowed_workspaces", ()))
         operator_paths = tuple(self._config.allowed_workspaces)
@@ -768,6 +779,7 @@ class WorkshopSettingsWorkspaceService:
             grants.append(
                 WorkspaceGrantOption(
                     path=str(resolved),
+                    name=self._workspace_name(resolved, base, home),
                     provenance=provenance,
                     available=resolved.is_dir(),
                     current=resolved == current,
@@ -836,14 +848,14 @@ class WorkshopSettingsWorkspaceService:
                 raise WorkshopSettingsWorkspaceAccessDenied("Operator-pinned workspace grants cannot be removed")
             namespace = self._namespace(authority)
             if matching.current or await sessions.canonical_workspace_active_references(namespace, str(requested)):
-                raise WorkshopSettingsWorkspaceBusy(
+                raise WorkshopWorkspaceGrantActive(
                     "Switch every active agent lane away from this workspace before removing its grant"
                 )
             if await sessions.canonical_workspace_in_flight_references(
                 str(authority.principal_id),
                 str(requested),
             ):
-                raise WorkshopSettingsWorkspaceBusy("Workspace grant cannot be removed during an active run")
+                raise WorkshopWorkspaceGrantRunBusy("Workspace grant cannot be removed during an active run")
             changed = await sessions.remove_canonical_workspace_grant(namespace, str(requested))
             if changed:
                 await sessions.delete_canonical_workspace_history(namespace, str(requested))
