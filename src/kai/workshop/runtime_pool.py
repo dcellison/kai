@@ -172,6 +172,17 @@ class WorkshopRuntimePool:
             commit_selection=commit_selection,
         )
 
+    async def reset_provider_session(
+        self,
+        runtime_profile_id: RuntimeAuthority,
+        *,
+        commit_reset: Callable[[bool], Awaitable[None]],
+    ) -> tuple[bool, bool]:
+        return await self._pool.reset_provider_session(
+            self._selector(runtime_profile_id),
+            commit_reset=commit_reset,
+        )
+
     def is_running(self, runtime_profile_id: RuntimeAuthority) -> bool:
         """Return whether this protected profile currently has a live backend."""
         return self._pool.get_if_exists(self._selector(runtime_profile_id)) is not None

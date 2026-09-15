@@ -17,6 +17,7 @@ import type {
   WorkshopEditableCapability,
   WorkshopRuntimeLaneRunStatus,
   WorkshopRuntimeLaneStatus,
+  WorkshopProviderSessionReset,
   WorkshopSettingsMutation,
   WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
@@ -4350,6 +4351,9 @@ export async function loadRuntimeLaneStatus(
     ) ||
     !(typeof payload.session_created_at === "string" || payload.session_created_at === null) ||
     !(typeof payload.session_updated_at === "string" || payload.session_updated_at === null) ||
+    !(Number.isSafeInteger(payload.fresh_session_generation) || payload.fresh_session_generation === null) ||
+    !(typeof payload.fresh_session_revision === "string" || payload.fresh_session_revision === null) ||
+    (typeof payload.fresh_session_revision === "string" && !/^[0-9a-f]{64}$/.test(payload.fresh_session_revision)) ||
     !(payload.operator_diagnostics === null || isRecord(payload.operator_diagnostics))
   ) {
     throw new Error("Kai returned an unsupported runtime lane status.");
@@ -4407,6 +4411,8 @@ export async function loadRuntimeLaneStatus(
     canManageRuntime: payload.can_manage_runtime,
     channelId: payload.channel_id,
     continuityState: payload.continuity_state as WorkshopRuntimeLaneStatus["continuityState"],
+    freshSessionGeneration: payload.fresh_session_generation as number | null,
+    freshSessionRevision: payload.fresh_session_revision,
     lastRun: parseRuntimeLaneRunStatus(payload.last_run),
     model: { source: payload.model.source, value: payload.model.value },
     operatorDiagnostics: diagnostics === null ? null : {
@@ -4431,6 +4437,54 @@ export async function loadRuntimeLaneStatus(
     workspace: payload.workspace,
     workspaceRevision: payload.workspace_revision,
     workspaces,
+  };
+}
+
+export async function startFreshProviderSession(
+  session: WorkshopSession,
+  agentId: string,
+  clientOperationId: string,
+): Promise<WorkshopProviderSessionReset> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/runtime-sessions/${encodeURIComponent(agentId)}/fresh`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_operation_id: clientOperationId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not start a fresh provider session."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    payload.channel_id !== session.channelId ||
+    payload.agent_id !== agentId ||
+    typeof payload.runtime_profile_id !== "string" ||
+    !RUNTIME_PROFILE_PATTERN.test(payload.runtime_profile_id) ||
+    !Number.isSafeInteger(payload.generation) ||
+    (payload.generation as number) < 1 ||
+    typeof payload.revision !== "string" ||
+    !/^[0-9a-f]{64}$/.test(payload.revision) ||
+    typeof payload.prior_session_present !== "boolean" ||
+    typeof payload.live_process_stopped !== "boolean" ||
+    typeof payload.replayed !== "boolean" ||
+    !Array.isArray(payload.preserved)
+  ) {
+    throw new Error("Kai returned an unsupported fresh provider session result.");
+  }
+  return {
+    agentId: payload.agent_id,
+    channelId: payload.channel_id,
+    generation: payload.generation as number,
+    liveProcessStopped: payload.live_process_stopped,
+    priorSessionPresent: payload.prior_session_present,
+    replayed: payload.replayed,
+    revision: payload.revision,
+    runtimeProfileId: payload.runtime_profile_id,
   };
 }
 

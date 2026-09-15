@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import FormData, web
@@ -4202,6 +4202,12 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
         )
         runtime_pool = MagicMock()
         runtime_pool.is_alive.return_value = False
+
+        async def reset_provider_session(_authority, *, commit_reset):
+            await commit_reset(False)
+            return True, False
+
+        runtime_pool.reset_provider_session = AsyncMock(side_effect=reset_provider_session)
         runtime_status = WorkshopRuntimeLaneStatusService(
             store,
             service,  # type: ignore[arg-type]
@@ -4271,6 +4277,8 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert payload["process_state"] == "hidden"
             assert payload["provider_session_state"] == "not_started"
             assert payload["continuity_state"] == "not_started"
+            assert payload["fresh_session_generation"] is None
+            assert payload["fresh_session_revision"] is None
             assert payload["active_run"] is None
             assert payload["last_run"] is None
             assert payload["operator_diagnostics"] is None
@@ -4290,6 +4298,52 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert await cross_principal.json() == {"error": {"code": "access_denied", "message": "Access denied"}}
             assert owner_mutation.status == 403
             assert service.runtime_changes == []
+
+            fresh_path = f"/v1/channels/{bob_channel}/runtime-sessions/{effective_agent_id}/fresh"
+            fresh = await client.post(
+                fresh_path,
+                headers={**headers, "Content-Type": "application/json"},
+                json={"client_operation_id": "browser-fresh-session-1"},
+            )
+            fresh_payload = await fresh.json()
+            assert fresh.status == 200
+            assert fresh_payload["channel_id"] == str(bob_channel)
+            assert fresh_payload["agent_id"] == effective_agent_id
+            assert fresh_payload["generation"] == 1
+            assert fresh_payload["prior_session_present"] is False
+            assert fresh_payload["live_process_stopped"] is False
+            assert fresh_payload["replayed"] is False
+            assert fresh_payload["preserved"] == [
+                "conversation_history",
+                "messages",
+                "memories",
+                "settings",
+                "browser_enrollment",
+            ]
+            visible_after_reset = await client.get(
+                f"/v1/channels/{bob_channel}/runtime-status",
+                headers=headers,
+            )
+            visible_payload = await visible_after_reset.json()
+            assert visible_after_reset.status == 200
+            assert visible_payload["fresh_session_generation"] == fresh_payload["generation"]
+            assert visible_payload["fresh_session_revision"] == fresh_payload["revision"]
+
+            replay = await client.post(
+                fresh_path,
+                headers={**headers, "Content-Type": "application/json"},
+                json={"client_operation_id": "browser-fresh-session-1"},
+            )
+            assert replay.status == 200
+            assert (await replay.json())["replayed"] is True
+            runtime_pool.reset_provider_session.assert_awaited_once()
+
+            unrelated_principal = await client.post(
+                fresh_path,
+                headers={"Authorization": "Bearer alice-token", "Content-Type": "application/json"},
+                json={"client_operation_id": "browser-fresh-session-cross-principal"},
+            )
+            assert unrelated_principal.status == 403
         finally:
             await client.close()
             await store.close()

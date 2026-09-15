@@ -241,6 +241,104 @@ class TestInstanceCreation:
         )
 
     @pytest.mark.asyncio
+    async def test_fresh_session_stops_only_the_selected_idle_lane(self, tmp_path):
+        runtime_id = profile_id(111)
+        primary = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        secondary = WorkshopInternalAPIExecutionContext(
+            primary.principal_id,
+            ChannelId("chn_" + "a" * 32),
+            AgentId("agt_" + "b" * 32),
+            runtime_id,
+        )
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="shared policy",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((primary, secondary)),
+        )
+        selected = pool.get(primary)
+        unrelated = pool.get(secondary)
+        selected.shutdown = AsyncMock()
+        unrelated.shutdown = AsyncMock()
+        commit_reset = AsyncMock()
+
+        accepted, live_process_stopped = await pool.reset_provider_session(
+            primary,
+            commit_reset=commit_reset,
+        )
+
+        assert accepted is True
+        assert live_process_stopped is True
+        selected.shutdown.assert_awaited_once()
+        unrelated.shutdown.assert_not_awaited()
+        commit_reset.assert_awaited_once_with(True)
+        assert pool.get_if_exists(primary) is None
+        assert pool.get_if_exists(secondary) is unrelated
+
+    @pytest.mark.asyncio
+    async def test_fresh_session_rejects_an_in_flight_lane_without_side_effects(self, tmp_path):
+        runtime_id = profile_id(111)
+        context = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)
+        profiles = WorkshopRuntimeProfileRegistry(
+            (
+                ProtectedRuntimeProfile(
+                    profile_id=runtime_id,
+                    display_name="shared policy",
+                    os_user=None,
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    timeout_seconds=120,
+                    allowed_services=(),
+                    home_workspace=tmp_path,
+                    workspace_base=None,
+                    allowed_workspaces=(),
+                ),
+            ),
+            legacy_runtime_keys={runtime_id: 111},
+        )
+        pool = SubprocessPool(
+            config=_make_config(allowed_user_ids={111}),
+            services_info=[],
+            runtime_profiles=profiles,
+            internal_api_contexts=WorkshopInternalAPIContextRegistry((context,)),
+        )
+        instance = pool.get(context)
+        instance.shutdown = AsyncMock()
+        runtime_key, _, _ = pool._resolve_runtime(context)
+        pool._in_flight.add(runtime_key)
+        commit_reset = AsyncMock()
+
+        accepted, live_process_stopped = await pool.reset_provider_session(
+            context,
+            commit_reset=commit_reset,
+        )
+
+        assert accepted is False
+        assert live_process_stopped is False
+        instance.shutdown.assert_not_awaited()
+        commit_reset.assert_not_awaited()
+        assert pool.get_if_exists(context) is instance
+
+    @pytest.mark.asyncio
     async def test_group_channel_requesters_share_instance_but_keep_per_turn_identity(self, tmp_path):
         runtime_id = profile_id(111)
         owner = WorkshopInternalAPIExecutionContext.for_unprotected_runtime(111, runtime_id)

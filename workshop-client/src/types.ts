@@ -641,6 +641,8 @@ export interface WorkshopRuntimeLaneStatus {
   canManageRuntime: boolean;
   channelId: string;
   continuityState: "not_started" | "active" | "refresh_pending" | "stale";
+  freshSessionGeneration: number | null;
+  freshSessionRevision: string | null;
   lastRun: WorkshopRuntimeLaneRunStatus | null;
   model: { source: string; value: string };
   operatorDiagnostics: {
@@ -662,6 +664,17 @@ export interface WorkshopRuntimeLaneStatus {
   workspace: string | null;
   workspaceRevision: string | null;
   workspaces: WorkshopWorkspaceOption[];
+}
+
+export interface WorkshopProviderSessionReset {
+  agentId: string;
+  channelId: string;
+  generation: number;
+  liveProcessStopped: boolean;
+  priorSessionPresent: boolean;
+  replayed: boolean;
+  revision: string;
+  runtimeProfileId: string;
 }
 
 export type WorkshopRoutingTaskClass = "conversation" | "coding" | "vision";

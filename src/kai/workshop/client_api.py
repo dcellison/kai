@@ -313,10 +313,13 @@ from kai.workshop.runtime_lane_status import (
     RuntimeLaneStatusSnapshot,
     WorkshopRuntimeLaneStatusAccessDenied,
     WorkshopRuntimeLaneStatusAmbiguous,
+    WorkshopRuntimeLaneStatusBusy,
     WorkshopRuntimeLaneStatusError,
+    WorkshopRuntimeLaneStatusReplayConflict,
     WorkshopRuntimeLaneStatusService,
     WorkshopRuntimeLaneStatusUnavailable,
 )
+from kai.workshop.runtime_sessions import ProviderSessionResetResult
 from kai.workshop.settings_workspaces import (
     MAX_WORKSPACE_ENVIRONMENT_KEY_CHARACTERS,
     MAX_WORKSPACE_ENVIRONMENT_KEYS,
@@ -424,6 +427,7 @@ _RUN_CONTEXT_MANIFESTS_PATH = "/v1/channels/{channel_id}/runs/{run_id}/context-m
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
 _RUNTIME_LANE_STATUS_PATH = "/v1/channels/{channel_id}/runtime-status"
+_RUNTIME_LANE_FRESH_SESSION_PATH = "/v1/channels/{channel_id}/runtime-sessions/{agent_id}/fresh"
 _ROUTING_ELIGIBILITY_PATH = "/v1/channels/{channel_id}/routing-eligibility"
 _ROUTING_POLICY_PATH = "/v1/channels/{channel_id}/routing-policy"
 _MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
@@ -3660,6 +3664,8 @@ def _serialize_runtime_lane_status(snapshot: RuntimeLaneStatusSnapshot) -> dict[
         "session_updated_at": (
             _format_timestamp(snapshot.session_updated_at) if snapshot.session_updated_at is not None else None
         ),
+        "fresh_session_generation": snapshot.fresh_session_generation,
+        "fresh_session_revision": snapshot.fresh_session_revision,
         "active_run": _serialize_runtime_lane_run(snapshot.active_run),
         "last_run": _serialize_runtime_lane_run(snapshot.last_run),
         "operator_diagnostics": (
@@ -3728,6 +3734,80 @@ async def _handle_runtime_lane_status(
             message="Invalid runtime status request",
         )
     return _json_response(_serialize_runtime_lane_status(snapshot), status=200)
+
+
+def _serialize_provider_session_reset(result: ProviderSessionResetResult) -> dict[str, object]:
+    return {
+        "version": 1,
+        "channel_id": str(result.channel_id),
+        "agent_id": str(result.agent_id),
+        "runtime_profile_id": str(result.runtime_profile_id),
+        "generation": result.generation,
+        "revision": result.revision,
+        "prior_session_present": result.prior_session_present,
+        "live_process_stopped": result.live_process_stopped,
+        "replayed": result.replayed,
+        "preserved": [
+            "conversation_history",
+            "messages",
+            "memories",
+            "settings",
+            "browser_enrollment",
+        ],
+    }
+
+
+async def _handle_runtime_lane_fresh_session(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopRuntimeLaneStatusService,
+) -> web.Response:
+    """Reset only the selected channel-agent provider-session lane."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid fresh-session request")
+    try:
+        channel_id = ChannelId(request.match_info["channel_id"])
+        agent_id = AgentId(request.match_info["agent_id"])
+        payload = await request.json()
+    except (KeyError, TypeError, UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid fresh-session request")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _CHANNEL_AGENT_OPERATION_FIELDS
+        or not isinstance(payload.get("client_operation_id"), str)
+        or not _CLIENT_MESSAGE_ID_PATTERN.fullmatch(payload["client_operation_id"])
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid fresh-session request")
+    try:
+        authority = await service.authority_for_principal_channel(
+            principal_id,
+            channel_id,
+            agent_id=agent_id,
+        )
+        result = await service.reset_provider_session(authority, payload["client_operation_id"])
+    except WorkshopRuntimeLaneStatusAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopRuntimeLaneStatusBusy as exc:
+        return _error_response(status=409, code="runtime_lane_busy", message=str(exc))
+    except WorkshopRuntimeLaneStatusReplayConflict as exc:
+        return _error_response(status=409, code="operation_replay_conflict", message=str(exc))
+    except WorkshopRuntimeLaneStatusAmbiguous as exc:
+        return _error_response(status=409, code="runtime_lane_ambiguous", message=str(exc))
+    except WorkshopRuntimeLaneStatusUnavailable as exc:
+        return _error_response(status=409, code="runtime_lane_unavailable", message=str(exc))
+    except WorkshopRuntimeLaneStatusError:
+        return _error_response(status=500, code="fresh_session_failed", message="Fresh provider session failed")
+    return _json_response(_serialize_provider_session_reset(result), status=200)
 
 
 async def _handle_routing_eligibility(
@@ -9950,7 +10030,19 @@ def register_workshop_read_routes(
                     service=runtime_lane_status,
                 )
 
+        async def handle_runtime_lane_fresh_session(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_runtime_lane_fresh_session(
+                    request,
+                    authenticator=authenticator,
+                    service=runtime_lane_status,
+                )
+
         app.router.add_get(_RUNTIME_LANE_STATUS_PATH, handle_runtime_lane_status)
+        app.router.add_post(
+            _RUNTIME_LANE_FRESH_SESSION_PATH,
+            handle_runtime_lane_fresh_session,
+        )
     if settings_workspaces is not None:
 
         async def handle_runtime_settings(request: web.Request) -> web.Response:

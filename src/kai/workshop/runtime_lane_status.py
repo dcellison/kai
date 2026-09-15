@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RunId, RuntimeProfileId
+from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
 from kai.workshop.run_lifecycle import DurableRun, load_durable_run
 from kai.workshop.runtime_pool import WorkshopRuntimePool
-from kai.workshop.runtime_sessions import CanonicalRuntimeSession, load_runtime_session
+from kai.workshop.runtime_sessions import (
+    CanonicalRuntimeSession,
+    ProviderSessionResetConflictError,
+    ProviderSessionResetResult,
+    load_provider_session_reset_operation,
+    load_provider_session_reset_state,
+    load_runtime_session,
+    reset_provider_session,
+)
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
@@ -34,6 +44,14 @@ class WorkshopRuntimeLaneStatusAmbiguous(WorkshopRuntimeLaneStatusError):
     """The request identifies more than one runtime lane."""
 
 
+class WorkshopRuntimeLaneStatusBusy(WorkshopRuntimeLaneStatusError):
+    """The requested runtime lane has an accepted or executing run."""
+
+
+class WorkshopRuntimeLaneStatusReplayConflict(WorkshopRuntimeLaneStatusError):
+    """A client operation ID belongs to another runtime lane."""
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeLaneStatusAuthority:
     requester_principal_id: PrincipalId
@@ -47,6 +65,9 @@ class RuntimeLaneStatusAuthority:
     runtime_profile_id: RuntimeProfileId
     owns_agent: bool
     operator: bool
+    private_context: bool = True
+    settings_channel_id: ChannelId | None = None
+    workspace_runtime_profile_id: RuntimeProfileId | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +111,8 @@ class RuntimeLaneStatusSnapshot:
     active_run: RuntimeLaneRunStatus | None
     last_run: RuntimeLaneRunStatus | None
     diagnostics: RuntimeLaneDiagnostics | None
+    fresh_session_generation: int | None = None
+    fresh_session_revision: str | None = None
 
 
 class WorkshopRuntimeLaneStatusService:
@@ -104,6 +127,7 @@ class WorkshopRuntimeLaneStatusService:
         self._store = store
         self._settings = settings
         self._runtime_pool = runtime_pool
+        self._reset_locks: dict[tuple[ChannelId, AgentId], asyncio.Lock] = {}
 
     async def authority_for_principal_channel(
         self,
@@ -130,7 +154,8 @@ class WorkshopRuntimeLaneStatusService:
             values.append(normalized_handle)
         async with self._store.connection.execute(
             "SELECT c.kind, a.id, a.name, ad.handle, ad.owner_principal_id, "
-            "ad.owner_runtime_profile_id, owner.display_name, wm.role "
+            "ad.owner_runtime_profile_id, owner.display_name, wm.role, "
+            "ad.owner_direct_channel_id, ra.runtime_profile_id "
             "FROM channel_agents ca "
             "JOIN channels c ON c.id = ca.channel_id "
             "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
@@ -138,6 +163,8 @@ class WorkshopRuntimeLaneStatusService:
             "JOIN principals owner ON owner.id = ad.owner_principal_id AND owner.kind = 'human' "
             "JOIN workshop_memberships wm ON wm.workshop_id = c.workshop_id "
             "AND wm.principal_id = ? "
+            "LEFT JOIN channel_agent_runtime_assignments ra "
+            "ON ra.channel_id = ca.channel_id AND ra.agent_id = ca.agent_id "
             f"WHERE {' AND '.join(clauses)} ORDER BY a.id",
             (principal_id, *values),
         ) as cursor:
@@ -167,7 +194,85 @@ class WorkshopRuntimeLaneStatusService:
             runtime_profile_id=runtime_profile_id,
             owns_agent=principal_id == sponsor_principal_id,
             operator=str(row[7]) == "admin",
+            private_context=str(row[0]) == "direct",
+            settings_channel_id=(ChannelId(str(row[8])) if row[8] is not None else None),
+            workspace_runtime_profile_id=(
+                RuntimeProfileId(str(row[9])) if str(row[0]) == "direct" and row[9] is not None else None
+            ),
         )
+
+    @staticmethod
+    def _runtime_authority(authority: RuntimeLaneStatusAuthority) -> WorkshopInternalAPIExecutionContext:
+        return WorkshopInternalAPIExecutionContext(
+            principal_id=authority.requester_principal_id,
+            channel_id=authority.channel_id,
+            agent_id=authority.agent_id,
+            runtime_profile_id=authority.runtime_profile_id,
+            private_context=authority.private_context,
+            sponsor_principal_id=authority.sponsor_principal_id,
+            settings_channel_id=authority.settings_channel_id,
+            workspace_runtime_profile_id=authority.workspace_runtime_profile_id,
+        )
+
+    async def reset_provider_session(
+        self,
+        authority: RuntimeLaneStatusAuthority,
+        client_operation_id: str,
+    ) -> ProviderSessionResetResult:
+        """Start a fresh provider session without clearing canonical user data."""
+        if not isinstance(client_operation_id, str) or not 1 <= len(client_operation_id) <= 128:
+            raise ValueError("client_operation_id must contain between 1 and 128 characters")
+        lock = self._reset_locks.setdefault((authority.channel_id, authority.agent_id), asyncio.Lock())
+        async with lock:
+            replay = await load_provider_session_reset_operation(
+                self._store,
+                authority.requester_principal_id,
+                client_operation_id,
+            )
+            if replay is not None:
+                if (
+                    replay.channel_id != authority.channel_id
+                    or replay.agent_id != authority.agent_id
+                    or replay.runtime_profile_id != authority.runtime_profile_id
+                ):
+                    raise WorkshopRuntimeLaneStatusReplayConflict(
+                        "The fresh-session operation ID already belongs to another runtime lane"
+                    )
+                return replay
+            active_run = await self._load_run(authority, active=True)
+            if active_run is not None:
+                raise WorkshopRuntimeLaneStatusBusy(
+                    "A fresh provider session cannot start while this agent has an active run"
+                )
+            result: ProviderSessionResetResult | None = None
+
+            async def commit_reset(live_process_stopped: bool) -> None:
+                nonlocal result
+                try:
+                    result = await reset_provider_session(
+                        self._store,
+                        requester_principal_id=authority.requester_principal_id,
+                        channel_id=authority.channel_id,
+                        agent_id=authority.agent_id,
+                        runtime_profile_id=authority.runtime_profile_id,
+                        client_operation_id=client_operation_id,
+                        live_process_stopped=live_process_stopped,
+                        occurred_at=datetime.now(UTC),
+                    )
+                except ProviderSessionResetConflictError as exc:
+                    raise WorkshopRuntimeLaneStatusReplayConflict(str(exc)) from exc
+
+            accepted, _ = await self._runtime_pool.reset_provider_session(
+                self._runtime_authority(authority),
+                commit_reset=commit_reset,
+            )
+            if not accepted:
+                raise WorkshopRuntimeLaneStatusBusy(
+                    "A fresh provider session cannot start while this agent has an active run"
+                )
+            if result is None:
+                raise WorkshopRuntimeLaneStatusError("Fresh provider-session reset was not recorded")
+            return result
 
     async def authority_for_transport_binding(
         self,
@@ -225,6 +330,11 @@ class WorkshopRuntimeLaneStatusService:
                 owner_workspace = None
 
         session = await load_runtime_session(self._store, authority.channel_id, authority.agent_id)
+        reset_state = await load_provider_session_reset_state(
+            self._store,
+            authority.channel_id,
+            authority.agent_id,
+        )
         active_run = await self._load_run(authority, active=True)
         last_run = await self._load_run(authority, active=False)
         provider_state, continuity_state = self._session_states(
@@ -276,6 +386,8 @@ class WorkshopRuntimeLaneStatusService:
             active_run=self._run_status(active_run),
             last_run=self._run_status(last_run),
             diagnostics=diagnostics,
+            fresh_session_generation=(reset_state.generation if reset_state is not None else None),
+            fresh_session_revision=(reset_state.revision if reset_state is not None else None),
         )
 
     async def _load_run(

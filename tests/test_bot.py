@@ -1265,16 +1265,47 @@ class TestHandleStart:
 
 class TestHandleNew:
     @pytest.mark.asyncio
-    async def test_clears_session_and_restarts(self):
-        claude = _make_mock_claude()
+    async def test_starts_fresh_canonical_provider_session(self):
         update = _make_update()
-        ctx = _make_context(claude=claude)
-        with patch("kai.bot.sessions.clear_session", new_callable=AsyncMock) as mock_clear:
-            await handle_new(update, ctx)
-        claude.restart.assert_called_once()
-        mock_clear.assert_called_once_with(12345)
+        update.update_id = 987
+        ctx = _make_context()
+        service = ctx.application.core_services.runtime_lane_status
+        authority = SimpleNamespace(agent_handle="kai")
+        service.authority_for_transport_binding = AsyncMock(return_value=authority)
+        service.reset_provider_session = AsyncMock(
+            return_value=SimpleNamespace(replayed=False, revision="a" * 64),
+        )
+
+        await handle_new(update, ctx)
+
+        service.authority_for_transport_binding.assert_awaited_once_with(
+            transport="telegram",
+            sender_subject="1",
+            channel_subject="12345",
+            agent_handle=None,
+        )
+        service.reset_provider_session.assert_awaited_once_with(
+            authority,
+            "telegram:new:987",
+        )
         reply = update.message.reply_text.call_args[0][0]
-        assert "cleared" in reply.lower()
+        assert "Fresh provider session ready for @kai" in reply
+        assert "history, memories, settings, and enrollment were preserved" in reply
+        assert "aaaaaaaaaaaa" in reply
+
+    @pytest.mark.asyncio
+    async def test_requires_explicit_agent_in_multi_agent_channel(self):
+        update = _make_update()
+        ctx = _make_context()
+        service = ctx.application.core_services.runtime_lane_status
+        service.authority_for_transport_binding = AsyncMock(
+            side_effect=WorkshopRuntimeLaneStatusAmbiguous("choose"),
+        )
+
+        await handle_new(update, ctx)
+
+        assert update.message.reply_text.await_args.args[0] == "Choose an agent in this channel: /new @agent"
+        service.reset_provider_session.assert_not_called()
 
 
 class TestHandleHelp:

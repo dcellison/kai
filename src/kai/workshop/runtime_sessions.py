@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from kai.workshop.domain import AgentId, ChannelId, MessageId, RunId, RuntimeProfileId
+from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId, RuntimeProfileId
 from kai.workshop.run_execution_authority import RunExecutionSelection
 from kai.workshop.store import WorkshopEventStore
 
@@ -16,6 +18,10 @@ class RuntimeSessionStateError(RuntimeError):
 
 class RuntimeSessionStateConflictError(RuntimeSessionStateError):
     """Continuity bookkeeping is stale or conflicts with newer authority."""
+
+
+class ProviderSessionResetConflictError(RuntimeSessionStateError):
+    """A reset operation ID was reused for a different runtime lane."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +56,31 @@ class CanonicalRuntimeSession:
 class RuntimeSessionSettlementResult:
     session: CanonicalRuntimeSession
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSessionResetResult:
+    requester_principal_id: PrincipalId
+    channel_id: ChannelId
+    agent_id: AgentId
+    runtime_profile_id: RuntimeProfileId
+    client_operation_id: str
+    generation: int
+    revision: str
+    prior_session_present: bool
+    live_process_stopped: bool
+    created_at: datetime
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSessionResetState:
+    channel_id: ChannelId
+    agent_id: AgentId
+    runtime_profile_id: RuntimeProfileId
+    generation: int
+    revision: str
+    updated_at: datetime
 
 
 def _timestamp(value: datetime) -> str:
@@ -128,6 +159,181 @@ async def clear_runtime_session(
     )
     await store.connection.commit()
     return cursor.rowcount > 0
+
+
+def _provider_session_reset_from_row(row, *, replayed: bool) -> ProviderSessionResetResult:
+    return ProviderSessionResetResult(
+        requester_principal_id=PrincipalId(str(row[0])),
+        client_operation_id=str(row[1]),
+        channel_id=ChannelId(str(row[2])),
+        agent_id=AgentId(str(row[3])),
+        runtime_profile_id=RuntimeProfileId(str(row[4])),
+        generation=int(row[5]),
+        revision=str(row[6]),
+        prior_session_present=bool(row[7]),
+        live_process_stopped=bool(row[8]),
+        created_at=_parse_timestamp(row[9]),
+        replayed=replayed,
+    )
+
+
+async def load_provider_session_reset_operation(
+    store: WorkshopEventStore,
+    requester_principal_id: PrincipalId,
+    client_operation_id: str,
+) -> ProviderSessionResetResult | None:
+    """Load one replay-safe reset receipt without changing its runtime lane."""
+    async with store.connection.execute(
+        "SELECT requester_principal_id, client_operation_id, channel_id, agent_id, "
+        "runtime_profile_id, generation, revision, prior_session_present, "
+        "live_process_stopped, created_at FROM provider_session_reset_operations "
+        "WHERE requester_principal_id = ? AND client_operation_id = ?",
+        (requester_principal_id, client_operation_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return None if row is None else _provider_session_reset_from_row(row, replayed=True)
+
+
+async def load_provider_session_reset_state(
+    store: WorkshopEventStore,
+    channel_id: ChannelId,
+    agent_id: AgentId,
+) -> ProviderSessionResetState | None:
+    """Load the shared fresh-session boundary visible to every adapter."""
+    async with store.connection.execute(
+        "SELECT channel_id, agent_id, runtime_profile_id, generation, revision, updated_at "
+        "FROM provider_session_reset_state WHERE channel_id = ? AND agent_id = ?",
+        (channel_id, agent_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    return ProviderSessionResetState(
+        channel_id=ChannelId(str(row[0])),
+        agent_id=AgentId(str(row[1])),
+        runtime_profile_id=RuntimeProfileId(str(row[2])),
+        generation=int(row[3]),
+        revision=str(row[4]),
+        updated_at=_parse_timestamp(row[5]),
+    )
+
+
+async def reset_provider_session(
+    store: WorkshopEventStore,
+    *,
+    requester_principal_id: PrincipalId,
+    channel_id: ChannelId,
+    agent_id: AgentId,
+    runtime_profile_id: RuntimeProfileId,
+    client_operation_id: str,
+    live_process_stopped: bool,
+    occurred_at: datetime,
+) -> ProviderSessionResetResult:
+    """Invalidate exactly one canonical lane and persist its replay-safe revision."""
+    if not isinstance(client_operation_id, str) or not 1 <= len(client_operation_id) <= 128:
+        raise ValueError("client_operation_id must contain between 1 and 128 characters")
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+        raise ValueError("occurred_at must be timezone-aware")
+    when = _timestamp(occurred_at)
+    await store.connection.execute("BEGIN IMMEDIATE")
+    try:
+        existing = await load_provider_session_reset_operation(
+            store,
+            requester_principal_id,
+            client_operation_id,
+        )
+        if existing is not None:
+            if (
+                existing.channel_id != channel_id
+                or existing.agent_id != agent_id
+                or existing.runtime_profile_id != runtime_profile_id
+            ):
+                raise ProviderSessionResetConflictError(
+                    "The fresh-session operation ID already belongs to another runtime lane"
+                )
+            await store.connection.commit()
+            return existing
+
+        async with store.connection.execute(
+            "SELECT generation FROM provider_session_reset_state WHERE channel_id = ? AND agent_id = ?",
+            (channel_id, agent_id),
+        ) as cursor:
+            state = await cursor.fetchone()
+        generation = 1 if state is None else int(state[0]) + 1
+        revision_payload = {
+            "version": 1,
+            "requester_principal_id": str(requester_principal_id),
+            "channel_id": str(channel_id),
+            "agent_id": str(agent_id),
+            "runtime_profile_id": str(runtime_profile_id),
+            "client_operation_id": client_operation_id,
+            "generation": generation,
+        }
+        revision = hashlib.sha256(
+            json.dumps(revision_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        async with store.connection.execute(
+            "SELECT 1 FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+            (channel_id, agent_id),
+        ) as cursor:
+            prior_session_present = await cursor.fetchone() is not None
+        await store.connection.execute(
+            "DELETE FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+            (channel_id, agent_id),
+        )
+        await store.connection.execute(
+            "INSERT INTO provider_session_reset_state "
+            "(channel_id, agent_id, runtime_profile_id, generation, revision, "
+            "last_client_operation_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(channel_id, agent_id) DO UPDATE SET "
+            "runtime_profile_id=excluded.runtime_profile_id, generation=excluded.generation, "
+            "revision=excluded.revision, last_client_operation_id=excluded.last_client_operation_id, "
+            "updated_at=excluded.updated_at",
+            (
+                channel_id,
+                agent_id,
+                runtime_profile_id,
+                generation,
+                revision,
+                client_operation_id,
+                when,
+            ),
+        )
+        await store.connection.execute(
+            "INSERT INTO provider_session_reset_operations "
+            "(requester_principal_id, client_operation_id, channel_id, agent_id, "
+            "runtime_profile_id, generation, revision, prior_session_present, "
+            "live_process_stopped, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                requester_principal_id,
+                client_operation_id,
+                channel_id,
+                agent_id,
+                runtime_profile_id,
+                generation,
+                revision,
+                int(prior_session_present),
+                int(live_process_stopped),
+                when,
+            ),
+        )
+        await store.connection.commit()
+    except BaseException:
+        await store.connection.rollback()
+        raise
+    return ProviderSessionResetResult(
+        requester_principal_id=requester_principal_id,
+        channel_id=channel_id,
+        agent_id=agent_id,
+        runtime_profile_id=runtime_profile_id,
+        client_operation_id=client_operation_id,
+        generation=generation,
+        revision=revision,
+        prior_session_present=prior_session_present,
+        live_process_stopped=live_process_stopped,
+        created_at=occurred_at.astimezone(UTC),
+        replayed=False,
+    )
 
 
 async def settle_runtime_session_in_transaction(
