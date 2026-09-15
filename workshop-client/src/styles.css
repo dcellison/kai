@@ -4939,6 +4939,7 @@ button:disabled {
 .workspace-settings-heading .panel-icon-button svg,
 .workspace-grant-list .panel-icon-button svg,
 .workspace-deletion-list .panel-icon-button svg,
+.workspace-secret-card .panel-icon-button svg,
 .workspace-creation-header .panel-icon-button svg {
   width: 1rem;
   height: 1rem;
@@ -4946,6 +4947,69 @@ button:disabled {
   stroke: currentColor;
   stroke-linecap: round;
   stroke-width: 1.8;
+}
+
+.workspace-secret-heading,
+.workspace-secret-list li,
+.workspace-secret-actions {
+  display: flex;
+  align-items: center;
+}
+
+.workspace-secret-heading,
+.workspace-secret-list li {
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.workspace-secret-heading > div,
+.workspace-secret-list li > span:first-child {
+  min-width: 0;
+}
+
+.workspace-secret-heading p {
+  margin-block: 0;
+}
+
+.workspace-secret-heading > div > p:last-child {
+  margin-top: 0.2rem;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.workspace-secret-list {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.7rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workspace-secret-list li {
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.workspace-secret-list strong,
+.workspace-secret-list small {
+  display: block;
+}
+
+.workspace-secret-list strong {
+  overflow: hidden;
+  font: 0.7rem var(--mono);
+  text-overflow: ellipsis;
+}
+
+.workspace-secret-list small {
+  margin-top: 0.12rem;
+  color: var(--color-text-muted);
+  font-size: 0.61rem;
+}
+
+.workspace-secret-actions {
+  flex: none;
+  gap: 0.2rem;
 }
 
 .workspace-grant-list,

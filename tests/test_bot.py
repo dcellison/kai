@@ -136,6 +136,7 @@ from kai.workshop.settings_workspaces import (
     EffectiveValue,
     WorkshopSettingsWorkspaceConflict,
     WorkspaceConfigSnapshot,
+    WorkspaceEnvironmentVariable,
 )
 from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
@@ -3798,6 +3799,77 @@ class TestHandleWorkspaceConfig:
             value="opus",
         )
         assert "opus" in update.message.reply_text.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_protected_runtime_uses_write_only_core_environment_service(self):
+        update = _make_update(text="/workspace config env SERVICE_TOKEN=secret-value")
+        ctx = _make_context()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        snapshot = WorkspaceConfigSnapshot(
+            workspace="/srv/kai",
+            model=EffectiveValue("opus", "workspace override", "sonnet"),
+            timeout_seconds=EffectiveValue(120, "runtime policy", 120),
+            environment_keys=("SERVICE_TOKEN",),
+            prompt=None,
+            has_prompt=False,
+            prompt_source=None,
+            override_fields=("env",),
+            revision="sws_test",
+            capabilities=(),
+            environment_variables=(WorkspaceEnvironmentVariable("SERVICE_TOKEN", "principal", True, True),),
+        )
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.set_workspace_environment_variable = AsyncMock(return_value=snapshot)
+        ctx.application.core_services.settings_workspaces = service
+
+        await _handle_workspace_config(
+            update,
+            ctx,
+            "config env SERVICE_TOKEN=secret-value",
+        )
+
+        service.set_workspace_environment_variable.assert_awaited_once_with(
+            authority,
+            key="SERVICE_TOKEN",
+            value="secret-value",
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        assert "SERVICE_TOKEN" in reply
+        assert "secret-value" not in reply
+
+    @pytest.mark.asyncio
+    async def test_protected_reset_all_preserves_workspace_secrets(self):
+        update = _make_update(text="/workspace config reset")
+        ctx = _make_context()
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        snapshot = WorkspaceConfigSnapshot(
+            workspace="/srv/kai",
+            model=EffectiveValue("sonnet", "runtime policy", "sonnet"),
+            timeout_seconds=EffectiveValue(120, "runtime policy", 120),
+            environment_keys=("SERVICE_TOKEN",),
+            prompt=None,
+            has_prompt=False,
+            prompt_source=None,
+            override_fields=("env",),
+            revision="sws_test",
+            capabilities=(),
+            environment_variables=(WorkspaceEnvironmentVariable("SERVICE_TOKEN", "principal", True, True),),
+        )
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.workspace_config = AsyncMock(return_value=snapshot)
+        service.reset_self_service_workspace_config = AsyncMock(return_value=snapshot)
+        ctx.application.core_services.settings_workspaces = service
+
+        await _handle_workspace_config(update, ctx, "config reset")
+
+        service.reset_self_service_workspace_config.assert_awaited_once_with(
+            authority,
+            field=None,
+            expected_revision="sws_test",
+        )
+        service.reset_workspace_config.assert_not_called()
 
     # ── 1. Show config with no overrides ────────────────────────────
 

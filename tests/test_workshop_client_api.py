@@ -176,6 +176,7 @@ from kai.workshop.settings_workspaces import (
     WorkspaceConfigSnapshot,
     WorkspaceCreationResult,
     WorkspaceDeletionResult,
+    WorkspaceEnvironmentVariable,
     WorkspaceGrantMutationResult,
     WorkspaceGrantOption,
     WorkspaceGrantSnapshot,
@@ -317,6 +318,7 @@ class _SettingsWorkspaces:
     added_workspace_grants: list[str] = field(default_factory=list)
     removed_workspace_grants: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
+    workspace_environment_changes: list[tuple[str, str]] = field(default_factory=list)
     runtime_changes: list[tuple[str, object]] = field(default_factory=list)
     catalogue_calls: list[tuple[str, str | None]] = field(default_factory=list)
 
@@ -540,6 +542,31 @@ class _SettingsWorkspaces:
     async def reset_self_service_workspace_config(self, *args, **kwargs):
         return await self.reset_workspace_config(*args, **kwargs)
 
+    async def set_workspace_environment_variable(
+        self,
+        _authority,
+        *,
+        key: str,
+        value: str,
+        workspace_path: str | None = None,
+        expected_revision: str | None = None,
+    ):
+        self._check_revision(expected_revision, "sws_workspace")
+        self.workspace_environment_changes.append(("set", key))
+        return self._workspace_config_snapshot()
+
+    async def delete_workspace_environment_variable(
+        self,
+        _authority,
+        *,
+        key: str,
+        workspace_path: str | None = None,
+        expected_revision: str | None = None,
+    ):
+        self._check_revision(expected_revision, "sws_workspace")
+        self.workspace_environment_changes.append(("remove", key))
+        return self._workspace_config_snapshot(), True
+
     def _snapshot(
         self,
         *,
@@ -633,6 +660,7 @@ class _SettingsWorkspaces:
             override_fields=(),
             revision="sws_workspace",
             capabilities=(EditableCapability("prompt", "workspace", "text", True),),
+            environment_variables=(WorkspaceEnvironmentVariable("SAFE_KEY", "principal", True, True),),
         )
 
 
@@ -4616,6 +4644,69 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert (await current.json())["environment_keys"] == ["SAFE_KEY"]
             assert changed.status == 200
             assert service.workspace_config_changes == [("timeout", "180")]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_workspace_environment_secret_flow_is_write_only_and_isolated(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            settings_workspaces=service,
+        )
+        path = f"/v1/channels/{alice_channel}/workspace-environment/NEW_SECRET"
+        secret = "q1577-must-never-be-returned"
+        headers = {
+            "Authorization": "Bearer alice-token",
+            "Content-Type": "application/json",
+        }
+        try:
+            stored = await client.put(
+                path,
+                headers=headers,
+                json={"revision": "sws_workspace", "value": secret},
+            )
+            removed = await client.delete(
+                path,
+                headers=headers,
+                json={"revision": "sws_workspace"},
+            )
+            foreign = await client.put(
+                path,
+                headers={**headers, "Authorization": "Bearer bob-token"},
+                json={"revision": "sws_workspace", "value": secret},
+            )
+
+            assert stored.status == 200
+            stored_payload = await stored.json()
+            assert stored_payload["environment_variables"] == [
+                {
+                    "key": "SAFE_KEY",
+                    "provenance": "principal",
+                    "editable": True,
+                    "removable": True,
+                }
+            ]
+            assert stored_payload["environment_policy"] == {
+                "maximum_keys": 64,
+                "maximum_key_characters": 128,
+                "maximum_value_bytes": 16384,
+                "values_write_only": True,
+            }
+            assert secret not in json.dumps(stored_payload)
+            assert removed.status == 200
+            assert secret not in await removed.text()
+            assert foreign.status == 403
+            assert secret not in await foreign.text()
+            assert service.workspace_environment_changes == [
+                ("set", "NEW_SECRET"),
+                ("remove", "NEW_SECRET"),
+            ]
         finally:
             await client.close()
             await store.close()

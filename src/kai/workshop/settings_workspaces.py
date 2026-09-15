@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import stat
 import unicodedata
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from kai.config import (
     WorkspaceConfig,
     canonicalize_model_for_backend,
     models_for_backend_policy,
+    parse_env_file,
     validate_model_for_backend_policy,
 )
 from kai.workshop.domain import AgentId, ChannelId, PrincipalId, RuntimeProfileId
@@ -79,6 +81,42 @@ class WorkshopSettingsWorkspaceConsistencyError(WorkshopSettingsWorkspaceError):
 MIN_SELF_SERVICE_TIMEOUT_SECONDS = 1
 MAX_SELF_SERVICE_PROMPT_CHARACTERS = 32_000
 MAX_SELF_SERVICE_WORKSPACE_NAME_CHARACTERS = 64
+MAX_WORKSPACE_ENVIRONMENT_KEYS = 64
+MAX_WORKSPACE_ENVIRONMENT_KEY_CHARACTERS = 128
+MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES = 16 * 1024
+
+_WORKSPACE_ENVIRONMENT_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_WORKSPACE_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "BASH_ENV",
+        "CODEX_HOME",
+        "CODEX_MODEL",
+        "CODEX_PROVIDER",
+        "DEEPSEEK_API_KEY",
+        "ENV",
+        "GENERIC_WEBHOOK_SECRET",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GITHUB_WEBHOOK_SECRET",
+        "HOME",
+        "KAI_WEBHOOK_SECRET",
+        "LOGNAME",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "PATH",
+        "PWD",
+        "SHELL",
+        "SSH_AUTH_SOCK",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_WEBHOOK_SECRET",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "WEBHOOK_SECRET",
+    }
+)
+_RESERVED_WORKSPACE_ENVIRONMENT_PREFIXES = ("DYLD_", "KAI_", "LD_", "PYTHON")
 
 
 def _runtime_can_self_grant_workspace(os_user: str | None, path: Path) -> bool:
@@ -252,7 +290,16 @@ class WorkspaceConfigSnapshot:
     override_fields: tuple[str, ...]
     revision: str
     capabilities: tuple[EditableCapability, ...]
+    environment_variables: tuple[WorkspaceEnvironmentVariable, ...] = ()
     mutation: SettingsMutationOutcome | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceEnvironmentVariable:
+    key: str
+    provenance: str
+    editable: bool
+    removable: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1147,14 +1194,12 @@ class WorkshopSettingsWorkspaceService:
             str(workspace),
         )
         model, timeout = await self._effective_values(authority, workspace)
-        env_keys: set[str] = set(yaml_config.env if yaml_config and yaml_config.env else ())
-        if raw_env := overrides.get("env"):
-            try:
-                decoded = json.loads(raw_env)
-                if isinstance(decoded, dict):
-                    env_keys.update(str(key) for key in decoded)
-            except json.JSONDecodeError:
-                pass
+        operator_environment_keys = self._operator_environment_keys(yaml_config)
+        principal_environment = self._decode_environment(overrides.get("env"))
+        environment_variables = self._environment_variables(
+            operator_environment_keys,
+            principal_environment,
+        )
         prompt: str | None = None
         prompt_source: str | None = None
         has_prompt = False
@@ -1190,7 +1235,7 @@ class WorkshopSettingsWorkspaceService:
             workspace=str(workspace),
             model=model,
             timeout_seconds=timeout,
-            environment_keys=tuple(sorted(env_keys)),
+            environment_keys=tuple(item.key for item in environment_variables),
             prompt=prompt,
             has_prompt=has_prompt,
             prompt_source=prompt_source,
@@ -1211,6 +1256,7 @@ class WorkshopSettingsWorkspaceService:
                 ),
                 maximum_timeout_seconds=profile.maximum_timeout_seconds,
             ),
+            environment_variables=environment_variables,
             mutation=mutation,
         )
 
@@ -1223,7 +1269,7 @@ class WorkshopSettingsWorkspaceService:
         workspace_path: str | None = None,
         expected_revision: str | None = None,
     ) -> WorkspaceConfigSnapshot:
-        if field not in {"model", "timeout", "env", "prompt"}:
+        if field not in {"model", "timeout", "prompt"}:
             raise WorkshopSettingsWorkspaceValidationError("Unsupported workspace setting")
         profile = self._runtime_pool.runtime_profile(self._runtime_authority(authority))
         backend, _provider = self._runtime_pool.get_backend_provider(self._runtime_authority(authority))
@@ -1250,18 +1296,6 @@ class WorkshopSettingsWorkspaceService:
                     f"and {profile.maximum_timeout_seconds} seconds"
                 )
             value = str(parsed_timeout)
-        elif field == "env":
-            try:
-                decoded = json.loads(value)
-            except json.JSONDecodeError as exc:
-                raise WorkshopSettingsWorkspaceValidationError("Environment override must be a JSON object") from exc
-            if not isinstance(decoded, dict) or not all(
-                isinstance(key, str) and isinstance(item, str) for key, item in decoded.items()
-            ):
-                raise WorkshopSettingsWorkspaceValidationError(
-                    "Environment override must contain string keys and values"
-                )
-            value = json.dumps(decoded, sort_keys=True)
         elif "\x00" in value or len(value) > MAX_SELF_SERVICE_PROMPT_CHARACTERS:
             raise WorkshopSettingsWorkspaceValidationError(
                 f"Prompt must contain at most {MAX_SELF_SERVICE_PROMPT_CHARACTERS} characters and no null bytes"
@@ -1314,7 +1348,7 @@ class WorkshopSettingsWorkspaceService:
         workspace_path: str | None = None,
         expected_revision: str | None = None,
     ) -> WorkspaceConfigSnapshot:
-        if field not in {None, "model", "timeout", "env", "prompt"}:
+        if field not in {None, "model", "timeout", "prompt"}:
             raise WorkshopSettingsWorkspaceValidationError("Unsupported workspace setting")
         async with self._lock(authority):
             workspace = await self._authorized_workspace(
@@ -1408,27 +1442,95 @@ class WorkshopSettingsWorkspaceService:
         key: str,
         value: str,
         workspace_path: str | None = None,
+        expected_revision: str | None = None,
     ) -> WorkspaceConfigSnapshot:
-        if not key:
-            raise WorkshopSettingsWorkspaceValidationError("Environment key cannot be empty")
+        key = self._validate_environment_key(key)
+        self._validate_environment_value(value)
         async with self._lock(authority):
             workspace = await self._authorized_workspace(
                 authority,
                 workspace_path,
             )
+            current = await self._workspace_config_locked(authority, str(workspace))
+            self._check_revision(current.revision, expected_revision)
+            namespace = self._namespace(authority)
             settings = await sessions.get_canonical_workspace_config_settings(
-                self._namespace(authority),
+                namespace,
                 str(workspace),
             )
             environment = self._decode_environment(settings.get("env"))
+            operator_keys = self._operator_environment_keys(self._config.get_workspace_config(workspace))
+            if key in operator_keys:
+                raise WorkshopSettingsWorkspaceAccessDenied("Operator-managed environment variables cannot be replaced")
+            if key not in environment and len(environment) >= MAX_WORKSPACE_ENVIRONMENT_KEYS:
+                raise WorkshopSettingsWorkspaceValidationError(
+                    f"A workspace can contain at most {MAX_WORKSPACE_ENVIRONMENT_KEYS} principal-managed environment variables"
+                )
+            prior = dict(settings)
+            prior_execution = await sessions.get_canonical_execution_settings(namespace)
+            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
+            changed = environment.get(key) != value
+            if not changed:
+                runtime_action = "unchanged"
+                snapshot = await self._workspace_config_locked(
+                    authority,
+                    str(workspace),
+                    mutation=SettingsMutationOutcome(
+                        operation="set_workspace_environment",
+                        changed=False,
+                        runtime_action=runtime_action,
+                        provider_session_invalidated=False,
+                    ),
+                )
+                await self._audit_environment_mutation(
+                    namespace,
+                    workspace,
+                    key=key,
+                    operation="set",
+                    changed=False,
+                    runtime_action=runtime_action,
+                )
+                return snapshot
             environment[key] = value
-            await self._set_workspace_config_locked(
-                authority,
-                workspace,
-                field="env",
-                value=json.dumps(environment, sort_keys=True),
-            )
-        return await self.workspace_config(authority, str(workspace))
+            mutation_applied = False
+            try:
+                applied = await self._set_workspace_config_locked(
+                    authority,
+                    workspace,
+                    field="env",
+                    value=json.dumps(environment, sort_keys=True),
+                )
+                mutation_applied = True
+                runtime_action = "restarted" if applied and was_running else "deferred_until_next_run"
+                snapshot = await self._workspace_config_locked(
+                    authority,
+                    str(workspace),
+                    mutation=SettingsMutationOutcome(
+                        operation="set_workspace_environment",
+                        changed=True,
+                        runtime_action=runtime_action,
+                        provider_session_invalidated=applied,
+                    ),
+                )
+                await self._audit_environment_mutation(
+                    namespace,
+                    workspace,
+                    key=key,
+                    operation="set",
+                    changed=True,
+                    runtime_action=runtime_action,
+                )
+                return snapshot
+            except BaseException:
+                if mutation_applied:
+                    await self._restore_after_failure(
+                        authority,
+                        namespace,
+                        execution_settings=prior_execution,
+                        workspace=workspace,
+                        workspace_settings=prior,
+                    )
+                raise
 
     async def delete_workspace_environment_variable(
         self,
@@ -1436,36 +1538,81 @@ class WorkshopSettingsWorkspaceService:
         *,
         key: str,
         workspace_path: str | None = None,
+        expected_revision: str | None = None,
     ) -> tuple[WorkspaceConfigSnapshot, bool]:
+        key = self._validate_environment_key(key)
         async with self._lock(authority):
             workspace = await self._authorized_workspace(
                 authority,
                 workspace_path,
             )
+            current = await self._workspace_config_locked(authority, str(workspace))
+            self._check_revision(current.revision, expected_revision)
+            namespace = self._namespace(authority)
             settings = await sessions.get_canonical_workspace_config_settings(
-                self._namespace(authority),
+                namespace,
                 str(workspace),
             )
             environment = self._decode_environment(settings.get("env"))
+            was_running = self._runtime_pool.is_running(self._runtime_authority(authority))
+            applied = False
+            prior = dict(settings)
+            prior_execution = await sessions.get_canonical_execution_settings(namespace)
+            mutation_applied = False
             if key not in environment:
                 changed = False
+                runtime_action = "unchanged"
             else:
                 changed = True
                 del environment[key]
-                if environment:
-                    await self._set_workspace_config_locked(
+                try:
+                    if environment:
+                        applied = await self._set_workspace_config_locked(
+                            authority,
+                            workspace,
+                            field="env",
+                            value=json.dumps(environment, sort_keys=True),
+                        )
+                    else:
+                        applied = await self._reset_workspace_config_locked(
+                            authority,
+                            workspace,
+                            field="env",
+                        )
+                    mutation_applied = True
+                    runtime_action = "restarted" if applied and was_running else "deferred_until_next_run"
+                except BaseException:
+                    raise
+            try:
+                snapshot = await self._workspace_config_locked(
+                    authority,
+                    str(workspace),
+                    mutation=SettingsMutationOutcome(
+                        operation="remove_workspace_environment",
+                        changed=changed,
+                        runtime_action=runtime_action,
+                        provider_session_invalidated=changed and applied,
+                    ),
+                )
+                await self._audit_environment_mutation(
+                    namespace,
+                    workspace,
+                    key=key,
+                    operation="remove",
+                    changed=changed,
+                    runtime_action=runtime_action,
+                )
+                return snapshot, changed
+            except BaseException:
+                if mutation_applied:
+                    await self._restore_after_failure(
                         authority,
-                        workspace,
-                        field="env",
-                        value=json.dumps(environment, sort_keys=True),
+                        namespace,
+                        execution_settings=prior_execution,
+                        workspace=workspace,
+                        workspace_settings=prior,
                     )
-                else:
-                    await self._reset_workspace_config_locked(
-                        authority,
-                        workspace,
-                        field="env",
-                    )
-        return await self.workspace_config(authority, str(workspace)), changed
+                raise
 
     async def _set_workspace_config_locked(
         self,
@@ -1971,6 +2118,88 @@ class WorkshopSettingsWorkspaceService:
         return {
             str(key): str(value) for key, value in decoded.items() if isinstance(key, str) and isinstance(value, str)
         }
+
+    @staticmethod
+    def _operator_environment_keys(
+        workspace_config: WorkspaceConfig | None,
+    ) -> set[str]:
+        if workspace_config is None:
+            return set()
+        keys = set(workspace_config.env or ())
+        if workspace_config.env_file is not None:
+            keys.update(parse_env_file(workspace_config.env_file))
+        return keys
+
+    @staticmethod
+    def _environment_variables(
+        operator_keys: set[str],
+        principal_environment: dict[str, str],
+    ) -> tuple[WorkspaceEnvironmentVariable, ...]:
+        variables: list[WorkspaceEnvironmentVariable] = []
+        for key in sorted(operator_keys | set(principal_environment)):
+            principal_override = key in principal_environment
+            operator_managed = key in operator_keys
+            provenance = (
+                "principal_override"
+                if principal_override and operator_managed
+                else "principal"
+                if principal_override
+                else "operator"
+            )
+            variables.append(
+                WorkspaceEnvironmentVariable(
+                    key=key,
+                    provenance=provenance,
+                    editable=principal_override and not operator_managed,
+                    removable=principal_override,
+                )
+            )
+        return tuple(variables)
+
+    @staticmethod
+    def _validate_environment_key(key: str) -> str:
+        normalized = key.strip()
+        if (
+            not normalized
+            or len(normalized) > MAX_WORKSPACE_ENVIRONMENT_KEY_CHARACTERS
+            or _WORKSPACE_ENVIRONMENT_KEY.fullmatch(normalized) is None
+        ):
+            raise WorkshopSettingsWorkspaceValidationError(
+                "Environment keys must use letters, digits, and underscores, and cannot begin with a digit"
+            )
+        if normalized in _RESERVED_WORKSPACE_ENVIRONMENT_KEYS or normalized.startswith(
+            _RESERVED_WORKSPACE_ENVIRONMENT_PREFIXES
+        ):
+            raise WorkshopSettingsWorkspaceValidationError("That environment key is protected by runtime policy")
+        return normalized
+
+    @staticmethod
+    def _validate_environment_value(value: str) -> None:
+        if "\x00" in value:
+            raise WorkshopSettingsWorkspaceValidationError("Environment values cannot contain null bytes")
+        if len(value.encode("utf-8")) > MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES:
+            raise WorkshopSettingsWorkspaceValidationError(
+                f"Environment values must contain at most {MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES} UTF-8 bytes"
+            )
+
+    @staticmethod
+    async def _audit_environment_mutation(
+        namespace: WorkshopExecutionStateNamespace,
+        workspace: Path,
+        *,
+        key: str,
+        operation: str,
+        changed: bool,
+        runtime_action: str,
+    ) -> None:
+        await sessions.record_workspace_environment_secret_audit(
+            namespace,
+            workspace_digest=hashlib.sha256(str(workspace.resolve()).encode("utf-8")).hexdigest(),
+            environment_key=key,
+            operation=operation,
+            changed=changed,
+            runtime_action=runtime_action,
+        )
 
     @staticmethod
     def _canonical_authority(

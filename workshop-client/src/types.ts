@@ -728,6 +728,13 @@ export interface WorkshopRunRoutingDecision {
 export interface WorkshopWorkspaceConfig {
   capabilities: WorkshopEditableCapability[];
   environmentKeys: string[];
+  environmentPolicy: {
+    maximumKeyCharacters: number;
+    maximumKeys: number;
+    maximumValueBytes: number;
+    valuesWriteOnly: boolean;
+  };
+  environmentVariables: WorkshopWorkspaceEnvironmentVariable[];
   hasPrompt: boolean;
   model: { defaultValue: string; source: string; value: string };
   mutation: WorkshopSettingsMutation | null;
@@ -737,6 +744,13 @@ export interface WorkshopWorkspaceConfig {
   revision: string;
   timeoutSeconds: { defaultValue: number; source: string; value: number };
   workspace: string;
+}
+
+export interface WorkshopWorkspaceEnvironmentVariable {
+  editable: boolean;
+  key: string;
+  provenance: "operator" | "principal" | "principal_override";
+  removable: boolean;
 }
 
 export interface WorkshopPreferenceDocument {

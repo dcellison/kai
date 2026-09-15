@@ -32,9 +32,11 @@ import {
   PreferenceRevisionConflictError,
   refreshAllModelCatalogues,
   restorePreferenceRevision,
+  removeWorkspaceEnvironmentSecret,
   removeExistingWorkspace,
   refreshModelCatalogue,
   savePreferenceDocument,
+  setWorkspaceEnvironmentSecret,
   SettingsRevisionConflictError,
   switchWorkspace,
   upsertOperatorModel,
@@ -133,6 +135,15 @@ function ExistingWorkspaceIcon(): React.JSX.Element {
     <svg aria-hidden="true" viewBox="0 0 24 24">
       <path d="M3.5 7.5h6l2 2h9v10h-17z" />
       <path d="M12 12v5m-2.5-2.5h5" />
+    </svg>
+  );
+}
+
+function WorkspaceSecretEditIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24">
+      <path d="m4 20 4.2-1 10.6-10.6-3.2-3.2L5 15.8z" />
+      <path d="m13.8 7 3.2 3.2" />
     </svg>
   );
 }
@@ -365,6 +376,12 @@ function SettingsWorkspaceContent({
   const [workspaceGrantOpen, setWorkspaceGrantOpen] = useState(false);
   const [workspaceGrantPath, setWorkspaceGrantPath] = useState("");
   const [workspaceGrantFormError, setWorkspaceGrantFormError] = useState<string | null>(null);
+  const [workspaceSecretOpen, setWorkspaceSecretOpen] = useState(false);
+  const [workspaceSecretKey, setWorkspaceSecretKey] = useState("");
+  const [workspaceSecretValue, setWorkspaceSecretValue] = useState("");
+  const [workspaceSecretEditing, setWorkspaceSecretEditing] = useState(false);
+  const [workspaceSecretBusy, setWorkspaceSecretBusy] = useState(false);
+  const [workspaceSecretError, setWorkspaceSecretError] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -1063,6 +1080,87 @@ function SettingsWorkspaceContent({
       }
     } finally {
       setRuntimeBusy(false);
+    }
+  };
+
+  const openWorkspaceSecret = (key: string | null): void => {
+    setWorkspaceSecretKey(key ?? "");
+    setWorkspaceSecretValue("");
+    setWorkspaceSecretEditing(key !== null);
+    setWorkspaceSecretError(null);
+    setWorkspaceSecretOpen(true);
+  };
+
+  const saveWorkspaceSecret = async (): Promise<void> => {
+    if (
+      !workspaceConfig ||
+      workspaceSecretBusy ||
+      !workspaceSecretKey.trim() ||
+      !workspaceSecretValue
+    ) {
+      return;
+    }
+    setWorkspaceSecretBusy(true);
+    setWorkspaceSecretError(null);
+    setRuntimeNotice(null);
+    try {
+      const changed = await setWorkspaceEnvironmentSecret(
+        session,
+        workspaceConfig.revision,
+        workspaceSecretKey.trim(),
+        workspaceSecretValue,
+      );
+      adoptWorkspace(changed);
+      adoptRuntime(await loadSettingsWorkspace(session));
+      setRuntimeNotice(mutationMessage(changed.mutation));
+      setWorkspaceSecretOpen(false);
+      setWorkspaceSecretKey("");
+      setWorkspaceSecretValue("");
+      setWorkspaceSecretEditing(false);
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshRuntime();
+        setWorkspaceSecretError(
+          "Workspace secrets changed elsewhere. Reopen this form and enter the value again.",
+        );
+        setWorkspaceSecretValue("");
+      } else if (!handleAccessFailure(caught)) {
+        setWorkspaceSecretError(errorText(caught, "Could not save workspace secret."));
+      }
+    } finally {
+      setWorkspaceSecretBusy(false);
+    }
+  };
+
+  const removeWorkspaceSecret = async (key: string): Promise<void> => {
+    if (
+      !workspaceConfig ||
+      workspaceSecretBusy ||
+      !await confirm(`Remove ${key} from this workspace? The active runtime may restart.`)
+    ) {
+      return;
+    }
+    setWorkspaceSecretBusy(true);
+    setWorkspaceSecretError(null);
+    setRuntimeNotice(null);
+    try {
+      const changed = await removeWorkspaceEnvironmentSecret(
+        session,
+        workspaceConfig.revision,
+        key,
+      );
+      adoptWorkspace(changed);
+      adoptRuntime(await loadSettingsWorkspace(session));
+      setRuntimeNotice(mutationMessage(changed.mutation));
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshRuntime();
+        setWorkspaceSecretError("Workspace secrets changed elsewhere. The latest state has been loaded.");
+      } else if (!handleAccessFailure(caught)) {
+        setWorkspaceSecretError(errorText(caught, "Could not remove workspace secret."));
+      }
+    } finally {
+      setWorkspaceSecretBusy(false);
     }
   };
 
@@ -2151,10 +2249,158 @@ function SettingsWorkspaceContent({
                     <div className="settings-actions"><button className="primary-button" type="submit" disabled={runtimeBusy || !workspaceTimeout || Number(workspaceTimeout) === workspaceConfig.timeoutSeconds.value}>Apply</button><button className="quiet-button" type="button" disabled={runtimeBusy || !workspaceConfig.overrideFields.includes("timeout")} onClick={() => void mutateWorkspace({ field: "reset", value: "timeout" }, "Remove this workspace timeout override?")}>Reset</button></div>
                   </form>
                 )}
+                <article className="settings-card workspace-secret-card">
+                  <div className="workspace-secret-heading">
+                    <div>
+                      <p className="settings-card-label">Workspace secrets</p>
+                      <p>Values are write-only and apply only to this workspace.</p>
+                    </div>
+                    <button
+                      className="panel-icon-button"
+                      type="button"
+                      aria-label="Add workspace secret"
+                      title="Add workspace secret"
+                      disabled={
+                        runtimeBusy ||
+                        workspaceSecretBusy ||
+                        workspaceConfig.environmentVariables.length >=
+                          workspaceConfig.environmentPolicy.maximumKeys
+                      }
+                      onClick={() => openWorkspaceSecret(null)}
+                    >
+                      <WorkspaceAddIcon />
+                    </button>
+                  </div>
+                  {workspaceConfig.environmentVariables.length > 0 ? (
+                    <ul className="workspace-secret-list">
+                      {workspaceConfig.environmentVariables.map((item) => (
+                        <li key={item.key}>
+                          <span>
+                            <strong>{item.key}</strong>
+                            <small>
+                              {item.provenance === "operator"
+                                ? "Operator managed"
+                                : item.provenance === "principal_override"
+                                  ? "Personal override of operator policy"
+                                  : "Managed by you"}
+                            </small>
+                          </span>
+                          <span className="workspace-secret-actions">
+                            {item.editable && (
+                              <button
+                                className="panel-icon-button"
+                                type="button"
+                                aria-label={`Replace ${item.key}`}
+                                title={`Replace ${item.key}`}
+                                disabled={workspaceSecretBusy}
+                                onClick={() => openWorkspaceSecret(item.key)}
+                              >
+                                <WorkspaceSecretEditIcon />
+                              </button>
+                            )}
+                            {item.removable && (
+                              <button
+                                className="panel-icon-button"
+                                type="button"
+                                aria-label={`Remove ${item.key}`}
+                                title={`Remove ${item.key}`}
+                                disabled={workspaceSecretBusy}
+                                onClick={() => void removeWorkspaceSecret(item.key)}
+                              >
+                                <WorkspaceDeleteIcon />
+                              </button>
+                            )}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>No workspace secrets configured.</p>
+                  )}
+                  {workspaceSecretError && (
+                    <p className="settings-error" role="alert">{workspaceSecretError}</p>
+                  )}
+                </article>
                 </div>
               </div>
             </div>
           </section>
+        )}
+        {workspaceSecretOpen && workspaceConfig && (
+          <div className="modal-backdrop" role="presentation">
+            <section
+              className="channel-creation-dialog workspace-creation-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="workspace-secret-title"
+            >
+              <header className="workspace-creation-header">
+                <div>
+                  <p className="overline">Write-only value</p>
+                  <h2 id="workspace-secret-title">
+                    {workspaceSecretEditing ? "Replace workspace secret" : "Add workspace secret"}
+                  </h2>
+                </div>
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label="Close workspace secret entry"
+                  title="Close workspace secret entry"
+                  disabled={workspaceSecretBusy}
+                  onClick={() => {
+                    setWorkspaceSecretOpen(false);
+                    setWorkspaceSecretKey("");
+                    setWorkspaceSecretValue("");
+                    setWorkspaceSecretEditing(false);
+                    setWorkspaceSecretError(null);
+                  }}
+                >
+                  <span aria-hidden="true">×</span>
+                </button>
+              </header>
+              <p>Kai stores the value without returning it to this or any other client.</p>
+              <form onSubmit={(event) => { event.preventDefault(); void saveWorkspaceSecret(); }}>
+                <label htmlFor="workspace-secret-key">Environment key</label>
+                <input
+                  id="workspace-secret-key"
+                  type="text"
+                  autoFocus={!workspaceSecretEditing}
+                  autoComplete="off"
+                  spellCheck={false}
+                  maxLength={workspaceConfig.environmentPolicy.maximumKeyCharacters}
+                  value={workspaceSecretKey}
+                  disabled={workspaceSecretBusy || workspaceSecretEditing}
+                  onChange={(event) => setWorkspaceSecretKey(event.target.value)}
+                />
+                <label htmlFor="workspace-secret-value">Secret value</label>
+                <input
+                  id="workspace-secret-value"
+                  type="password"
+                  autoFocus={workspaceSecretEditing}
+                  autoComplete="new-password"
+                  value={workspaceSecretValue}
+                  disabled={workspaceSecretBusy}
+                  onChange={(event) => setWorkspaceSecretValue(event.target.value)}
+                />
+                {workspaceSecretError && (
+                  <p className="form-error" role="alert">{workspaceSecretError}</p>
+                )}
+                <div className="form-actions">
+                  <button
+                    className="primary-button"
+                    type="submit"
+                    disabled={
+                      workspaceSecretBusy ||
+                      !workspaceSecretKey.trim() ||
+                      !workspaceSecretValue
+                    }
+                  >
+                    {workspaceSecretBusy ? "Saving…" : workspaceSecretEditing ? "Replace secret" : "Add secret"}
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
         )}
         {workspaceCreationOpen && runtime && (
           <div className="modal-backdrop" role="presentation">

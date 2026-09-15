@@ -73,11 +73,13 @@ import {
   refreshAllModelCatalogues,
   refreshModelCatalogue,
   searchMemories,
+  removeWorkspaceEnvironmentSecret,
   restorePreferenceRevision,
   restoreDirectMessage,
   resumeStandingObservation,
   savePreferenceDocument,
   setMessageReaction,
+  setWorkspaceEnvironmentSecret,
   setThreadFollowed,
   startAgentConversation,
   startHumanConversation,
@@ -628,6 +630,20 @@ function workspaceConfigPayload(
       default_value: 1800,
     },
     environment_keys: ["PROTECTED_KEY"],
+    environment_variables: [
+      {
+        key: "PROTECTED_KEY",
+        provenance: "operator",
+        editable: false,
+        removable: false,
+      },
+    ],
+    environment_policy: {
+      maximum_keys: 64,
+      maximum_key_characters: 128,
+      maximum_value_bytes: 16384,
+      values_write_only: true,
+    },
     prompt: null,
     has_prompt: false,
     prompt_source: null,
@@ -1482,6 +1498,51 @@ describe("Workshop client API", () => {
         value: "timeout",
       }),
     ).rejects.toBeInstanceOf(SettingsRevisionConflictError);
+  });
+
+  it("uses the dedicated write-only workspace secret flow", async () => {
+    const secret = "q1577-never-render-or-return";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(workspaceConfigPayload()))
+      .mockResolvedValueOnce(Response.json(workspaceConfigPayload()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stored = await setWorkspaceEnvironmentSecret(
+      session,
+      "sws_workspace",
+      "SERVICE_TOKEN",
+      secret,
+    );
+    const removed = await removeWorkspaceEnvironmentSecret(
+      session,
+      "sws_workspace",
+      "SERVICE_TOKEN",
+    );
+
+    expect(stored.environmentVariables).toEqual([
+      {
+        key: "PROTECTED_KEY",
+        provenance: "operator",
+        editable: false,
+        removable: false,
+      },
+    ]);
+    expect(JSON.stringify(stored)).not.toContain(secret);
+    expect(JSON.stringify(removed)).not.toContain(secret);
+    expect(fetchMock.mock.calls[0]).toEqual([
+      `/v1/channels/${channelId}/workspace-environment/SERVICE_TOKEN`,
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ revision: "sws_workspace", value: secret }),
+      }),
+    ]);
+    expect(fetchMock.mock.calls[1]).toEqual([
+      `/v1/channels/${channelId}/workspace-environment/SERVICE_TOKEN`,
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ revision: "sws_workspace" }),
+      }),
+    ]);
   });
 
   it("loads and mutates redacted personal GitHub settings", async () => {

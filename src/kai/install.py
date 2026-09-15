@@ -113,6 +113,7 @@ from kai.workshop.diagnostics import (
     workshop_transcript_authority_status,
     workshop_transition_tooling_status,
     workshop_unread_authority_status,
+    workshop_workspace_environment_secret_status,
     workshop_workspace_grant_status,
 )
 from kai.workshop.domain import RuntimeProfileId, WorkshopId
@@ -10004,6 +10005,7 @@ def _cmd_status() -> None:
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
     print(_runtime_key_cutover_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
     print(workshop_workspace_grant_status(Path(data_dir) / "kai.db"))
+    print(workshop_workspace_environment_secret_status(Path(data_dir) / "kai.db"))
     print(workshop_execution_state_status(Path(data_dir) / "kai.db"))
     print(workshop_operational_state_status(Path(data_dir) / "kai.db"))
     print(

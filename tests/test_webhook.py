@@ -908,6 +908,7 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/workspaces",
                 "/v1/channels/{channel_id}/workspace-grants",
                 "/v1/channels/{channel_id}/workspace-config",
+                "/v1/channels/{channel_id}/workspace-environment/{environment_key}",
                 "/v1/settings/model-catalogue/refresh-all",
                 "/v1/preferences",
                 "/v1/preferences/revisions",

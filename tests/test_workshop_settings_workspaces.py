@@ -1,5 +1,6 @@
 """Transport-neutral settings/workspace service tests."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -15,6 +16,8 @@ from kai.workshop.execution_state import (
 )
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 from kai.workshop.settings_workspaces import (
+    MAX_WORKSPACE_ENVIRONMENT_KEYS,
+    MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES,
     EffectiveValue,
     WorkshopSettingsWorkspaceAccessDenied,
     WorkshopSettingsWorkspaceBusy,
@@ -851,6 +854,7 @@ async def test_workspace_config_mutation_applies_core_precedence_without_exposin
 ) -> None:
     service, pool, authority, _, _ = _service(tmp_path)
     stored: dict[str, str] = {}
+    audits: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     async def get_settings(_namespace):
         return {}
@@ -877,6 +881,9 @@ async def test_workspace_config_mutation_applies_core_precedence_without_exposin
     async def clear_session(_namespace) -> None:
         return None
 
+    async def audit_environment(*args, **kwargs) -> None:
+        audits.append((args, kwargs))
+
     monkeypatch.setattr(sessions, "get_canonical_execution_settings", get_settings)
     monkeypatch.setattr(
         sessions,
@@ -890,6 +897,11 @@ async def test_workspace_config_mutation_applies_core_precedence_without_exposin
     )
     monkeypatch.setattr(sessions, "build_canonical_workspace_config", build_config)
     monkeypatch.setattr(sessions, "clear_canonical_runtime_session", clear_session)
+    monkeypatch.setattr(
+        sessions,
+        "record_workspace_environment_secret_audit",
+        audit_environment,
+    )
 
     model_snapshot = await service.set_workspace_config(
         authority,
@@ -909,6 +921,130 @@ async def test_workspace_config_mutation_applies_core_precedence_without_exposin
     )
     assert env_snapshot.environment_keys == ("WORKSHOP_SECRET",)
     assert "not-for-read-responses" not in repr(env_snapshot)
+    assert len(audits) == 1
+    assert len(audits[0][0]) == 1
+    assert audits[0][1] == {
+        "workspace_digest": audits[0][1]["workspace_digest"],
+        "environment_key": "WORKSHOP_SECRET",
+        "operation": "set",
+        "changed": True,
+        "runtime_action": "restarted",
+    }
+    assert len(str(audits[0][1]["workspace_digest"])) == 64
+    assert "not-for-read-responses" not in repr(audits)
+    assert pool.events == [
+        f"workspace-config:{pool.home}",
+        f"workspace-config:{pool.home}",
+    ]
+
+
+async def test_workspace_environment_policy_hides_values_and_protects_operator_keys(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = Config(
+        telegram_bot_token="unused",
+        allowed_user_ids=set(),
+        default_backend="codex",
+        default_model="gpt-5.6-sol",
+    )
+    service, pool, authority, _, _ = _service(tmp_path, config=config)
+    config.workspace_configs[pool.home.resolve()] = WorkspaceConfig(
+        path=pool.home.resolve(),
+        env={"OPERATOR_SECRET": "operator-value"},
+    )
+    _canonical_state(
+        monkeypatch,
+        workspace={"env": '{"PRINCIPAL_SECRET":"principal-value"}'},
+    )
+
+    snapshot = await service.workspace_config(authority)
+
+    # Operator values are visible only as non-editable key metadata.
+    assert [(item.key, item.provenance, item.editable, item.removable) for item in snapshot.environment_variables] == [
+        ("OPERATOR_SECRET", "operator", False, False),
+        ("PRINCIPAL_SECRET", "principal", True, True),
+    ]
+    assert "operator-value" not in repr(snapshot)
+    assert "principal-value" not in repr(snapshot)
+    with pytest.raises(WorkshopSettingsWorkspaceAccessDenied, match="Operator-managed"):
+        await service.set_workspace_environment_variable(
+            authority,
+            key="OPERATOR_SECRET",
+            value="replacement",
+            expected_revision=snapshot.revision,
+        )
+
+
+async def test_workspace_environment_validation_is_central_and_bounded(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, _, authority, _, _ = _service(tmp_path)
+    _, workspace, replace_calls, _ = _canonical_state(
+        monkeypatch,
+        workspace={"env": json.dumps({f"KEY_{index}": "value" for index in range(MAX_WORKSPACE_ENVIRONMENT_KEYS)})},
+    )
+    snapshot = await service.workspace_config(authority)
+
+    for key in ("1INVALID", "BAD-KEY", "PATH", "KAI_SECRET", "PYTHONPATH"):
+        with pytest.raises(WorkshopSettingsWorkspaceValidationError):
+            await service.set_workspace_environment_variable(
+                authority,
+                key=key,
+                value="value",
+                expected_revision=snapshot.revision,
+            )
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="null bytes"):
+        await service.set_workspace_environment_variable(
+            authority,
+            key="VALID_KEY",
+            value="bad\x00value",
+            expected_revision=snapshot.revision,
+        )
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="UTF-8 bytes"):
+        await service.set_workspace_environment_variable(
+            authority,
+            key="VALID_KEY",
+            value="x" * (MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES + 1),
+            expected_revision=snapshot.revision,
+        )
+    with pytest.raises(WorkshopSettingsWorkspaceValidationError, match="at most"):
+        await service.set_workspace_environment_variable(
+            authority,
+            key="ONE_TOO_MANY",
+            value="value",
+            expected_revision=snapshot.revision,
+        )
+    assert len(json.loads(workspace["env"])) == MAX_WORKSPACE_ENVIRONMENT_KEYS
+    assert replace_calls == []
+
+
+async def test_workspace_environment_audit_failure_restores_secret_and_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, pool, authority, _, _ = _service(tmp_path)
+    _, workspace, _, _ = _canonical_state(
+        monkeypatch,
+        workspace={"env": '{"EXISTING_SECRET":"original"}'},
+    )
+
+    async def fail_audit(*_args, **_kwargs):
+        raise OSError("audit unavailable")
+
+    monkeypatch.setattr(sessions, "record_workspace_environment_secret_audit", fail_audit)
+    snapshot = await service.workspace_config(authority)
+
+    with pytest.raises(OSError, match="audit unavailable"):
+        await service.set_workspace_environment_variable(
+            authority,
+            key="EXISTING_SECRET",
+            value="replacement",
+            expected_revision=snapshot.revision,
+        )
+
+    assert workspace == {"env": '{"EXISTING_SECRET":"original"}'}
     assert pool.events == [
         f"workspace-config:{pool.home}",
         f"workspace-config:{pool.home}",
@@ -947,11 +1083,19 @@ def _canonical_state(monkeypatch, *, execution=None, workspace=None):
     async def clear_session(_namespace):
         clear_calls.append("clear")
 
+    async def audit_environment(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(sessions, "get_canonical_execution_settings", get_execution)
     monkeypatch.setattr(sessions, "get_canonical_workspace_config_settings", get_workspace)
     monkeypatch.setattr(sessions, "get_canonical_workspace_history", get_history)
     monkeypatch.setattr(sessions, "replace_canonical_settings_state", replace_state)
     monkeypatch.setattr(sessions, "clear_canonical_runtime_session", clear_session)
+    monkeypatch.setattr(
+        sessions,
+        "record_workspace_environment_secret_audit",
+        audit_environment,
+    )
     monkeypatch.setattr(sessions, "build_canonical_workspace_config", AsyncMock(return_value=None))
     return stored_execution, stored_workspace, replace_calls, clear_calls
 

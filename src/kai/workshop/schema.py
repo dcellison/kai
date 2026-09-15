@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 81
+WORKSHOP_SCHEMA_VERSION = 82
 
 
 @dataclass(frozen=True, slots=True)
@@ -3602,6 +3602,38 @@ _REPLAY_SAFE_WORKSPACE_GRANT_MIGRATION_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_WORKSPACE_ENVIRONMENT_SECRET_AUDIT_SCHEMA = SchemaMigration(
+    version=82,
+    name="workspace_environment_secret_audit",
+    statements=(
+        """
+        CREATE TABLE workspace_environment_secret_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            workspace_digest TEXT NOT NULL CHECK (length(workspace_digest) = 64),
+            environment_key TEXT NOT NULL CHECK (
+                length(environment_key) BETWEEN 1 AND 128
+            ),
+            operation TEXT NOT NULL CHECK (operation IN ('set', 'remove')),
+            changed INTEGER NOT NULL CHECK (changed IN (0, 1)),
+            runtime_action TEXT NOT NULL CHECK (
+                runtime_action IN ('unchanged', 'restarted', 'deferred_until_next_run')
+            ),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+        "CREATE INDEX workspace_environment_secret_audit_authority_idx "
+        "ON workspace_environment_secret_audit "
+        "(principal_id, runtime_profile_id, created_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3684,6 +3716,7 @@ _MIGRATIONS = (
     _CANONICAL_CONVERSATION_OBSERVATION_SCHEMA,
     _CANONICAL_WORKSPACE_GRANT_AUTHORITY_SCHEMA,
     _REPLAY_SAFE_WORKSPACE_GRANT_MIGRATION_SCHEMA,
+    _WORKSPACE_ENVIRONMENT_SECRET_AUDIT_SCHEMA,
 )
 
 

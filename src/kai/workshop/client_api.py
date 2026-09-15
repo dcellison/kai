@@ -318,6 +318,9 @@ from kai.workshop.runtime_lane_status import (
     WorkshopRuntimeLaneStatusUnavailable,
 )
 from kai.workshop.settings_workspaces import (
+    MAX_WORKSPACE_ENVIRONMENT_KEY_CHARACTERS,
+    MAX_WORKSPACE_ENVIRONMENT_KEYS,
+    MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES,
     EditableCapability,
     SettingsMutationOutcome,
     SettingsWorkspaceAuthority,
@@ -427,6 +430,7 @@ _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
 _WORKSPACE_COLLECTION_PATH = "/v1/channels/{channel_id}/workspaces"
 _WORKSPACE_GRANTS_PATH = "/v1/channels/{channel_id}/workspace-grants"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
+_WORKSPACE_ENVIRONMENT_PATH = "/v1/channels/{channel_id}/workspace-environment/{environment_key}"
 _PREFERENCES_PATH = "/v1/preferences"
 _PRINCIPAL_POLICY_PATH = "/v1/principal-policy"
 _PREFERENCE_REVISIONS_PATH = "/v1/preferences/revisions"
@@ -486,6 +490,9 @@ _WORKSPACE_GRANT_REQUEST_FIELDS = frozenset({"path"})
 _MAX_WORKSPACE_CREATION_BODY_BYTES = 2_048
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
+_WORKSPACE_ENVIRONMENT_SET_FIELDS = frozenset({"value", "path", "revision"})
+_WORKSPACE_ENVIRONMENT_REMOVE_FIELDS = frozenset({"path", "revision"})
+_MAX_WORKSPACE_ENVIRONMENT_BODY_BYTES = MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES + 2_048
 _PREFERENCE_UPDATE_FIELDS = frozenset({"content", "revision"})
 _PRINCIPAL_POLICY_UPDATE_FIELDS = frozenset({"content", "revision"})
 _PREFERENCE_RESTORE_FIELDS = frozenset({"revision"})
@@ -1594,6 +1601,21 @@ def _serialize_workspace_config(
         "capabilities": [_serialize_editable_capability(item) for item in snapshot.capabilities],
         "mutation": _serialize_settings_mutation(snapshot.mutation),
         "environment_keys": list(snapshot.environment_keys),
+        "environment_variables": [
+            {
+                "key": item.key,
+                "provenance": item.provenance,
+                "editable": item.editable,
+                "removable": item.removable,
+            }
+            for item in snapshot.environment_variables
+        ],
+        "environment_policy": {
+            "maximum_keys": MAX_WORKSPACE_ENVIRONMENT_KEYS,
+            "maximum_key_characters": MAX_WORKSPACE_ENVIRONMENT_KEY_CHARACTERS,
+            "maximum_value_bytes": MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES,
+            "values_write_only": True,
+        },
         "prompt": snapshot.prompt,
         "has_prompt": snapshot.has_prompt,
         "prompt_source": snapshot.prompt_source,
@@ -4338,6 +4360,83 @@ async def _handle_workspace_config_update(
         return _error_response(status=403, code="access_denied", message="Access denied")
     except WorkshopSettingsWorkspaceValidationError as exc:
         return _error_response(status=400, code="invalid_setting", message=str(exc))
+    return _json_response(_serialize_workspace_config(snapshot), status=200)
+
+
+async def _handle_workspace_environment_update(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query or (
+        request.content_length is not None and request.content_length > _MAX_WORKSPACE_ENVIRONMENT_BODY_BYTES
+    ):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid workspace environment request",
+        )
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        return _error_response(status=400, code="invalid_request", message="Invalid JSON request")
+    expected_fields = (
+        _WORKSPACE_ENVIRONMENT_SET_FIELDS if request.method == "PUT" else _WORKSPACE_ENVIRONMENT_REMOVE_FIELDS
+    )
+    if not isinstance(payload, dict) or set(payload) - expected_fields:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid workspace environment request",
+        )
+    revision = payload.get("revision")
+    path = payload.get("path")
+    value = payload.get("value")
+    if (
+        not isinstance(revision, str)
+        or (path is not None and not isinstance(path, str))
+        or (request.method == "PUT" and not isinstance(value, str))
+        or (request.method == "DELETE" and "value" in payload)
+    ):
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid workspace environment request",
+        )
+    try:
+        if request.method == "PUT":
+            assert isinstance(value, str)
+            snapshot = await service.set_workspace_environment_variable(
+                authority,
+                key=request.match_info["environment_key"],
+                value=value,
+                workspace_path=path,
+                expected_revision=revision,
+            )
+        else:
+            snapshot, _changed = await service.delete_workspace_environment_variable(
+                authority,
+                key=request.match_info["environment_key"],
+                workspace_path=path,
+                expected_revision=revision,
+            )
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_environment", message=str(exc))
     return _json_response(_serialize_workspace_config(snapshot), status=200)
 
 
@@ -9830,6 +9929,16 @@ def register_workshop_read_routes(
                     service=settings_workspaces,
                 )
 
+        async def handle_workspace_environment_update(
+            request: web.Request,
+        ) -> web.Response:
+            async with request_lock:
+                return await _handle_workspace_environment_update(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
         app.router.add_get(_RUNTIME_SETTINGS_PATH, handle_runtime_settings)
         app.router.add_patch(
             _RUNTIME_SETTINGS_PATH,
@@ -9853,6 +9962,14 @@ def register_workshop_read_routes(
         app.router.add_patch(
             _WORKSPACE_CONFIG_PATH,
             handle_workspace_config_update,
+        )
+        app.router.add_put(
+            _WORKSPACE_ENVIRONMENT_PATH,
+            handle_workspace_environment_update,
+        )
+        app.router.add_delete(
+            _WORKSPACE_ENVIRONMENT_PATH,
+            handle_workspace_environment_update,
         )
     if routing_eligibility is not None:
 

@@ -938,6 +938,15 @@ describe("Workshop React client", () => {
     vi.mocked(loadWorkspaceConfig).mockResolvedValue({
       capabilities: [],
       environmentKeys: ["PROTECTED_KEY"],
+      environmentVariables: [
+        { editable: false, key: "PROTECTED_KEY", provenance: "operator", removable: false },
+      ],
+      environmentPolicy: {
+        maximumKeyCharacters: 128,
+        maximumKeys: 64,
+        maximumValueBytes: 16384,
+        valuesWriteOnly: true,
+      },
       hasPrompt: false,
       model: settingsWorkspace.model,
       mutation: null,

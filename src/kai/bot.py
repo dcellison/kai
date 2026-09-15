@@ -1934,9 +1934,15 @@ async def _handle_canonical_workspace_config(
 
         if field == "reset":
             reset_field = value.lower() if value else None
-            snapshot = await service.reset_workspace_config(
+            if reset_field == "env":
+                await update.message.reply_text(
+                    "Remove workspace environment variables individually with /workspace config env -KEY."
+                )
+                return
+            snapshot = await service.reset_self_service_workspace_config(
                 authority,
                 field=reset_field,
+                expected_revision=(await service.workspace_config(authority)).revision,
             )
             if reset_field is None:
                 message = "All workspace config cleared. Using global defaults."
@@ -2027,8 +2033,11 @@ async def _handle_canonical_workspace_environment(
     assert update.message is not None
     if not value:
         snapshot = await service.workspace_config(authority)
-        if snapshot.environment_keys:
-            keys = "\n".join(f"  {key}" for key in snapshot.environment_keys)
+        if snapshot.environment_variables:
+            keys = "\n".join(
+                f"  {item.key}" + (" (operator-managed)" if item.provenance == "operator" else "")
+                for item in snapshot.environment_variables
+            )
             await update.message.reply_text(f"Workspace env vars:\n{keys}")
         else:
             await update.message.reply_text("No workspace env vars set.")
