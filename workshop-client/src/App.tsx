@@ -50,6 +50,7 @@ import {
   setMessageReaction,
   setThreadFollowed,
   startHumanConversation,
+  startFreshProviderSession,
   submitCommand,
   switchWorkspace,
   updateStandingParticipation,
@@ -66,6 +67,7 @@ import type {
   WorkshopRunTraceSignal,
   WorkshopChannelSummary,
   WorkshopRuntimeLaneStatus,
+  WorkshopProviderSessionReset,
   WorkshopChannelUnreadState,
   WorkshopThreadUnreadMutation,
   WorkshopThreadUnreadState,
@@ -2365,6 +2367,15 @@ function RestoreIcon(): React.JSX.Element {
   );
 }
 
+function FreshSessionIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path d="M20 11a8 8 0 1 0-2.34 5.66" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+      <path d="M20 5v6h-6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
 function ViewIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
@@ -2869,6 +2880,7 @@ function WorkshopView({
   onLoadRun,
   onLoadRunTrace,
   onLoadRuntimeLaneStatus,
+  onStartFreshProviderSession,
   onLoadThread,
   onLoadThreadUnread,
   onLoadReactors,
@@ -2958,6 +2970,10 @@ function WorkshopView({
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
   onLoadRuntimeLaneStatus: (agentId: string | null) => Promise<WorkshopRuntimeLaneStatus>;
+  onStartFreshProviderSession: (
+    agentId: string,
+    clientOperationId: string,
+  ) => Promise<WorkshopProviderSessionReset>;
   onLoadThread: (
     rootMessageId: string,
     cursor: string | null,
@@ -3066,6 +3082,8 @@ function WorkshopView({
     useState<string | null>(null);
   const [runtimeLaneStatuses, setRuntimeLaneStatuses] =
     useState<WorkshopRuntimeLaneStatus[]>([]);
+  const [freshSessionBusyAgentId, setFreshSessionBusyAgentId] = useState<string | null>(null);
+  const [freshSessionNotice, setFreshSessionNotice] = useState<string | null>(null);
   const effectiveAgentRuntime = runtimeLaneStatuses.length === 1
     ? runtimeLaneStatuses[0]
     : null;
@@ -3897,6 +3915,41 @@ function WorkshopView({
       );
     } finally {
       setSwitchingWorkspace(false);
+    }
+  };
+
+  const beginFreshProviderSession = async (status: WorkshopRuntimeLaneStatus): Promise<void> => {
+    if (
+      freshSessionBusyAgentId !== null ||
+      status.activeRun !== null ||
+      !await confirm(
+        `Start a fresh provider session for ${status.agentName}? This ends only this channel-and-agent provider session and its live process. Conversation history, messages, memories, settings, and this browser's enrollment are preserved.`,
+      )
+    ) {
+      return;
+    }
+    setFreshSessionBusyAgentId(status.agentId);
+    setFreshSessionNotice(null);
+    setSettingsWorkspaceError(null);
+    try {
+      const result = await onStartFreshProviderSession(
+        status.agentId,
+        createClientMessageId(),
+      );
+      const refreshed = await onLoadRuntimeLaneStatus(status.agentId);
+      setRuntimeLaneStatuses((current) => current.map((item) =>
+        item.agentId === status.agentId ? refreshed : item
+      ));
+      setActiveRun(null);
+      setFreshSessionNotice(
+        `Fresh provider session ready for ${status.agentName}. Revision ${result.revision.slice(0, 12)}.`,
+      );
+    } catch (caught) {
+      setSettingsWorkspaceError(
+        caught instanceof Error ? caught.message : "Could not start a fresh provider session.",
+      );
+    } finally {
+      setFreshSessionBusyAgentId(null);
     }
   };
 
@@ -5478,9 +5531,21 @@ function WorkshopView({
                 {runtimeLaneStatuses.map((status) => {
                   const displayedRun = status.activeRun ?? status.lastRun;
                   return <div className="runtime-settings" key={status.agentId}>
-                    <p className="settings-source">
-                      {channel.kind === "group" ? status.agentName : "Agent runtime"}
-                    </p>
+                    <div className="runtime-lane-heading">
+                      <p className="settings-source">
+                        {channel.kind === "group" ? status.agentName : "Agent runtime"}
+                      </p>
+                      <button
+                        className="panel-icon-button runtime-fresh-session"
+                        type="button"
+                        aria-label={`Start a fresh provider session for ${status.agentName}`}
+                        title="Start fresh provider session"
+                        disabled={freshSessionBusyAgentId !== null || status.activeRun !== null}
+                        onClick={() => void beginFreshProviderSession(status)}
+                      >
+                        <FreshSessionIcon />
+                      </button>
+                    </div>
                     <p>
                       <strong>{status.backend}</strong>
                       {status.provider ? ` · ${status.provider}` : ""}
@@ -5500,6 +5565,14 @@ function WorkshopView({
                       {displayedRun ? ` · Last run: ${displayedRun.status}` : " · No runs yet"}
                       {status.sessionUpdatedAt ? ` · ${formatTimestamp(status.sessionUpdatedAt)}` : ""}
                     </p>
+                    {status.freshSessionRevision && (
+                      <p className="settings-source">
+                        Fresh-session revision: <code>{status.freshSessionRevision.slice(0, 12)}</code>
+                        {status.freshSessionGeneration !== null
+                          ? ` · generation ${status.freshSessionGeneration}`
+                          : ""}
+                      </p>
+                    )}
                     {status.workspaceMode === "neutral" ? (
                       <p className="settings-source">No shared workspace</p>
                     ) : (
@@ -5543,6 +5616,10 @@ function WorkshopView({
             ) : (
               <p>No agent runtime is assigned to this channel.</p>
             )}
+            {settingsWorkspaceError && runtimeLaneStatuses.length > 0 && (
+              <p className="settings-error" role="alert">{settingsWorkspaceError}</p>
+            )}
+            {freshSessionNotice && <p className="settings-success" role="status">{freshSessionNotice}</p>}
           </section>}
 
           {!humanDirect && <section className="context-section trace-section">
@@ -6096,6 +6173,11 @@ function ActiveWorkshopClient({
       throw caught;
     }
   }, [onAuthenticationFailure, session]);
+  const startConversationFreshProviderSession = useCallback(
+    (agentId: string, clientOperationId: string) =>
+      withAccessHandling(() => startFreshProviderSession(session, agentId, clientOperationId)),
+    [session, withAccessHandling],
+  );
   const switchConversationWorkspace = useCallback(
     (path: string, revision: string) =>
       withAccessHandling(() => switchWorkspace(session, path, revision)),
@@ -6227,6 +6309,7 @@ function ActiveWorkshopClient({
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
       onLoadRuntimeLaneStatus={loadConversationRuntimeStatus}
+      onStartFreshProviderSession={startConversationFreshProviderSession}
       onLoadThread={loadSelectedThread}
       onLoadThreadUnread={loadSelectedThreadUnread}
       onAdvanceThreadRead={advanceSelectedThreadRead}

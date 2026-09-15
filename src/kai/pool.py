@@ -1893,6 +1893,33 @@ class SubprocessPool:
             self._selected_backends[runtime_key] = option.option_id
             return True
 
+    async def reset_provider_session(
+        self,
+        runtime: RuntimeSelector,
+        *,
+        commit_reset: Callable[[bool], Awaitable[None]],
+    ) -> tuple[bool, bool]:
+        """End one idle lane's provider processes and commit its canonical reset.
+
+        The exact channel-agent lane lock also covers routed backend instances,
+        preventing a fresh-session request from racing execution preparation.
+        Return ``(accepted, live_process_stopped)``; a busy lane is rejected
+        without invoking the persistence callback.
+        """
+        runtime_key, _, profile = self._resolve_runtime(runtime)
+        if profile is None:
+            raise RuntimeError("Provider-session reset requires a protected runtime profile")
+        async with self._backend_transition_lock(runtime_key):
+            if self._profile_has_in_flight(runtime_key):
+                return False, False
+            live_process_stopped = any(
+                key == runtime_key or (isinstance(key, _RoutedRuntimeKey) and key.runtime_key == runtime_key)
+                for key in self._pool
+            )
+            await self._apply_retained_context_invalidation(runtime_key)
+            await commit_reset(live_process_stopped)
+            return True, live_process_stopped
+
     async def change_workspace(
         self,
         runtime: RuntimeSelector,

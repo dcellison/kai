@@ -903,6 +903,7 @@ class TestNotificationChatIdMutations:
                 "/v1/channels/{channel_id}/runs/{run_id}/context-manifests",
                 "/v1/channels/{channel_id}/settings",
                 "/v1/channels/{channel_id}/runtime-status",
+                "/v1/channels/{channel_id}/runtime-sessions/{agent_id}/fresh",
                 "/v1/channels/{channel_id}/models",
                 "/v1/channels/{channel_id}/workspace",
                 "/v1/channels/{channel_id}/workspaces",

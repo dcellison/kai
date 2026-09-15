@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 83
+WORKSHOP_SCHEMA_VERSION = 84
 
 
 @dataclass(frozen=True, slots=True)
@@ -3731,6 +3731,60 @@ _CANONICAL_MEMORY_PROJECT_REGISTRY_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_CANONICAL_PROVIDER_SESSION_RESET_SCHEMA = SchemaMigration(
+    version=84,
+    name="canonical_provider_session_reset",
+    statements=(
+        """
+        CREATE TABLE provider_session_reset_state (
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            revision TEXT NOT NULL CHECK (
+                length(revision) = 64 AND revision NOT GLOB '*[^0-9a-f]*'
+            ),
+            last_client_operation_id TEXT NOT NULL CHECK (
+                length(last_client_operation_id) BETWEEN 1 AND 128
+            ),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (channel_id, agent_id)
+        )
+        """,
+        """
+        CREATE TABLE provider_session_reset_operations (
+            requester_principal_id TEXT NOT NULL
+                REFERENCES principals(id) ON DELETE RESTRICT,
+            client_operation_id TEXT NOT NULL CHECK (
+                length(client_operation_id) BETWEEN 1 AND 128
+            ),
+            channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            generation INTEGER NOT NULL CHECK (generation > 0),
+            revision TEXT NOT NULL CHECK (
+                length(revision) = 64 AND revision NOT GLOB '*[^0-9a-f]*'
+            ),
+            prior_session_present INTEGER NOT NULL CHECK (
+                prior_session_present IN (0, 1)
+            ),
+            live_process_stopped INTEGER NOT NULL CHECK (
+                live_process_stopped IN (0, 1)
+            ),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (requester_principal_id, client_operation_id)
+        )
+        """,
+        "CREATE INDEX provider_session_reset_operations_lane_idx "
+        "ON provider_session_reset_operations (channel_id, agent_id, generation)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3815,6 +3869,7 @@ _MIGRATIONS = (
     _REPLAY_SAFE_WORKSPACE_GRANT_MIGRATION_SCHEMA,
     _WORKSPACE_ENVIRONMENT_SECRET_AUDIT_SCHEMA,
     _CANONICAL_MEMORY_PROJECT_REGISTRY_SCHEMA,
+    _CANONICAL_PROVIDER_SESSION_RESET_SCHEMA,
 )
 
 

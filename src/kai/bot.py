@@ -106,7 +106,9 @@ from kai.workshop.runtime_lane_status import (
     RuntimeLaneStatusSnapshot,
     WorkshopRuntimeLaneStatusAccessDenied,
     WorkshopRuntimeLaneStatusAmbiguous,
+    WorkshopRuntimeLaneStatusBusy,
     WorkshopRuntimeLaneStatusError,
+    WorkshopRuntimeLaneStatusReplayConflict,
     WorkshopRuntimeLaneStatusUnavailable,
 )
 from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
@@ -440,18 +442,48 @@ async def _end_session(chat_id: int) -> None:
 
 @_require_auth
 async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle /new — kill the Claude process and start a fresh session.
-
-    Clears the session from the database and kills the subprocess so
-    the next message launches a new one.
-    """
+    """Handle /new as a thin Telegram adapter over canonical lane reset."""
     assert update.message is not None
-    chat_id = _chat_id(update)
-    pool = _get_pool(context)
-    await pool.restart(chat_id)
-    await _end_session(chat_id)
-    await update.message.reply_text("Session cleared. Starting fresh.")
+    args = context.args or []
+    if len(args) > 1:
+        await update.message.reply_text("Usage: /new [@agent]")
+        return
+    service = _get_core_services(context).runtime_lane_status
+    try:
+        authority = await service.authority_for_transport_binding(
+            transport="telegram",
+            sender_subject=str(_user_id(update)),
+            channel_subject=str(_chat_id(update)),
+            agent_handle=args[0] if args else None,
+        )
+        result = await service.reset_provider_session(
+            authority,
+            f"telegram:new:{update.update_id}",
+        )
+    except WorkshopRuntimeLaneStatusAmbiguous:
+        await update.message.reply_text("Choose an agent in this channel: /new @agent")
+        return
+    except WorkshopRuntimeLaneStatusBusy as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except WorkshopRuntimeLaneStatusReplayConflict:
+        await update.message.reply_text("This fresh-session request conflicts with an earlier operation.")
+        return
+    except WorkshopRuntimeLaneStatusUnavailable as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except WorkshopRuntimeLaneStatusAccessDenied:
+        await update.message.reply_text("A fresh provider session is unavailable for this Telegram conversation.")
+        return
+    except (TypeError, ValueError, WorkshopRuntimeLaneStatusError):
+        await update.message.reply_text("Usage: /new [@agent]")
+        return
+    replay = " Request already applied." if result.replayed else ""
+    await update.message.reply_text(
+        f"Fresh provider session ready for @{authority.agent_handle}. "
+        "Conversation history, memories, settings, and enrollment were preserved. "
+        f"Revision: {result.revision[:12]}.{replay}"
+    )
 
 
 # ── Model selection ──────────────────────────────────────────────────
@@ -1396,6 +1428,11 @@ def _render_runtime_lane_status(snapshot: RuntimeLaneStatusSnapshot) -> str:
         f"Run: {run_label}",
         f"Process: {snapshot.process_state.title()}",
     ]
+    if snapshot.fresh_session_revision is not None:
+        lines.append(
+            "Fresh-session revision: "
+            f"{snapshot.fresh_session_revision[:12]} (generation {snapshot.fresh_session_generation})"
+        )
     if snapshot.session_created_at is not None:
         lines.append(f"Session started: {_stats_local_time(snapshot.session_created_at)}")
     if snapshot.session_updated_at is not None:

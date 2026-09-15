@@ -85,6 +85,7 @@ import {
   setThreadFollowed,
   startAgentConversation,
   startHumanConversation,
+  startFreshProviderSession,
   submitCommand,
   streamTimeline,
   streamAgentChanges,
@@ -515,6 +516,8 @@ function runtimeLaneStatusPayload(): Record<string, unknown> {
     process_state: "stopped",
     provider_session_state: "active",
     continuity_state: "active",
+    fresh_session_generation: null,
+    fresh_session_revision: null,
     session_created_at: "2026-09-15T10:00:00Z",
     session_updated_at: "2026-09-15T10:05:00Z",
     active_run: null,
@@ -1414,6 +1417,50 @@ describe("Workshop client API", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       `/v1/channels/${channelId}/runtime-status`,
     );
+  });
+
+  it("starts one replay-safe fresh provider session without clearing canonical state", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        version: 1,
+        channel_id: channelId,
+        agent_id: agentId,
+        runtime_profile_id: runtimeProfileId,
+        generation: 3,
+        revision: "a".repeat(64),
+        prior_session_present: true,
+        live_process_stopped: true,
+        replayed: false,
+        preserved: [
+          "conversation_history",
+          "messages",
+          "memories",
+          "settings",
+          "browser_enrollment",
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      startFreshProviderSession(session, agentId, "browser-fresh-session-1"),
+    ).resolves.toEqual({
+      agentId,
+      channelId,
+      generation: 3,
+      liveProcessStopped: true,
+      priorSessionPresent: true,
+      replayed: false,
+      revision: "a".repeat(64),
+      runtimeProfileId,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `/v1/channels/${channelId}/runtime-sessions/${agentId}/fresh`,
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "POST" });
+    expect(JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({
+      client_operation_id: "browser-fresh-session-1",
+    });
   });
 
   it("rejects a neutral runtime projection that exposes a workspace", async () => {

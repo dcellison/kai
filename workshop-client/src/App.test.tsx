@@ -65,6 +65,7 @@ import {
   setThreadFollowed,
   startAgentConversation,
   startHumanConversation,
+  startFreshProviderSession,
   submitCommand,
   switchWorkspace,
   updateStandingParticipation,
@@ -150,6 +151,7 @@ vi.mock("./api", async (importOriginal) => {
     setThreadFollowed: vi.fn(),
     startAgentConversation: vi.fn(),
     startHumanConversation: vi.fn(),
+    startFreshProviderSession: vi.fn(),
     submitCommand: vi.fn(),
     switchWorkspace: vi.fn(),
     updateStandingParticipation: vi.fn(),
@@ -645,6 +647,8 @@ const runtimeLaneStatus: WorkshopRuntimeLaneStatus = {
   canManageRuntime: true,
   channelId,
   continuityState: "active",
+  freshSessionGeneration: null,
+  freshSessionRevision: null,
   lastRun: {
     acceptedAt: "2026-09-15T10:04:00Z",
     runId: "run_00000000000000000000000000000001",
@@ -919,6 +923,16 @@ describe("Workshop React client", () => {
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ collaborationActivity: [], entries: [], hasMore: false });
     vi.mocked(loadRuntimeLaneStatus).mockResolvedValue(runtimeLaneStatus);
+    vi.mocked(startFreshProviderSession).mockResolvedValue({
+      agentId: runtimeLaneStatus.agentId,
+      channelId,
+      generation: 1,
+      liveProcessStopped: false,
+      priorSessionPresent: true,
+      replayed: false,
+      revision: "a".repeat(64),
+      runtimeProfileId,
+    });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
     vi.mocked(loadStandingParticipation).mockResolvedValue(standingParticipation);
     vi.mocked(updateStandingParticipation).mockResolvedValue(standingParticipation);
@@ -2856,6 +2870,33 @@ describe("Workshop React client", () => {
 
     await user.click(screen.getByRole("button", { name: "Kai" }));
     expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
+  });
+
+  it("starts a fresh provider session for the explicit runtime lane", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    const action = await screen.findByRole("button", {
+      name: "Start a fresh provider session for Kai",
+    });
+    await user.click(action);
+    expect(screen.getByText(/Conversation history, messages, memories, settings/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => expect(startFreshProviderSession).toHaveBeenCalledWith(
+      { channelId, token: "existing-session" },
+      runtimeLaneStatus.agentId,
+      expect.stringMatching(/^browser-[0-9a-f]{32}$/),
+    ));
+    expect(await screen.findByText(/Fresh provider session ready for Kai/)).toHaveTextContent(
+      "Revision aaaaaaaaaaaa",
+    );
+    expect(loadRuntimeLaneStatus).toHaveBeenCalledTimes(2);
+    expect(localStorage.getItem("kai.workshop.client-credential.v1")).toContain("existing-session");
   });
 
   it("creates a channel from the sidebar and opens it", async () => {

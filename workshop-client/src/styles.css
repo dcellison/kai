@@ -2911,6 +2911,23 @@ button:disabled {
   padding-top: 0.8rem;
 }
 
+.runtime-lane-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.runtime-fresh-session {
+  flex: 0 0 auto;
+}
+
+.context-section .settings-success {
+  margin: 0.55rem 0 0;
+  color: var(--color-success);
+  font-size: 0.66rem;
+}
+
 .runtime-diagnostics {
   color: var(--color-text-muted);
   font-size: 0.66rem;
