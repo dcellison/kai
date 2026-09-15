@@ -319,7 +319,11 @@ from kai.workshop.settings_workspaces import (
     WorkshopSettingsWorkspaceError,
     WorkshopSettingsWorkspaceService,
     WorkshopSettingsWorkspaceValidationError,
+    WorkshopWorkspaceGrantActive,
+    WorkshopWorkspaceGrantRunBusy,
     WorkspaceConfigSnapshot,
+    WorkspaceGrantMutationResult,
+    WorkspaceGrantSnapshot,
 )
 from kai.workshop.standing_participation import (
     ChannelStandingSnapshot,
@@ -412,6 +416,7 @@ _MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
 _MODEL_CATALOGUE_ADMIN_REFRESH_PATH = "/v1/settings/model-catalogue/refresh-all"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
 _WORKSPACE_COLLECTION_PATH = "/v1/channels/{channel_id}/workspaces"
+_WORKSPACE_GRANTS_PATH = "/v1/channels/{channel_id}/workspace-grants"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
 _PREFERENCES_PATH = "/v1/preferences"
 _PRINCIPAL_POLICY_PATH = "/v1/principal-policy"
@@ -468,6 +473,7 @@ _MODEL_CATALOGUE_OPERATOR_FIELDS = frozenset({"option_id", "model_id", "display_
 _WORKSPACE_REQUEST_FIELDS = frozenset({"path", "revision"})
 _WORKSPACE_CREATION_REQUEST_FIELDS = frozenset({"name", "revision"})
 _WORKSPACE_DELETION_REQUEST_FIELDS = frozenset({"name", "confirmation", "revision"})
+_WORKSPACE_GRANT_REQUEST_FIELDS = frozenset({"path"})
 _MAX_WORKSPACE_CREATION_BODY_BYTES = 2_048
 _WORKSPACE_CONFIG_REQUEST_FIELDS = frozenset({"field", "value", "path", "revision"})
 _WORKSPACE_CONFIG_RESET_FIELDS = frozenset({"reset", "path", "revision"})
@@ -633,6 +639,34 @@ def _serialize_settings_workspace(
             for option in snapshot.workspaces
         ],
     }
+
+
+def _serialize_workspace_grants(snapshot: WorkspaceGrantSnapshot) -> dict[str, object]:
+    return {
+        "version": 1,
+        "principal_id": str(snapshot.principal_id),
+        "runtime_profile_id": str(snapshot.runtime_profile_id),
+        "workspace_base": snapshot.workspace_base,
+        "grants": [
+            {
+                "path": item.path,
+                "name": item.name,
+                "provenance": item.provenance,
+                "available": item.available,
+                "current": item.current,
+                "removable": item.removable,
+            }
+            for item in snapshot.grants
+        ],
+    }
+
+
+def _serialize_workspace_grant_mutation(
+    result: WorkspaceGrantMutationResult,
+) -> dict[str, object]:
+    payload = _serialize_workspace_grants(result.snapshot)
+    payload["mutation"] = {"path": result.path, "changed": result.changed}
+    return payload
 
 
 def _serialize_editable_capability(capability: EditableCapability) -> dict[str, object]:
@@ -4143,6 +4177,69 @@ async def _handle_workspace_deletion(
         "memory_project_unregistered": result.memory_project_unregistered,
     }
     return _json_response(response_payload, status=200)
+
+
+async def _handle_workspace_grants(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace grant request")
+    if request.method == "GET":
+        if request.can_read_body:
+            return _error_response(
+                status=400,
+                code="invalid_request",
+                message="Invalid workspace grant request",
+            )
+        snapshot = await service.inspect_workspace_grants(authority)
+        return _json_response(_serialize_workspace_grants(snapshot), status=200)
+    if request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace grant request")
+    if request.content_length is not None and request.content_length > _MAX_WORKSPACE_CREATION_BODY_BYTES:
+        return _error_response(status=400, code="invalid_request", message="Workspace grant request is too large")
+    raw = await request.content.read(_MAX_WORKSPACE_CREATION_BODY_BYTES + 1)
+    try:
+        payload = json.loads(raw) if len(raw) <= _MAX_WORKSPACE_CREATION_BODY_BYTES else None
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _WORKSPACE_GRANT_REQUEST_FIELDS
+        or not isinstance(payload.get("path"), str)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid workspace grant request")
+    try:
+        if request.method == "POST":
+            result = await service.add_existing_workspace(authority, payload["path"])
+        else:
+            result = await service.remove_existing_workspace(authority, payload["path"])
+    except WorkshopWorkspaceGrantActive as exc:
+        return _error_response(status=409, code="workspace_grant_active", message=str(exc))
+    except WorkshopWorkspaceGrantRunBusy as exc:
+        return _error_response(status=409, code="workspace_grant_run_busy", message=str(exc))
+    except WorkshopSettingsWorkspaceBusy as exc:
+        return _error_response(status=409, code="workspace_grant_busy", message=str(exc))
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_workspace", message=str(exc))
+    return _json_response(
+        _serialize_workspace_grant_mutation(result),
+        status=201 if request.method == "POST" and result.changed else 200,
+    )
 
 
 async def _handle_workspace_config(
@@ -9705,6 +9802,14 @@ def register_workshop_read_routes(
                     service=settings_workspaces,
                 )
 
+        async def handle_workspace_grants(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_workspace_grants(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
         async def handle_workspace_config(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_workspace_config(
@@ -9743,6 +9848,9 @@ def register_workshop_read_routes(
         app.router.add_post(_ACTIVE_WORKSPACE_PATH, handle_active_workspace_update)
         app.router.add_post(_WORKSPACE_COLLECTION_PATH, handle_workspace_creation)
         app.router.add_delete(_WORKSPACE_COLLECTION_PATH, handle_workspace_deletion)
+        app.router.add_get(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
+        app.router.add_post(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
+        app.router.add_delete(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
         app.router.add_get(_WORKSPACE_CONFIG_PATH, handle_workspace_config)
         app.router.add_patch(
             _WORKSPACE_CONFIG_PATH,

@@ -606,6 +606,23 @@ export interface WorkshopWorkspaceDeletion {
   settings: WorkshopSettingsWorkspace;
 }
 
+export interface WorkshopWorkspaceGrant {
+  available: boolean;
+  current: boolean;
+  name: string;
+  path: string;
+  provenance: string;
+  removable: boolean;
+}
+
+export interface WorkshopWorkspaceGrants {
+  grants: WorkshopWorkspaceGrant[];
+  mutation: { changed: boolean; path: string } | null;
+  principalId: string;
+  runtimeProfileId: string;
+  workspaceBase: string | null;
+}
+
 export interface WorkshopEffectiveAgentRuntime {
   agentHandle: string;
   agentId: string;

@@ -169,9 +169,14 @@ from kai.workshop.settings_workspaces import (
     SettingsWorkspaceSnapshot,
     WorkshopSettingsWorkspaceAccessDenied,
     WorkshopSettingsWorkspaceConflict,
+    WorkshopWorkspaceGrantActive,
+    WorkshopWorkspaceGrantRunBusy,
     WorkspaceConfigSnapshot,
     WorkspaceCreationResult,
     WorkspaceDeletionResult,
+    WorkspaceGrantMutationResult,
+    WorkspaceGrantOption,
+    WorkspaceGrantSnapshot,
     WorkspaceOption,
 )
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
@@ -307,6 +312,8 @@ class _SettingsWorkspaces:
     switched: list[str] = field(default_factory=list)
     created_workspaces: list[str] = field(default_factory=list)
     deleted_workspaces: list[str] = field(default_factory=list)
+    added_workspace_grants: list[str] = field(default_factory=list)
+    removed_workspace_grants: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
     runtime_changes: list[tuple[str, object]] = field(default_factory=list)
     catalogue_calls: list[tuple[str, str | None]] = field(default_factory=list)
@@ -431,6 +438,44 @@ class _SettingsWorkspaces:
             directory_deleted=True,
             memory_project_unregistered=name.lower(),
         )
+
+    def _grant_snapshot(self) -> WorkspaceGrantSnapshot:
+        grants = [
+            WorkspaceGrantOption("/srv/kai", "kai", "profile", True, True, False),
+            WorkspaceGrantOption("/srv/operator", "operator", "operator", True, False, False),
+        ]
+        grants.extend(
+            WorkspaceGrantOption(path, Path(path).name, "principal_added", True, False, True)
+            for path in self.added_workspace_grants
+            if path not in self.removed_workspace_grants
+        )
+        return WorkspaceGrantSnapshot(
+            principal_id=self.principal_id,
+            runtime_profile_id=profile_id(101),
+            workspace_base="/srv/home",
+            grants=tuple(grants),
+        )
+
+    async def inspect_workspace_grants(self, _authority):
+        return self._grant_snapshot()
+
+    async def add_existing_workspace(self, _authority, path: str):
+        changed = path not in self.added_workspace_grants
+        if changed:
+            self.added_workspace_grants.append(path)
+        return WorkspaceGrantMutationResult(self._grant_snapshot(), path, changed)
+
+    async def remove_existing_workspace(self, _authority, path: str):
+        if path == "/srv/kai":
+            raise WorkshopSettingsWorkspaceAccessDenied("pinned")
+        if path == "/srv/active":
+            raise WorkshopWorkspaceGrantActive("switch away first")
+        if path == "/srv/running":
+            raise WorkshopWorkspaceGrantRunBusy("active run")
+        changed = path not in self.removed_workspace_grants
+        if changed:
+            self.removed_workspace_grants.append(path)
+        return WorkspaceGrantMutationResult(self._grant_snapshot(), path, changed)
 
     async def set_model(
         self,
@@ -4414,6 +4459,98 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
                 "memory_project_unregistered": "qualification-1520",
             }
             assert service.deleted_workspaces == ["qualification-1520"]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_owner_manages_existing_workspace_grants_through_canonical_authority(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            settings_workspaces=service,
+        )
+        path = f"/v1/channels/{alice_channel}/workspace-grants"
+        headers = {"Authorization": "Bearer alice-token"}
+        mutation_headers = {**headers, "Content-Type": "application/json"}
+        try:
+            initial = await client.get(path, headers=headers)
+            added = await client.post(path, headers=mutation_headers, json={"path": "/srv/alice/research"})
+            replay = await client.post(path, headers=mutation_headers, json={"path": "/srv/alice/research"})
+            removed = await client.delete(path, headers=mutation_headers, json={"path": "/srv/alice/research"})
+            malformed = await client.post(
+                path,
+                headers=mutation_headers,
+                json={"path": "/srv/alice/leak", "principal_id": str(alice_id)},
+            )
+            foreign = await client.get(
+                path,
+                headers={"Authorization": "Bearer bob-token"},
+            )
+
+            assert initial.status == 200
+            initial_payload = await initial.json()
+            assert initial_payload["workspace_base"] == "/srv/home"
+            assert initial_payload["grants"][0] == {
+                "path": "/srv/kai",
+                "name": "kai",
+                "provenance": "profile",
+                "available": True,
+                "current": True,
+                "removable": False,
+            }
+            assert added.status == 201
+            assert (await added.json())["mutation"] == {
+                "path": "/srv/alice/research",
+                "changed": True,
+            }
+            assert replay.status == 200
+            assert (await replay.json())["mutation"]["changed"] is False
+            assert removed.status == 200
+            assert (await removed.json())["mutation"]["changed"] is True
+            assert malformed.status == 400
+            assert (await malformed.json())["error"]["code"] == "invalid_request"
+            assert foreign.status == 403
+            assert service.added_workspace_grants == ["/srv/alice/research"]
+            assert service.removed_workspace_grants == ["/srv/alice/research"]
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_workspace_grant_removal_returns_stable_policy_codes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            settings_workspaces=service,
+        )
+        path = f"/v1/channels/{alice_channel}/workspace-grants"
+        headers = {
+            "Authorization": "Bearer alice-token",
+            "Content-Type": "application/json",
+        }
+        try:
+            pinned = await client.delete(path, headers=headers, json={"path": "/srv/kai"})
+            active = await client.delete(path, headers=headers, json={"path": "/srv/active"})
+            running = await client.delete(path, headers=headers, json={"path": "/srv/running"})
+
+            assert pinned.status == 403
+            assert (await pinned.json())["error"] == {
+                "code": "access_denied",
+                "message": "Access denied",
+            }
+            assert active.status == 409
+            assert (await active.json())["error"]["code"] == "workspace_grant_active"
+            assert running.status == 409
+            assert (await running.json())["error"]["code"] == "workspace_grant_run_busy"
         finally:
             await client.close()
             await store.close()

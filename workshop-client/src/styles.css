@@ -4893,7 +4893,14 @@ button:disabled {
   margin: 0;
 }
 
+.workspace-settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
 .workspace-settings-heading .panel-icon-button svg,
+.workspace-grant-list .panel-icon-button svg,
 .workspace-deletion-list .panel-icon-button svg,
 .workspace-creation-header .panel-icon-button svg {
   width: 1rem;
@@ -4904,22 +4911,41 @@ button:disabled {
   stroke-width: 1.8;
 }
 
+.workspace-grant-list,
 .workspace-deletion-list {
   grid-column: 2;
   min-width: 0;
   margin-top: 0.65rem;
 }
 
+.agent-runtime-controls .workspace-grant-list,
 .agent-runtime-controls .workspace-deletion-list {
   grid-column: auto;
 }
 
+.workspace-grant-list-heading > p,
 .workspace-deletion-list > p {
   margin: 0 0 0.35rem;
   color: var(--color-text-muted);
   font-size: 0.68rem;
 }
 
+.workspace-grant-list-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.workspace-grant-list-heading small {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font: 0.61rem var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-grant-list ul,
 .workspace-deletion-list ul {
   display: grid;
   gap: 0.35rem;
@@ -4928,6 +4954,7 @@ button:disabled {
   list-style: none;
 }
 
+.workspace-grant-list li,
 .workspace-deletion-list li {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -4939,16 +4966,21 @@ button:disabled {
   background: var(--color-panel);
 }
 
+.workspace-grant-list li > span,
+.workspace-grant-list small,
 .workspace-deletion-list li > span,
 .workspace-deletion-list small {
   min-width: 0;
 }
 
+.workspace-grant-list strong,
+.workspace-grant-list small,
 .workspace-deletion-list strong,
 .workspace-deletion-list small {
   display: block;
 }
 
+.workspace-grant-list li > span > small,
 .workspace-deletion-list small {
   overflow: hidden;
   margin-top: 0.15rem;
