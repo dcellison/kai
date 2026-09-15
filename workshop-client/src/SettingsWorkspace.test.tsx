@@ -26,8 +26,10 @@ import {
   refreshAllModelCatalogues,
   refreshModelCatalogue,
   restorePreferenceRevision,
+  removeWorkspaceEnvironmentSecret,
   removeExistingWorkspace,
   savePreferenceDocument,
+  setWorkspaceEnvironmentSecret,
   switchWorkspace,
   upsertOperatorModel,
   updateGitHubSettings,
@@ -81,9 +83,11 @@ vi.mock("./api", async (importOriginal) => {
     deleteWorkspace: vi.fn(),
     removeExistingWorkspace: vi.fn(),
     restorePreferenceRevision: vi.fn(),
+    removeWorkspaceEnvironmentSecret: vi.fn(),
     refreshAllModelCatalogues: vi.fn(),
     refreshModelCatalogue: vi.fn(),
     savePreferenceDocument: vi.fn(),
+    setWorkspaceEnvironmentSecret: vi.fn(),
     switchWorkspace: vi.fn(),
     upsertOperatorModel: vi.fn(),
     deactivateOperatorModel: vi.fn(),
@@ -289,6 +293,15 @@ const workspaceConfig: WorkshopWorkspaceConfig = {
     },
   ],
   environmentKeys: ["PROTECTED_KEY"],
+  environmentVariables: [
+    { editable: false, key: "PROTECTED_KEY", provenance: "operator", removable: false },
+  ],
+  environmentPolicy: {
+    maximumKeyCharacters: 128,
+    maximumKeys: 64,
+    maximumValueBytes: 16384,
+    valuesWriteOnly: true,
+  },
   hasPrompt: false,
   model: runtime.model,
   mutation: null,
@@ -539,6 +552,8 @@ describe("Settings workspace", () => {
     vi.mocked(updateClientPreference).mockResolvedValue(clientPreferences);
     vi.mocked(updateAppearancePreference).mockResolvedValue(appearancePreferences);
     vi.mocked(updateWorkspaceConfig).mockResolvedValue(workspaceConfig);
+    vi.mocked(setWorkspaceEnvironmentSecret).mockResolvedValue(workspaceConfig);
+    vi.mocked(removeWorkspaceEnvironmentSecret).mockResolvedValue(workspaceConfig);
     vi.mocked(switchWorkspace).mockResolvedValue({
       ...runtime,
       revision: "sws_home",
@@ -831,6 +846,31 @@ describe("Settings workspace", () => {
     expect(prompt.closest(".settings-card-column")).toBe(workspaceColumn);
   });
 
+  it("stores workspace secrets through a dedicated write-only form", async () => {
+    const user = userEvent.setup();
+    renderAgentRuntime();
+
+    await user.click(await screen.findByRole("button", { name: "Add workspace secret" }));
+    const dialog = screen.getByRole("dialog", { name: "Add workspace secret" });
+    await user.type(within(dialog).getByLabelText("Environment key"), "SERVICE_TOKEN");
+    await user.type(within(dialog).getByLabelText("Secret value"), "secret-value");
+    await user.click(within(dialog).getByRole("button", { name: "Add secret" }));
+
+    await waitFor(() => {
+      expect(setWorkspaceEnvironmentSecret).toHaveBeenCalledWith(
+        session,
+        "sws_workspace",
+        "SERVICE_TOKEN",
+        "secret-value",
+      );
+    });
+    expect(screen.queryByRole("dialog", { name: "Add workspace secret" })).toBeNull();
+    expect(screen.queryByText("secret-value")).toBeNull();
+    expect(screen.getByText("Operator managed")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Replace PROTECTED_KEY" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remove PROTECTED_KEY" })).toBeNull();
+  });
+
   it("refreshes one catalogue or every context without changing runtime settings", async () => {
     const user = userEvent.setup();
     renderAgentRuntime();
@@ -914,7 +954,8 @@ describe("Settings workspace", () => {
     expect(screen.getByRole("option", { name: "Home" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Kai" })).toHaveValue("0");
     expect(screen.getByRole("option", { name: "Home" })).toHaveValue("1");
-    expect(screen.queryByText("PROTECTED_KEY")).not.toBeInTheDocument();
+    expect(screen.getByText("PROTECTED_KEY")).toBeVisible();
+    expect(screen.getByText("Operator managed")).toBeVisible();
     expect(screen.queryByText(runtime.principalId)).not.toBeInTheDocument();
     expect(screen.queryByText(runtime.runtimeProfileId)).not.toBeInTheDocument();
     expect(screen.getByText("/srv/kai")).toBeVisible();

@@ -3463,6 +3463,19 @@ function parseWorkspaceConfig(payload: unknown): WorkshopWorkspaceConfig {
     !Number.isSafeInteger(payload.timeout_seconds.default_value) ||
     !Array.isArray(payload.environment_keys) ||
     payload.environment_keys.some((item) => typeof item !== "string") ||
+    !Array.isArray(payload.environment_variables) ||
+    payload.environment_variables.some((item) => (
+      !isRecord(item) ||
+      typeof item.key !== "string" ||
+      !["operator", "principal", "principal_override"].includes(String(item.provenance)) ||
+      typeof item.editable !== "boolean" ||
+      typeof item.removable !== "boolean"
+    )) ||
+    !isRecord(payload.environment_policy) ||
+    !Number.isSafeInteger(payload.environment_policy.maximum_keys) ||
+    !Number.isSafeInteger(payload.environment_policy.maximum_key_characters) ||
+    !Number.isSafeInteger(payload.environment_policy.maximum_value_bytes) ||
+    payload.environment_policy.values_write_only !== true ||
     (payload.prompt !== null && typeof payload.prompt !== "string") ||
     typeof payload.has_prompt !== "boolean" ||
     (payload.prompt_source !== null && typeof payload.prompt_source !== "string") ||
@@ -3474,6 +3487,21 @@ function parseWorkspaceConfig(payload: unknown): WorkshopWorkspaceConfig {
   return {
     capabilities: parseEditableCapabilities(payload.capabilities),
     environmentKeys: payload.environment_keys as string[],
+    environmentPolicy: {
+      maximumKeyCharacters: payload.environment_policy.maximum_key_characters as number,
+      maximumKeys: payload.environment_policy.maximum_keys as number,
+      maximumValueBytes: payload.environment_policy.maximum_value_bytes as number,
+      valuesWriteOnly: true,
+    },
+    environmentVariables: payload.environment_variables.map((item) => {
+      const variable = item as Record<string, unknown>;
+      return {
+        editable: variable.editable as boolean,
+        key: variable.key as string,
+        provenance: variable.provenance as "operator" | "principal" | "principal_override",
+        removable: variable.removable as boolean,
+      };
+    }),
     hasPrompt: payload.has_prompt,
     model: {
       defaultValue: payload.model.default_value,
@@ -4910,6 +4938,59 @@ export async function updateWorkspaceConfig(
   }
   if (!response.ok) {
     throw new Error(safeErrorMessage(payload, "Could not update workspace settings."));
+  }
+  return parseWorkspaceConfig(payload);
+}
+
+export async function setWorkspaceEnvironmentSecret(
+  session: WorkshopSession,
+  revision: string,
+  key: string,
+  value: string,
+): Promise<WorkshopWorkspaceConfig> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace-environment/${encodeURIComponent(key)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision, value }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Workspace secrets changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not save workspace secret."));
+  }
+  return parseWorkspaceConfig(payload);
+}
+
+export async function removeWorkspaceEnvironmentSecret(
+  session: WorkshopSession,
+  revision: string,
+  key: string,
+): Promise<WorkshopWorkspaceConfig> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/workspace-environment/${encodeURIComponent(key)}`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Workspace secrets changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not remove workspace secret."));
   }
   return parseWorkspaceConfig(payload);
 }

@@ -1454,6 +1454,40 @@ async def delete_all_canonical_workspace_config(
     await _get_db().commit()
 
 
+async def record_workspace_environment_secret_audit(
+    namespace: WorkshopExecutionStateNamespace,
+    *,
+    workspace_digest: str,
+    environment_key: str,
+    operation: str,
+    changed: bool,
+    runtime_action: str,
+) -> None:
+    """Record secret metadata only; environment values never enter the audit log."""
+    if operation not in {"set", "remove"}:
+        raise ValueError("Unsupported workspace environment audit operation")
+    if runtime_action not in {"unchanged", "restarted", "deferred_until_next_run"}:
+        raise ValueError("Unsupported workspace environment runtime action")
+    await _get_db().execute(
+        "INSERT INTO workspace_environment_secret_audit "
+        "(principal_id, channel_id, agent_id, runtime_profile_id, "
+        "workspace_digest, environment_key, operation, changed, runtime_action) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            namespace.principal_id,
+            namespace.channel_id,
+            namespace.agent_id,
+            namespace.runtime_profile_id,
+            workspace_digest,
+            environment_key,
+            operation,
+            int(changed),
+            runtime_action,
+        ),
+    )
+    await _get_db().commit()
+
+
 async def get_workspace_config_settings(chat_id: int, workspace_path: str) -> dict[str, str]:
     """
     Get all config overrides for a user's workspace.

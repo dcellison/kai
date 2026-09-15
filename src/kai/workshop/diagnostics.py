@@ -97,6 +97,11 @@ _WORKSPACE_GRANT_AUTHORITY_TABLES = {
     "runtime_profile_owners",
     "workshop_workspace_grant_migrations",
 }
+_WORKSPACE_ENVIRONMENT_SECRET_TABLES = {
+    "channel_agent_runtime_assignments",
+    "channel_agent_workspace_settings",
+    "workspace_environment_secret_audit",
+}
 _PROTECTED_EXECUTION_STATE_LANES_SQL = (
     " FROM channel_agent_runtime_assignments a "
     "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
@@ -1789,6 +1794,68 @@ def workshop_workspace_grant_status(db_path: Path) -> str:
                 f"legacy={legacy_migrated}), invalid={invalid}, orphaned={orphaned}, "
                 f"legacy gaps={legacy_gaps}; authority=canonical principal/runtime, "
                 "protected legacy writes=disabled"
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+
+
+def workshop_workspace_environment_secret_status(db_path: Path) -> str:
+    """Describe write-only canonical workspace environment state without values."""
+    prefix = "Workshop workspace environment secrets:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical workspace-secret schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _WORKSPACE_ENVIRONMENT_SECRET_TABLES:
+                return f"{prefix} pending; canonical workspace-secret schema unavailable"
+            rows = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_workspace_settings WHERE field = 'env'",
+            )
+            malformed = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_workspace_settings "
+                "WHERE field = 'env' AND CASE "
+                "WHEN NOT json_valid(value) THEN 1 "
+                "WHEN json_type(value) != 'object' THEN 1 ELSE 0 END",
+            )
+            keys = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM channel_agent_workspace_settings settings, "
+                "json_each(CASE WHEN json_valid(settings.value) "
+                "AND json_type(settings.value) = 'object' THEN settings.value ELSE '{}' END) "
+                "WHERE settings.field = 'env'",
+            )
+            audits = _scalar(connection, "SELECT COUNT(*) FROM workspace_environment_secret_audit")
+            sets = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workspace_environment_secret_audit WHERE operation = 'set'",
+            )
+            removals = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workspace_environment_secret_audit WHERE operation = 'remove'",
+            )
+            integrity_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workspace_environment_secret_audit audit "
+                "WHERE NOT EXISTS (SELECT 1 FROM channel_agent_runtime_assignments assignment "
+                "WHERE assignment.channel_id = audit.channel_id "
+                "AND assignment.agent_id = audit.agent_id "
+                "AND assignment.runtime_profile_id = audit.runtime_profile_id)",
+            )
+            state = "active" if malformed == 0 and integrity_gaps == 0 else "INCOMPLETE"
+            return (
+                f"{prefix} {state}; workspace states={rows}, principal keys={keys}, "
+                f"audits={audits} (set={sets}, remove={removals}), malformed={malformed}, "
+                f"integrity gaps={integrity_gaps}; authority=canonical/write-only"
             )
         finally:
             connection.close()
