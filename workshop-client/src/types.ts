@@ -753,6 +753,27 @@ export interface WorkshopWorkspaceEnvironmentVariable {
   removable: boolean;
 }
 
+export interface WorkshopMemoryProject {
+  available: boolean;
+  current: boolean;
+  displayName: string;
+  projectId: string;
+  provenance: "operator_pinned" | "principal_registered" | "principal_created" | "legacy_migrated";
+  removable: boolean;
+  stateVersion: number | null;
+  workspaceRoots: string[];
+}
+
+export interface WorkshopMemoryProjectRegistry {
+  activeProjectId: string | null;
+  currentWorkspace: string;
+  mutation: { changed: boolean; note: string; projectId: string } | null;
+  principalId: string;
+  projects: WorkshopMemoryProject[];
+  revision: string;
+  runtimeProfileId: string;
+}
+
 export interface WorkshopPreferenceDocument {
   contextInvalidation?: WorkshopContextInvalidation;
   content: string;

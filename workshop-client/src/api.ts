@@ -28,6 +28,7 @@ import type {
   WorkshopRunRoutingDecision,
   WorkshopRoutingTaskClass,
   WorkshopWorkspaceConfig,
+  WorkshopMemoryProjectRegistry,
   WorkshopPreferenceDocument,
   WorkshopPreferenceHistory,
   WorkshopPrincipalPolicyDocument,
@@ -3522,6 +3523,68 @@ function parseWorkspaceConfig(payload: unknown): WorkshopWorkspaceConfig {
   };
 }
 
+function parseMemoryProjectRegistry(payload: unknown): WorkshopMemoryProjectRegistry {
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    typeof payload.principal_id !== "string" ||
+    typeof payload.runtime_profile_id !== "string" ||
+    typeof payload.current_workspace !== "string" ||
+    (payload.active_project_id !== null && typeof payload.active_project_id !== "string") ||
+    typeof payload.revision !== "string" ||
+    !Array.isArray(payload.projects) ||
+    payload.projects.some((item) => (
+      !isRecord(item) ||
+      typeof item.project_id !== "string" ||
+      typeof item.display_name !== "string" ||
+      !Array.isArray(item.workspace_roots) ||
+      item.workspace_roots.some((root) => typeof root !== "string") ||
+      !["operator_pinned", "principal_registered", "principal_created", "legacy_migrated"].includes(
+        String(item.provenance),
+      ) ||
+      typeof item.current !== "boolean" ||
+      typeof item.available !== "boolean" ||
+      typeof item.removable !== "boolean" ||
+      (item.state_version !== null && !Number.isSafeInteger(item.state_version))
+    )) ||
+    (payload.mutation !== undefined && (
+      !isRecord(payload.mutation) ||
+      typeof payload.mutation.project_id !== "string" ||
+      typeof payload.mutation.changed !== "boolean" ||
+      typeof payload.mutation.note !== "string"
+    ))
+  ) {
+    throw new Error("Kai returned unsupported memory-project registry state.");
+  }
+  return {
+    activeProjectId: payload.active_project_id as string | null,
+    currentWorkspace: payload.current_workspace,
+    mutation: payload.mutation === undefined
+      ? null
+      : {
+          projectId: payload.mutation.project_id as string,
+          changed: payload.mutation.changed as boolean,
+          note: payload.mutation.note as string,
+        },
+    principalId: payload.principal_id,
+    projects: payload.projects.map((item) => {
+      const project = item as Record<string, unknown>;
+      return {
+        available: project.available as boolean,
+        current: project.current as boolean,
+        displayName: project.display_name as string,
+        projectId: project.project_id as string,
+        provenance: project.provenance as "operator_pinned" | "principal_registered" | "principal_created" | "legacy_migrated",
+        removable: project.removable as boolean,
+        stateVersion: project.state_version as number | null,
+        workspaceRoots: project.workspace_roots as string[],
+      };
+    }),
+    revision: payload.revision,
+    runtimeProfileId: payload.runtime_profile_id,
+  };
+}
+
 function parseContextInvalidation(
   payload: Record<string, unknown>,
 ): WorkshopPreferenceDocument["contextInvalidation"] {
@@ -4911,6 +4974,72 @@ export async function loadWorkspaceConfig(
     throw new Error(safeErrorMessage(payload, "Could not load workspace settings."));
   }
   return parseWorkspaceConfig(payload);
+}
+
+export async function loadMemoryProjects(
+  session: WorkshopSession,
+): Promise<WorkshopMemoryProjectRegistry> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/memory-projects`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load memory projects."));
+  }
+  return parseMemoryProjectRegistry(payload);
+}
+
+export async function registerMemoryProject(
+  session: WorkshopSession,
+  revision: string,
+  name: string,
+): Promise<WorkshopMemoryProjectRegistry> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/memory-projects`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision, name }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Memory projects changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not register memory project."));
+  }
+  return parseMemoryProjectRegistry(payload);
+}
+
+export async function unregisterMemoryProject(
+  session: WorkshopSession,
+  revision: string,
+  projectId: string,
+): Promise<WorkshopMemoryProjectRegistry> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/channels/${encodeURIComponent(session.channelId)}/memory-projects/${encodeURIComponent(projectId)}`,
+    {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (response.status === 409) {
+    throw new SettingsRevisionConflictError(
+      safeErrorMessage(payload, "Memory projects changed since they were loaded."),
+    );
+  }
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not unregister memory project."));
+  }
+  return parseMemoryProjectRegistry(payload);
 }
 
 export async function updateWorkspaceConfig(

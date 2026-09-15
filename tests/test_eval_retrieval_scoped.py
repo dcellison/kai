@@ -709,7 +709,7 @@ class TestProjectRegistryBootstrap:
             patch.object(mp_mod.sessions, "init_db", new=AsyncMock()),
             patch.object(
                 mp_mod.sessions,
-                "get_memory_project_rows",
+                "get_canonical_memory_project_rows",
                 new=AsyncMock(return_value=rows),
             ),
         ):

@@ -451,7 +451,10 @@ class WorkshopMemoryQueryService:
 
         active = detect_active_memory_project(
             Path(workspace),
-            merged_registry(self._config.memory_projects),
+            merged_registry(
+                self._config.memory_projects,
+                principal_id=str(authority.principal_id),
+            ),
         )
         return active.project_id if active is not None and active.memory_enabled else None
 
@@ -462,7 +465,10 @@ class WorkshopMemoryQueryService:
         """Return memory-enabled projects reachable by an owned runtime."""
         from kai.memory_projects import detect_active_memory_project, merged_registry
 
-        registry = merged_registry(self._config.memory_projects)
+        registry = merged_registry(
+            self._config.memory_projects,
+            principal_id=str(authority.principal_id),
+        )
         if not registry:
             return ()
         authorized: dict[str, MemoryProjectOption] = {}

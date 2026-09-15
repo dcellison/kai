@@ -21,6 +21,7 @@ import {
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   loadWorkspaceGrants,
+  loadMemoryProjects,
   PreferenceRevisionConflictError,
   SettingsRevisionConflictError,
   refreshAllModelCatalogues,
@@ -28,6 +29,7 @@ import {
   restorePreferenceRevision,
   removeWorkspaceEnvironmentSecret,
   removeExistingWorkspace,
+  registerMemoryProject,
   savePreferenceDocument,
   setWorkspaceEnvironmentSecret,
   switchWorkspace,
@@ -42,6 +44,7 @@ import {
   updateAppearancePreference,
   updateRuntimeSettings,
   updateWorkspaceConfig,
+  unregisterMemoryProject,
 } from "./api";
 import { AgentRuntimeControls, SettingsWorkspace } from "./SettingsWorkspace";
 import { HumanAvatarCacheProvider } from "./HumanAvatar";
@@ -59,6 +62,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
   WorkshopWorkspaceGrants,
+  WorkshopMemoryProjectRegistry,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -78,10 +82,12 @@ vi.mock("./api", async (importOriginal) => {
     loadSettingsWorkspace: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     loadWorkspaceGrants: vi.fn(),
+    loadMemoryProjects: vi.fn(),
     addExistingWorkspace: vi.fn(),
     createWorkspace: vi.fn(),
     deleteWorkspace: vi.fn(),
     removeExistingWorkspace: vi.fn(),
+    registerMemoryProject: vi.fn(),
     restorePreferenceRevision: vi.fn(),
     removeWorkspaceEnvironmentSecret: vi.fn(),
     refreshAllModelCatalogues: vi.fn(),
@@ -101,6 +107,7 @@ vi.mock("./api", async (importOriginal) => {
     updateAppearancePreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
+    unregisterMemoryProject: vi.fn(),
   };
 });
 
@@ -338,6 +345,37 @@ const workspaceGrants: WorkshopWorkspaceGrants = {
   workspaceBase: "/srv/home",
 };
 
+const memoryProjects: WorkshopMemoryProjectRegistry = {
+  activeProjectId: "kai",
+  currentWorkspace: "/srv/kai",
+  mutation: null,
+  principalId: runtime.principalId,
+  projects: [
+    {
+      available: true,
+      current: true,
+      displayName: "Kai",
+      projectId: "kai",
+      provenance: "operator_pinned",
+      removable: false,
+      stateVersion: null,
+      workspaceRoots: ["/srv/kai"],
+    },
+    {
+      available: true,
+      current: false,
+      displayName: "Notes",
+      projectId: "notes",
+      provenance: "principal_registered",
+      removable: true,
+      stateVersion: 0,
+      workspaceRoots: ["/srv/alice/notes"],
+    },
+  ],
+  revision: "mpr_current",
+  runtimeProfileId: runtime.runtimeProfileId,
+};
+
 const githubSettings: WorkshopGitHubSettings = {
   githubLogin: "dcellison",
   issueTriage: { enabled: false, resettable: true, source: "user" },
@@ -523,6 +561,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadAppearancePreferences).mockResolvedValue(appearancePreferences);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
     vi.mocked(loadWorkspaceGrants).mockResolvedValue(workspaceGrants);
+    vi.mocked(loadMemoryProjects).mockResolvedValue(memoryProjects);
     vi.mocked(savePreferenceDocument).mockResolvedValue({
       ...preference,
       content: "# Preferences\n\nUse examples.\n",
@@ -608,6 +647,23 @@ describe("Settings workspace", () => {
       ...workspaceGrants,
       grants: workspaceGrants.grants.filter((item) => item.path !== "/srv/alice/notes"),
       mutation: { changed: true, path: "/srv/alice/notes" },
+    });
+    vi.mocked(registerMemoryProject).mockResolvedValue({
+      ...memoryProjects,
+      mutation: {
+        changed: true,
+        note: "Registered memory project 'research'.",
+        projectId: "research",
+      },
+    });
+    vi.mocked(unregisterMemoryProject).mockResolvedValue({
+      ...memoryProjects,
+      projects: memoryProjects.projects.filter((item) => item.projectId !== "notes"),
+      mutation: {
+        changed: true,
+        note: "Unregistered memory project 'notes'.",
+        projectId: "notes",
+      },
     });
     vi.mocked(deleteWorkspace).mockResolvedValue({
       directoryDeleted: true,
@@ -958,8 +1014,8 @@ describe("Settings workspace", () => {
     expect(screen.getByText("Operator managed")).toBeVisible();
     expect(screen.queryByText(runtime.principalId)).not.toBeInTheDocument();
     expect(screen.queryByText(runtime.runtimeProfileId)).not.toBeInTheDocument();
-    expect(screen.getByText("/srv/kai")).toBeVisible();
-    expect(screen.getByText("/srv/alice/notes")).toBeVisible();
+    expect(screen.getAllByText("/srv/kai")[0]).toBeVisible();
+    expect(screen.getAllByText("/srv/alice/notes")[0]).toBeVisible();
   });
 
   it("saves preference Markdown and reports dirty state", async () => {
@@ -1145,6 +1201,35 @@ describe("Settings workspace", () => {
     ));
     expect(await screen.findByText("Access to notes was removed. The directory was not deleted.")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Remove access to Kai" })).not.toBeInTheDocument();
+  });
+
+  it("registers and unregisters memory projects through the active agent runtime", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadMemoryProjects).mockResolvedValueOnce({
+      ...memoryProjects,
+      activeProjectId: null,
+      currentWorkspace: "/srv/home",
+      projects: memoryProjects.projects.map((item) => ({ ...item, current: false })),
+    });
+    renderAgentRuntime();
+
+    const name = await screen.findByLabelText("Register active workspace");
+    await user.type(name, "research");
+    await user.click(screen.getByRole("button", { name: "Register memory project" }));
+    await waitFor(() => expect(registerMemoryProject).toHaveBeenCalledWith(
+      session,
+      "mpr_current",
+      "research",
+    ));
+    expect(await screen.findByText("Registered memory project 'research'.")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Unregister Notes" }));
+    await acceptConfirmation(user, /Unregister memory project notes/);
+    await waitFor(() => expect(unregisterMemoryProject).toHaveBeenCalledWith(
+      session,
+      "mpr_current",
+      "notes",
+    ));
   });
 
   it("requires the exact workspace name before permanent deletion", async () => {

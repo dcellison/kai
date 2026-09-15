@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 82
+WORKSHOP_SCHEMA_VERSION = 83
 
 
 @dataclass(frozen=True, slots=True)
@@ -3634,6 +3634,103 @@ _WORKSPACE_ENVIRONMENT_SECRET_AUDIT_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_CANONICAL_MEMORY_PROJECT_REGISTRY_SCHEMA = SchemaMigration(
+    version=83,
+    name="canonical_memory_project_registry",
+    statements=(
+        """
+        CREATE TABLE principal_memory_projects (
+            project_id TEXT PRIMARY KEY CHECK (
+                length(project_id) BETWEEN 1 AND 64
+            ),
+            display_name TEXT NOT NULL CHECK (
+                length(trim(display_name)) BETWEEN 1 AND 128
+            ),
+            workspace_root TEXT NOT NULL UNIQUE CHECK (
+                length(trim(workspace_root)) > 0
+            ),
+            principal_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            memory_enabled INTEGER NOT NULL DEFAULT 1 CHECK (
+                memory_enabled IN (0, 1)
+            ),
+            default_scope_for_new_facts TEXT CHECK (
+                default_scope_for_new_facts IS NULL
+                OR default_scope_for_new_facts IN ('global', 'project')
+            ),
+            provenance TEXT NOT NULL CHECK (
+                provenance IN (
+                    'principal_registered', 'principal_created', 'legacy_migrated'
+                )
+            ),
+            state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        "CREATE INDEX principal_memory_projects_owner_idx "
+        "ON principal_memory_projects (principal_id, runtime_profile_id, created_at)",
+        """
+        CREATE TABLE workshop_memory_project_migrations (
+            legacy_project_id TEXT PRIMARY KEY,
+            legacy_created_by INTEGER NOT NULL,
+            principal_id TEXT,
+            runtime_profile_id TEXT,
+            outcome TEXT NOT NULL CHECK (
+                outcome IN ('migrated', 'missing_owner', 'invalid', 'conflicting')
+            ),
+            source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+            reconciled_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        """
+        CREATE TABLE workshop_memory_project_registry_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            pinned_projects INTEGER NOT NULL CHECK (pinned_projects >= 0),
+            pinned_roots INTEGER NOT NULL CHECK (pinned_roots >= 0),
+            configuration_digest TEXT NOT NULL CHECK (length(configuration_digest) = 64),
+            reconciled_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        """
+        CREATE TABLE workshop_memory_project_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            project_id TEXT NOT NULL CHECK (
+                length(project_id) BETWEEN 1 AND 64
+            ),
+            workspace_digest TEXT NOT NULL CHECK (length(workspace_digest) = 64),
+            operation TEXT NOT NULL CHECK (
+                operation IN ('register', 'unregister')
+            ),
+            changed INTEGER NOT NULL CHECK (changed IN (0, 1)),
+            state_version INTEGER NOT NULL CHECK (state_version >= 0),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        "CREATE INDEX workshop_memory_project_audit_owner_idx "
+        "ON workshop_memory_project_audit (principal_id, runtime_profile_id, created_at)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3717,6 +3814,7 @@ _MIGRATIONS = (
     _CANONICAL_WORKSPACE_GRANT_AUTHORITY_SCHEMA,
     _REPLAY_SAFE_WORKSPACE_GRANT_MIGRATION_SCHEMA,
     _WORKSPACE_ENVIRONMENT_SECRET_AUDIT_SCHEMA,
+    _CANONICAL_MEMORY_PROJECT_REGISTRY_SCHEMA,
 )
 
 

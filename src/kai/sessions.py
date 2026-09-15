@@ -87,6 +87,10 @@ from kai.workshop.memory_authority import (
     WorkshopMemoryAuthorityMigration,
     reconcile_workshop_memory_authority,
 )
+from kai.workshop.memory_project_registry import (
+    WorkshopMemoryProjectRegistryMigration,
+    reconcile_memory_project_registry,
+)
 from kai.workshop.operational_state import (
     WorkshopOperationalStateMigration,
     reconcile_workshop_operational_state,
@@ -122,7 +126,7 @@ from kai.workshop.workspace_grants import (
 )
 
 if TYPE_CHECKING:
-    from kai.config import Config, WorkspaceConfig
+    from kai.config import Config, MemoryProjectConfig, WorkspaceConfig
 
 log = logging.getLogger(__name__)
 
@@ -547,6 +551,21 @@ async def initialize_workshop_workspace_grant_authority(
             _get_db(),
             registry,
             runtime_profiles,
+        )
+
+
+async def initialize_workshop_memory_project_registry(
+    registry: WorkshopExecutionStateRegistry,
+    pinned_projects: dict[str, MemoryProjectConfig],
+) -> WorkshopMemoryProjectRegistryMigration:
+    """Backfill legacy project rows into canonical principal/runtime ownership."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        return await reconcile_memory_project_registry(
+            _get_db(),
+            registry,
+            pinned_projects,
         )
 
 
@@ -2177,6 +2196,155 @@ async def get_memory_project_rows() -> list[dict]:
             }
             for row in rows
         ]
+
+
+async def get_canonical_memory_project_rows(
+    principal_id: str | None = None,
+) -> list[dict[str, object]]:
+    """Return canonical project rows, optionally restricted to one owner."""
+    query = (
+        "SELECT project_id, display_name, workspace_root, principal_id, runtime_profile_id, "
+        "memory_enabled, default_scope_for_new_facts, provenance, state_version, created_at, updated_at "
+        "FROM principal_memory_projects"
+    )
+    parameters: tuple[object, ...] = ()
+    if principal_id is not None:
+        query += " WHERE principal_id = ?"
+        parameters = (principal_id,)
+    query += " ORDER BY created_at, project_id"
+    async with _get_db().execute(query, parameters) as cursor:
+        return [
+            {
+                **dict(row),
+                "memory_enabled": bool(row["memory_enabled"]),
+            }
+            for row in await cursor.fetchall()
+        ]
+
+
+async def register_canonical_memory_project(
+    namespace: WorkshopExecutionStateNamespace,
+    *,
+    project_id: str,
+    display_name: str,
+    workspace_root: str,
+    provenance: str,
+    workspace_digest: str,
+) -> dict[str, object]:
+    """Atomically register and audit one canonical principal-owned project."""
+    if provenance not in {"principal_registered", "principal_created"}:
+        raise ValueError("Invalid memory-project provenance")
+    db = _get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute(
+            "INSERT INTO principal_memory_projects "
+            "(project_id, display_name, workspace_root, principal_id, runtime_profile_id, "
+            "memory_enabled, default_scope_for_new_facts, provenance) "
+            "VALUES (?, ?, ?, ?, ?, 1, 'project', ?)",
+            (
+                project_id,
+                display_name,
+                workspace_root,
+                namespace.principal_id,
+                namespace.runtime_profile_id,
+                provenance,
+            ),
+        )
+        await db.execute(
+            "INSERT INTO workshop_memory_project_audit "
+            "(principal_id, channel_id, agent_id, runtime_profile_id, project_id, "
+            "workspace_digest, operation, changed, state_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'register', 1, 0)",
+            (
+                namespace.principal_id,
+                namespace.channel_id,
+                namespace.agent_id,
+                namespace.runtime_profile_id,
+                project_id,
+                workspace_digest,
+            ),
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    rows = await get_canonical_memory_project_rows(str(namespace.principal_id))
+    return next(row for row in rows if row["project_id"] == project_id)
+
+
+async def unregister_canonical_memory_project(
+    namespace: WorkshopExecutionStateNamespace,
+    *,
+    project_id: str,
+    expected_state_version: int,
+    workspace_digest: str,
+) -> bool:
+    """Atomically remove and audit one exact canonical project revision."""
+    db = _get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            "DELETE FROM principal_memory_projects WHERE project_id = ? AND principal_id = ? "
+            "AND runtime_profile_id = ? AND state_version = ?",
+            (
+                project_id,
+                namespace.principal_id,
+                namespace.runtime_profile_id,
+                expected_state_version,
+            ),
+        )
+        changed = cursor.rowcount > 0
+        await db.execute(
+            "INSERT INTO workshop_memory_project_audit "
+            "(principal_id, channel_id, agent_id, runtime_profile_id, project_id, "
+            "workspace_digest, operation, changed, state_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'unregister', ?, ?)",
+            (
+                namespace.principal_id,
+                namespace.channel_id,
+                namespace.agent_id,
+                namespace.runtime_profile_id,
+                project_id,
+                workspace_digest,
+                1 if changed else 0,
+                expected_state_version,
+            ),
+        )
+        await db.commit()
+        return changed
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def record_canonical_memory_project_noop(
+    namespace: WorkshopExecutionStateNamespace,
+    *,
+    project_id: str,
+    workspace_digest: str,
+    operation: str,
+    state_version: int,
+) -> None:
+    """Audit an idempotent canonical project mutation without changing state."""
+    if operation not in {"register", "unregister"}:
+        raise ValueError("Invalid memory-project audit operation")
+    await _get_db().execute(
+        "INSERT INTO workshop_memory_project_audit "
+        "(principal_id, channel_id, agent_id, runtime_profile_id, project_id, "
+        "workspace_digest, operation, changed, state_version) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        (
+            namespace.principal_id,
+            namespace.channel_id,
+            namespace.agent_id,
+            namespace.runtime_profile_id,
+            project_id,
+            workspace_digest,
+            operation,
+            state_version,
+        ),
+    )
+    await _get_db().commit()
 
 
 async def get_all_workspace_paths(limit: int = 100) -> list[str]:

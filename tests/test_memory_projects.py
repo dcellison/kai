@@ -320,6 +320,25 @@ class TestDbRegistryCache:
         assert merged_registry({}) == {}
         assert db_registry_creator("anvil") is None
 
+    def test_canonical_rows_are_visible_only_to_the_owning_principal(self, tmp_path):
+        root = tmp_path / "private"
+        root.mkdir()
+        load_db_registry(
+            [
+                _row(
+                    "private",
+                    root,
+                    principal_id="prn_owner",
+                    runtime_profile_id="rtp_owner",
+                    provenance="principal_registered",
+                    state_version=0,
+                )
+            ]
+        )
+
+        assert "private" in merged_registry({}, principal_id="prn_owner")
+        assert "private" not in merged_registry({}, principal_id="prn_other")
+
     @pytest.mark.parametrize(
         "bad_overrides",
         [

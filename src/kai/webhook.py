@@ -1876,7 +1876,10 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
         )
         active_project = detect_active_memory_project(
             workspace,
-            merged_registry(api_config.memory_projects),
+            merged_registry(
+                api_config.memory_projects,
+                principal_id=str(principal.principal_id),
+            ),
         )
     except Exception:
         log.exception("Memory add workspace scope resolution failed")

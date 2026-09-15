@@ -134,7 +134,9 @@ from kai.workshop.runtime_lane_status import (
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.settings_workspaces import (
     EffectiveValue,
+    WorkshopSettingsWorkspaceAccessDenied,
     WorkshopSettingsWorkspaceConflict,
+    WorkshopSettingsWorkspaceValidationError,
     WorkspaceConfigSnapshot,
     WorkspaceEnvironmentVariable,
 )
@@ -5720,42 +5722,38 @@ def _mp_yaml(project_id: str, root: Path):
 class TestHandleProject:
     async def test_register_current_workspace(self, tmp_path):
         from kai.bot import handle_project
-        from kai.memory_projects import db_registry_creator, merged_registry
 
         ws = tmp_path / "phi"
         ws.mkdir()
         update = _make_update("/project register")
-        ctx = _make_context(
-            pool=_make_mock_claude(workspace=ws),
-            args=["register"],
+        ctx = _make_context(pool=_make_mock_claude(workspace=ws), args=["register"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.register_memory_project = AsyncMock(
+            return_value=SimpleNamespace(note="Registered memory project 'phi' for this workspace.")
         )
-        with patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist:
-            await handle_project(update, ctx)
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
 
-        persist.assert_awaited_once()
-        assert persist.call_args.kwargs["project_id"] == "phi"
-        assert persist.call_args.kwargs["created_by"] == 12345
-        # Restart-free contract: the cache sees the project immediately.
-        assert "phi" in merged_registry({})
-        assert db_registry_creator("phi") == 12345
+        service.register_memory_project.assert_awaited_once_with(authority, "phi")
         reply = update.message.reply_text.call_args.args[0]
         assert "Registered memory project 'phi'" in reply
 
     async def test_register_explicit_name_overrides_dir_name(self, tmp_path):
         from kai.bot import handle_project
-        from kai.memory_projects import merged_registry
 
         ws = tmp_path / "some-checkout"
         ws.mkdir()
         update = _make_update("/project register Anvil")
         ctx = _make_context(pool=_make_mock_claude(workspace=ws), args=["register", "Anvil"])
-        with patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock):
-            await handle_project(update, ctx)
-
-        merged = merged_registry({})
-        assert "anvil" in merged
-        # Display name keeps the user's casing; the id is the slug.
-        assert merged["anvil"].display_name == "Anvil"
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.register_memory_project = AsyncMock(return_value=SimpleNamespace(note="Registered."))
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
+        service.register_memory_project.assert_awaited_once_with(authority, "Anvil")
 
     async def test_register_inside_existing_project_rejected(self, tmp_path):
         from kai.bot import handle_project
@@ -5763,13 +5761,15 @@ class TestHandleProject:
         root = tmp_path / "kai"
         sub = root / "subdir"
         sub.mkdir(parents=True)
-        config = _make_config(memory_projects={"kai": _mp_yaml("kai", root)})
         update = _make_update("/project register")
-        ctx = _make_context(config=config, pool=_make_mock_claude(workspace=sub), args=["register"])
-        with patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist:
-            await handle_project(update, ctx)
-
-        persist.assert_not_awaited()
+        ctx = _make_context(pool=_make_mock_claude(workspace=sub), args=["register"])
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = SimpleNamespace()
+        service.register_memory_project = AsyncMock(
+            side_effect=WorkshopSettingsWorkspaceValidationError("This workspace is already inside project 'kai'")
+        )
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
         reply = update.message.reply_text.call_args.args[0]
         assert "already inside project 'kai'" in reply
 
@@ -5780,13 +5780,15 @@ class TestHandleProject:
         yaml_root.mkdir()
         ws = tmp_path / "kai"
         ws.mkdir()
-        config = _make_config(memory_projects={"kai": _mp_yaml("kai", yaml_root)})
         update = _make_update("/project register kai")
-        ctx = _make_context(config=config, pool=_make_mock_claude(workspace=ws), args=["register", "kai"])
-        with patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist:
-            await handle_project(update, ctx)
-
-        persist.assert_not_awaited()
+        ctx = _make_context(pool=_make_mock_claude(workspace=ws), args=["register", "kai"])
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = SimpleNamespace()
+        service.register_memory_project = AsyncMock(
+            side_effect=WorkshopSettingsWorkspaceValidationError("Project id 'kai' is already registered")
+        )
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
         reply = update.message.reply_text.call_args.args[0]
         assert "already registered" in reply
 
@@ -5797,215 +5799,93 @@ class TestHandleProject:
         ws.mkdir()
         update = _make_update("/project register 'bad name!'")
         ctx = _make_context(pool=_make_mock_claude(workspace=ws), args=["register", "bad name!"])
-        with patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist:
-            await handle_project(update, ctx)
-
-        persist.assert_not_awaited()
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = SimpleNamespace()
+        service.register_memory_project = AsyncMock(
+            side_effect=WorkshopSettingsWorkspaceValidationError("Invalid project name")
+        )
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
         reply = update.message.reply_text.call_args.args[0]
         assert "Invalid project name" in reply
 
     async def test_unregister_pinned_project_refused(self, tmp_path):
         from kai.bot import handle_project
 
-        root = tmp_path / "kai"
-        root.mkdir()
-        config = _make_config(memory_projects={"kai": _mp_yaml("kai", root)})
         update = _make_update("/project unregister kai")
-        ctx = _make_context(config=config, args=["unregister", "kai"])
-        with patch("kai.bot.sessions.unregister_memory_project", new_callable=AsyncMock) as remove:
-            await handle_project(update, ctx)
-
-        remove.assert_not_awaited()
+        ctx = _make_context(args=["unregister", "kai"])
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = SimpleNamespace()
+        service.unregister_memory_project = AsyncMock(
+            side_effect=WorkshopSettingsWorkspaceAccessDenied("Operator-pinned memory projects cannot be unregistered")
+        )
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
         reply = update.message.reply_text.call_args.args[0]
-        assert "operator-pinned" in reply
+        assert "Operator-pinned" in reply
 
     async def test_unregister_by_other_user_refused(self, tmp_path):
         from kai.bot import handle_project
-        from kai.memory_projects import load_db_registry
 
-        root = tmp_path / "phi"
-        root.mkdir()
-        load_db_registry(
-            [
-                {
-                    "project_id": "phi",
-                    "display_name": "Phi",
-                    "workspace_root": str(root),
-                    "memory_enabled": True,
-                    "default_scope_for_new_facts": "project",
-                    "created_by": 777,
-                }
-            ]
-        )
         update = _make_update("/project unregister phi")
         ctx = _make_context(args=["unregister", "phi"])
-        with patch("kai.bot.sessions.unregister_memory_project", new_callable=AsyncMock) as remove:
-            await handle_project(update, ctx)
-
-        remove.assert_not_awaited()
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = SimpleNamespace()
+        service.unregister_memory_project = AsyncMock(
+            side_effect=WorkshopSettingsWorkspaceAccessDenied("Only the owning principal runtime can unregister")
+        )
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
         reply = update.message.reply_text.call_args.args[0]
-        assert "registered by another user" in reply
+        assert "owning principal" in reply
 
     async def test_unregister_by_creator_succeeds(self, tmp_path):
         from kai.bot import handle_project
-        from kai.memory_projects import load_db_registry, merged_registry
 
-        root = tmp_path / "phi"
-        root.mkdir()
-        load_db_registry(
-            [
-                {
-                    "project_id": "phi",
-                    "display_name": "Phi",
-                    "workspace_root": str(root),
-                    "memory_enabled": True,
-                    "default_scope_for_new_facts": "project",
-                    "created_by": 12345,
-                }
-            ]
-        )
         update = _make_update("/project unregister phi")
         ctx = _make_context(args=["unregister", "phi"])
-        with patch("kai.bot.sessions.unregister_memory_project", new_callable=AsyncMock, return_value=True) as remove:
-            await handle_project(update, ctx)
-
-        remove.assert_awaited_once_with("phi")
-        assert merged_registry({}) == {}
+        authority = SimpleNamespace()
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.unregister_memory_project = AsyncMock(
+            return_value=SimpleNamespace(note="Unregistered memory project 'phi'.")
+        )
+        ctx.application.core_services.settings_workspaces = service
+        await handle_project(update, ctx)
+        service.unregister_memory_project.assert_awaited_once_with(authority, "phi")
         reply = update.message.reply_text.call_args.args[0]
         assert "Unregistered" in reply
 
-    async def test_stale_unregister_authorization_rechecked_under_lock(self, tmp_path):
-        """Unregister authorization must be read under the mutation
-        lock: a creator read before the lock can authorize against a
-        row that earlier queued mutations delete and a different
-        user re-registers under the same id. The test holds the lock,
-        starts the stale unregister so it queues, swaps the row's
-        owner while it waits, and asserts the recheck denies the
-        deletion and the new owner's project survives."""
-        from kai.bot import handle_project
-        from kai.memory_projects import (
-            db_registry_remove,
-            db_registry_upsert,
-            load_db_registry,
-            merged_registry,
-            registry_mutation_lock,
-        )
-
-        root_old = tmp_path / "phi-old"
-        root_old.mkdir()
-        root_new = tmp_path / "phi-new"
-        root_new.mkdir()
-        # phi originally registered by chat 999 (the stale caller).
-        load_db_registry(
-            [
-                {
-                    "project_id": "phi",
-                    "display_name": "Phi",
-                    "workspace_root": str(root_old),
-                    "memory_enabled": True,
-                    "default_scope_for_new_facts": "project",
-                    "created_by": 999,
-                }
-            ]
-        )
-        update = _make_update("/project unregister phi", chat_id=999)
-        ctx = _make_context(args=["unregister", "phi"])
-
-        with patch("kai.bot.sessions.unregister_memory_project", new_callable=AsyncMock) as remove:
-            async with registry_mutation_lock():
-                # The stale unregister starts and queues behind the
-                # held lock BEFORE the ownership swap below.
-                task = asyncio.create_task(handle_project(update, ctx))
-                await asyncio.sleep(0)
-                # Earlier queued mutations, simulated under the held
-                # lock: the old phi goes away and a different user
-                # re-registers the id.
-                db_registry_remove("phi")
-                db_registry_upsert(
-                    {
-                        "project_id": "phi",
-                        "display_name": "Phi",
-                        "workspace_root": str(root_new),
-                        "memory_enabled": True,
-                        "default_scope_for_new_facts": "project",
-                        "created_by": 12345,
-                    }
-                )
-            await task
-
-        remove.assert_not_awaited()
-        reply = update.message.reply_text.call_args.args[0]
-        assert "registered by another user" in reply
-        # The new owner's project survives with its new root.
-        merged = merged_registry({})
-        assert merged["phi"].workspace_roots == (root_new.resolve(),)
-
-    async def test_concurrent_parent_child_registration_serialized(self, tmp_path):
-        """The nested-root guard reads the merged view BEFORE an
-        awaited DB insert; without the registry mutation lock, two
-        concurrent registrations both pass their guards against the
-        same stale view and commit a parent/child pair (the child
-        then steals the parent's subtree via longest-prefix
-        detection). With the lock, the second registration observes
-        the first and is rejected. The persist stub yields to the
-        event loop to force the interleaving the lock must close."""
-        from kai.bot import _register_memory_project_for
-        from kai.memory_projects import detect_active_memory_project, merged_registry
-
-        parent = tmp_path / "parent"
-        child = parent / "child"
-        child.mkdir(parents=True)
-        config = _make_config()
-
-        async def _yielding_persist(**kwargs):
-            await asyncio.sleep(0)
-
-        with patch(
-            "kai.bot.sessions.register_memory_project",
-            new=AsyncMock(side_effect=_yielding_persist),
-        ):
-            results = await asyncio.gather(
-                _register_memory_project_for(config, 12345, parent, "parent"),
-                _register_memory_project_for(config, 12345, child, "child"),
-            )
-
-        successes = [message for ok, message in results if ok]
-        rejections = [message for ok, message in results if not ok]
-        assert len(successes) == 1
-        assert len(rejections) == 1
-        assert "already inside project" in rejections[0]
-        # The merged registry must never contain nested DB-owned
-        # roots: detection from inside the child resolves to the
-        # single registered project.
-        merged = merged_registry({})
-        assert len(merged) == 1
-        active = detect_active_memory_project(child, merged)
-        assert active is not None
-        assert active.project_id == "parent"
-
     async def test_list_shows_provenance_and_active_marker(self, tmp_path):
         from kai.bot import handle_project
-        from kai.memory_projects import load_db_registry
 
         yaml_root = tmp_path / "kai"
         yaml_root.mkdir()
         db_root = tmp_path / "phi"
         db_root.mkdir()
-        load_db_registry(
-            [
-                {
-                    "project_id": "phi",
-                    "display_name": "Phi",
-                    "workspace_root": str(db_root),
-                    "memory_enabled": True,
-                    "default_scope_for_new_facts": "project",
-                    "created_by": 12345,
-                }
-            ]
-        )
-        config = _make_config(memory_projects={"kai": _mp_yaml("kai", yaml_root)})
         update = _make_update("/project")
-        ctx = _make_context(config=config, pool=_make_mock_claude(workspace=db_root), args=[])
+        ctx = _make_context(pool=_make_mock_claude(workspace=db_root), args=[])
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = SimpleNamespace()
+        service.inspect_memory_projects = AsyncMock(
+            return_value=SimpleNamespace(
+                projects=(
+                    SimpleNamespace(
+                        project_id="kai",
+                        provenance="operator_pinned",
+                        current=False,
+                        workspace_roots=(str(yaml_root),),
+                    ),
+                    SimpleNamespace(
+                        project_id="phi",
+                        provenance="principal_registered",
+                        current=True,
+                        workspace_roots=(str(db_root),),
+                    ),
+                )
+            )
+        )
+        ctx.application.core_services.settings_workspaces = service
         await handle_project(update, ctx)
 
         reply = update.message.reply_text.call_args.args[0]
@@ -6082,96 +5962,6 @@ class TestWorkspaceNewAutoRegister:
         replies = [call.args[0] for call in update.message.reply_text.call_args_list]
         assert any("Workspace created and selected" in reply for reply in replies)
         assert replies[-1] == "Registered memory project 'myproj' for this workspace."
-
-    async def test_workspace_new_registers_project(self, tmp_path):
-        """/workspace new is the strong project signal: the created
-        directory is registered automatically and the user is told."""
-        from kai.bot import handle_workspace
-        from kai.memory_projects import merged_registry
-
-        update = _make_update("/workspace new myproj")
-        ctx = _make_context(args=["new", "myproj"])
-
-        proc = MagicMock()
-        proc.wait = AsyncMock(return_value=0)
-        with (
-            _mock_resolve(base=tmp_path),
-            patch("kai.bot.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc),
-            patch("kai.bot._switch_workspace", new_callable=AsyncMock),
-            patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist,
-        ):
-            await handle_workspace(update, ctx)
-
-        persist.assert_awaited_once()
-        assert persist.call_args.kwargs["project_id"] == "myproj"
-        assert "myproj" in merged_registry({})
-        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
-        assert any("Registered memory project 'myproj'" in r for r in replies)
-
-    async def test_workspace_new_subpath_registers_basename(self, tmp_path):
-        """/workspace new accepts relative subpaths; the auto-hook
-        must register the created directory's BASENAME, since the
-        raw argument's separator would fail slug validation and
-        silently skip registration on a perfectly valid creation."""
-        from kai.bot import handle_workspace
-        from kai.memory_projects import merged_registry
-
-        update = _make_update("/workspace new sub/project")
-        ctx = _make_context(args=["new", "sub/project"])
-
-        proc = MagicMock()
-        proc.wait = AsyncMock(return_value=0)
-        with (
-            _mock_resolve(base=tmp_path),
-            patch("kai.bot.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc),
-            patch("kai.bot._switch_workspace", new_callable=AsyncMock),
-            patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist,
-        ):
-            await handle_workspace(update, ctx)
-
-        persist.assert_awaited_once()
-        assert persist.call_args.kwargs["project_id"] == "project"
-        assert "project" in merged_registry({})
-
-    async def test_workspace_new_registration_failure_does_not_block(self, tmp_path):
-        """A registration failure warns but the workspace creation
-        and switch still happen."""
-        from kai.bot import handle_workspace
-        from kai.memory_projects import load_db_registry
-
-        # Pre-register the SAME id so the auto-hook hits the
-        # duplicate-id rejection.
-        other_root = tmp_path / "elsewhere"
-        other_root.mkdir()
-        load_db_registry(
-            [
-                {
-                    "project_id": "myproj",
-                    "display_name": "Myproj",
-                    "workspace_root": str(other_root),
-                    "memory_enabled": True,
-                    "default_scope_for_new_facts": "project",
-                    "created_by": 777,
-                }
-            ]
-        )
-        update = _make_update("/workspace new myproj")
-        ctx = _make_context(args=["new", "myproj"])
-
-        proc = MagicMock()
-        proc.wait = AsyncMock(return_value=0)
-        with (
-            _mock_resolve(base=tmp_path),
-            patch("kai.bot.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc),
-            patch("kai.bot._switch_workspace", new_callable=AsyncMock) as switch,
-            patch("kai.bot.sessions.register_memory_project", new_callable=AsyncMock) as persist,
-        ):
-            await handle_workspace(update, ctx)
-
-        persist.assert_not_awaited()
-        switch.assert_awaited_once()
-        replies = [c.args[0] for c in update.message.reply_text.call_args_list]
-        assert any("memory project not registered" in r for r in replies)
 
 
 # ── handle_review_command (Telegram manual review) ─────────────────────

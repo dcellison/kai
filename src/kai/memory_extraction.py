@@ -3296,7 +3296,14 @@ async def extract_and_store(
     # registrations route writes without a restart.
     active_project: ActiveMemoryProject | None = None
     if workspace:
-        active_project = detect_active_memory_project(Path(workspace), merged_registry(config.memory_projects))
+        project_principal_id = user_id if user_id.startswith("prn_") else None
+        active_project = detect_active_memory_project(
+            Path(workspace),
+            merged_registry(
+                config.memory_projects,
+                principal_id=project_principal_id,
+            ),
+        )
 
     sem = _get_semaphore(user_id)
     # Pre-initialize the storage counters so the post-try summary log

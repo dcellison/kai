@@ -105,6 +105,7 @@ from kai.workshop.diagnostics import (
     workshop_human_provisioning_status,
     workshop_legacy_jsonl_archive_status,
     workshop_memory_authority_status,
+    workshop_memory_project_registry_status,
     workshop_operational_state_status,
     workshop_runtime_session_status,
     workshop_standing_observation_status,
@@ -10005,6 +10006,7 @@ def _cmd_status() -> None:
     print(workshop_runtime_session_status(Path(data_dir) / "kai.db"))
     print(_runtime_key_cutover_status(Path(data_dir) / "kai.db", RUNTIME_PROFILES_YAML))
     print(workshop_workspace_grant_status(Path(data_dir) / "kai.db"))
+    print(workshop_memory_project_registry_status(Path(data_dir) / "kai.db"))
     print(workshop_workspace_environment_secret_status(Path(data_dir) / "kai.db"))
     print(workshop_execution_state_status(Path(data_dir) / "kai.db"))
     print(workshop_operational_state_status(Path(data_dir) / "kai.db"))

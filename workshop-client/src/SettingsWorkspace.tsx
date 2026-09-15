@@ -26,6 +26,7 @@ import {
   loadChannelNotificationPolicy,
   loadClientPreferences,
   loadModelCatalogue,
+  loadMemoryProjects,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
   loadWorkspaceGrants,
@@ -34,6 +35,7 @@ import {
   restorePreferenceRevision,
   removeWorkspaceEnvironmentSecret,
   removeExistingWorkspace,
+  registerMemoryProject,
   refreshModelCatalogue,
   savePreferenceDocument,
   setWorkspaceEnvironmentSecret,
@@ -49,6 +51,7 @@ import {
   updateHumanDisplayName,
   uploadHumanAvatar,
   updateWorkspaceConfig,
+  unregisterMemoryProject,
 } from "./api";
 import type {
   WorkshopEditableCapability,
@@ -67,6 +70,7 @@ import type {
   WorkshopHumanProfile,
   WorkshopHumanAvatar,
   WorkshopHumanAvatarDescriptor,
+  WorkshopMemoryProjectRegistry,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
@@ -279,6 +283,16 @@ function workspaceProvenanceLabel(provenance: string): string {
   return labels[provenance] ?? provenance.replaceAll("_", " ");
 }
 
+function memoryProjectProvenanceLabel(provenance: string): string {
+  const labels: Record<string, string> = {
+    legacy_migrated: "Migrated project",
+    operator_pinned: "Operator pinned",
+    principal_created: "Created with workspace",
+    principal_registered: "Registered by you",
+  };
+  return labels[provenance] ?? provenance.replaceAll("_", " ");
+}
+
 type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
   executionProfileControl?: ReactNode;
@@ -382,6 +396,11 @@ function SettingsWorkspaceContent({
   const [workspaceSecretEditing, setWorkspaceSecretEditing] = useState(false);
   const [workspaceSecretBusy, setWorkspaceSecretBusy] = useState(false);
   const [workspaceSecretError, setWorkspaceSecretError] = useState<string | null>(null);
+  const [memoryProjects, setMemoryProjects] = useState<WorkshopMemoryProjectRegistry | null>(null);
+  const [memoryProjectName, setMemoryProjectName] = useState("");
+  const [memoryProjectsBusy, setMemoryProjectsBusy] = useState(false);
+  const [memoryProjectsError, setMemoryProjectsError] = useState<string | null>(null);
+  const [memoryProjectsNotice, setMemoryProjectsNotice] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -565,12 +584,25 @@ function SettingsWorkspaceContent({
     setWorkspacePrompt(snapshot.prompt ?? "");
   }, []);
 
+  const refreshMemoryProjects = useCallback(async (): Promise<void> => {
+    setMemoryProjectsError(null);
+    try {
+      setMemoryProjects(await loadMemoryProjects(session));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setMemoryProjectsError(errorText(caught, "Could not load memory projects."));
+      }
+      setMemoryProjects(null);
+    }
+  }, [handleAccessFailure, session]);
+
   const refreshRuntime = useCallback(async (): Promise<void> => {
     setRuntimeLoading(true);
     setWorkspaceGrantsLoading(true);
     setRuntimeError(null);
     setWorkspaceError(null);
     setWorkspaceGrantsError(null);
+    setMemoryProjectsError(null);
     try {
       const settings = await loadSettingsWorkspace(session);
       adoptRuntime(settings);
@@ -581,6 +613,7 @@ function SettingsWorkspaceContent({
       setRuntime(null);
       setWorkspaceConfig(null);
       setWorkspaceGrants(null);
+      setMemoryProjects(null);
       setRuntimeLoading(false);
       setWorkspaceGrantsLoading(false);
       return;
@@ -611,7 +644,15 @@ function SettingsWorkspaceContent({
     } finally {
       setWorkspaceGrantsLoading(false);
     }
-  }, [adoptRuntime, adoptWorkspace, handleAccessFailure, onAuthenticationFailure, session]);
+    await refreshMemoryProjects();
+  }, [
+    adoptRuntime,
+    adoptWorkspace,
+    handleAccessFailure,
+    onAuthenticationFailure,
+    refreshMemoryProjects,
+    session,
+  ]);
 
   useEffect(() => {
     if (!runtime || !runtimeBackend) {
@@ -1036,6 +1077,7 @@ function SettingsWorkspaceContent({
       );
       adoptRuntime(changed);
       adoptWorkspace(await loadWorkspaceConfig(session));
+      await refreshMemoryProjects();
       setRuntimeNotice(mutationMessage(changed.mutation));
     } catch (caught) {
       if (change.field === "backend") {
@@ -1359,6 +1401,7 @@ function SettingsWorkspaceContent({
       const changed = await switchWorkspace(session, path, runtime.revision);
       adoptRuntime(changed);
       adoptWorkspace(await loadWorkspaceConfig(session));
+      await refreshMemoryProjects();
       setRuntimeNotice(mutationMessage(changed.mutation));
     } catch (caught) {
       if (caught instanceof SettingsRevisionConflictError) {
@@ -1387,6 +1430,7 @@ function SettingsWorkspaceContent({
         runtime.revision,
       );
       adoptRuntime(created.settings);
+      await refreshMemoryProjects();
       const notices = [
         created.directoryCreated
           ? "Workspace created and selected. The conversation session was cleared."
@@ -1440,6 +1484,7 @@ function SettingsWorkspaceContent({
         runtime.revision,
       );
       adoptRuntime(deleted.settings);
+      await refreshMemoryProjects();
       setRuntimeNotice(
         deleted.directoryDeleted
           ? `Workspace ${workspaceDeletionName} was permanently deleted.`
@@ -1488,6 +1533,63 @@ function SettingsWorkspaceContent({
       }
     } finally {
       setWorkspaceGrantsBusy(false);
+    }
+  };
+
+  const addMemoryProject = async (): Promise<void> => {
+    if (!memoryProjects || !memoryProjectName.trim() || memoryProjectsBusy) {
+      return;
+    }
+    setMemoryProjectsBusy(true);
+    setMemoryProjectsError(null);
+    setMemoryProjectsNotice(null);
+    try {
+      const changed = await registerMemoryProject(
+        session,
+        memoryProjects.revision,
+        memoryProjectName.trim(),
+      );
+      setMemoryProjects(changed);
+      setMemoryProjectName("");
+      setMemoryProjectsNotice(changed.mutation?.note ?? "Memory project registered.");
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshRuntime();
+        setMemoryProjectsError("Memory projects changed elsewhere. The latest list has been loaded.");
+      } else if (!handleAccessFailure(caught)) {
+        setMemoryProjectsError(errorText(caught, "Could not register memory project."));
+      }
+    } finally {
+      setMemoryProjectsBusy(false);
+    }
+  };
+
+  const removeMemoryProject = async (projectId: string): Promise<void> => {
+    if (!memoryProjects || memoryProjectsBusy || !await confirm(
+      `Unregister memory project ${projectId}? Existing memories will not be deleted.`,
+    )) {
+      return;
+    }
+    setMemoryProjectsBusy(true);
+    setMemoryProjectsError(null);
+    setMemoryProjectsNotice(null);
+    try {
+      const changed = await unregisterMemoryProject(
+        session,
+        memoryProjects.revision,
+        projectId,
+      );
+      setMemoryProjects(changed);
+      setMemoryProjectsNotice(changed.mutation?.note ?? "Memory project unregistered.");
+    } catch (caught) {
+      if (caught instanceof SettingsRevisionConflictError) {
+        await refreshRuntime();
+        setMemoryProjectsError("Memory projects changed elsewhere. The latest list has been loaded.");
+      } else if (!handleAccessFailure(caught)) {
+        setMemoryProjectsError(errorText(caught, "Could not unregister memory project."));
+      }
+    } finally {
+      setMemoryProjectsBusy(false);
     }
   };
 
@@ -2188,6 +2290,91 @@ function SettingsWorkspaceContent({
               )}
               {workspaceGrantsError && workspaceGrants && (
                 <p className="settings-error" role="alert">{workspaceGrantsError}</p>
+              )}
+            </div>
+            <div className="workspace-grant-list memory-project-list">
+              <div className="workspace-grant-list-heading">
+                <p>Memory project</p>
+                <small>
+                  {memoryProjects?.activeProjectId
+                    ? `Current: ${memoryProjects.activeProjectId}`
+                    : "The active workspace is not registered"}
+                </small>
+              </div>
+              {memoryProjects ? (
+                <>
+                  {!memoryProjects.activeProjectId && (
+                    <form
+                      className="memory-project-registration"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void addMemoryProject();
+                      }}
+                    >
+                      <label htmlFor="memory-project-name">Register active workspace</label>
+                      <div>
+                        <input
+                          id="memory-project-name"
+                          type="text"
+                          maxLength={64}
+                          pattern="[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}"
+                          placeholder="project-name"
+                          value={memoryProjectName}
+                          disabled={memoryProjectsBusy}
+                          onChange={(event) => setMemoryProjectName(event.target.value)}
+                        />
+                        <button
+                          className="panel-icon-button"
+                          type="submit"
+                          aria-label="Register memory project"
+                          title="Register memory project"
+                          disabled={memoryProjectsBusy || !memoryProjectName.trim()}
+                        >
+                          <WorkspaceAddIcon />
+                        </button>
+                      </div>
+                    </form>
+                  )}
+                  {memoryProjects.projects.length > 0 ? (
+                    <ul>
+                      {memoryProjects.projects.map((project) => (
+                        <li key={project.projectId}>
+                          <span>
+                            <strong>{project.displayName}</strong>
+                            <small>{project.workspaceRoots.join(", ")}</small>
+                            <small>
+                              {memoryProjectProvenanceLabel(project.provenance)}
+                              {project.current ? " · current" : ""}
+                              {!project.available ? " · unavailable" : ""}
+                            </small>
+                          </span>
+                          {project.removable && (
+                            <button
+                              className="panel-icon-button"
+                              type="button"
+                              aria-label={`Unregister ${project.displayName}`}
+                              title={`Unregister ${project.displayName}`}
+                              disabled={memoryProjectsBusy}
+                              onClick={() => void removeMemoryProject(project.projectId)}
+                            >
+                              <WorkspaceDeleteIcon />
+                            </button>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>No memory projects registered.</p>
+                  )}
+                </>
+              ) : (
+                <p role="alert">{memoryProjectsError ?? "Memory projects are unavailable."}</p>
+              )}
+              {memoryProjectsNotice && (
+                <p className="settings-notice" role="status">{memoryProjectsNotice}</p>
+              )}
+              {memoryProjectsError && memoryProjects && (
+                <p className="settings-error" role="alert">{memoryProjectsError}</p>
               )}
             </div>
             {runtime.workspaces.some((item) => item.deletable) && (
