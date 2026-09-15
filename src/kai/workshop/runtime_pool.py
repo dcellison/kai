@@ -176,6 +176,10 @@ class WorkshopRuntimePool:
         """Return whether this protected profile currently has a live backend."""
         return self._pool.get_if_exists(self._selector(runtime_profile_id)) is not None
 
+    def is_alive(self, runtime_profile_id: RuntimeAuthority) -> bool:
+        """Return whether this protected profile's subprocess is alive."""
+        return self._pool.is_alive(self._selector(runtime_profile_id))
+
     def get_role_model(
         self,
         runtime_profile_id: RuntimeAuthority,

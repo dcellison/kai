@@ -28,7 +28,7 @@ import {
   loadAppearancePreferences,
   loadChannelMembers,
   loadChannelMessage,
-  loadEffectiveAgentRuntime,
+  loadRuntimeLaneStatus,
   loadAgentDefinitions,
   loadAgentEnablements,
   loadAgentProvisioningSetups,
@@ -65,7 +65,7 @@ import type {
   WorkshopRunTracePage,
   WorkshopRunTraceSignal,
   WorkshopChannelSummary,
-  WorkshopEffectiveAgentRuntime,
+  WorkshopRuntimeLaneStatus,
   WorkshopChannelUnreadState,
   WorkshopThreadUnreadMutation,
   WorkshopThreadUnreadState,
@@ -2868,7 +2868,7 @@ function WorkshopView({
   onLoadHumanPeers,
   onLoadRun,
   onLoadRunTrace,
-  onLoadEffectiveAgentRuntime,
+  onLoadRuntimeLaneStatus,
   onLoadThread,
   onLoadThreadUnread,
   onLoadReactors,
@@ -2957,7 +2957,7 @@ function WorkshopView({
   onLoadHumanPeers: () => Promise<WorkshopHumanPeer[]>;
   onLoadRun: (runId: string) => Promise<WorkshopRun>;
   onLoadRunTrace: (runId: string, afterSeq: number) => Promise<WorkshopRunTracePage>;
-  onLoadEffectiveAgentRuntime: () => Promise<WorkshopEffectiveAgentRuntime>;
+  onLoadRuntimeLaneStatus: (agentId: string | null) => Promise<WorkshopRuntimeLaneStatus>;
   onLoadThread: (
     rootMessageId: string,
     cursor: string | null,
@@ -3064,8 +3064,11 @@ function WorkshopView({
   const [resizingContext, setResizingContext] = useState(false);
   const [settingsWorkspaceError, setSettingsWorkspaceError] =
     useState<string | null>(null);
-  const [effectiveAgentRuntime, setEffectiveAgentRuntime] =
-    useState<WorkshopEffectiveAgentRuntime | null>(null);
+  const [runtimeLaneStatuses, setRuntimeLaneStatuses] =
+    useState<WorkshopRuntimeLaneStatus[]>([]);
+  const effectiveAgentRuntime = runtimeLaneStatuses.length === 1
+    ? runtimeLaneStatuses[0]
+    : null;
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [channelCreation, setChannelCreation] = useState<{
@@ -3821,27 +3824,32 @@ function WorkshopView({
 
   useEffect(() => {
     let cancelled = false;
-    setEffectiveAgentRuntime(null);
+    setRuntimeLaneStatuses([]);
     setSettingsWorkspaceError(null);
-    const directAgent = channel.kind === "direct" && channel.agents.length === 1;
-    if (!channel.canSubmitCommands || humanDirect || !directAgent) {
+    const activeAgents = channel.agents.filter(
+      (agent) => agent.lifecycleState === "active" && agent.runtimeProfileId !== null,
+    );
+    if (!channel.canSubmitCommands || humanDirect || activeAgents.length === 0) {
       return () => {
         cancelled = true;
       };
     }
-    void onLoadEffectiveAgentRuntime()
-      .then((runtime) => {
+    const targets = channel.kind === "group"
+      ? activeAgents.map((agent) => agent.agentId)
+      : [null];
+    void Promise.all(targets.map((agentId) => onLoadRuntimeLaneStatus(agentId)))
+      .then((statuses) => {
         if (cancelled) {
           return;
         }
-        setEffectiveAgentRuntime(runtime);
+        setRuntimeLaneStatuses(statuses);
       })
       .catch((caught) => {
         if (!cancelled) {
           setSettingsWorkspaceError(
             caught instanceof Error
               ? caught.message
-              : "Could not load settings and workspaces.",
+              : "Could not load runtime status.",
           );
         }
       });
@@ -3849,12 +3857,14 @@ function WorkshopView({
       cancelled = true;
     };
   }, [
-    channel.agents.length,
+    channel.agents,
     channel.canSubmitCommands,
     channel.kind,
     channelId,
     humanDirect,
-    onLoadEffectiveAgentRuntime,
+    onLoadRuntimeLaneStatus,
+    activeRun?.status,
+    auxiliaryWorkspaceOpen,
   ]);
 
   const selectWorkspace = async (path: string): Promise<void> => {
@@ -3873,16 +3883,13 @@ function WorkshopView({
         path,
         effectiveAgentRuntime.workspaceRevision,
       );
-      setEffectiveAgentRuntime((current) =>
-        current === null
-          ? null
-          : {
-              ...current,
-              workspace: snapshot.workspace,
-              workspaceRevision: snapshot.revision,
-              workspaces: snapshot.workspaces,
-            },
-      );
+      setRuntimeLaneStatuses((current) => current.map((status) => ({
+        ...status,
+        workspace: snapshot.workspace,
+        workspaceLabel: snapshot.workspaces.find((item) => item.current)?.name ?? status.workspaceLabel,
+        workspaceRevision: snapshot.revision,
+        workspaces: snapshot.workspaces,
+      })));
       setActiveRun(null);
     } catch (caught) {
       setSettingsWorkspaceError(
@@ -5466,64 +5473,73 @@ function WorkshopView({
               {channel.kind === "group" ? "05" : "03"}
             </span>
             <h3>Runtime and workspace</h3>
-            {effectiveAgentRuntime ? (
-              <div className="runtime-settings">
-                <p className="settings-source">Agent runtime</p>
-                <p>
-                  <strong>{effectiveAgentRuntime.backend}</strong>
-                  {effectiveAgentRuntime.provider
-                    ? ` · ${effectiveAgentRuntime.provider}`
-                    : ""}
-                </p>
-                <p>
-                  Model: <code>{effectiveAgentRuntime.model.value}</code>
-                  <br />
-                  Timeout: {effectiveAgentRuntime.timeoutSeconds.value}s
-                </p>
-                {!effectiveAgentRuntime.canManageRuntime && (
-                  <p className="settings-source">
-                    Sponsored by {effectiveAgentRuntime.sponsorDisplayName}
-                  </p>
-                )}
-                <p className="settings-source">
-                  Model: {effectiveAgentRuntime.model.source}; timeout:{" "}
-                  {effectiveAgentRuntime.timeoutSeconds.source}
-                </p>
-                {effectiveAgentRuntime.workspaceMode === "neutral" ? (
-                  <>
-                    <p className="settings-source">No shared workspace</p>
-                    <p>
-                      This conversation runs in an isolated Kai-managed workspace.
-                      Your files remain private until workspace collaboration is explicitly granted.
+            {runtimeLaneStatuses.length > 0 ? (
+              <div className="runtime-lane-statuses">
+                {runtimeLaneStatuses.map((status) => {
+                  const displayedRun = status.activeRun ?? status.lastRun;
+                  return <div className="runtime-settings" key={status.agentId}>
+                    <p className="settings-source">
+                      {channel.kind === "group" ? status.agentName : "Agent runtime"}
                     </p>
-                  </>
-                ) : (
-                  <>
-                    <label htmlFor={`workspace-${channelId}`}>Your workspace</label>
-                    <div className="runtime-workspace-select">
-                      <select
-                        id={`workspace-${channelId}`}
-                        value={effectiveAgentRuntime.workspace ?? ""}
-                        disabled={switchingWorkspace || isRunActive(activeRun)}
-                        onChange={(event) => void selectWorkspace(event.target.value)}
-                      >
-                        {effectiveAgentRuntime.workspaces.map((workspaceOption) => (
-                          <option key={workspaceOption.path} value={workspaceOption.path}>
-                            {workspaceOption.name}
-                          </option>
-                        ))}
-                      </select>
-                      <span aria-hidden="true"><SelectChevronIcon /></span>
-                    </div>
-                  </>
-                )}
+                    <p>
+                      <strong>{status.backend}</strong>
+                      {status.provider ? ` · ${status.provider}` : ""}
+                    </p>
+                    <p>
+                      Model: <code>{status.model.value}</code>
+                      <br />
+                      Timeout: {status.timeoutSeconds.value}s
+                    </p>
+                    {!status.canManageRuntime && (
+                      <p className="settings-source">
+                        Sponsored by {status.sponsorDisplayName}
+                      </p>
+                    )}
+                    <p className="settings-source">
+                      Session: {status.providerSessionState.replaceAll("_", " ")}
+                      {displayedRun ? ` · Last run: ${displayedRun.status}` : " · No runs yet"}
+                      {status.sessionUpdatedAt ? ` · ${formatTimestamp(status.sessionUpdatedAt)}` : ""}
+                    </p>
+                    {status.workspaceMode === "neutral" ? (
+                      <p className="settings-source">No shared workspace</p>
+                    ) : (
+                      <>
+                        <label htmlFor={`workspace-${channelId}`}>Your workspace</label>
+                        <div className="runtime-workspace-select">
+                          <select
+                            id={`workspace-${channelId}`}
+                            value={status.workspace ?? ""}
+                            disabled={switchingWorkspace || isRunActive(activeRun)}
+                            onChange={(event) => void selectWorkspace(event.target.value)}
+                          >
+                            {status.workspaces.map((workspaceOption) => (
+                              <option key={workspaceOption.path} value={workspaceOption.path}>
+                                {workspaceOption.name}
+                              </option>
+                            ))}
+                          </select>
+                          <span aria-hidden="true"><SelectChevronIcon /></span>
+                        </div>
+                      </>
+                    )}
+                    {status.operatorDiagnostics && (
+                      <details className="runtime-diagnostics">
+                        <summary>Runtime diagnostics</summary>
+                        <dl>
+                          <div><dt>Process</dt><dd>{status.processState}</dd></div>
+                          <div><dt>Continuity</dt><dd>{status.continuityState.replaceAll("_", " ")}</dd></div>
+                          <div><dt>Profile</dt><dd><code>{status.operatorDiagnostics.runtimeProfileId}</code></dd></div>
+                          <div><dt>Context boundary</dt><dd>{status.operatorDiagnostics.contextThroughEventPosition ?? "none"}</dd></div>
+                        </dl>
+                      </details>
+                    )}
+                  </div>;
+                })}
               </div>
             ) : settingsWorkspaceError ? (
               <p className="settings-error">{settingsWorkspaceError}</p>
-            ) : channel.kind === "group" ? (
-              <p>Runtime is selected per agent when that agent participates.</p>
             ) : channel.canSubmitCommands ? (
-              <p>Loading runtime settings…</p>
+              <p>Loading runtime status…</p>
             ) : (
               <p>No agent runtime is assigned to this channel.</p>
             )}
@@ -6070,9 +6086,9 @@ function ActiveWorkshopClient({
     (artifactId: string) => startArtifactDownload(session, artifactId),
     [session],
   );
-  const loadConversationEffectiveRuntime = useCallback(async () => {
+  const loadConversationRuntimeStatus = useCallback(async (agentId: string | null) => {
     try {
-      return await loadEffectiveAgentRuntime(session);
+      return await loadRuntimeLaneStatus(session, agentId);
     } catch (caught) {
       if (caught instanceof AuthenticationError) {
         onAuthenticationFailure(caught.message);
@@ -6210,7 +6226,7 @@ function ActiveWorkshopClient({
       onDetachAgent={detachSelectedAgent}
       onLoadRun={loadSelectedRun}
       onLoadRunTrace={loadSelectedRunTrace}
-      onLoadEffectiveAgentRuntime={loadConversationEffectiveRuntime}
+      onLoadRuntimeLaneStatus={loadConversationRuntimeStatus}
       onLoadThread={loadSelectedThread}
       onLoadThreadUnread={loadSelectedThreadUnread}
       onAdvanceThreadRead={advanceSelectedThreadRead}

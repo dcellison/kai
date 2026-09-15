@@ -102,6 +102,13 @@ from kai.workshop.preferences import (
     WorkshopPreferenceStorageError,
     WorkshopPreferenceValidationError,
 )
+from kai.workshop.runtime_lane_status import (
+    RuntimeLaneStatusSnapshot,
+    WorkshopRuntimeLaneStatusAccessDenied,
+    WorkshopRuntimeLaneStatusAmbiguous,
+    WorkshopRuntimeLaneStatusError,
+    WorkshopRuntimeLaneStatusUnavailable,
+)
 from kai.workshop.scheduled_jobs import WorkshopScheduledJobAuthority
 from kai.workshop.settings_workspaces import (
     SettingsWorkspaceAuthority,
@@ -464,9 +471,8 @@ def _get_user_backend_provider(pool: SubprocessPool, chat_id: int, config: Confi
 def _get_user_provider(pool: SubprocessPool, chat_id: int, config: Config) -> str:
     """Derive the effective provider for a user without creating an instance.
 
-    Thin wrapper around _get_user_backend_provider, kept for the
-    handful of callers that only need the provider value (display in
-    /stats, log messages). Backend-aware callers should use
+    Thin wrapper around _get_user_backend_provider for callers that only
+    need the provider value. Backend-aware callers should use
     _get_user_backend_provider directly.
     """
     _, provider = _get_user_backend_provider(pool, chat_id, config)
@@ -1365,37 +1371,68 @@ async def handle_voice_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # ── Info and management commands ─────────────────────────────────────
 
 
-def _stats_local_time(utc_timestamp: str) -> str:
-    """Render a stored UTC session timestamp in the host's local zone.
+def _stats_local_time(value: datetime) -> str:
+    """Render a canonical aware timestamp in the host's local zone."""
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
-    The sessions table stores SQLite CURRENT_TIMESTAMP values, which are
-    always UTC at second precision with no zone marker. Readers compare
-    /stats output against their local wall clock, so the value is
-    converted to the host zone and labeled with the zone name. Storage
-    stays UTC; only rendering changes.
-    """
-    parsed = datetime.strptime(utc_timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def _render_runtime_lane_status(snapshot: RuntimeLaneStatusSnapshot) -> str:
+    run = snapshot.active_run or snapshot.last_run
+    run_label = "None"
+    if run is not None:
+        run_label = run.status.replace("_", " ").title()
+        if run.terminal_code is not None:
+            run_label += f" ({run.terminal_code.replace('_', ' ')})"
+    session_label = snapshot.provider_session_state.replace("_", " ").title()
+    continuity_label = snapshot.continuity_state.replace("_", " ").title()
+    workspace_label = snapshot.workspace_label or "Private owner workspace"
+    lines = [
+        f"Agent: {snapshot.authority.agent_name} (@{snapshot.authority.agent_handle})",
+        f"Backend: {snapshot.backend} · {snapshot.provider}",
+        f"Model: {snapshot.model_value}",
+        f"Workspace: {workspace_label}",
+        f"Provider session: {session_label}",
+        f"Continuity: {continuity_label}",
+        f"Run: {run_label}",
+        f"Process: {snapshot.process_state.title()}",
+    ]
+    if snapshot.session_created_at is not None:
+        lines.append(f"Session started: {_stats_local_time(snapshot.session_created_at)}")
+    if snapshot.session_updated_at is not None:
+        lines.append(f"Session updated: {_stats_local_time(snapshot.session_updated_at)}")
+    return "\n".join(lines)
 
 
 @_require_auth
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /stats: show session info, model, and process status."""
+    """Handle /stats through canonical channel-agent runtime authority."""
     assert update.message is not None
-    chat_id = _chat_id(update)
-    pool = _get_pool(context)
-    stats = await sessions.get_stats(chat_id)
-    alive = pool.is_alive(chat_id)
-    if not stats:
-        await update.message.reply_text(f"No active session.\nProcess alive: {alive}")
+    args = context.args or []
+    if len(args) > 1:
+        await update.message.reply_text("Usage: /stats [@agent]")
         return
-    await update.message.reply_text(
-        f"Session: {stats['session_id'][:8]}...\n"
-        f"Model: {stats['model']}\n"
-        f"Started: {_stats_local_time(stats['created_at'])}\n"
-        f"Last used: {_stats_local_time(stats['last_used_at'])}\n"
-        f"Process alive: {alive}"
-    )
+    service = _get_core_services(context).runtime_lane_status
+    try:
+        authority = await service.authority_for_transport_binding(
+            transport="telegram",
+            sender_subject=str(_user_id(update)),
+            channel_subject=str(_chat_id(update)),
+            agent_handle=args[0] if args else None,
+        )
+        snapshot = await service.inspect(authority)
+    except WorkshopRuntimeLaneStatusAmbiguous:
+        await update.message.reply_text("Choose an agent in this channel: /stats @agent")
+        return
+    except WorkshopRuntimeLaneStatusUnavailable as exc:
+        await update.message.reply_text(str(exc))
+        return
+    except WorkshopRuntimeLaneStatusAccessDenied:
+        await update.message.reply_text("Runtime status is unavailable for this Telegram conversation.")
+        return
+    except WorkshopRuntimeLaneStatusError:
+        await update.message.reply_text("Usage: /stats [@agent]")
+        return
+    await update.message.reply_text(_render_runtime_lane_status(snapshot))
 
 
 def _scheduled_job_authority(
@@ -4477,7 +4514,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/voice <name> - Set voice\n"
         "/voices - Choose a voice (inline buttons)\n"
         "\n"
-        "/stats - Show session info\n"
+        "/stats [@agent] - Show canonical runtime status\n"
         "/job - List scheduled jobs\n"
         "/job info <id> - Show job details\n"
         "/job cancel <id> - Cancel a job\n"

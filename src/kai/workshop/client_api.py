@@ -308,6 +308,15 @@ from kai.workshop.routing_policy import (
 )
 from kai.workshop.run_lifecycle import DurableRun, RunNotFoundError, RunStatus
 from kai.workshop.run_previews import RunPreview, WorkshopRunPreviewRegistry
+from kai.workshop.runtime_lane_status import (
+    RuntimeLaneRunStatus,
+    RuntimeLaneStatusSnapshot,
+    WorkshopRuntimeLaneStatusAccessDenied,
+    WorkshopRuntimeLaneStatusAmbiguous,
+    WorkshopRuntimeLaneStatusError,
+    WorkshopRuntimeLaneStatusService,
+    WorkshopRuntimeLaneStatusUnavailable,
+)
 from kai.workshop.settings_workspaces import (
     EditableCapability,
     SettingsMutationOutcome,
@@ -409,7 +418,7 @@ _RUN_TRACE_PATH = "/v1/channels/{channel_id}/runs/{run_id}/trace"
 _RUN_CONTEXT_MANIFESTS_PATH = "/v1/channels/{channel_id}/runs/{run_id}/context-manifests"
 _RUN_CANCELLATION_PATH = "/v1/channels/{channel_id}/runs/{run_id}/cancel"
 _RUNTIME_SETTINGS_PATH = "/v1/channels/{channel_id}/settings"
-_EFFECTIVE_AGENT_RUNTIME_PATH = "/v1/channels/{channel_id}/effective-agent-runtime"
+_RUNTIME_LANE_STATUS_PATH = "/v1/channels/{channel_id}/runtime-status"
 _ROUTING_ELIGIBILITY_PATH = "/v1/channels/{channel_id}/routing-eligibility"
 _ROUTING_POLICY_PATH = "/v1/channels/{channel_id}/routing-policy"
 _MODEL_CATALOGUE_PATH = "/v1/channels/{channel_id}/models"
@@ -3542,14 +3551,74 @@ async def _handle_runtime_settings(
     )
 
 
-async def _handle_effective_agent_runtime(
+def _serialize_runtime_lane_run(run: RuntimeLaneRunStatus | None) -> dict[str, object] | None:
+    if run is None:
+        return None
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "accepted_at": _format_timestamp(run.accepted_at),
+        "started_at": _format_timestamp(run.started_at) if run.started_at is not None else None,
+        "terminal_at": _format_timestamp(run.terminal_at) if run.terminal_at is not None else None,
+        "terminal_code": run.terminal_code,
+    }
+
+
+def _serialize_runtime_lane_status(snapshot: RuntimeLaneStatusSnapshot) -> dict[str, object]:
+    authority = snapshot.authority
+    diagnostics = snapshot.diagnostics
+    return {
+        "version": 1,
+        "channel_id": str(authority.channel_id),
+        "agent_id": str(authority.agent_id),
+        "agent_name": authority.agent_name,
+        "agent_handle": authority.agent_handle,
+        "sponsor_display_name": authority.sponsor_display_name,
+        "can_manage_runtime": authority.owns_agent,
+        "backend": snapshot.backend,
+        "provider": snapshot.provider,
+        "model": {"value": snapshot.model_value, "source": snapshot.model_source},
+        "timeout_seconds": {"value": snapshot.timeout_seconds, "source": snapshot.timeout_source},
+        "workspace_mode": snapshot.workspace_mode,
+        "workspace_label": snapshot.workspace_label,
+        "workspace": snapshot.workspace,
+        "workspace_revision": snapshot.workspace_revision,
+        "workspaces": [
+            {"path": path, "name": name, "current": current, "home": home}
+            for path, name, current, home in snapshot.workspaces
+        ],
+        "process_state": snapshot.process_state,
+        "provider_session_state": snapshot.provider_session_state,
+        "continuity_state": snapshot.continuity_state,
+        "session_created_at": (
+            _format_timestamp(snapshot.session_created_at) if snapshot.session_created_at is not None else None
+        ),
+        "session_updated_at": (
+            _format_timestamp(snapshot.session_updated_at) if snapshot.session_updated_at is not None else None
+        ),
+        "active_run": _serialize_runtime_lane_run(snapshot.active_run),
+        "last_run": _serialize_runtime_lane_run(snapshot.last_run),
+        "operator_diagnostics": (
+            {
+                "runtime_profile_id": str(diagnostics.runtime_profile_id),
+                "provider_session_revision": diagnostics.provider_session_revision,
+                "provider_session_present": diagnostics.provider_session_present,
+                "last_run_id": diagnostics.last_run_id,
+                "context_through_event_position": diagnostics.context_through_event_position,
+            }
+            if diagnostics is not None
+            else None
+        ),
+    }
+
+
+async def _handle_runtime_lane_status(
     request: web.Request,
     *,
-    store: WorkshopEventStore,
     authenticator: WorkshopClientAuthenticator,
-    service: WorkshopSettingsWorkspaceService,
+    service: WorkshopRuntimeLaneStatusService,
 ) -> web.Response:
-    """Project the runtime that will execute one direct-agent conversation."""
+    """Read one explicit canonical channel-agent runtime lane."""
     principal_id = await authenticator.authenticate(request)
     if not isinstance(principal_id, PrincipalId):
         response = _error_response(
@@ -3559,11 +3628,11 @@ async def _handle_effective_agent_runtime(
         )
         response.headers["WWW-Authenticate"] = "Bearer"
         return response
-    if request.query or request.can_read_body:
+    if not set(request.query) <= {"agent_id"} or request.can_read_body:
         return _error_response(
             status=400,
             code="invalid_request",
-            message="Invalid effective runtime request",
+            message="Invalid runtime status request",
         )
     try:
         channel_id = ChannelId(request.match_info["channel_id"])
@@ -3573,98 +3642,28 @@ async def _handle_effective_agent_runtime(
             code="invalid_request",
             message="Invalid channel request",
         )
-    if not await CanonicalChannelAuthorizer(store).can_read_channel(principal_id, channel_id):
-        return _error_response(status=403, code="access_denied", message="Access denied")
-
-    async with store.connection.execute(
-        "SELECT a.id, a.name, ad.handle, ad.owner_principal_id, "
-        "ad.owner_runtime_profile_id, owner.display_name "
-        "FROM channels c "
-        "JOIN channel_agents ca ON ca.channel_id = c.id AND ca.detached_at IS NULL "
-        "JOIN agents a ON a.id = ca.agent_id AND a.workshop_id = c.workshop_id "
-        "JOIN agent_definitions ad ON ad.agent_id = a.id AND ad.lifecycle_state = 'active' "
-        "JOIN principals owner ON owner.id = ad.owner_principal_id AND owner.kind = 'human' "
-        "WHERE c.id = ? AND c.kind = 'direct' "
-        "ORDER BY a.id",
-        (channel_id,),
-    ) as cursor:
-        rows = list(await cursor.fetchall())
-    if len(rows) != 1:
-        code = "effective_runtime_ambiguous" if len(rows) > 1 else "effective_runtime_unavailable"
-        return _error_response(
-            status=409,
-            code=code,
-            message=(
-                "This conversation has more than one effective agent runtime"
-                if len(rows) > 1
-                else "This conversation has no effective agent runtime"
-            ),
-        )
-    row = rows[0]
-    if row[3] is None or row[4] is None:
-        return _error_response(
-            status=409,
-            code="effective_runtime_unavailable",
-            message="This agent has no owner-sponsored runtime",
-        )
     try:
-        agent_id = AgentId(str(row[0]))
-        sponsor_principal_id = PrincipalId(str(row[3]))
-        runtime_profile_id = RuntimeProfileId(str(row[4]))
-        runtime_authority = service.authority_for_principal_profile(
-            sponsor_principal_id,
-            runtime_profile_id,
+        raw_agent_id = _single_query_value(request, "agent_id")
+        agent_id = AgentId(raw_agent_id) if raw_agent_id is not None else None
+        authority = await service.authority_for_principal_channel(
+            principal_id,
+            channel_id,
+            agent_id=agent_id,
         )
-        runtime_snapshot = await service.inspect(runtime_authority)
-        owns_agent = principal_id == sponsor_principal_id
-        workspace_snapshot = None
-        if owns_agent:
-            workspace_authority = service.authority_for_principal_channel(
-                principal_id,
-                channel_id,
-            )
-            workspace_snapshot = await service.inspect(workspace_authority)
-    except (TypeError, ValueError, WorkshopSettingsWorkspaceAccessDenied):
+        snapshot = await service.inspect(authority)
+    except (TypeError, ValueError, WorkshopRuntimeLaneStatusError) as exc:
+        if isinstance(exc, WorkshopRuntimeLaneStatusAccessDenied):
+            return _error_response(status=403, code="access_denied", message="Access denied")
+        if isinstance(exc, WorkshopRuntimeLaneStatusAmbiguous):
+            return _error_response(status=409, code="runtime_lane_ambiguous", message=str(exc))
+        if isinstance(exc, WorkshopRuntimeLaneStatusUnavailable):
+            return _error_response(status=409, code="runtime_lane_unavailable", message=str(exc))
         return _error_response(
-            status=409,
-            code="effective_runtime_unavailable",
-            message="This agent has no valid owner-sponsored runtime",
+            status=400,
+            code="invalid_request",
+            message="Invalid runtime status request",
         )
-    return _json_response(
-        {
-            "version": 1,
-            "channel_id": str(channel_id),
-            "agent_id": str(agent_id),
-            "agent_name": str(row[1]),
-            "agent_handle": str(row[2]),
-            "sponsor_principal_id": str(sponsor_principal_id),
-            "sponsor_display_name": str(row[5]),
-            "can_manage_runtime": owns_agent,
-            "backend": runtime_snapshot.backend,
-            "provider": runtime_snapshot.provider,
-            "model": {
-                "value": runtime_snapshot.model.value,
-                "source": runtime_snapshot.model.source,
-            },
-            "timeout_seconds": {
-                "value": runtime_snapshot.timeout_seconds.value,
-                "source": runtime_snapshot.timeout_seconds.source,
-            },
-            "workspace_mode": "owner" if owns_agent else "neutral",
-            "workspace": workspace_snapshot.workspace if workspace_snapshot is not None else None,
-            "workspace_revision": workspace_snapshot.revision if workspace_snapshot is not None else None,
-            "workspaces": [
-                {
-                    "path": option.path,
-                    "name": option.name,
-                    "current": option.current,
-                    "home": option.home,
-                }
-                for option in (workspace_snapshot.workspaces if workspace_snapshot is not None else ())
-            ],
-        },
-        status=200,
-    )
+    return _json_response(_serialize_runtime_lane_status(snapshot), status=200)
 
 
 async def _handle_routing_eligibility(
@@ -8883,6 +8882,7 @@ def register_workshop_read_routes(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
+    runtime_lane_status: WorkshopRuntimeLaneStatusService | None = None,
     routing_eligibility: WorkshopRoutingEligibilityService | None = None,
     routing_policy: WorkshopRoutingPolicyService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
@@ -9706,21 +9706,23 @@ def register_workshop_read_routes(
 
         app.router.add_get(_ARTIFACT_CONTENT_PATH, handle_artifact_content)
         app.router.add_post(_ARTIFACT_DOWNLOAD_PATH, handle_artifact_download)
+    if runtime_lane_status is not None:
+
+        async def handle_runtime_lane_status(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_runtime_lane_status(
+                    request,
+                    authenticator=authenticator,
+                    service=runtime_lane_status,
+                )
+
+        app.router.add_get(_RUNTIME_LANE_STATUS_PATH, handle_runtime_lane_status)
     if settings_workspaces is not None:
 
         async def handle_runtime_settings(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_runtime_settings(
                     request,
-                    authenticator=authenticator,
-                    service=settings_workspaces,
-                )
-
-        async def handle_effective_agent_runtime(request: web.Request) -> web.Response:
-            async with request_lock:
-                return await _handle_effective_agent_runtime(
-                    request,
-                    store=store,
                     authenticator=authenticator,
                     service=settings_workspaces,
                 )
@@ -9829,10 +9831,6 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_RUNTIME_SETTINGS_PATH, handle_runtime_settings)
-        app.router.add_get(
-            _EFFECTIVE_AGENT_RUNTIME_PATH,
-            handle_effective_agent_runtime,
-        )
         app.router.add_patch(
             _RUNTIME_SETTINGS_PATH,
             handle_runtime_settings_update,
