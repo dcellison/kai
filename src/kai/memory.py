@@ -2473,7 +2473,14 @@ async def retrieve_scoped_memories(
     from kai.memory_projects import detect_active_memory_project, merged_registry
 
     if context.workspace is not None:
-        active_project = detect_active_memory_project(context.workspace, merged_registry(_config.memory_projects))
+        canonical_user_id = canonical_memory_user_id(str(context.chat_id))
+        active_project = detect_active_memory_project(
+            context.workspace,
+            merged_registry(
+                _config.memory_projects,
+                principal_id=(canonical_user_id if canonical_user_id.startswith("prn_") else None),
+            ),
+        )
 
     # Step 3: build allowed scopes. Project scope is admitted only
     # when an active project is detected AND that project has

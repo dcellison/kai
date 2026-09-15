@@ -5091,6 +5091,28 @@ button:disabled {
   white-space: nowrap;
 }
 
+.memory-project-registration {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0 0 0.55rem;
+}
+
+.memory-project-registration > label {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.memory-project-registration > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.memory-project-registration input {
+  min-width: 0;
+}
+
 .workspace-creation-header {
   display: flex;
   align-items: start;

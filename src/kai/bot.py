@@ -2754,24 +2754,6 @@ async def _handle_workspace_allowed(
 _NO_BASE_MSG = "No workspace base configured. Ask the operator to set a runtime workspace base or WORKSPACE_BASE."
 
 
-async def _register_memory_project_for(
-    config: Config,
-    chat_id: int,
-    root: Path,
-    raw_name: str,
-) -> tuple[bool, str]:
-    """Compatibility wrapper around the transport-neutral registry operation."""
-    from kai.memory_projects import register_workspace_memory_project
-
-    registered, _changed, note = await register_workspace_memory_project(
-        config,
-        chat_id,
-        root,
-        raw_name,
-    )
-    return registered, note
-
-
 @_require_auth
 async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -2787,29 +2769,29 @@ async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Operator-pinned projects (from the host-side registry file) are
     visible in the listing but cannot be unregistered from chat.
     """
-    from kai.memory_projects import (
-        db_registry_creator,
-        db_registry_remove,
-        detect_active_memory_project,
-        merged_registry,
-    )
-
     assert update.message is not None
     chat_id = _chat_id(update)
-    pool = _get_pool(context)
-    config: Config = context.bot_data["config"]
+    authority = _canonical_settings_authority(context, chat_id)
+    if authority is None:
+        await update.message.reply_text("Memory-project management requires canonical runtime authority.")
+        return
+    service = _get_core_services(context).settings_workspaces
 
     args = context.args or []
     sub = args[0].lower() if args else "list"
 
     if sub == "register":
-        current = Path(await pool.get_effective_workspace(chat_id))
+        current = Path(await _get_pool(context).get_effective_workspace(chat_id))
         raw_name = args[1] if len(args) > 1 else current.name
-        # The message text alone distinguishes success from rejection
-        # for the user; the boolean exists for the /workspace new
-        # auto-hook, which prefixes failures with a "Note:" wrapper.
-        _ok, message = await _register_memory_project_for(config, chat_id, current, raw_name)
-        await update.message.reply_text(message)
+        try:
+            result = await service.register_memory_project(authority, raw_name)
+        except WorkshopSettingsWorkspaceAccessDenied:
+            await update.message.reply_text("This runtime cannot register the current workspace.")
+            return
+        except (WorkshopSettingsWorkspaceConflict, WorkshopSettingsWorkspaceValidationError) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await update.message.reply_text(result.note)
         return
 
     if sub == "unregister":
@@ -2817,73 +2799,33 @@ async def handle_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Usage: /project unregister <name>")
             return
         project_id = args[1].strip().lower()
-        from kai.memory_projects import registry_mutation_lock
-
-        # The role comes from static config and cannot go stale;
-        # everything keyed on the registry row must be read under the
-        # mutation lock below.
-        user = config.get_user_config(chat_id)
-        is_admin = user is not None and user.role == "admin"
-
-        # Pinned check, creator lookup, authorization, AND the delete
-        # all under the registry mutation lock: a creator read before
-        # the lock can authorize against a row that an earlier queued
-        # mutation deletes and a different user re-registers under
-        # the same id, letting stale authorization delete the new
-        # owner's project. The denial is computed inside the lock and
-        # replied outside it, so Telegram I/O never holds the lock.
-        denial: str | None = None
-        removed = False
-        async with registry_mutation_lock():
-            if project_id in config.memory_projects:
-                denial = f"Project '{project_id}' is operator-pinned; it cannot be unregistered from chat."
-            else:
-                creator = db_registry_creator(project_id)
-                if creator is None:
-                    denial = f"No chat-registered project named '{project_id}'."
-                elif chat_id != creator and not is_admin:
-                    denial = (
-                        f"Project '{project_id}' was registered by another user; "
-                        "only they or an admin can unregister it."
-                    )
-                else:
-                    removed = await sessions.unregister_memory_project(project_id)
-                    db_registry_remove(project_id)
-        if denial is not None:
-            await update.message.reply_text(denial)
+        try:
+            result = await service.unregister_memory_project(authority, project_id)
+        except WorkshopSettingsWorkspaceAccessDenied as exc:
+            await update.message.reply_text(str(exc))
             return
-        log.info(
-            "memory.project.registry %s",
-            json.dumps(
-                {"action": "unregister", "project_id": project_id, "by": chat_id},
-                separators=(",", ":"),
-            ),
-        )
-        if removed:
-            await update.message.reply_text(f"Unregistered memory project '{project_id}'.")
-        else:
-            await update.message.reply_text(f"Project '{project_id}' was already gone.")
+        except (WorkshopSettingsWorkspaceConflict, WorkshopSettingsWorkspaceValidationError) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        await update.message.reply_text(result.note)
         return
 
     if sub != "list":
         await update.message.reply_text("Usage: /project [list | register [name] | unregister <name>]")
         return
 
-    merged = merged_registry(config.memory_projects)
-    if not merged:
+    snapshot = await service.inspect_memory_projects(authority)
+    if not snapshot.projects:
         await update.message.reply_text(
             "No memory projects registered.\nUse /project register [name] in a workspace to create one."
         )
         return
-    current = Path(await pool.get_effective_workspace(chat_id))
-    active = detect_active_memory_project(current, merged)
     lines = ["Memory projects:"]
-    for project_id in sorted(merged):
-        cfg = merged[project_id]
-        provenance = "pinned" if project_id in config.memory_projects else "user"
-        marker = " (active)" if active is not None and active.project_id == project_id else ""
-        lines.append(f"- {project_id} [{provenance}]{marker}")
-        for project_root in cfg.workspace_roots:
+    for project in snapshot.projects:
+        provenance = "pinned" if project.provenance == "operator_pinned" else "user"
+        marker = " (active)" if project.current else ""
+        lines.append(f"- {project.project_id} [{provenance}]{marker}")
+        for project_root in project.workspace_roots:
             lines.append(f"    {project_root}")
     await update.message.reply_text("\n".join(lines))
 
@@ -2909,7 +2851,6 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     assert update.message is not None
     chat_id = _chat_id(update)
     pool = _get_pool(context)
-    config: Config = context.bot_data["config"]
     home = pool.get_home_workspace(chat_id)
 
     # Resolve per-user workspace access (workspace_base + allowed list)
@@ -3051,12 +2992,10 @@ async def handle_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # subpaths ("sub/project"), whose separator would fail the
         # project-id slug validation; the final path component
         # matches /project register's default for the same directory.
-        registered, register_note = await _register_memory_project_for(config, chat_id, resolved, resolved.name)
         await _switch_workspace(update, context, resolved)
-        if registered:
-            await update.message.reply_text(register_note)
-        else:
-            await update.message.reply_text(f"Note: memory project not registered: {register_note}")
+        await update.message.reply_text(
+            "Note: memory project was not registered because canonical runtime authority is unavailable."
+        )
         return
 
     # "config" keyword: view or modify workspace settings.

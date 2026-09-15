@@ -214,6 +214,114 @@ async def test_exact_canonical_authority_fails_closed(tmp_path: Path) -> None:
         )
 
 
+async def test_memory_project_registry_is_revisioned_audited_and_live(
+    tmp_path: Path,
+) -> None:
+    from kai.memory_projects import load_db_registry, merged_registry
+
+    await sessions.init_db(tmp_path / "kai.db")
+    load_db_registry([])
+    service, pool, authority, principal_id, _ = _service(tmp_path)
+    pool.workspace = pool.allowed
+
+    initial = await service.inspect_memory_projects(authority)
+    created = await service.register_memory_project(
+        authority,
+        "research",
+        expected_revision=initial.revision,
+    )
+    replay = await service.register_memory_project(
+        authority,
+        "research",
+        expected_revision=created.snapshot.revision,
+    )
+
+    assert created.changed is True
+    assert replay.changed is False
+    assert created.snapshot.active_project_id == "research"
+    assert created.snapshot.projects[0].provenance == "principal_registered"
+    assert "research" in merged_registry({}, principal_id=str(principal_id))
+    async with sessions._get_db().execute(
+        "SELECT operation, changed FROM workshop_memory_project_audit ORDER BY id"
+    ) as cursor:
+        assert [tuple(row) for row in await cursor.fetchall()] == [
+            ("register", 1),
+            ("register", 0),
+        ]
+
+    removed = await service.unregister_memory_project(
+        authority,
+        "research",
+        expected_revision=replay.snapshot.revision,
+    )
+
+    assert removed.changed is True
+    assert "research" not in merged_registry({}, principal_id=str(principal_id))
+    assert await sessions.get_canonical_memory_project_rows() == []
+    await sessions.close_db()
+
+
+async def test_memory_project_registry_denies_pinned_and_cross_principal_mutation(
+    tmp_path: Path,
+) -> None:
+    from kai.memory_projects import load_db_registry
+
+    await sessions.init_db(tmp_path / "kai.db")
+    load_db_registry([])
+    pinned_root = tmp_path / "pinned"
+    pinned_root.mkdir()
+    pinned = {
+        "kai": SimpleNamespace(
+            project_id="kai",
+            display_name="Kai",
+            workspace_roots=(pinned_root,),
+            memory_enabled=True,
+            default_scope_for_new_facts="project",
+        )
+    }
+    config = Config(
+        telegram_bot_token="unused",
+        allowed_user_ids=set(),
+        default_backend="codex",
+        default_model="gpt-5.6-sol",
+        memory_projects=pinned,
+    )
+    service, pool, authority, _, _ = _service(tmp_path, config=config)
+    initial = await service.inspect_memory_projects(authority)
+    with pytest.raises(WorkshopSettingsWorkspaceAccessDenied):
+        await service.unregister_memory_project(
+            authority,
+            "kai",
+            expected_revision=initial.revision,
+        )
+
+    other_namespace = WorkshopExecutionStateNamespace(
+        principal_id=PrincipalId("prn_" + "8" * 32),
+        channel_id=ChannelId("chn_" + "9" * 32),
+        agent_id=AgentId("agt_" + "7" * 32),
+        runtime_profile_id=profile_id(202),
+        legacy_runtime_key=202,
+    )
+    await sessions.register_canonical_memory_project(
+        other_namespace,
+        project_id="foreign",
+        display_name="Foreign",
+        workspace_root=str(pool.allowed),
+        provenance="principal_registered",
+        workspace_digest="1" * 64,
+    )
+    load_db_registry(await sessions.get_canonical_memory_project_rows())
+    current = await service.inspect_memory_projects(authority)
+    assert all(project.project_id != "foreign" for project in current.projects)
+    with pytest.raises(WorkshopSettingsWorkspaceAccessDenied):
+        await service.unregister_memory_project(
+            authority,
+            "foreign",
+            expected_revision=current.revision,
+        )
+    await sessions.close_db()
+
+
 async def test_model_change_uses_one_ordered_core_transaction(
     tmp_path: Path,
     monkeypatch,
@@ -589,14 +697,17 @@ async def test_workspace_creation_uses_configured_base_and_is_idempotent(
     )
     register_project = AsyncMock(
         side_effect=[
-            (True, True, "Registered memory project 'research-notes' for this workspace."),
-            (True, False, "Memory project 'research-notes' was already registered for this workspace."),
+            SimpleNamespace(
+                changed=True,
+                note="Registered memory project 'research-notes' for this workspace.",
+            ),
+            SimpleNamespace(
+                changed=False,
+                note="Memory project 'research-notes' was already registered for this workspace.",
+            ),
         ]
     )
-    monkeypatch.setattr(
-        "kai.workshop.settings_workspaces._register_workspace_memory_project",
-        register_project,
-    )
+    monkeypatch.setattr(service, "register_memory_project", register_project)
     revision = (await service.inspect(authority)).revision
 
     created = await service.create_workspace(
@@ -656,11 +767,21 @@ async def test_workspace_deletion_removes_files_and_canonical_state(
     )
     delete_state = AsyncMock()
     monkeypatch.setattr(sessions, "delete_canonical_workspace_state", delete_state)
-    unregister = AsyncMock(return_value="qualification-1520")
     monkeypatch.setattr(
-        "kai.memory_projects.unregister_workspace_memory_project",
-        unregister,
+        sessions,
+        "get_canonical_memory_project_rows",
+        AsyncMock(
+            return_value=[
+                {
+                    "project_id": "qualification-1520",
+                    "workspace_root": str(target),
+                    "runtime_profile_id": str(authority.runtime_profile_id),
+                }
+            ]
+        ),
     )
+    unregister = AsyncMock(return_value=SimpleNamespace(changed=True, project_id="qualification-1520"))
+    monkeypatch.setattr(service, "unregister_memory_project", unregister)
 
     revision = (await service.inspect(authority)).revision
     result = await service.delete_workspace(
@@ -826,8 +947,9 @@ async def test_protected_workspace_creation_uses_privileged_runtime_provisioner(
     monkeypatch.setattr(sessions, "add_canonical_workspace_grant", AsyncMock(return_value=True))
     monkeypatch.setattr(sessions, "upsert_canonical_workspace_history", AsyncMock())
     monkeypatch.setattr(
-        "kai.workshop.settings_workspaces._register_workspace_memory_project",
-        AsyncMock(return_value=(True, True, "Registered memory project.")),
+        service,
+        "register_memory_project",
+        AsyncMock(return_value=SimpleNamespace(changed=True, note="Registered memory project.")),
     )
 
     result = await service.create_workspace(authority, "protected-project")

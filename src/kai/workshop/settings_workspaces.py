@@ -78,6 +78,16 @@ class WorkshopSettingsWorkspaceConsistencyError(WorkshopSettingsWorkspaceError):
     """A failed mutation could not restore persistent and live state."""
 
 
+class _AlreadyHeldLock:
+    """No-op async context used by compound service operations."""
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
 MIN_SELF_SERVICE_TIMEOUT_SECONDS = 1
 MAX_SELF_SERVICE_PROMPT_CHARACTERS = 32_000
 MAX_SELF_SERVICE_WORKSPACE_NAME_CHARACTERS = 64
@@ -132,23 +142,6 @@ def _runtime_can_self_grant_workspace(os_user: str | None, path: Path) -> bool:
         metadata.st_uid == account.pw_uid
         and bool(metadata.st_mode & stat.S_IRUSR)
         and bool(metadata.st_mode & stat.S_IXUSR)
-    )
-
-
-async def _register_workspace_memory_project(
-    config: Config,
-    creator_runtime_key: int,
-    root: Path,
-    name: str,
-) -> tuple[bool, bool, str]:
-    """Load the memory registry lazily to avoid its sessions import cycle."""
-    from kai.memory_projects import register_workspace_memory_project
-
-    return await register_workspace_memory_project(
-        config,
-        creator_runtime_key,
-        root,
-        name,
     )
 
 
@@ -238,6 +231,36 @@ class WorkspaceGrantMutationResult:
     snapshot: WorkspaceGrantSnapshot
     path: str
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryProjectRegistryOption:
+    project_id: str
+    display_name: str
+    workspace_roots: tuple[str, ...]
+    provenance: str
+    current: bool
+    available: bool
+    removable: bool
+    state_version: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryProjectRegistrySnapshot:
+    principal_id: PrincipalId
+    runtime_profile_id: RuntimeProfileId
+    current_workspace: str
+    active_project_id: str | None
+    projects: tuple[MemoryProjectRegistryOption, ...]
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryProjectMutationResult:
+    snapshot: MemoryProjectRegistrySnapshot
+    project_id: str
+    changed: bool
+    note: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -909,6 +932,257 @@ class WorkshopSettingsWorkspaceService:
             after = await self._inspect_workspace_grants_locked(authority)
             return WorkspaceGrantMutationResult(after, str(requested), changed)
 
+    async def inspect_memory_projects(
+        self,
+        authority: SettingsWorkspaceAuthority,
+    ) -> MemoryProjectRegistrySnapshot:
+        """List effective pinned and principal-owned memory projects."""
+        async with self._lock(authority):
+            return await self._inspect_memory_projects_locked(authority)
+
+    async def _inspect_memory_projects_locked(
+        self,
+        authority: SettingsWorkspaceAuthority,
+    ) -> MemoryProjectRegistrySnapshot:
+        from kai.memory_projects import detect_active_memory_project, merged_registry
+
+        self._namespace(authority)
+        current = await self._authorized_workspace(authority, None)
+        canonical_rows = await sessions.get_canonical_memory_project_rows(str(authority.principal_id))
+        merged = merged_registry(
+            self._config.memory_projects,
+            principal_id=str(authority.principal_id),
+        )
+        active = detect_active_memory_project(current, merged)
+        options: list[MemoryProjectRegistryOption] = []
+        for project_id, project in sorted(self._config.memory_projects.items()):
+            roots = tuple(str(root.resolve(strict=False)) for root in project.workspace_roots)
+            options.append(
+                MemoryProjectRegistryOption(
+                    project_id=project_id,
+                    display_name=project.display_name,
+                    workspace_roots=roots,
+                    provenance="operator_pinned",
+                    current=active is not None and active.project_id == project_id,
+                    available=all(Path(root).is_dir() for root in roots),
+                    removable=False,
+                    state_version=None,
+                )
+            )
+        for row in canonical_rows:
+            project_id = str(row["project_id"])
+            if project_id not in merged:
+                continue
+            root = str(row["workspace_root"])
+            state_version = row["state_version"]
+            assert isinstance(state_version, int)
+            options.append(
+                MemoryProjectRegistryOption(
+                    project_id=project_id,
+                    display_name=str(row["display_name"]),
+                    workspace_roots=(root,),
+                    provenance=str(row["provenance"]),
+                    current=active is not None and active.project_id == project_id,
+                    available=Path(root).is_dir(),
+                    removable=(
+                        str(row["principal_id"]) == str(authority.principal_id)
+                        and str(row["runtime_profile_id"]) == str(authority.runtime_profile_id)
+                    ),
+                    state_version=state_version,
+                )
+            )
+        options.sort(key=lambda item: (not item.current, item.display_name.casefold(), item.project_id))
+        revision_payload = [
+            {
+                "project_id": item.project_id,
+                "roots": item.workspace_roots,
+                "provenance": item.provenance,
+                "state_version": item.state_version,
+            }
+            for item in options
+        ]
+        revision = hashlib.sha256(
+            json.dumps(
+                {
+                    "principal_id": str(authority.principal_id),
+                    "runtime_profile_id": str(authority.runtime_profile_id),
+                    "current_workspace": str(current),
+                    "projects": revision_payload,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return MemoryProjectRegistrySnapshot(
+            principal_id=authority.principal_id,
+            runtime_profile_id=authority.runtime_profile_id,
+            current_workspace=str(current),
+            active_project_id=active.project_id if active is not None else None,
+            projects=tuple(options),
+            revision=revision,
+        )
+
+    async def register_memory_project(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        name: str,
+        *,
+        workspace_path: str | None = None,
+        expected_revision: str | None = None,
+        provenance: str = "principal_registered",
+        _lock_held: bool = False,
+    ) -> MemoryProjectMutationResult:
+        """Register one authorized workspace through canonical ownership."""
+        project_id = name.strip().lower()
+        if name != name.strip() or not project_id or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", project_id) is None:
+            raise WorkshopSettingsWorkspaceValidationError(
+                "Project name must use letters, digits, - or _ and be at most 64 characters"
+            )
+        if provenance not in {"principal_registered", "principal_created"}:
+            raise WorkshopSettingsWorkspaceValidationError("Invalid memory-project provenance")
+        lock = _AlreadyHeldLock() if _lock_held else self._lock(authority)
+        async with lock:
+            from kai.memory_projects import db_registry_upsert, registry_mutation_lock
+
+            current = await self._inspect_memory_projects_locked(authority)
+            self._check_revision(current.revision, expected_revision)
+            workspace = await self._authorized_workspace(authority, workspace_path)
+            workspace = workspace.resolve(strict=True)
+            namespace = self._namespace(authority)
+            workspace_digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()
+            async with registry_mutation_lock():
+                all_rows = await sessions.get_canonical_memory_project_rows()
+                exact = next(
+                    (
+                        row
+                        for row in all_rows
+                        if str(row["project_id"]) == project_id
+                        or Path(str(row["workspace_root"])).resolve(strict=False) == workspace
+                    ),
+                    None,
+                )
+                if exact is not None:
+                    exact_state_version = exact["state_version"]
+                    assert isinstance(exact_state_version, int)
+                    same = (
+                        str(exact["project_id"]) == project_id
+                        and Path(str(exact["workspace_root"])).resolve(strict=False) == workspace
+                        and str(exact["principal_id"]) == str(authority.principal_id)
+                        and str(exact["runtime_profile_id"]) == str(authority.runtime_profile_id)
+                    )
+                    if not same:
+                        raise WorkshopSettingsWorkspaceValidationError(
+                            "That project name or workspace is already registered"
+                        )
+                    await sessions.record_canonical_memory_project_noop(
+                        namespace,
+                        project_id=project_id,
+                        workspace_digest=workspace_digest,
+                        operation="register",
+                        state_version=exact_state_version,
+                    )
+                    snapshot = await self._inspect_memory_projects_locked(authority)
+                    return MemoryProjectMutationResult(
+                        snapshot,
+                        project_id,
+                        False,
+                        f"Memory project '{project_id}' was already registered for this workspace.",
+                    )
+                for pinned_id, pinned in self._config.memory_projects.items():
+                    if project_id == pinned_id or any(
+                        workspace == root or workspace.is_relative_to(root) or root.is_relative_to(workspace)
+                        for root in pinned.workspace_roots
+                    ):
+                        raise WorkshopSettingsWorkspaceValidationError(
+                            f"This workspace conflicts with operator-pinned project '{pinned_id}'"
+                        )
+                for row in all_rows:
+                    root = Path(str(row["workspace_root"])).resolve(strict=False)
+                    if workspace.is_relative_to(root) or root.is_relative_to(workspace):
+                        raise WorkshopSettingsWorkspaceValidationError(
+                            "This workspace overlaps another registered memory project"
+                        )
+                try:
+                    row = await sessions.register_canonical_memory_project(
+                        namespace,
+                        project_id=project_id,
+                        display_name=name,
+                        workspace_root=str(workspace),
+                        provenance=provenance,
+                        workspace_digest=workspace_digest,
+                    )
+                except Exception as exc:
+                    raise WorkshopSettingsWorkspaceConflict(
+                        "The memory-project registry changed during registration"
+                    ) from exc
+                if not db_registry_upsert(row):
+                    raise WorkshopSettingsWorkspaceConsistencyError(
+                        "The canonical memory project could not enter the live registry"
+                    )
+            snapshot = await self._inspect_memory_projects_locked(authority)
+            return MemoryProjectMutationResult(
+                snapshot,
+                project_id,
+                True,
+                f"Registered memory project '{project_id}' for this workspace.",
+            )
+
+    async def unregister_memory_project(
+        self,
+        authority: SettingsWorkspaceAuthority,
+        project_id: str,
+        *,
+        expected_revision: str | None = None,
+        _lock_held: bool = False,
+    ) -> MemoryProjectMutationResult:
+        """Remove one mutable project owned by the exact principal/runtime."""
+        requested = project_id.strip().lower()
+        lock = _AlreadyHeldLock() if _lock_held else self._lock(authority)
+        async with lock:
+            from kai.memory_projects import db_registry_remove, registry_mutation_lock
+
+            current = await self._inspect_memory_projects_locked(authority)
+            self._check_revision(current.revision, expected_revision)
+            if requested in self._config.memory_projects:
+                raise WorkshopSettingsWorkspaceAccessDenied("Operator-pinned memory projects cannot be unregistered")
+            async with registry_mutation_lock():
+                rows = await sessions.get_canonical_memory_project_rows()
+                row = next((item for item in rows if str(item["project_id"]) == requested), None)
+                if row is None:
+                    snapshot = await self._inspect_memory_projects_locked(authority)
+                    return MemoryProjectMutationResult(
+                        snapshot,
+                        requested,
+                        False,
+                        f"Project '{requested}' was already gone.",
+                    )
+                if str(row["principal_id"]) != str(authority.principal_id) or str(row["runtime_profile_id"]) != str(
+                    authority.runtime_profile_id
+                ):
+                    raise WorkshopSettingsWorkspaceAccessDenied(
+                        "Only the owning principal runtime can unregister this memory project"
+                    )
+                namespace = self._namespace(authority)
+                root = Path(str(row["workspace_root"])).resolve(strict=False)
+                row_state_version = row["state_version"]
+                assert isinstance(row_state_version, int)
+                changed = await sessions.unregister_canonical_memory_project(
+                    namespace,
+                    project_id=requested,
+                    expected_state_version=row_state_version,
+                    workspace_digest=hashlib.sha256(str(root).encode("utf-8")).hexdigest(),
+                )
+                if not changed:
+                    raise WorkshopSettingsWorkspaceConflict("The memory-project registry changed during removal")
+                db_registry_remove(requested)
+            snapshot = await self._inspect_memory_projects_locked(authority)
+            return MemoryProjectMutationResult(
+                snapshot,
+                requested,
+                True,
+                f"Unregistered memory project '{requested}'.",
+            )
+
     async def _switch_workspace_locked(
         self,
         authority: SettingsWorkspaceAuthority,
@@ -1031,22 +1305,22 @@ class WorkshopSettingsWorkspaceService:
                 provenance="principal_created",
             )
             git_ready = provisioned.git_ready
-            creator_runtime_key = self._runtime_pool.legacy_runtime_key(authority.runtime_profile_id)
-            if creator_runtime_key is None:
+            try:
+                registration = await self.register_memory_project(
+                    authority,
+                    workspace_name,
+                    workspace_path=str(target_resolved),
+                    provenance="principal_created",
+                    _lock_held=True,
+                )
+            except WorkshopSettingsWorkspaceError as exc:
                 memory_project_registered = False
                 memory_project_created = False
-                memory_project_note = "This runtime has no memory-project registration identity."
+                memory_project_note = f"Memory project was not registered: {exc}"
             else:
-                (
-                    memory_project_registered,
-                    memory_project_created,
-                    memory_project_note,
-                ) = await _register_workspace_memory_project(
-                    self._config,
-                    creator_runtime_key,
-                    target_resolved,
-                    workspace_name,
-                )
+                memory_project_registered = True
+                memory_project_created = registration.changed
+                memory_project_note = registration.note
             switched = await self._switch_workspace_locked(
                 authority,
                 target_resolved,
@@ -1143,15 +1417,25 @@ class WorkshopSettingsWorkspaceService:
                     "Workspace deletion returned a path outside the configured workspace base"
                 )
             await sessions.delete_canonical_workspace_state(namespace, str(target_resolved))
-            creator_runtime_key = self._runtime_pool.legacy_runtime_key(authority.runtime_profile_id)
             memory_project_unregistered = None
-            if creator_runtime_key is not None:
-                from kai.memory_projects import unregister_workspace_memory_project
-
-                memory_project_unregistered = await unregister_workspace_memory_project(
-                    target_resolved,
-                    creator_runtime_key,
+            projects = await sessions.get_canonical_memory_project_rows(str(authority.principal_id))
+            owned_project = next(
+                (
+                    row
+                    for row in projects
+                    if str(row["runtime_profile_id"]) == str(authority.runtime_profile_id)
+                    and Path(str(row["workspace_root"])).resolve(strict=False) == target_resolved
+                ),
+                None,
+            )
+            if owned_project is not None:
+                unregistered = await self.unregister_memory_project(
+                    authority,
+                    str(owned_project["project_id"]),
+                    _lock_held=True,
                 )
+                if unregistered.changed:
+                    memory_project_unregistered = unregistered.project_id
             snapshot = await self._inspect_locked(
                 authority,
                 mutation=SettingsMutationOutcome(

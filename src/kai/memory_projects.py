@@ -177,6 +177,9 @@ _VALID_DEFAULT_SCOPES: frozenset[str] = frozenset({"global", "project"})
 
 _db_registry: dict[str, MemoryProjectConfig] = {}
 _db_creators: dict[str, int] = {}
+_db_owners: dict[str, tuple[str, str]] = {}
+_db_provenance: dict[str, str] = {}
+_db_versions: dict[str, int] = {}
 
 # Serializes registry mutations (guard + DB write + cache update).
 # The nested-root and collision guards are reads of the merged view
@@ -265,6 +268,9 @@ def load_db_registry(rows: list[dict]) -> None:
     """
     _db_registry.clear()
     _db_creators.clear()
+    _db_owners.clear()
+    _db_provenance.clear()
+    _db_versions.clear()
     for row in rows:
         cfg = _row_to_config(row)
         if cfg is None:
@@ -273,6 +279,16 @@ def load_db_registry(rows: list[dict]) -> None:
         created_by = row.get("created_by")
         if isinstance(created_by, int):
             _db_creators[cfg.project_id] = created_by
+        principal_id = row.get("principal_id")
+        runtime_profile_id = row.get("runtime_profile_id")
+        if isinstance(principal_id, str) and isinstance(runtime_profile_id, str):
+            _db_owners[cfg.project_id] = (principal_id, runtime_profile_id)
+        provenance = row.get("provenance")
+        if isinstance(provenance, str):
+            _db_provenance[cfg.project_id] = provenance
+        state_version = row.get("state_version")
+        if isinstance(state_version, int):
+            _db_versions[cfg.project_id] = state_version
 
 
 def db_registry_upsert(row: dict) -> bool:
@@ -287,6 +303,16 @@ def db_registry_upsert(row: dict) -> bool:
     created_by = row.get("created_by")
     if isinstance(created_by, int):
         _db_creators[cfg.project_id] = created_by
+    principal_id = row.get("principal_id")
+    runtime_profile_id = row.get("runtime_profile_id")
+    if isinstance(principal_id, str) and isinstance(runtime_profile_id, str):
+        _db_owners[cfg.project_id] = (principal_id, runtime_profile_id)
+    provenance = row.get("provenance")
+    if isinstance(provenance, str):
+        _db_provenance[cfg.project_id] = provenance
+    state_version = row.get("state_version")
+    if isinstance(state_version, int):
+        _db_versions[cfg.project_id] = state_version
     return True
 
 
@@ -295,12 +321,38 @@ def db_registry_remove(project_id: str) -> None:
     hook for the unregister handler)."""
     _db_registry.pop(project_id, None)
     _db_creators.pop(project_id, None)
+    _db_owners.pop(project_id, None)
+    _db_provenance.pop(project_id, None)
+    _db_versions.pop(project_id, None)
 
 
 def db_registry_creator(project_id: str) -> int | None:
     """chat_id that registered a project, for the unregister
     permission check. None for YAML-pinned or unknown projects."""
     return _db_creators.get(project_id)
+
+
+def canonical_registry_rows() -> tuple[dict[str, object], ...]:
+    """Return a metadata-only snapshot of canonical cached registrations."""
+    rows: list[dict[str, object]] = []
+    for project_id, config in _db_registry.items():
+        owner = _db_owners.get(project_id)
+        if owner is None:
+            continue
+        rows.append(
+            {
+                "project_id": project_id,
+                "display_name": config.display_name,
+                "workspace_root": str(config.workspace_roots[0]),
+                "memory_enabled": config.memory_enabled,
+                "default_scope_for_new_facts": config.default_scope_for_new_facts,
+                "principal_id": owner[0],
+                "runtime_profile_id": owner[1],
+                "provenance": _db_provenance.get(project_id, "principal_registered"),
+                "state_version": _db_versions.get(project_id, 0),
+            }
+        )
+    return tuple(rows)
 
 
 async def unregister_workspace_memory_project(
@@ -403,7 +455,11 @@ async def register_workspace_memory_project(
     return True, True, f"Registered memory project '{project_id}' for this workspace."
 
 
-def merged_registry(yaml_projects: dict[str, MemoryProjectConfig]) -> dict[str, MemoryProjectConfig]:
+def merged_registry(
+    yaml_projects: dict[str, MemoryProjectConfig],
+    *,
+    principal_id: str | None = None,
+) -> dict[str, MemoryProjectConfig]:
     """
     The detection view: user-registered projects under the
     operator-pinned YAML layer.
@@ -432,6 +488,10 @@ def merged_registry(yaml_projects: dict[str, MemoryProjectConfig]) -> dict[str, 
 
     merged: dict[str, MemoryProjectConfig] = {}
     for project_id, cfg in _db_registry.items():
+        if principal_id is not None:
+            owner = _db_owners.get(project_id)
+            if owner is None or owner[0] != principal_id:
+                continue
         if project_id in yaml_projects:
             log.debug("memory_projects: db project %r shadowed by yaml id", project_id)
             continue
@@ -464,5 +524,5 @@ async def load_project_registry(config: Config) -> dict[str, MemoryProjectConfig
     no CLI has to depend on another CLI just for the bootstrap.
     """
     await sessions.init_db(config.session_db_path)
-    load_db_registry(await sessions.get_memory_project_rows())
+    load_db_registry(await sessions.get_canonical_memory_project_rows())
     return merged_registry(config.memory_projects)

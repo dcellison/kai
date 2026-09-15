@@ -594,16 +594,6 @@ def _start() -> None:
             len(channel_history.namespaces),
         )
 
-        # Load user-registered memory projects into the detection
-        # cache. Must follow init_db (the rows live in the session
-        # DB) and precede message handling, because both detection
-        # call sites read the merged registry on the very first
-        # turn. After startup the /project handlers keep the cache
-        # in lockstep with the DB; this is the only bulk load.
-        from kai.memory_projects import load_db_registry
-
-        load_db_registry(await sessions.get_memory_project_rows())
-
         core_host: KaiApplicationHost | None = None
         telegram_adapter: HttpIngressAdapter | None = None
         cleanup_task: asyncio.Task[None] | None = None
@@ -657,6 +647,25 @@ def _start() -> None:
             workspace_grant_migration.legacy_rows,
             workspace_grant_migration.migrated_rows,
             workspace_grant_migration.invalid_rows,
+        )
+        memory_project_migration = await sessions.initialize_workshop_memory_project_registry(
+            execution_state,
+            config.memory_projects,
+        )
+        from kai.memory_projects import load_db_registry
+
+        load_db_registry(await sessions.get_canonical_memory_project_rows())
+        logging.info(
+            "Workshop canonical memory-project registry ready "
+            "(pinned=%d, principal=%d, legacy=%d, newly_migrated=%d, "
+            "missing_owners=%d, invalid=%d, conflicting=%d)",
+            memory_project_migration.pinned_projects,
+            memory_project_migration.principal_projects,
+            memory_project_migration.legacy_projects,
+            memory_project_migration.newly_migrated,
+            memory_project_migration.missing_owners,
+            memory_project_migration.invalid,
+            memory_project_migration.conflicting,
         )
         operational_migration = await sessions.initialize_workshop_operational_state(
             execution_state,

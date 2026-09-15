@@ -546,7 +546,11 @@ async def _scope_inputs(
     retrieval takes for a None workspace.
     """
     config: Config = context.bot_data["config"]
-    registry = merged_registry(config.memory_projects)
+    canonical_principal_id = memory.canonical_memory_user_id(str(chat_id))
+    registry = merged_registry(
+        config.memory_projects,
+        principal_id=(canonical_principal_id if canonical_principal_id.startswith("prn_") else None),
+    )
     pool: SubprocessPool | None = get_core_services(context).subprocess_pool
     if pool is None:
         return registry, None

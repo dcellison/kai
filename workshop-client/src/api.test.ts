@@ -67,6 +67,7 @@ import {
   loadWorkshopHumans,
   loadFollowedThreads,
   loadWorkspaceConfig,
+  loadMemoryProjects,
   moveMemoriesScope,
   moveMemoryScope,
   redeemEnrollment,
@@ -74,6 +75,7 @@ import {
   refreshModelCatalogue,
   searchMemories,
   removeWorkspaceEnvironmentSecret,
+  registerMemoryProject,
   restorePreferenceRevision,
   restoreDirectMessage,
   resumeStandingObservation,
@@ -103,6 +105,7 @@ import {
   updateAgentCollaborationPolicy,
   updateStandingParticipation,
   updateWorkspaceConfig,
+  unregisterMemoryProject,
   upsertOperatorModel,
   revokeAgentCollaborationGrants,
 } from "./api";
@@ -1288,6 +1291,66 @@ describe("Workshop client API", () => {
       name: "Research Notes",
       revision: "sws_current",
     });
+  });
+
+  it("loads and mutates the canonical memory-project registry", async () => {
+    const payload = {
+      active_project_id: "kai",
+      current_workspace: "/srv/kai",
+      principal_id: "prn_00000000000000000000000000000001",
+      projects: [{
+        available: true,
+        current: true,
+        display_name: "Kai",
+        project_id: "kai",
+        provenance: "operator_pinned",
+        removable: false,
+        state_version: null,
+        workspace_roots: ["/srv/kai"],
+      }],
+      revision: "mpr_current",
+      runtime_profile_id: runtimeProfileId,
+      version: 1,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(payload))
+      .mockResolvedValueOnce(Response.json({
+        ...payload,
+        mutation: {
+          changed: true,
+          note: "Registered memory project 'research'.",
+          project_id: "research",
+        },
+      }, { status: 201 }))
+      .mockResolvedValueOnce(Response.json({
+        ...payload,
+        mutation: {
+          changed: true,
+          note: "Unregistered memory project 'research'.",
+          project_id: "research",
+        },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadMemoryProjects(session)).resolves.toMatchObject({
+      activeProjectId: "kai",
+      projects: [{ projectId: "kai", provenance: "operator_pinned" }],
+    });
+    await expect(registerMemoryProject(session, "mpr_current", "research"))
+      .resolves.toMatchObject({ mutation: { changed: true, projectId: "research" } });
+    await expect(unregisterMemoryProject(session, "mpr_current", "research"))
+      .resolves.toMatchObject({ mutation: { changed: true, projectId: "research" } });
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `/v1/channels/${channelId}/memory-projects`,
+      `/v1/channels/${channelId}/memory-projects`,
+      `/v1/channels/${channelId}/memory-projects/research`,
+    ]);
+    expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+      name: "research",
+      revision: "mpr_current",
+    });
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "DELETE" });
   });
 
   it("deletes a workspace only with its exact confirmation", async () => {

@@ -102,6 +102,14 @@ _WORKSPACE_ENVIRONMENT_SECRET_TABLES = {
     "channel_agent_workspace_settings",
     "workspace_environment_secret_audit",
 }
+_MEMORY_PROJECT_REGISTRY_TABLES = {
+    "memory_projects",
+    "principal_memory_projects",
+    "runtime_profile_owners",
+    "workshop_memory_project_audit",
+    "workshop_memory_project_migrations",
+    "workshop_memory_project_registry_state",
+}
 _PROTECTED_EXECUTION_STATE_LANES_SQL = (
     " FROM channel_agent_runtime_assignments a "
     "JOIN channels c ON c.id = a.channel_id AND c.kind = 'direct' AND c.archived_at IS NULL "
@@ -1794,6 +1802,89 @@ def workshop_workspace_grant_status(db_path: Path) -> str:
                 f"legacy={legacy_migrated}), invalid={invalid}, orphaned={orphaned}, "
                 f"legacy gaps={legacy_gaps}; authority=canonical principal/runtime, "
                 "protected legacy writes=disabled"
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+
+
+def workshop_memory_project_registry_status(db_path: Path) -> str:
+    """Describe canonical pinned/principal memory-project authority."""
+    prefix = "Workshop memory-project registry:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical memory-project schema unavailable"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not tables >= _MEMORY_PROJECT_REGISTRY_TABLES:
+                return f"{prefix} pending; canonical memory-project schema unavailable"
+            pinned = _scalar(
+                connection,
+                "SELECT COALESCE(MAX(pinned_projects), 0) FROM workshop_memory_project_registry_state",
+            )
+            principal = _scalar(connection, "SELECT COUNT(*) FROM principal_memory_projects")
+            registered = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_memory_projects WHERE provenance = 'principal_registered'",
+            )
+            created = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_memory_projects WHERE provenance = 'principal_created'",
+            )
+            legacy = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_memory_projects WHERE provenance = 'legacy_migrated'",
+            )
+            missing = sum(
+                int(not Path(str(row[0])).is_dir())
+                for row in connection.execute("SELECT workspace_root FROM principal_memory_projects")
+            )
+            conflicting = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_memory_project_migrations WHERE outcome = 'conflicting'",
+            )
+            invalid = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_memory_project_migrations WHERE outcome = 'invalid'",
+            )
+            missing_owners = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM workshop_memory_project_migrations WHERE outcome = 'missing_owner'",
+            )
+            orphaned = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_memory_projects p WHERE NOT EXISTS "
+                "(SELECT 1 FROM runtime_profile_owners o WHERE o.runtime_profile_id = p.runtime_profile_id "
+                "AND o.principal_id = p.principal_id)",
+            )
+            legacy_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_projects legacy WHERE NOT EXISTS "
+                "(SELECT 1 FROM workshop_memory_project_migrations migration "
+                "WHERE migration.legacy_project_id = legacy.project_id)",
+            )
+            audits = _scalar(connection, "SELECT COUNT(*) FROM workshop_memory_project_audit")
+            active = (
+                missing == 0
+                and conflicting == 0
+                and invalid == 0
+                and missing_owners == 0
+                and orphaned == 0
+                and legacy_gaps == 0
+            )
+            state = "active" if active else "INCOMPLETE"
+            return (
+                f"{prefix} {state}; pinned={pinned}, principal={principal} "
+                f"(registered={registered}, created={created}, legacy={legacy}), missing={missing}, "
+                f"conflicting={conflicting}, invalid={invalid}, missing owners={missing_owners}, "
+                f"orphaned={orphaned}, legacy gaps={legacy_gaps}, audits={audits}; "
+                "authority=canonical principal/runtime, pinned removal=denied, protected legacy writes=disabled"
             )
         finally:
             connection.close()

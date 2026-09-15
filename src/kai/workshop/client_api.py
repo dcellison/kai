@@ -322,6 +322,8 @@ from kai.workshop.settings_workspaces import (
     MAX_WORKSPACE_ENVIRONMENT_KEYS,
     MAX_WORKSPACE_ENVIRONMENT_VALUE_BYTES,
     EditableCapability,
+    MemoryProjectMutationResult,
+    MemoryProjectRegistrySnapshot,
     SettingsMutationOutcome,
     SettingsWorkspaceAuthority,
     SettingsWorkspaceSnapshot,
@@ -429,6 +431,8 @@ _MODEL_CATALOGUE_ADMIN_REFRESH_PATH = "/v1/settings/model-catalogue/refresh-all"
 _ACTIVE_WORKSPACE_PATH = "/v1/channels/{channel_id}/workspace"
 _WORKSPACE_COLLECTION_PATH = "/v1/channels/{channel_id}/workspaces"
 _WORKSPACE_GRANTS_PATH = "/v1/channels/{channel_id}/workspace-grants"
+_MEMORY_PROJECTS_PATH = "/v1/channels/{channel_id}/memory-projects"
+_MEMORY_PROJECT_PATH = "/v1/channels/{channel_id}/memory-projects/{project_id}"
 _WORKSPACE_CONFIG_PATH = "/v1/channels/{channel_id}/workspace-config"
 _WORKSPACE_ENVIRONMENT_PATH = "/v1/channels/{channel_id}/workspace-environment/{environment_key}"
 _PREFERENCES_PATH = "/v1/preferences"
@@ -1621,6 +1625,44 @@ def _serialize_workspace_config(
         "prompt_source": snapshot.prompt_source,
         "override_fields": list(snapshot.override_fields),
     }
+
+
+def _serialize_memory_projects(
+    snapshot: MemoryProjectRegistrySnapshot,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "principal_id": str(snapshot.principal_id),
+        "runtime_profile_id": str(snapshot.runtime_profile_id),
+        "current_workspace": snapshot.current_workspace,
+        "active_project_id": snapshot.active_project_id,
+        "revision": snapshot.revision,
+        "projects": [
+            {
+                "project_id": item.project_id,
+                "display_name": item.display_name,
+                "workspace_roots": list(item.workspace_roots),
+                "provenance": item.provenance,
+                "current": item.current,
+                "available": item.available,
+                "removable": item.removable,
+                "state_version": item.state_version,
+            }
+            for item in snapshot.projects
+        ],
+    }
+
+
+def _serialize_memory_project_mutation(
+    result: MemoryProjectMutationResult,
+) -> dict[str, object]:
+    payload = _serialize_memory_projects(result.snapshot)
+    payload["mutation"] = {
+        "project_id": result.project_id,
+        "changed": result.changed,
+        "note": result.note,
+    }
+    return payload
 
 
 def _serialize_memory_record(record: MemoryRecordSummary) -> dict[str, object]:
@@ -4261,6 +4303,99 @@ async def _handle_workspace_grants(
         _serialize_workspace_grant_mutation(result),
         status=201 if request.method == "POST" and result.changed else 200,
     )
+
+
+async def _handle_memory_projects(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
+    if request.method == "GET":
+        if request.can_read_body:
+            return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
+        snapshot = await service.inspect_memory_projects(authority)
+        return _json_response(_serialize_memory_projects(snapshot), status=200)
+    if request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
+    if request.content_length is not None and request.content_length > _MAX_WORKSPACE_CREATION_BODY_BYTES:
+        return _error_response(status=400, code="invalid_request", message="Memory-project request is too large")
+    raw = await request.content.read(_MAX_WORKSPACE_CREATION_BODY_BYTES + 1)
+    try:
+        payload = json.loads(raw) if len(raw) <= _MAX_WORKSPACE_CREATION_BODY_BYTES else None
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict) or set(payload) != {"revision", "name"}:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
+    if not isinstance(payload.get("revision"), str) or not isinstance(payload.get("name"), str):
+        return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
+    try:
+        result = await service.register_memory_project(
+            authority,
+            payload["name"],
+            expected_revision=payload["revision"],
+        )
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    except WorkshopSettingsWorkspaceAccessDenied:
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_project", message=str(exc))
+    return _json_response(
+        _serialize_memory_project_mutation(result),
+        status=201 if result.changed else 200,
+    )
+
+
+async def _handle_memory_project_removal(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopSettingsWorkspaceService,
+) -> web.Response:
+    authority, error = await _authenticate_settings_authority(
+        request,
+        authenticator=authenticator,
+        service=service,
+    )
+    if error is not None:
+        if error.status == 401:
+            error.headers["WWW-Authenticate"] = "Bearer"
+        return error
+    assert authority is not None
+    if request.query or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
+    try:
+        payload = await request.json()
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict) or set(payload) != {"revision"} or not isinstance(payload.get("revision"), str):
+        return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
+    try:
+        result = await service.unregister_memory_project(
+            authority,
+            request.match_info["project_id"],
+            expected_revision=payload["revision"],
+        )
+    except WorkshopSettingsWorkspaceConflict as exc:
+        return _error_response(status=409, code="settings_conflict", message=str(exc))
+    except WorkshopSettingsWorkspaceAccessDenied as exc:
+        return _error_response(status=403, code="access_denied", message=str(exc))
+    except WorkshopSettingsWorkspaceValidationError as exc:
+        return _error_response(status=400, code="invalid_project", message=str(exc))
+    return _json_response(_serialize_memory_project_mutation(result), status=200)
 
 
 async def _handle_workspace_config(
@@ -9911,6 +10046,22 @@ def register_workshop_read_routes(
                     service=settings_workspaces,
                 )
 
+        async def handle_memory_projects(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_projects(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
+        async def handle_memory_project_removal(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_project_removal(
+                    request,
+                    authenticator=authenticator,
+                    service=settings_workspaces,
+                )
+
         async def handle_workspace_config(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_workspace_config(
@@ -9958,6 +10109,9 @@ def register_workshop_read_routes(
         app.router.add_get(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
         app.router.add_post(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
         app.router.add_delete(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
+        app.router.add_get(_MEMORY_PROJECTS_PATH, handle_memory_projects)
+        app.router.add_post(_MEMORY_PROJECTS_PATH, handle_memory_projects)
+        app.router.add_delete(_MEMORY_PROJECT_PATH, handle_memory_project_removal)
         app.router.add_get(_WORKSPACE_CONFIG_PATH, handle_workspace_config)
         app.router.add_patch(
             _WORKSPACE_CONFIG_PATH,

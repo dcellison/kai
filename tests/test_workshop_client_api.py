@@ -166,6 +166,9 @@ from kai.workshop.settings_workspaces import (
     BackendOption,
     EditableCapability,
     EffectiveValue,
+    MemoryProjectMutationResult,
+    MemoryProjectRegistryOption,
+    MemoryProjectRegistrySnapshot,
     ModelOption,
     SettingsMutationOutcome,
     SettingsWorkspaceSnapshot,
@@ -317,6 +320,8 @@ class _SettingsWorkspaces:
     deleted_workspaces: list[str] = field(default_factory=list)
     added_workspace_grants: list[str] = field(default_factory=list)
     removed_workspace_grants: list[str] = field(default_factory=list)
+    registered_memory_projects: list[str] = field(default_factory=list)
+    removed_memory_projects: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
     workspace_environment_changes: list[tuple[str, str]] = field(default_factory=list)
     runtime_changes: list[tuple[str, object]] = field(default_factory=list)
@@ -462,6 +467,72 @@ class _SettingsWorkspaces:
 
     async def inspect_workspace_grants(self, _authority):
         return self._grant_snapshot()
+
+    def _memory_project_snapshot(self) -> MemoryProjectRegistrySnapshot:
+        projects = [
+            MemoryProjectRegistryOption(
+                "kai",
+                "Kai",
+                ("/srv/kai",),
+                "operator_pinned",
+                True,
+                True,
+                False,
+                None,
+            )
+        ]
+        projects.extend(
+            MemoryProjectRegistryOption(
+                project_id,
+                project_id.capitalize(),
+                (f"/srv/home/workspaces/{project_id}",),
+                "principal_registered",
+                False,
+                True,
+                True,
+                0,
+            )
+            for project_id in self.registered_memory_projects
+            if project_id not in self.removed_memory_projects
+        )
+        return MemoryProjectRegistrySnapshot(
+            self.principal_id,
+            profile_id(101),
+            "/srv/kai",
+            "kai",
+            tuple(projects),
+            "mpr_current",
+        )
+
+    async def inspect_memory_projects(self, _authority):
+        return self._memory_project_snapshot()
+
+    async def register_memory_project(self, _authority, name: str, *, expected_revision=None):
+        self._check_revision(expected_revision, "mpr_current")
+        project_id = name.lower()
+        changed = project_id not in self.registered_memory_projects
+        if changed:
+            self.registered_memory_projects.append(project_id)
+        return MemoryProjectMutationResult(
+            self._memory_project_snapshot(),
+            project_id,
+            changed,
+            f"Registered memory project '{project_id}' for this workspace.",
+        )
+
+    async def unregister_memory_project(self, _authority, project_id: str, *, expected_revision=None):
+        self._check_revision(expected_revision, "mpr_current")
+        if project_id == "kai":
+            raise WorkshopSettingsWorkspaceAccessDenied("pinned")
+        changed = project_id not in self.removed_memory_projects
+        if changed:
+            self.removed_memory_projects.append(project_id)
+        return MemoryProjectMutationResult(
+            self._memory_project_snapshot(),
+            project_id,
+            changed,
+            f"Unregistered memory project '{project_id}'.",
+        )
 
     async def add_existing_workspace(self, _authority, path: str):
         changed = path not in self.added_workspace_grants
@@ -4607,6 +4678,66 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert (await active.json())["error"]["code"] == "workspace_grant_active"
             assert running.status == 409
             assert (await running.json())["error"]["code"] == "workspace_grant_run_busy"
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_memory_projects_share_revisioned_canonical_authority(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        service = _SettingsWorkspaces(alice_id, alice_channel)
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+            settings_workspaces=service,
+        )
+        path = f"/v1/channels/{alice_channel}/memory-projects"
+        headers = {"Authorization": "Bearer alice-token"}
+        mutation_headers = {**headers, "Content-Type": "application/json"}
+        try:
+            initial = await client.get(path, headers=headers)
+            created = await client.post(
+                path,
+                headers=mutation_headers,
+                json={"name": "research", "revision": "mpr_current"},
+            )
+            replay = await client.post(
+                path,
+                headers=mutation_headers,
+                json={"name": "research", "revision": "mpr_current"},
+            )
+            removed = await client.delete(
+                f"{path}/research",
+                headers=mutation_headers,
+                json={"revision": "mpr_current"},
+            )
+            pinned = await client.delete(
+                f"{path}/kai",
+                headers=mutation_headers,
+                json={"revision": "mpr_current"},
+            )
+            malformed = await client.post(
+                path,
+                headers=mutation_headers,
+                json={"name": "leak", "revision": "mpr_current", "principal_id": str(alice_id)},
+            )
+            foreign = await client.get(path, headers={"Authorization": "Bearer bob-token"})
+
+            assert initial.status == 200
+            assert (await initial.json())["projects"][0]["provenance"] == "operator_pinned"
+            assert created.status == 201
+            assert (await created.json())["mutation"]["changed"] is True
+            assert replay.status == 200
+            assert (await replay.json())["mutation"]["changed"] is False
+            assert removed.status == 200
+            assert (await removed.json())["mutation"]["changed"] is True
+            assert pinned.status == 403
+            assert malformed.status == 400
+            assert foreign.status == 403
+            assert service.registered_memory_projects == ["research"]
+            assert service.removed_memory_projects == ["research"]
         finally:
             await client.close()
             await store.close()
