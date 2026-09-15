@@ -36,7 +36,7 @@ import {
   loadAgentCollaborationPolicy,
   loadAppearancePreferences,
   loadEarlierTimeline,
-  loadEffectiveAgentRuntime,
+  loadRuntimeLaneStatus,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
@@ -489,14 +489,13 @@ function settingsPayload(overrides: Record<string, unknown> = {}): Record<string
   };
 }
 
-function effectiveAgentRuntimePayload(): Record<string, unknown> {
+function runtimeLaneStatusPayload(): Record<string, unknown> {
   return {
     version: 1,
     channel_id: channelId,
     agent_id: agentId,
     agent_name: "Kai",
     agent_handle: "kai",
-    sponsor_principal_id: "prn_00000000000000000000000000000001",
     sponsor_display_name: "Daniel",
     can_manage_runtime: false,
     backend: "codex",
@@ -504,9 +503,25 @@ function effectiveAgentRuntimePayload(): Record<string, unknown> {
     model: { value: "gpt-5.6-sol", source: "runtime policy" },
     timeout_seconds: { value: 1800, source: "runtime policy" },
     workspace_mode: "neutral",
+    workspace_label: null,
     workspace: null,
     workspace_revision: null,
     workspaces: [],
+    process_state: "stopped",
+    provider_session_state: "active",
+    continuity_state: "active",
+    session_created_at: "2026-09-15T10:00:00Z",
+    session_updated_at: "2026-09-15T10:05:00Z",
+    active_run: null,
+    last_run: {
+      run_id: "run_00000000000000000000000000000001",
+      status: "completed",
+      accepted_at: "2026-09-15T10:04:00Z",
+      started_at: "2026-09-15T10:04:01Z",
+      terminal_at: "2026-09-15T10:05:00Z",
+      terminal_code: null,
+    },
+    operator_diagnostics: null,
   };
 }
 
@@ -1291,13 +1306,13 @@ describe("Workshop client API", () => {
     });
   });
 
-  it("loads the read-only effective agent runtime projection", async () => {
+  it("loads the canonical runtime-lane status projection", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      Response.json(effectiveAgentRuntimePayload()),
+      Response.json(runtimeLaneStatusPayload()),
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(loadEffectiveAgentRuntime(session)).resolves.toEqual({
+    await expect(loadRuntimeLaneStatus(session)).resolves.toMatchObject({
       agentHandle: "kai",
       agentId,
       agentName: "Kai",
@@ -1307,15 +1322,18 @@ describe("Workshop client API", () => {
       model: { value: "gpt-5.6-sol", source: "runtime policy" },
       provider: "openai",
       sponsorDisplayName: "Daniel",
-      sponsorPrincipalId: "prn_00000000000000000000000000000001",
+      processState: "stopped",
+      providerSessionState: "active",
+      continuityState: "active",
       timeoutSeconds: { value: 1800, source: "runtime policy" },
       workspaceMode: "neutral",
+      workspaceLabel: null,
       workspace: null,
       workspaceRevision: null,
       workspaces: [],
     });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      `/v1/channels/${channelId}/effective-agent-runtime`,
+      `/v1/channels/${channelId}/runtime-status`,
     );
   });
 
@@ -1324,13 +1342,13 @@ describe("Workshop client API", () => {
       "fetch",
       vi.fn().mockResolvedValue(
         Response.json({
-          ...effectiveAgentRuntimePayload(),
+          ...runtimeLaneStatusPayload(),
           workspace: "/var/lib/kai/home/scott",
         }),
       ),
     );
 
-    await expect(loadEffectiveAgentRuntime(session)).rejects.toThrow(
+    await expect(loadRuntimeLaneStatus(session)).rejects.toThrow(
       "Kai returned an inconsistent effective workspace.",
     );
   });

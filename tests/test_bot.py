@@ -125,6 +125,12 @@ from kai.workshop.preferences import (
     WorkshopPreferenceConflict,
     WorkshopPreferenceStorageError,
 )
+from kai.workshop.runtime_lane_status import (
+    RuntimeLaneRunStatus,
+    RuntimeLaneStatusAuthority,
+    RuntimeLaneStatusSnapshot,
+    WorkshopRuntimeLaneStatusAmbiguous,
+)
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.settings_workspaces import (
     EffectiveValue,
@@ -1051,6 +1057,7 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
             delete_job=AsyncMock(return_value=False),
         ),
         client_preferences=client_preferences,
+        runtime_lane_status=MagicMock(),
     )
     ctx.application = application
     ctx.args = args or []
@@ -1369,38 +1376,112 @@ class TestHandleStop:
 
 
 class TestHandleStats:
-    @pytest.mark.asyncio
-    async def test_no_active_session(self):
-        update = _make_update()
-        ctx = _make_context()
-        with patch("kai.bot.sessions.get_stats", new_callable=AsyncMock, return_value=None):
-            await handle_stats(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "No active session" in reply
+    @staticmethod
+    def _snapshot(*, with_session: bool) -> RuntimeLaneStatusSnapshot:
+        authority = RuntimeLaneStatusAuthority(
+            requester_principal_id=PrincipalId("prn_" + "1" * 32),
+            channel_id=ChannelId("chn_" + "2" * 32),
+            channel_kind="direct",
+            agent_id=AgentId("agt_" + "3" * 32),
+            agent_name="Kai",
+            agent_handle="kai",
+            sponsor_principal_id=PrincipalId("prn_" + "1" * 32),
+            sponsor_display_name="Daniel",
+            runtime_profile_id=profile_id(1),
+            owns_agent=True,
+            operator=True,
+        )
+        session_created = datetime(2026, 1, 1, 12, 0, tzinfo=UTC) if with_session else None
+        session_updated = datetime(2026, 1, 2, 15, 30, 45, tzinfo=UTC) if with_session else None
+        last_run = (
+            RuntimeLaneRunStatus(
+                run_id="run_" + "4" * 32,
+                status="completed",
+                accepted_at=datetime(2026, 1, 2, 15, 29, tzinfo=UTC),
+                started_at=datetime(2026, 1, 2, 15, 29, 1, tzinfo=UTC),
+                terminal_at=session_updated,
+                terminal_code=None,
+            )
+            if with_session
+            else None
+        )
+        return RuntimeLaneStatusSnapshot(
+            authority=authority,
+            backend="codex",
+            provider="openai",
+            model_value="gpt-5.6-sol",
+            model_source="runtime policy",
+            timeout_seconds=1800,
+            timeout_source="runtime policy",
+            workspace_mode="owner",
+            workspace_label="kai",
+            workspace="/private/workspace",
+            workspace_revision="sws_current",
+            workspaces=(),
+            process_state="stopped",
+            provider_session_state="active" if with_session else "not_started",
+            continuity_state="active" if with_session else "not_started",
+            session_created_at=session_created,
+            session_updated_at=session_updated,
+            active_run=None,
+            last_run=last_run,
+            diagnostics=None,
+        )
 
     @pytest.mark.asyncio
-    async def test_active_session(self):
+    async def test_status_without_provider_session_uses_canonical_lane(self):
         update = _make_update()
         ctx = _make_context()
-        stats = {
-            "session_id": "abcd1234efgh",
-            "model": "sonnet",
-            "created_at": "2026-01-01 12:00:00",
-            "last_used_at": "2026-01-02 15:30:45",
-        }
-        with patch("kai.bot.sessions.get_stats", new_callable=AsyncMock, return_value=stats):
-            await handle_stats(update, ctx)
+        service = ctx.application.core_services.runtime_lane_status
+        authority = self._snapshot(with_session=False).authority
+        service.authority_for_transport_binding = AsyncMock(return_value=authority)
+        service.inspect = AsyncMock(return_value=self._snapshot(with_session=False))
+        await handle_stats(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
-        assert "abcd1234" in reply
-        assert "sonnet" in reply
+        assert "Agent: Kai (@kai)" in reply
+        assert "Provider session: Not Started" in reply
+        service.authority_for_transport_binding.assert_awaited_once_with(
+            transport="telegram",
+            sender_subject="1",
+            channel_subject="12345",
+            agent_handle=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_active_session_renders_canonical_status_and_explicit_agent(self):
+        update = _make_update()
+        ctx = _make_context(args=["@kai"])
+        snapshot = self._snapshot(with_session=True)
+        service = ctx.application.core_services.runtime_lane_status
+        service.authority_for_transport_binding = AsyncMock(return_value=snapshot.authority)
+        service.inspect = AsyncMock(return_value=snapshot)
+        await handle_stats(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Backend: codex · openai" in reply
+        assert "Model: gpt-5.6-sol" in reply
+        assert "Workspace: kai" in reply
+        assert "Run: Completed" in reply
         # Stored values are UTC; the reply must show them converted to the
         # host zone with a zone label. Expected values are computed with an
         # independent conversion so the assertion holds in any host zone,
         # including across the EST/EDT boundary.
         expected_started = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         expected_last_used = datetime(2026, 1, 2, 15, 30, 45, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        assert f"Started: {expected_started}" in reply
-        assert f"Last used: {expected_last_used}" in reply
+        assert f"Session started: {expected_started}" in reply
+        assert f"Session updated: {expected_last_used}" in reply
+        assert service.authority_for_transport_binding.await_args.kwargs["agent_handle"] == "@kai"
+
+    @pytest.mark.asyncio
+    async def test_multi_agent_channel_requires_an_explicit_agent(self):
+        update = _make_update()
+        ctx = _make_context()
+        service = ctx.application.core_services.runtime_lane_status
+        service.authority_for_transport_binding = AsyncMock(side_effect=WorkshopRuntimeLaneStatusAmbiguous("choose"))
+
+        await handle_stats(update, ctx)
+
+        assert update.message.reply_text.await_args.args[0] == ("Choose an agent in this channel: /stats @agent")
+        service.inspect.assert_not_called()
 
 
 # ── handle_jobs ──────────────────────────────────────────────────────

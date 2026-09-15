@@ -2901,6 +2901,43 @@ button:disabled {
   gap: 0.7rem;
 }
 
+.runtime-lane-statuses {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.runtime-lane-statuses > .runtime-settings + .runtime-settings {
+  border-top: 1px solid var(--color-border);
+  padding-top: 0.8rem;
+}
+
+.runtime-diagnostics {
+  color: var(--color-text-muted);
+  font-size: 0.66rem;
+}
+
+.runtime-diagnostics summary {
+  cursor: pointer;
+  color: var(--color-text);
+}
+
+.runtime-diagnostics dl {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0.35rem 0 0;
+}
+
+.runtime-diagnostics dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.runtime-diagnostics dt,
+.runtime-diagnostics dd {
+  margin: 0;
+}
+
 .runtime-settings p {
   margin: 0;
 }

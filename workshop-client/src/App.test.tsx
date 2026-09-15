@@ -29,7 +29,7 @@ import {
   loadChannelMembers,
   loadChannelMessage,
   loadChannelUnread,
-  loadEffectiveAgentRuntime,
+  loadRuntimeLaneStatus,
   loadHumanNotificationCounts,
   loadHumanNotifications,
   loadWorkshopHumans,
@@ -82,7 +82,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopHumanNotification,
   WorkshopChannelUnreadState,
-  WorkshopEffectiveAgentRuntime,
+  WorkshopRuntimeLaneStatus,
   WorkshopThreadUnreadState,
   WorkshopFollowedThread,
   WorkshopStandingParticipation,
@@ -109,7 +109,7 @@ vi.mock("./api", async (importOriginal) => {
     loadChannelMembers: vi.fn(),
     loadChannelMessage: vi.fn(),
     loadChannelUnread: vi.fn(),
-    loadEffectiveAgentRuntime: vi.fn(),
+    loadRuntimeLaneStatus: vi.fn(),
     loadHumanNotificationCounts: vi.fn(),
     loadHumanNotifications: vi.fn(),
     loadWorkshopHumans: vi.fn(),
@@ -636,25 +636,40 @@ const settingsWorkspace: WorkshopSettingsWorkspace = {
     },
   ],
 };
-const effectiveAgentRuntime: WorkshopEffectiveAgentRuntime = {
+const runtimeLaneStatus: WorkshopRuntimeLaneStatus = {
+  activeRun: null,
   agentHandle: "kai",
   agentId: "agt_00000000000000000000000000000002",
   agentName: "Kai",
   backend: settingsWorkspace.backend,
   canManageRuntime: true,
   channelId,
+  continuityState: "active",
+  lastRun: {
+    acceptedAt: "2026-09-15T10:04:00Z",
+    runId: "run_00000000000000000000000000000001",
+    startedAt: "2026-09-15T10:04:01Z",
+    status: "completed",
+    terminalAt: "2026-09-15T10:05:00Z",
+    terminalCode: null,
+  },
   model: {
     source: settingsWorkspace.model.source,
     value: settingsWorkspace.model.value,
   },
+  operatorDiagnostics: null,
+  processState: "stopped",
   provider: settingsWorkspace.provider,
+  providerSessionState: "active",
+  sessionCreatedAt: "2026-09-15T10:00:00Z",
+  sessionUpdatedAt: "2026-09-15T10:05:00Z",
   sponsorDisplayName: "Daniel",
-  sponsorPrincipalId: "prn_00000000000000000000000000000001",
   timeoutSeconds: {
     source: settingsWorkspace.timeoutSeconds.source,
     value: settingsWorkspace.timeoutSeconds.value,
   },
   workspaceMode: "owner",
+  workspaceLabel: "kai",
   workspace: settingsWorkspace.workspace,
   workspaceRevision: settingsWorkspace.revision,
   workspaces: settingsWorkspace.workspaces,
@@ -903,7 +918,7 @@ describe("Workshop React client", () => {
     vi.mocked(markHumanNotificationsRead).mockResolvedValue([]);
     vi.mocked(loadRun).mockResolvedValue(completedRun);
     vi.mocked(loadRunTrace).mockResolvedValue({ collaborationActivity: [], entries: [], hasMore: false });
-    vi.mocked(loadEffectiveAgentRuntime).mockResolvedValue(effectiveAgentRuntime);
+    vi.mocked(loadRuntimeLaneStatus).mockResolvedValue(runtimeLaneStatus);
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
     vi.mocked(loadStandingParticipation).mockResolvedValue(standingParticipation);
     vi.mocked(updateStandingParticipation).mockResolvedValue(standingParticipation);
@@ -1879,9 +1894,10 @@ describe("Workshop React client", () => {
         principalId: "prn_00000000000000000000000000000003",
       },
     });
-    vi.mocked(loadEffectiveAgentRuntime).mockResolvedValue({
-      ...effectiveAgentRuntime,
+    vi.mocked(loadRuntimeLaneStatus).mockResolvedValue({
+      ...runtimeLaneStatus,
       canManageRuntime: false,
+      processState: "hidden",
       workspaceMode: "neutral",
       workspace: null,
       workspaceRevision: null,
@@ -2717,6 +2733,20 @@ describe("Workshop React client", () => {
       throughPosition: 25,
       previousCursor: null,
     }));
+    vi.mocked(loadRuntimeLaneStatus).mockImplementation(async (_session, agentId) => ({
+      ...runtimeLaneStatus,
+      agentHandle: agentId?.endsWith("09") ? "qualification" : "kai",
+      agentId: agentId ?? runtimeLaneStatus.agentId,
+      agentName: agentId?.endsWith("09") ? "Qualification" : "Kai",
+      canManageRuntime: false,
+      channelId: secondChannelId,
+      processState: "hidden",
+      workspaceMode: "neutral",
+      workspaceLabel: null,
+      workspace: null,
+      workspaceRevision: null,
+      workspaces: [],
+    }));
     render(<App />);
 
     expect(await screen.findByText(`History for ${channelId}`)).toBeVisible();
@@ -2759,6 +2789,16 @@ describe("Workshop React client", () => {
     );
     const groupChannel = {
       ...navigation.workshops[0].channels[0],
+      agents: [
+        ...navigation.workshops[0].channels[0].agents,
+        {
+          ...navigation.workshops[0].channels[0].agents[0],
+          agentId: "agt_00000000000000000000000000000009",
+          handle: "qualification",
+          name: "Qualification",
+          principalId: "prn_00000000000000000000000000000009",
+        },
+      ],
       channelId: secondChannelId,
       kind: "group" as const,
       name: "Wake policy qualification",
@@ -2792,14 +2832,16 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${secondChannelId}`),
     ).toBeVisible();
-    expect(await screen.findByText(
-      "Runtime is selected per agent when that agent participates.",
-    )).toBeVisible();
+    expect(await screen.findByText("Qualification")).toBeVisible();
     expect(screen.queryByLabelText("Workspace")).toBeNull();
-    expect(loadEffectiveAgentRuntime).not.toHaveBeenCalledWith({
-      channelId: secondChannelId,
-      token: "existing-session",
-    });
+    expect(loadRuntimeLaneStatus).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      "agt_00000000000000000000000000000001",
+    );
+    expect(loadRuntimeLaneStatus).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      "agt_00000000000000000000000000000009",
+    );
     await waitFor(() => expect(loadNavigation).toHaveBeenCalledTimes(1));
     expect((await screen.findAllByText("Live")).length).toBeGreaterThanOrEqual(1);
 

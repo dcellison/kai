@@ -623,19 +623,42 @@ export interface WorkshopWorkspaceGrants {
   workspaceBase: string | null;
 }
 
-export interface WorkshopEffectiveAgentRuntime {
+export interface WorkshopRuntimeLaneRunStatus {
+  acceptedAt: string;
+  runId: string;
+  startedAt: string | null;
+  status: "accepted" | "started" | "completed" | "failed" | "cancelled";
+  terminalAt: string | null;
+  terminalCode: string | null;
+}
+
+export interface WorkshopRuntimeLaneStatus {
   agentHandle: string;
   agentId: string;
   agentName: string;
+  activeRun: WorkshopRuntimeLaneRunStatus | null;
   backend: string;
   canManageRuntime: boolean;
   channelId: string;
+  continuityState: "not_started" | "active" | "refresh_pending" | "stale";
+  lastRun: WorkshopRuntimeLaneRunStatus | null;
   model: { source: string; value: string };
+  operatorDiagnostics: {
+    contextThroughEventPosition: number | null;
+    lastRunId: string | null;
+    providerSessionPresent: boolean;
+    providerSessionRevision: string | null;
+    runtimeProfileId: string;
+  } | null;
+  processState: "alive" | "stopped" | "hidden";
   provider: string;
+  providerSessionState: "not_started" | "active" | "refresh_pending" | "stateless" | "stale";
+  sessionCreatedAt: string | null;
+  sessionUpdatedAt: string | null;
   sponsorDisplayName: string;
-  sponsorPrincipalId: string;
   timeoutSeconds: { source: string; value: number };
   workspaceMode: "owner" | "neutral";
+  workspaceLabel: string | null;
   workspace: string | null;
   workspaceRevision: string | null;
   workspaces: WorkshopWorkspaceOption[];

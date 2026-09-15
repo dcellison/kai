@@ -134,6 +134,7 @@ from kai.workshop.proactive_publication import (
 from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
+from kai.workshop.runtime_lane_status import WorkshopRuntimeLaneStatusService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.scheduled_jobs import (
     WorkshopScheduledJobAuthority,
@@ -2203,6 +2204,7 @@ async def _register_workshop_client_api(
     run_previews: WorkshopRunPreviewRegistry | None = None,
     artifact_service: WorkshopArtifactService | None = None,
     settings_workspaces: WorkshopSettingsWorkspaceService | None = None,
+    runtime_lane_status: WorkshopRuntimeLaneStatusService | None = None,
     routing_eligibility: WorkshopRoutingEligibilityService | None = None,
     routing_policy: WorkshopRoutingPolicyService | None = None,
     memory_queries: WorkshopMemoryQueryService | None = None,
@@ -2253,6 +2255,7 @@ async def _register_workshop_client_api(
             run_previews=run_previews,
             artifact_service=artifact_service,
             settings_workspaces=settings_workspaces,
+            runtime_lane_status=runtime_lane_status,
             routing_eligibility=routing_eligibility,
             routing_policy=routing_policy,
             memory_queries=memory_queries,
@@ -2353,6 +2356,7 @@ async def start(
             run_previews=core_services.run_previews,
             artifact_service=core_services.artifacts,
             settings_workspaces=core_services.settings_workspaces,
+            runtime_lane_status=core_services.runtime_lane_status,
             routing_eligibility=getattr(core_services, "routing_eligibility", None),
             routing_policy=getattr(core_services, "routing_policy", None),
             memory_queries=core_services.memory_queries,

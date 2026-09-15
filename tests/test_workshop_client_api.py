@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import FormData, web
@@ -160,6 +161,7 @@ from kai.workshop.run_lifecycle import (
     WorkshopRunLifecycle,
 )
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
+from kai.workshop.runtime_lane_status import WorkshopRuntimeLaneStatusService
 from kai.workshop.settings_workspaces import (
     BackendOption,
     EditableCapability,
@@ -1140,6 +1142,7 @@ async def _open_client(
     human_avatars=None,
     collaboration_policy=None,
     standing_participation=None,
+    runtime_lane_status=None,
     invalidate_agent_context=None,
 ) -> TestClient:
     app = web.Application()
@@ -1170,6 +1173,7 @@ async def _open_client(
         human_avatars=human_avatars,
         collaboration_policy=collaboration_policy,
         standing_participation=standing_participation,
+        runtime_lane_status=runtime_lane_status,
         invalidate_agent_context=invalidate_agent_context,
     )
     client = TestClient(TestServer(app))
@@ -4086,7 +4090,7 @@ class TestWorkshopRoutingPolicyHTTPContract:
 
 
 class TestWorkshopSettingsWorkspaceHTTPContract:
-    async def test_nonowner_reads_only_the_effective_owner_sponsored_runtime(
+    async def test_runtime_lane_status_is_canonical_and_hides_owner_private_state(
         self,
         tmp_path: Path,
     ) -> None:
@@ -4097,23 +4101,41 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             secondary_principal_id=bob_id,
             secondary_channel_id=bob_channel,
         )
+        runtime_pool = MagicMock()
+        runtime_pool.is_alive.return_value = False
+        runtime_status = WorkshopRuntimeLaneStatusService(
+            store,
+            service,  # type: ignore[arg-type]
+            runtime_pool,
+        )
+        browser_authority = await runtime_status.authority_for_principal_channel(
+            bob_id,
+            bob_channel,
+        )
+        telegram_authority = await runtime_status.authority_for_transport_binding(
+            transport="telegram",
+            sender_subject="202",
+            channel_subject="202",
+        )
+        assert telegram_authority == browser_authority
         client = await _open_client(
             store,
             _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
             settings_workspaces=service,
+            runtime_lane_status=runtime_status,
         )
         headers = {"Authorization": "Bearer bob-token"}
         try:
             effective = await client.get(
-                f"/v1/channels/{bob_channel}/effective-agent-runtime",
+                f"/v1/channels/{bob_channel}/runtime-status",
                 headers=headers,
             )
             owner_effective = await client.get(
-                f"/v1/channels/{alice_channel}/effective-agent-runtime",
+                f"/v1/channels/{alice_channel}/runtime-status",
                 headers={"Authorization": "Bearer alice-token"},
             )
             cross_principal = await client.get(
-                f"/v1/channels/{alice_channel}/effective-agent-runtime",
+                f"/v1/channels/{alice_channel}/runtime-status",
                 headers=headers,
             )
             owner_mutation = await client.patch(
@@ -4131,31 +4153,37 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert isinstance(payload["agent_id"], str)
             assert payload["agent_id"].startswith("agt_")
             effective_agent_id = payload["agent_id"]
-            assert payload == {
-                "version": 1,
-                "channel_id": str(bob_channel),
-                "agent_id": effective_agent_id,
-                "agent_name": "Kai",
-                "agent_handle": "kai",
-                "sponsor_principal_id": str(alice_id),
-                "sponsor_display_name": "Alice",
-                "can_manage_runtime": False,
-                "backend": "codex",
-                "provider": "openai",
-                "model": {"value": "gpt-5.6-sol", "source": "runtime policy"},
-                "timeout_seconds": {"value": 120, "source": "runtime policy"},
-                "workspace_mode": "neutral",
-                "workspace": None,
-                "workspace_revision": None,
-                "workspaces": [],
-            }
+            assert payload["version"] == 1
+            assert payload["channel_id"] == str(bob_channel)
+            assert payload["agent_id"] == effective_agent_id
+            assert payload["agent_name"] == "Kai"
+            assert payload["agent_handle"] == "kai"
+            assert payload["sponsor_display_name"] == "Alice"
+            assert payload["can_manage_runtime"] is False
+            assert payload["backend"] == "codex"
+            assert payload["provider"] == "openai"
+            assert payload["model"] == {"value": "gpt-5.6-sol", "source": "runtime policy"}
+            assert payload["timeout_seconds"] == {"value": 120, "source": "runtime policy"}
+            assert payload["workspace_mode"] == "neutral"
+            assert payload["workspace_label"] is None
+            assert payload["workspace"] is None
+            assert payload["workspace_revision"] is None
+            assert payload["workspaces"] == []
+            assert payload["process_state"] == "hidden"
+            assert payload["provider_session_state"] == "not_started"
+            assert payload["continuity_state"] == "not_started"
+            assert payload["active_run"] is None
+            assert payload["last_run"] is None
+            assert payload["operator_diagnostics"] is None
             assert "capabilities" not in payload
+            assert "sponsor_principal_id" not in payload
             assert "/srv/kai" not in json.dumps(payload)
             owner_payload = await owner_effective.json()
             assert owner_effective.status == 200
             assert owner_payload["can_manage_runtime"] is True
             assert owner_payload["workspace_mode"] == "owner"
-            assert owner_payload["sponsor_principal_id"] == str(alice_id)
+            assert owner_payload["process_state"] == "stopped"
+            assert owner_payload["operator_diagnostics"]["runtime_profile_id"] == str(profile_id(101))
             for field in ("agent_id", "backend", "provider", "model", "timeout_seconds"):
                 assert owner_payload[field] == payload[field]
             assert owner_payload["workspace"] == "/srv/kai"

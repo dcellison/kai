@@ -99,7 +99,7 @@ _TELEGRAM_COMMANDS = (
     BotCommand("preferences", "View or edit your preferences"),
     BotCommand("voice", "Toggle voice or set voice name"),
     BotCommand("voices", "Choose a voice"),
-    BotCommand("stats", "Show session info and cost"),
+    BotCommand("stats", "Show canonical runtime status"),
     BotCommand("job", "Manage scheduled jobs"),
     BotCommand("webhooks", "Show webhook server status"),
     BotCommand("help", "Show available commands"),

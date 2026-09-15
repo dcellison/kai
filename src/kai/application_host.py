@@ -68,6 +68,7 @@ from kai.workshop.proactive_publication import (
 from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
+from kai.workshop.runtime_lane_status import WorkshopRuntimeLaneStatusService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
 from kai.workshop.runtime_state import WorkshopRuntimeStateWriter
@@ -205,6 +206,7 @@ class KaiCoreServices:
     scheduler: WorkshopCanonicalScheduler
     artifacts: WorkshopArtifactService
     settings_workspaces: WorkshopSettingsWorkspaceService
+    runtime_lane_status: WorkshopRuntimeLaneStatusService
     memory_queries: WorkshopMemoryQueryService
     preference_documents: WorkshopPreferenceService
     principal_policies: WorkshopPrincipalPolicyService
@@ -452,6 +454,11 @@ class KaiApplicationHost:
                 self._execution_state,
                 model_catalogue,
             )
+            runtime_lane_status = WorkshopRuntimeLaneStatusService(
+                client_store,
+                settings_workspaces,
+                runtime_pool,
+            )
             memory_queries = WorkshopMemoryQueryService(
                 self._config,
                 client_store,
@@ -561,6 +568,7 @@ class KaiApplicationHost:
                 artifacts=artifacts,
                 human_avatars=human_avatars,
                 settings_workspaces=settings_workspaces,
+                runtime_lane_status=runtime_lane_status,
                 memory_queries=memory_queries,
                 preference_documents=preference_documents,
                 principal_policies=principal_policies,

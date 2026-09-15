@@ -15,7 +15,8 @@ import type {
   WorkshopRunTransition,
   WorkshopSession,
   WorkshopEditableCapability,
-  WorkshopEffectiveAgentRuntime,
+  WorkshopRuntimeLaneRunStatus,
+  WorkshopRuntimeLaneStatus,
   WorkshopSettingsMutation,
   WorkshopModelCatalogue,
   WorkshopSettingsWorkspace,
@@ -4183,17 +4184,47 @@ export async function loadSettingsWorkspace(
   return parseSettingsWorkspace(payload, session.channelId);
 }
 
-export async function loadEffectiveAgentRuntime(
+function parseRuntimeLaneRunStatus(value: unknown): WorkshopRuntimeLaneRunStatus | null {
+  if (value === null) {
+    return null;
+  }
+  if (
+    !isRecord(value) ||
+    typeof value.run_id !== "string" ||
+    typeof value.status !== "string" ||
+    !["accepted", "started", "completed", "failed", "cancelled"].includes(value.status) ||
+    typeof value.accepted_at !== "string" ||
+    !(typeof value.started_at === "string" || value.started_at === null) ||
+    !(typeof value.terminal_at === "string" || value.terminal_at === null) ||
+    !(typeof value.terminal_code === "string" || value.terminal_code === null)
+  ) {
+    throw new Error("Kai returned an unsupported runtime run status.");
+  }
+  return {
+    acceptedAt: value.accepted_at,
+    runId: value.run_id,
+    startedAt: value.started_at,
+    status: value.status as WorkshopRuntimeLaneRunStatus["status"],
+    terminalAt: value.terminal_at,
+    terminalCode: value.terminal_code,
+  };
+}
+
+export async function loadRuntimeLaneStatus(
   session: WorkshopSession,
-): Promise<WorkshopEffectiveAgentRuntime> {
+  agentId: string | null = null,
+): Promise<WorkshopRuntimeLaneStatus> {
+  const target = agentId === null
+    ? `/v1/channels/${encodeURIComponent(session.channelId)}/runtime-status`
+    : `/v1/channels/${encodeURIComponent(session.channelId)}/runtime-status?agent_id=${encodeURIComponent(agentId)}`;
   const response = await authorizedFetch(
     session,
-    `/v1/channels/${encodeURIComponent(session.channelId)}/effective-agent-runtime`,
+    target,
   );
   const payload = await responsePayload(response);
   if (!response.ok) {
     throw new Error(
-      safeErrorMessage(payload, "Could not load the effective agent runtime."),
+      safeErrorMessage(payload, "Could not load runtime status."),
     );
   }
   if (
@@ -4204,8 +4235,6 @@ export async function loadEffectiveAgentRuntime(
     !AGENT_PATTERN.test(payload.agent_id) ||
     typeof payload.agent_name !== "string" ||
     typeof payload.agent_handle !== "string" ||
-    typeof payload.sponsor_principal_id !== "string" ||
-    !PRINCIPAL_PATTERN.test(payload.sponsor_principal_id) ||
     typeof payload.sponsor_display_name !== "string" ||
     typeof payload.can_manage_runtime !== "boolean" ||
     typeof payload.backend !== "string" ||
@@ -4217,11 +4246,22 @@ export async function loadEffectiveAgentRuntime(
     !Number.isSafeInteger(payload.timeout_seconds.value) ||
     typeof payload.timeout_seconds.source !== "string" ||
     !["owner", "neutral"].includes(String(payload.workspace_mode)) ||
+    !(typeof payload.workspace_label === "string" || payload.workspace_label === null) ||
     !(typeof payload.workspace === "string" || payload.workspace === null) ||
     !(typeof payload.workspace_revision === "string" || payload.workspace_revision === null) ||
-    !Array.isArray(payload.workspaces)
+    !Array.isArray(payload.workspaces) ||
+    !["alive", "stopped", "hidden"].includes(String(payload.process_state)) ||
+    !["not_started", "active", "refresh_pending", "stateless", "stale"].includes(
+      String(payload.provider_session_state),
+    ) ||
+    !["not_started", "active", "refresh_pending", "stale"].includes(
+      String(payload.continuity_state),
+    ) ||
+    !(typeof payload.session_created_at === "string" || payload.session_created_at === null) ||
+    !(typeof payload.session_updated_at === "string" || payload.session_updated_at === null) ||
+    !(payload.operator_diagnostics === null || isRecord(payload.operator_diagnostics))
   ) {
-    throw new Error("Kai returned an unsupported effective agent runtime.");
+    throw new Error("Kai returned an unsupported runtime lane status.");
   }
   const workspaces = payload.workspaces.map((rawWorkspace) => {
     if (
@@ -4252,22 +4292,51 @@ export async function loadEffectiveAgentRuntime(
   ) {
     throw new Error("Kai returned an inconsistent effective workspace.");
   }
+  const diagnostics = payload.operator_diagnostics;
+  if (
+    diagnostics !== null &&
+    (!isRecord(diagnostics) ||
+      typeof diagnostics.runtime_profile_id !== "string" ||
+      !RUNTIME_PROFILE_PATTERN.test(diagnostics.runtime_profile_id) ||
+      !(typeof diagnostics.provider_session_revision === "string" ||
+        diagnostics.provider_session_revision === null) ||
+      typeof diagnostics.provider_session_present !== "boolean" ||
+      !(typeof diagnostics.last_run_id === "string" || diagnostics.last_run_id === null) ||
+      !(Number.isSafeInteger(diagnostics.context_through_event_position) ||
+        diagnostics.context_through_event_position === null))
+  ) {
+    throw new Error("Kai returned unsupported runtime diagnostics.");
+  }
   return {
+    activeRun: parseRuntimeLaneRunStatus(payload.active_run),
     agentHandle: payload.agent_handle,
     agentId: payload.agent_id,
     agentName: payload.agent_name,
     backend: payload.backend,
     canManageRuntime: payload.can_manage_runtime,
     channelId: payload.channel_id,
+    continuityState: payload.continuity_state as WorkshopRuntimeLaneStatus["continuityState"],
+    lastRun: parseRuntimeLaneRunStatus(payload.last_run),
     model: { source: payload.model.source, value: payload.model.value },
+    operatorDiagnostics: diagnostics === null ? null : {
+      contextThroughEventPosition: diagnostics.context_through_event_position as number | null,
+      lastRunId: diagnostics.last_run_id as string | null,
+      providerSessionPresent: diagnostics.provider_session_present as boolean,
+      providerSessionRevision: diagnostics.provider_session_revision as string | null,
+      runtimeProfileId: diagnostics.runtime_profile_id as string,
+    },
+    processState: payload.process_state as WorkshopRuntimeLaneStatus["processState"],
     provider: payload.provider,
+    providerSessionState: payload.provider_session_state as WorkshopRuntimeLaneStatus["providerSessionState"],
+    sessionCreatedAt: payload.session_created_at,
+    sessionUpdatedAt: payload.session_updated_at,
     sponsorDisplayName: payload.sponsor_display_name,
-    sponsorPrincipalId: payload.sponsor_principal_id,
     timeoutSeconds: {
       source: payload.timeout_seconds.source,
       value: payload.timeout_seconds.value as number,
     },
     workspaceMode,
+    workspaceLabel: payload.workspace_label,
     workspace: payload.workspace,
     workspaceRevision: payload.workspace_revision,
     workspaces,
