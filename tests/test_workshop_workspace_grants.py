@@ -94,6 +94,85 @@ async def test_version_seventy_nine_database_preserves_legacy_grants(
     await sessions.close_db()
 
 
+async def test_version_eighty_receipts_upgrade_before_projection_rebuild(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from kai.workshop import schema
+
+    database = tmp_path / "workspace-grant-rebuild.db"
+    human = BootstrapHuman(
+        "Human 101",
+        "admin",
+        "telegram",
+        "101",
+        "101",
+        profile_id(101),
+    )
+    profiles = profile_registry(101)
+
+    with monkeypatch.context() as migration_context:
+        migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 80)
+        migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:80])
+        await sessions.init_db(database)
+        await sessions.add_allowed_workspace(101, "/projects/from-telegram")
+        await sessions.bootstrap_workshop_foundation((human,))
+        registry, _execution_migration = await sessions.initialize_workshop_execution_state(profiles)
+        await sessions.initialize_workshop_workspace_grant_authority(registry, profiles)
+        await sessions._get_db().execute(
+            "ALTER TABLE workshop_workspace_grant_migrations RENAME TO workshop_workspace_grant_migrations_without_fk"
+        )
+        await sessions._get_db().execute(
+            """
+            CREATE TABLE workshop_workspace_grant_migrations (
+                runtime_profile_id TEXT PRIMARY KEY CHECK (
+                    length(runtime_profile_id) BETWEEN 1 AND 128
+                ),
+                legacy_runtime_key INTEGER NOT NULL UNIQUE CHECK (legacy_runtime_key > 0),
+                principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+                legacy_rows INTEGER NOT NULL CHECK (legacy_rows >= 0),
+                migrated_rows INTEGER NOT NULL CHECK (migrated_rows >= 0),
+                invalid_rows INTEGER NOT NULL CHECK (invalid_rows >= 0),
+                migrated_at TEXT NOT NULL
+            )
+            """
+        )
+        await sessions._get_db().execute(
+            "INSERT INTO workshop_workspace_grant_migrations "
+            "SELECT * FROM workshop_workspace_grant_migrations_without_fk"
+        )
+        await sessions._get_db().execute("DROP TABLE workshop_workspace_grant_migrations_without_fk")
+        await sessions._get_db().commit()
+        async with sessions._get_db().execute(
+            "SELECT runtime_profile_id, legacy_runtime_key, principal_id, "
+            "legacy_rows, migrated_rows, invalid_rows "
+            "FROM workshop_workspace_grant_migrations"
+        ) as cursor:
+            receipt = await cursor.fetchone()
+        assert receipt is not None
+        async with sessions._get_db().execute("PRAGMA foreign_key_list(workshop_workspace_grant_migrations)") as cursor:
+            assert len(await cursor.fetchall()) == 1
+        await sessions.close_db()
+
+    await sessions.init_db(database)
+    result = await sessions.bootstrap_workshop_foundation((human,))
+
+    assert result.workshop_id
+    async with sessions._get_db().execute(
+        "SELECT runtime_profile_id, legacy_runtime_key, principal_id, "
+        "legacy_rows, migrated_rows, invalid_rows "
+        "FROM workshop_workspace_grant_migrations"
+    ) as cursor:
+        upgraded_receipt = await cursor.fetchone()
+    assert upgraded_receipt is not None
+    assert tuple(upgraded_receipt) == tuple(receipt)
+    async with sessions._get_db().execute("PRAGMA foreign_key_list(workshop_workspace_grant_migrations)") as cursor:
+        assert await cursor.fetchall() == []
+    async with sessions._get_db().execute("PRAGMA foreign_key_check") as cursor:
+        assert await cursor.fetchall() == []
+    await sessions.close_db()
+
+
 async def test_canonical_grants_are_isolated_by_principal_and_runtime(database: Path) -> None:
     profiles, registry = await _bootstrap(database, 101, 202)
     await sessions.initialize_workshop_workspace_grant_authority(registry, profiles)
