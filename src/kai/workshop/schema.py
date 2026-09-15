@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 80
+WORKSHOP_SCHEMA_VERSION = 81
 
 
 @dataclass(frozen=True, slots=True)
@@ -3557,13 +3557,48 @@ _CANONICAL_WORKSPACE_GRANT_AUTHORITY_SCHEMA = SchemaMigration(
                 length(runtime_profile_id) BETWEEN 1 AND 128
             ),
             legacy_runtime_key INTEGER NOT NULL UNIQUE CHECK (legacy_runtime_key > 0),
-            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            -- This durable migration receipt survives canonical projection
+            -- rebuilds, so principal_id deliberately is not a foreign key
+            -- into the replayed principals table.
+            principal_id TEXT NOT NULL,
             legacy_rows INTEGER NOT NULL CHECK (legacy_rows >= 0),
             migrated_rows INTEGER NOT NULL CHECK (migrated_rows >= 0),
             invalid_rows INTEGER NOT NULL CHECK (invalid_rows >= 0),
             migrated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
         """,
+    ),
+)
+
+
+_REPLAY_SAFE_WORKSPACE_GRANT_MIGRATION_SCHEMA = SchemaMigration(
+    version=81,
+    name="replay_safe_workspace_grant_migration_receipts",
+    statements=(
+        "ALTER TABLE workshop_workspace_grant_migrations RENAME TO workshop_workspace_grant_migrations_v80",
+        """
+        CREATE TABLE workshop_workspace_grant_migrations (
+            runtime_profile_id TEXT PRIMARY KEY CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            legacy_runtime_key INTEGER NOT NULL UNIQUE CHECK (legacy_runtime_key > 0),
+            principal_id TEXT NOT NULL,
+            legacy_rows INTEGER NOT NULL CHECK (legacy_rows >= 0),
+            migrated_rows INTEGER NOT NULL CHECK (migrated_rows >= 0),
+            invalid_rows INTEGER NOT NULL CHECK (invalid_rows >= 0),
+            migrated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """,
+        """
+        INSERT INTO workshop_workspace_grant_migrations (
+            runtime_profile_id, legacy_runtime_key, principal_id,
+            legacy_rows, migrated_rows, invalid_rows, migrated_at
+        )
+        SELECT runtime_profile_id, legacy_runtime_key, principal_id,
+            legacy_rows, migrated_rows, invalid_rows, migrated_at
+        FROM workshop_workspace_grant_migrations_v80
+        """,
+        "DROP TABLE workshop_workspace_grant_migrations_v80",
     ),
 )
 
@@ -3648,6 +3683,7 @@ _MIGRATIONS = (
     _RETAINED_CONTEXT_REVISION_SCHEMA,
     _CANONICAL_CONVERSATION_OBSERVATION_SCHEMA,
     _CANONICAL_WORKSPACE_GRANT_AUTHORITY_SCHEMA,
+    _REPLAY_SAFE_WORKSPACE_GRANT_MIGRATION_SCHEMA,
 )
 
 
