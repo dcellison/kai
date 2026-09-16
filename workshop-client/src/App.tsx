@@ -2391,7 +2391,6 @@ function ContextSection({
   return (
     <details className={`context-section${className ? ` ${className}` : ""}`}>
       <summary className="context-section-toggle">
-        <SelectChevronIcon />
         <span className="section-number">{number}</span>
         <h3 className="context-section-title">{title}</h3>
       </summary>

@@ -2484,22 +2484,13 @@ button:disabled {
 
 .context-section-toggle {
   display: grid;
-  grid-template-columns: 1rem 2rem minmax(0, 1fr);
+  grid-template-columns: 2rem minmax(0, 1fr);
   align-items: center;
   gap: 0.45rem;
   min-height: 2.7rem;
   padding: 0.5rem 1rem;
   color: var(--color-text-strong);
   cursor: pointer;
-  list-style: none;
-}
-
-.context-section-toggle::marker {
-  content: "";
-}
-
-.context-section-toggle::-webkit-details-marker {
-  display: none;
 }
 
 .context-section-toggle:hover,
@@ -2520,16 +2511,6 @@ button:disabled {
   font-weight: 540;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.context-section-toggle svg {
-  width: 1rem;
-  height: 1rem;
-  transition: transform 140ms ease;
-}
-
-.context-section[open] > .context-section-toggle svg {
-  transform: rotate(180deg);
 }
 
 .context-section-body {
