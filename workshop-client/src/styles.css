@@ -103,8 +103,8 @@
 }
 
 .context-source-card > header .panel-icon-button svg {
-  width: 0.68rem;
-  height: 0.68rem;
+  width: 1rem;
+  height: 1rem;
 }
 
 .context-source-card h4,
@@ -2479,8 +2479,57 @@ button:disabled {
 }
 
 .context-section {
-  padding: 0.6rem 1rem 0.68rem;
   border-bottom: 1px solid var(--color-border);
+}
+
+.context-section-toggle {
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr) 1rem;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.7rem;
+  padding: 0.5rem 1rem;
+  color: var(--color-text-strong);
+  cursor: pointer;
+  list-style: none;
+}
+
+.context-section-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.context-section-toggle:hover,
+.context-section-toggle:focus-visible {
+  background: color-mix(in srgb, var(--color-text) 4%, transparent);
+  outline: none;
+}
+
+.context-section-toggle .section-number {
+  margin: 0;
+}
+
+.context-section-toggle .context-section-title {
+  overflow: hidden;
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1rem;
+  font-weight: 540;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-section-toggle svg {
+  width: 1rem;
+  height: 1rem;
+  transition: transform 140ms ease;
+}
+
+.context-section[open] > .context-section-toggle svg {
+  transform: rotate(180deg);
+}
+
+.context-section-body {
+  padding: 0 1rem 0.68rem;
 }
 
 .context-section h3 {
@@ -2510,18 +2559,15 @@ button:disabled {
   white-space: nowrap;
 }
 
-.context-section-heading {
+.context-section-body-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
+  justify-content: flex-end;
+  min-height: 2rem;
+  margin: -0.15rem 0 0.25rem;
 }
 
-.context-section-heading h3 {
-  margin-right: auto;
-}
-
-.context-section-heading .panel-icon-button svg {
+.context-section-body-actions .panel-icon-button svg {
   width: 1rem;
   height: 1rem;
   flex: none;

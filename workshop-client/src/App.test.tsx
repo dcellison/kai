@@ -165,6 +165,19 @@ const humanDirectChannelId = "chn_33333333333333333333333333333333";
 const definitionId = "adf_00000000000000000000000000000001";
 const revisionId = "adr_00000000000000000000000000000001";
 const runtimeProfileId = "rtp_00000000000000000000000000000001";
+
+async function openContextSection(title: string): Promise<HTMLDetailsElement> {
+  const heading = await screen.findByText(title, {
+    selector: ".context-section-title",
+  });
+  const section = heading.closest("details");
+  if (!(section instanceof HTMLDetailsElement)) {
+    throw new Error(`Missing context section for ${title}`);
+  }
+  section.open = true;
+  return section;
+}
+
 const navigation: WorkshopNavigation = {
   principal: {
     displayName: "Daniel",
@@ -1088,6 +1101,16 @@ describe("Workshop React client", () => {
     expect(screen.queryByText("Canonical Workshop command")).toBeNull();
     const channelContext = screen.getByLabelText("Channel context");
     expect(within(channelContext).queryByText("Canonical identity")).toBeNull();
+    const numberedSections = Array.from(
+      channelContext.querySelectorAll<HTMLDetailsElement>("details.context-section"),
+    );
+    expect(numberedSections).toHaveLength(4);
+    expect(numberedSections.every((section) => !section.open)).toBe(true);
+    await user.click(
+      within(channelContext).getByText("Channel authority", {
+        selector: ".context-section-title",
+      }),
+    );
     expect(within(channelContext).getByText(
       "You can read and send messages in this channel. Mention an agent to direct a request to it.",
     )).toBeVisible();
@@ -1881,6 +1904,7 @@ describe("Workshop React client", () => {
 
     render(<App />);
 
+    await openContextSection("Runtime and workspace");
     expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
     const selector = screen.getByLabelText("Your workspace");
     expect(selector).toHaveValue("/Users/kai/Projects/kai");
@@ -1929,6 +1953,7 @@ describe("Workshop React client", () => {
 
     render(<App />);
 
+    await openContextSection("Runtime and workspace");
     expect(await screen.findByText("Sponsored by Daniel")).toBeVisible();
     expect(screen.getByText("codex")).toBeVisible();
     expect(screen.getByText("· openai")).toBeVisible();
@@ -1960,6 +1985,7 @@ describe("Workshop React client", () => {
       .mockResolvedValueOnce({ collaborationActivity: [], entries: [traceEntry(3)], hasMore: false });
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await openContextSection("Run inspector");
 
     const startedRun: WorkshopRun = {
       ...completedRun,
@@ -2028,6 +2054,7 @@ describe("Workshop React client", () => {
       .mockResolvedValueOnce(page);
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await openContextSection("Run inspector");
 
     const startedRun: WorkshopRun = {
       ...completedRun,
@@ -2781,6 +2808,7 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${notificationChannelId}`),
     ).toBeVisible();
+    await openContextSection("Channel authority");
     expect(screen.getByText("GitHub")).toBeVisible();
     expect(screen.getByText("Durable notification feed")).toBeVisible();
     expect(
@@ -2855,6 +2883,8 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${secondChannelId}`),
     ).toBeVisible();
+    await openContextSection("Runtime and workspace");
+    await openContextSection("Agent participation");
     expect(await screen.findByText("Qualification")).toBeVisible();
     expect(screen.queryByLabelText("Workspace")).toBeNull();
     expect(loadRuntimeLaneStatus).toHaveBeenCalledWith(
@@ -3029,6 +3059,7 @@ describe("Workshop React client", () => {
       "existing-session",
       secondChannelId,
     ]);
+    await openContextSection("Archived");
     expect(
       await screen.findByText(/preserved and read-only/),
     ).toBeVisible();
@@ -3108,6 +3139,7 @@ describe("Workshop React client", () => {
       humanDirectChannelId,
     ]);
     expect(screen.queryByRole("button", { name: "Scott" })).toBeNull();
+    await openContextSection("Archived for you");
     expect(
       (await screen.findAllByText(/direct message is archived for you/i)).length,
     ).toBeGreaterThan(0);
@@ -3148,6 +3180,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
+    await openContextSection("People");
     const composer = await screen.findByLabelText(
       "Message Wake policy qualification",
     );
@@ -3188,6 +3221,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
+    await openContextSection("People");
     const composer = await screen.findByLabelText(
       "Message Wake policy qualification",
     );
@@ -3197,7 +3231,7 @@ describe("Workshop React client", () => {
     );
     expect(composer).toHaveValue("@scott ");
     expect(screen.queryByRole("option", { name: /Daniel/ })).toBeNull();
-    const channelPeople = screen.getByRole("heading", { name: "People" }).closest("section");
+    const channelPeople = screen.getByRole("heading", { name: "People" }).closest("details");
     expect(channelPeople).not.toBeNull();
     expect(channelPeople?.querySelectorAll(".context-person-avatar")).toHaveLength(2);
   });
@@ -3218,6 +3252,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
+    await openContextSection("People");
     await user.click(
       await screen.findByRole("button", { name: "Manage channel members" }),
     );
@@ -3520,6 +3555,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
+    await openContextSection("Agent participation");
     expect(await screen.findByText("Awake in this channel")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Dismiss Kai" }));
 
@@ -3579,6 +3615,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
+    await openContextSection("Agent participation");
 
     expect(await screen.findByText(/Joined in .* · standing/)).toBeVisible();
     expect(await screen.findByTitle("Agent contribution from standing participation")).toBeVisible();
@@ -3612,6 +3649,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
+    await openContextSection("Agent participation");
     await user.click(
       await screen.findByRole("button", { name: "Manage channel agents" }),
     );
@@ -3695,7 +3733,8 @@ describe("Workshop React client", () => {
     expect(screen.getByRole("heading", { name: "Conversation with Scott" })).toBeVisible();
     expect(screen.queryByRole("heading", { name: "Welcome to Scott" })).toBeNull();
     expect(screen.getByText("Messages here are private to you and Scott.")).toBeVisible();
-    const directPeople = screen.getByRole("heading", { name: "People" }).closest("section");
+    await openContextSection("People");
+    const directPeople = screen.getByRole("heading", { name: "People" }).closest("details");
     expect(directPeople).not.toBeNull();
     expect(directPeople?.querySelectorAll(".context-person-avatar")).toHaveLength(2);
     expect(await screen.findByRole("button", { name: "Reply to message" })).toBeVisible();
