@@ -1106,6 +1106,11 @@ describe("Workshop React client", () => {
     );
     expect(numberedSections).toHaveLength(4);
     expect(numberedSections.every((section) => !section.open)).toBe(true);
+    expect(
+      numberedSections.every(
+        (section) => section.querySelector("summary")?.firstElementChild?.tagName === "svg",
+      ),
+    ).toBe(true);
     await user.click(
       within(channelContext).getByText("Channel authority", {
         selector: ".context-section-title",

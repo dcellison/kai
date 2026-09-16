@@ -2484,7 +2484,7 @@ button:disabled {
 
 .context-section-toggle {
   display: grid;
-  grid-template-columns: 2rem minmax(0, 1fr) 1rem;
+  grid-template-columns: 1rem 2rem minmax(0, 1fr);
   align-items: center;
   gap: 0.45rem;
   min-height: 2.7rem;
@@ -2492,6 +2492,10 @@ button:disabled {
   color: var(--color-text-strong);
   cursor: pointer;
   list-style: none;
+}
+
+.context-section-toggle::marker {
+  content: "";
 }
 
 .context-section-toggle::-webkit-details-marker {
