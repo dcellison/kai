@@ -1108,7 +1108,7 @@ describe("Workshop React client", () => {
     expect(numberedSections.every((section) => !section.open)).toBe(true);
     expect(
       numberedSections.every(
-        (section) => section.querySelector("summary")?.firstElementChild?.tagName === "svg",
+        (section) => section.querySelector("summary")?.querySelector("svg") === null,
       ),
     ).toBe(true);
     await user.click(
