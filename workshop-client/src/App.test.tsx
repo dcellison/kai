@@ -3266,7 +3266,16 @@ describe("Workshop React client", () => {
 
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Archive channel" }));
+    const settingsButton = screen.getByRole("button", {
+      name: "Channel settings",
+    }) as HTMLButtonElement;
+    const archiveButton = screen.getByRole("button", {
+      name: "Archive channel",
+    }) as HTMLButtonElement;
+    const headerButtons = [...(archiveButton.closest("header")?.querySelectorAll("button") ?? [])];
+    expect(headerButtons.indexOf(settingsButton)).toBeLessThan(headerButtons.indexOf(archiveButton));
+    expect(headerButtons.at(-1)).toBe(archiveButton);
+    await user.click(archiveButton);
     const confirmation = screen.getByRole("dialog", { name: "Continue?" });
     await user.click(
       within(confirmation).getByRole("button", { name: "Continue" }),
@@ -3840,11 +3849,15 @@ describe("Workshop React client", () => {
 
     expect(await screen.findByText(/Joined in .* · standing/)).toBeVisible();
     expect(await screen.findByTitle("Agent contribution from standing participation")).toBeVisible();
-    const policy = screen.getByRole("checkbox", { name: /Standing participation/ });
-    expect(policy).toBeChecked();
+    expect(screen.queryByRole("checkbox", { name: /Standing participation/ })).toBeNull();
     expect(screen.getByRole("button", {
       name: "Dismiss Kai from standing participation",
     })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Channel settings" }));
+    const settings = await screen.findByRole("dialog", { name: "Channel settings" });
+    const policy = within(settings).getByRole("checkbox", { name: /Standing participation/ });
+    expect(policy).toBeChecked();
+    expect(within(settings).getByText("Host limits")).toBeVisible();
     await user.click(policy);
     expect(updateStandingParticipation).toHaveBeenCalledWith(
       { channelId: secondChannelId, token: "existing-session" },

@@ -1923,6 +1923,98 @@ function ChannelMemberManagementDialog({
   );
 }
 
+function ChannelSettingsDialog({
+  busy,
+  channelName,
+  error,
+  loading,
+  onClose,
+  onStandingChange,
+  participation,
+}: {
+  busy: boolean;
+  channelName: string;
+  error: string | null;
+  loading: boolean;
+  onClose: () => void;
+  onStandingChange: (enabled: boolean) => Promise<void>;
+  participation: WorkshopStandingParticipation | null;
+}): React.JSX.Element {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        className="channel-creation-dialog channel-settings-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="channel-settings-title"
+      >
+        <header className="channel-archive-header">
+          <div>
+            <p className="overline"># {channelName}</p>
+            <h2 id="channel-settings-title">Channel settings</h2>
+          </div>
+          <button
+            className="panel-icon-button"
+            type="button"
+            aria-label="Close channel settings"
+            title="Close channel settings"
+            disabled={busy}
+            onClick={onClose}
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </header>
+        <section className="channel-settings-section" aria-labelledby="channel-participation-title">
+          <h3 id="channel-participation-title">Participation</h3>
+          {loading && !participation && (
+            <p className="channel-settings-state" role="status">
+              Loading participation policy…
+            </p>
+          )}
+          {participation && (
+            <>
+              <label className="standing-policy-toggle">
+                <input
+                  type="checkbox"
+                  checked={participation.policy.enabled}
+                  disabled={!participation.policy.canManage || busy}
+                  onChange={(event) => void onStandingChange(event.target.checked)}
+                />
+                <span>
+                  <strong>Standing participation</strong>
+                  <small>
+                    {participation.policy.enabled
+                      ? participation.policy.hostEnabled
+                        ? "On for this channel"
+                        : "Requested here · unavailable on this host"
+                      : "Off for this channel"}
+                  </small>
+                </span>
+              </label>
+              {!participation.policy.canManage && (
+                <p>Only a channel owner can change this policy.</p>
+              )}
+              <details className="standing-limits">
+                <summary>Host limits</summary>
+                <dl>
+                  <div><dt>Agents</dt><dd>{participation.policy.maxAgentsPerChannel}/channel</dd></div>
+                  <div><dt>Observe batch</dt><dd>{participation.policy.maxMessagesPerObserveRun} messages</dd></div>
+                  <div><dt>Pending</dt><dd>{participation.policy.maxPendingMessagesPerScope}/scope</dd></div>
+                  <div><dt>Observation</dt><dd>{participation.policy.maxObserveRunsPerHour}/hour</dd></div>
+                  <div><dt>Contributions</dt><dd>{participation.policy.maxUnsolicitedMessagesPerHour}/hour</dd></div>
+                  <div><dt>Cooldown</dt><dd>{participation.policy.minimumUnsolicitedIntervalSeconds}s</dd></div>
+                  <div><dt>Quiet expiry</dt><dd>{participation.policy.quietExpirySeconds}s</dd></div>
+                </dl>
+              </details>
+            </>
+          )}
+          {error && <p className="settings-error" role="alert">{error}</p>}
+        </section>
+      </section>
+    </div>
+  );
+}
+
 function ArchivedChannelsDialog({
   channels,
   busyChannelId,
@@ -2352,7 +2444,7 @@ function ThreadFollowIcon({ followed }: { followed: boolean }): React.JSX.Elemen
   );
 }
 
-function ManageAgentsIcon(): React.JSX.Element {
+function SettingsIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
       <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
@@ -3190,6 +3282,7 @@ function WorkshopView({
   const [archivedChannelsOpen, setArchivedChannelsOpen] = useState(false);
   const [archivedDirectMessagesOpen, setArchivedDirectMessagesOpen] = useState(false);
   const [archivedAgentsOpen, setArchivedAgentsOpen] = useState(false);
+  const [channelSettingsOpen, setChannelSettingsOpen] = useState(false);
   const [humanConversationOpen, setHumanConversationOpen] = useState(false);
   const [channelLifecycleBusy, setChannelLifecycleBusy] = useState<string | null>(null);
   const [directMessageArchiveBusy, setDirectMessageArchiveBusy] = useState<string | null>(null);
@@ -3213,6 +3306,7 @@ function WorkshopView({
   const [standingLoading, setStandingLoading] = useState(false);
   const [standingError, setStandingError] = useState<string | null>(null);
   const [standingPolicyBusy, setStandingPolicyBusy] = useState(false);
+  const [standingPolicyError, setStandingPolicyError] = useState<string | null>(null);
   const [standingResumeKey, setStandingResumeKey] = useState<string | null>(null);
   const [showSilentObservations, setShowSilentObservations] = useState(false);
   const [standingNotice, setStandingNotice] = useState<string | null>(null);
@@ -3521,6 +3615,8 @@ function WorkshopView({
     setStandingParticipation(null);
     setStandingNotice(null);
     setShowSilentObservations(false);
+    setStandingPolicyError(null);
+    setChannelSettingsOpen(false);
   }, [channelId]);
 
   useEffect(() => {
@@ -3648,7 +3744,7 @@ function WorkshopView({
     const current = standingParticipation;
     if (!current || standingPolicyBusy) return;
     setStandingPolicyBusy(true);
-    setStandingError(null);
+    setStandingPolicyError(null);
     try {
       applyStandingSnapshot(await updateStandingParticipation(
         { channelId, token: memoryToken },
@@ -3657,7 +3753,7 @@ function WorkshopView({
         createClientMessageId(),
       ));
     } catch (caught) {
-      setStandingError(
+      setStandingPolicyError(
         caught instanceof Error ? caught.message : "Could not update standing participation.",
       );
       await refreshStandingParticipation().catch(() => undefined);
@@ -5390,41 +5486,56 @@ function WorkshopView({
               <h2>{symbol} {channelName}</h2>
             </div>
             {channel.kind === "group" && channel.role === "owner" && (
-              <button
-                className="panel-icon-button"
-                type="button"
-                aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
-                title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
-                disabled={channelLifecycleBusy !== null || activeResponseRuns.length > 0}
-                onClick={() => void (
-                  !channelIsArchived(channel)
-                    ? archiveSelectedChannel()
-                    : restoreArchivedChannel(channelId)
+              <div className="context-channel-actions">
+                {!channelIsArchived(channel) && (
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label="Channel settings"
+                    title="Channel settings"
+                    onClick={() => setChannelSettingsOpen(true)}
+                  >
+                    <SettingsIcon />
+                  </button>
                 )}
-              >
-                {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
-              </button>
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                  title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                  disabled={channelLifecycleBusy !== null || activeResponseRuns.length > 0}
+                  onClick={() => void (
+                    !channelIsArchived(channel)
+                      ? archiveSelectedChannel()
+                      : restoreArchivedChannel(channelId)
+                  )}
+                >
+                  {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
+                </button>
+              </div>
             )}
             {channel.kind === "direct" &&
               !channel.agents.some((agent) => agent.lifecycleState === "archived") && (
-              <button
-                className="panel-icon-button"
-                type="button"
-                aria-label={directMessageArchived
-                  ? "Restore direct message"
-                  : "Archive direct message"}
-                title={directMessageArchived
-                  ? "Restore direct message"
-                  : "Archive direct message"}
-                disabled={directMessageArchiveBusy !== null || activeResponseRuns.length > 0}
-                onClick={() => void (
-                  directMessageArchived
-                    ? restoreArchivedDirectMessage(channelId)
-                    : archiveSelectedDirectMessage()
-                )}
-              >
-                {directMessageArchived ? <RestoreIcon /> : <ArchiveIcon />}
-              </button>
+              <div className="context-channel-actions">
+                <button
+                  className="panel-icon-button"
+                  type="button"
+                  aria-label={directMessageArchived
+                    ? "Restore direct message"
+                    : "Archive direct message"}
+                  title={directMessageArchived
+                    ? "Restore direct message"
+                    : "Archive direct message"}
+                  disabled={directMessageArchiveBusy !== null || activeResponseRuns.length > 0}
+                  onClick={() => void (
+                    directMessageArchived
+                      ? restoreArchivedDirectMessage(channelId)
+                      : archiveSelectedDirectMessage()
+                  )}
+                >
+                  {directMessageArchived ? <RestoreIcon /> : <ArchiveIcon />}
+                </button>
+              </div>
             )}
           </header>
 
@@ -5527,7 +5638,7 @@ function WorkshopView({
                     disabled={agentManagementLoading}
                     onClick={() => void openAgentManagement()}
                   >
-                    <ManageAgentsIcon />
+                    <SettingsIcon />
                   </button>
                 ) : undefined
               }
@@ -5536,36 +5647,6 @@ function WorkshopView({
             >
               {standingNotice && (
                 <p className="standing-notice" role="status">{standingNotice}</p>
-              )}
-              {standingLoading && !standingParticipation && <p>Loading standing participation…</p>}
-              {standingParticipation && (
-                <>
-                  <label className="standing-policy-toggle">
-                    <input
-                      type="checkbox"
-                      checked={standingParticipation.policy.enabled}
-                      disabled={
-                        !standingParticipation.policy.canManage ||
-                        standingPolicyBusy ||
-                        channelIsArchived(channel)
-                      }
-                      onChange={(event) => void setStandingPolicy(event.target.checked)}
-                    />
-                    <span>
-                      <strong>Standing participation</strong>
-                      <small>
-                        {standingParticipation.policy.enabled
-                          ? standingParticipation.policy.hostEnabled
-                            ? "On for this channel"
-                            : "Requested here · unavailable on this host"
-                          : "Off for this channel"}
-                      </small>
-                    </span>
-                  </label>
-                  {!standingParticipation.policy.canManage && (
-                    <p>Only a channel owner can change this policy.</p>
-                  )}
-                </>
               )}
               {channel.agents.length === 0 && <p>No agents are attached.</p>}
               <ul>
@@ -5641,20 +5722,6 @@ function WorkshopView({
                   );
                 })}
               </ul>
-              {standingParticipation && (
-                <details className="standing-limits">
-                  <summary>Host limits</summary>
-                  <dl>
-                    <div><dt>Agents</dt><dd>{standingParticipation.policy.maxAgentsPerChannel}/channel</dd></div>
-                    <div><dt>Observe batch</dt><dd>{standingParticipation.policy.maxMessagesPerObserveRun} messages</dd></div>
-                    <div><dt>Pending</dt><dd>{standingParticipation.policy.maxPendingMessagesPerScope}/scope</dd></div>
-                    <div><dt>Observation</dt><dd>{standingParticipation.policy.maxObserveRunsPerHour}/hour</dd></div>
-                    <div><dt>Contributions</dt><dd>{standingParticipation.policy.maxUnsolicitedMessagesPerHour}/hour</dd></div>
-                    <div><dt>Cooldown</dt><dd>{standingParticipation.policy.minimumUnsolicitedIntervalSeconds}s</dd></div>
-                    <div><dt>Quiet expiry</dt><dd>{standingParticipation.policy.quietExpirySeconds}s</dd></div>
-                  </dl>
-                </details>
-              )}
               {standingError && <p className="settings-error" role="alert">{standingError}</p>}
             </ContextSection>
           )}
@@ -5871,6 +5938,17 @@ function WorkshopView({
           </section>
         )}
       </aside>
+      {channelSettingsOpen && channel.kind === "group" && (
+        <ChannelSettingsDialog
+          busy={standingPolicyBusy}
+          channelName={channelName}
+          error={standingPolicyError ?? (standingParticipation ? null : standingError)}
+          loading={standingLoading}
+          onClose={() => setChannelSettingsOpen(false)}
+          onStandingChange={setStandingPolicy}
+          participation={standingParticipation}
+        />
+      )}
       {archivedChannelsOpen && (
         <ArchivedChannelsDialog
           channels={workshop.channels.filter(
