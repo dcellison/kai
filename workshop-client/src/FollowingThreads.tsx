@@ -1,7 +1,8 @@
 import { useState } from "react";
 
-import type { WorkshopFollowedThread } from "./types";
+import type { ConnectionState, WorkshopFollowedThread } from "./types";
 import type { FollowedThreadClientState } from "./useFollowedThreads";
+import { ActivityWorkspaceHeader } from "./ActivityWorkspaceHeader";
 
 function formatTime(value: string): string {
   const parsed = new Date(value);
@@ -33,34 +34,27 @@ function BellIcon({ followed = false }: { followed?: boolean }): React.JSX.Eleme
 }
 
 export function FollowingThreads({
+  connection,
   following,
-  onClose,
   onOpen,
+  workshopName,
 }: {
+  connection: ConnectionState;
   following: FollowedThreadClientState & {
     unfollow: (thread: WorkshopFollowedThread) => Promise<void>;
   };
-  onClose: () => void;
   onOpen: (thread: WorkshopFollowedThread) => boolean;
+  workshopName: string;
 }): React.JSX.Element {
   const [navigationError, setNavigationError] = useState<string | null>(null);
   return (
     <section className="following-workspace" aria-label="Following">
-      <header className="following-header">
-        <div>
-          <p className="overline">Workspace</p>
-          <h1>Following</h1>
-        </div>
-        <button
-          className="panel-icon-button"
-          type="button"
-          aria-label="Back to conversation"
-          title="Back to conversation"
-          onClick={onClose}
-        >
-          <span aria-hidden="true">←</span>
-        </button>
-      </header>
+      <ActivityWorkspaceHeader
+        connection={connection}
+        symbol={<BellIcon />}
+        title="Following"
+        workshopName={workshopName}
+      />
 
       <div className="following-summary" aria-live="polite">
         <strong>{following.threads.length}</strong>

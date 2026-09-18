@@ -4895,15 +4895,17 @@ function WorkshopView({
         />
       ) : mentionsOpen ? (
         <MentionsInbox
+          connection={connection}
           inbox={inbox}
-          onClose={() => onSelectChannel(channelId)}
           onOpen={onOpenHumanNotification}
+          workshopName={workshop.name}
         />
       ) : followingOpen ? (
         <FollowingThreads
+          connection={connection}
           following={following}
-          onClose={() => onSelectChannel(channelId)}
           onOpen={onOpenFollowedThread}
+          workshopName={workshop.name}
         />
       ) : (
         <>
