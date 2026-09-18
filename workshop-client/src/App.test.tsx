@@ -3275,6 +3275,10 @@ describe("Workshop React client", () => {
       name: "Archive channel",
     }) as HTMLButtonElement;
     const headerButtons = [...(archiveButton.closest("header")?.querySelectorAll("button") ?? [])];
+    const titleRow = archiveButton.closest(".context-channel-title-row");
+    expect(titleRow).not.toBeNull();
+    expect(titleRow).toContainElement(settingsButton);
+    expect(titleRow?.querySelector("h2")).toHaveTextContent("# Lifecycle qualification");
     expect(headerButtons.indexOf(settingsButton)).toBeLessThan(headerButtons.indexOf(archiveButton));
     expect(headerButtons.at(-1)).toBe(archiveButton);
     await user.click(archiveButton);
