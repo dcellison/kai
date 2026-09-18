@@ -78,6 +78,13 @@ class ImplementationState(StrEnum):
     PLANNED = "planned"
 
 
+class CompatibilityRemovalGate(StrEnum):
+    """Named condition that permits a temporary adapter compatibility path."""
+
+    SINGLE_USER_DEPLOYMENT_RETIRED = "single_user_deployment_retired"
+    TELEGRAM_MEMORY_CONVERGED = "telegram_memory_converged"
+
+
 class ContextRequirement(StrEnum):
     """Non-secret context predicates used only for discovery hints."""
 
@@ -218,6 +225,7 @@ class CapabilityDefinition:
     idempotency: IdempotencyPolicy
     revision_check: bool
     continuity_effect: ContinuityEffect
+    compatibility_removal_gate: CompatibilityRemovalGate | None
     requirements: frozenset[ContextRequirement]
     presentations: Mapping[AdapterId, AdapterPresentation]
 
@@ -322,6 +330,7 @@ def _capability(
     idempotency: IdempotencyPolicy = IdempotencyPolicy.NONE,
     revision_check: bool = False,
     continuity_effect: ContinuityEffect = ContinuityEffect.NONE,
+    compatibility_removal_gate: CompatibilityRemovalGate | None = None,
     requirements: tuple[ContextRequirement, ...] = (),
 ) -> CapabilityDefinition:
     return CapabilityDefinition(
@@ -336,6 +345,7 @@ def _capability(
         idempotency=idempotency,
         revision_check=revision_check,
         continuity_effect=continuity_effect,
+        compatibility_removal_gate=compatibility_removal_gate,
         requirements=frozenset(requirements),
         presentations=_presentations(telegram, workshop),
     )
@@ -360,7 +370,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "conversation.run.cancel",
         "Stop response",
         "Interrupt the active agent response in this conversation.",
-        "conversation_execution",
+        "private_text_execution",
         AuthorityScope.CONVERSATION,
         telegram=_telegram(
             "stop",
@@ -371,13 +381,15 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         mutates_state=True,
         idempotency=IdempotencyPolicy.REQUIRED,
         continuity_effect=ContinuityEffect.CANCEL_ACTIVE_RUN,
+        implementation_state=ImplementationState.MIXED_COMPATIBILITY,
+        compatibility_removal_gate=CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED,
         requirements=_AGENT_CONVERSATION,
     ),
     _capability(
         "conversation.session.reset",
         "Start fresh provider session",
         "Replace one agent's provider session without removing conversation history or memory.",
-        "runtime_sessions",
+        "runtime_lane_status",
         AuthorityScope.PRINCIPAL_AGENT,
         telegram=_telegram(
             "new",
@@ -400,7 +412,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "runtime.model.manage",
         "Change model",
         "Inspect, refresh, and select models for an authorized runtime.",
-        "runtime_settings",
+        "settings_workspaces",
         AuthorityScope.PRINCIPAL_AGENT,
         telegram=_telegram(
             "model",
@@ -420,13 +432,15 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         continuity_effect=ContinuityEffect.MAY_RESTART_RUNTIME,
+        implementation_state=ImplementationState.MIXED_COMPATIBILITY,
+        compatibility_removal_gate=CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED,
         requirements=(*_AUTHENTICATED, ContextRequirement.AGENT),
     ),
     _capability(
         "runtime.backend.manage",
         "Change backend",
         "Inspect and select an authorized backend for an agent runtime.",
-        "runtime_settings",
+        "settings_workspaces",
         AuthorityScope.PRINCIPAL_AGENT,
         telegram=_telegram(
             "backend",
@@ -446,6 +460,8 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         continuity_effect=ContinuityEffect.MAY_RESTART_RUNTIME,
+        implementation_state=ImplementationState.MIXED_COMPATIBILITY,
+        compatibility_removal_gate=CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED,
         requirements=(*_AUTHENTICATED, ContextRequirement.AGENT),
     ),
     _capability(
@@ -473,6 +489,8 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
         continuity_effect=ContinuityEffect.MAY_RESTART_RUNTIME,
+        implementation_state=ImplementationState.MIXED_COMPATIBILITY,
+        compatibility_removal_gate=CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED,
         requirements=(*_AUTHENTICATED, ContextRequirement.AGENT),
     ),
     _capability(
@@ -494,7 +512,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "workspace.catalogue.manage",
         "Open workspaces",
         "Inspect, authorize, create, select, remove, or delete eligible workspaces.",
-        "workspace_grants",
+        "settings_workspaces",
         AuthorityScope.PRINCIPAL,
         telegram=_telegram(
             "workspace",
@@ -534,13 +552,15 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
+        implementation_state=ImplementationState.MIXED_COMPATIBILITY,
+        compatibility_removal_gate=CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED,
         requirements=_AUTHENTICATED,
     ),
     _capability(
         "workspace.memory_project.manage",
         "Memory projects",
         "Inspect or change the memory-project registration for an authorized workspace.",
-        "memory_project_registry",
+        "settings_workspaces",
         AuthorityScope.PRINCIPAL,
         telegram=_telegram(
             "project",
@@ -593,6 +613,8 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
+        implementation_state=ImplementationState.MIXED_COMPATIBILITY,
+        compatibility_removal_gate=CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED,
         requirements=_AUTHENTICATED,
     ),
     _capability(
@@ -680,6 +702,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
             input_shape=CapabilityInputShape.MEMORY_OPERATION,
         ),
         implementation_state=ImplementationState.MIXED_COMPATIBILITY,
+        compatibility_removal_gate=CompatibilityRemovalGate.TELEGRAM_MEMORY_CONVERGED,
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
@@ -1035,6 +1058,16 @@ def validate_capability_registry(
             or item.continuity_effect != ContinuityEffect.NONE
         ):
             raise ValueError(f"Read-only capability {item.operation_id} declares mutation semantics")
+        if (
+            item.implementation_state == ImplementationState.MIXED_COMPATIBILITY
+            and item.compatibility_removal_gate is None
+        ):
+            raise ValueError(f"Mixed compatibility capability {item.operation_id} lacks a removal gate")
+        if (
+            item.implementation_state != ImplementationState.MIXED_COMPATIBILITY
+            and item.compatibility_removal_gate is not None
+        ):
+            raise ValueError(f"Canonical capability {item.operation_id} declares a compatibility removal gate")
         if (
             item.authority_scope == AuthorityScope.ADMINISTRATOR
             and ContextRequirement.ADMINISTRATOR not in item.requirements

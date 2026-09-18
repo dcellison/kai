@@ -191,6 +191,42 @@ async def test_token_is_write_only_replaceable_and_removable(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_trusted_automation_reads_credential_by_canonical_authority(tmp_path: Path) -> None:
+    store, service, registry = await _seed(tmp_path / "kai.db")
+    try:
+        first = registry.namespaces[0]
+        second = registry.namespaces[1]
+        authority = service.authority_for_principal(first.principal_id)
+        await service.set_token(authority, "automation-token")
+
+        assert await service.credential_for_automation(authority) == "automation-token"
+        with pytest.raises(WorkshopGitHubSettingsAccessDenied):
+            await service.credential_for_automation(
+                GitHubSettingsAuthority(first.principal_id, second.runtime_profile_id)
+            )
+    finally:
+        await service.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_other_subscriber_query_uses_canonical_principals(tmp_path: Path) -> None:
+    store, service, registry = await _seed(tmp_path / "kai.db")
+    try:
+        alice = service.authority_for_principal(registry.namespaces[0].principal_id)
+        bob = service.authority_for_principal(registry.namespaces[1].principal_id)
+
+        assert await service.has_other_repository_subscribers(alice, "owner/repo") is True
+        await service.set_repository_subscription(bob, "owner/repo", subscribed=False)
+        assert await service.has_other_repository_subscribers(alice, "owner/repo") is False
+        with pytest.raises(WorkshopGitHubSettingsValidationError):
+            await service.has_other_repository_subscribers(alice, "invalid")
+    finally:
+        await service.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_revision_and_cross_principal_authority_fail_closed(tmp_path: Path) -> None:
     store, service, registry = await _seed(tmp_path / "kai.db")
     try:

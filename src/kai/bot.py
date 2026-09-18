@@ -44,6 +44,7 @@ from kai.config import (
     OPEN_ENDED_PROVIDERS,
     PROVIDER_DEFAULTS,
     Config,
+    DeploymentMode,
     ModelRole,
     WorkspaceConfig,
     canonicalize_model_for_backend,
@@ -1623,11 +1624,11 @@ async def handle_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @_require_auth
 async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /stop through canonical cancellation, with a legacy fallback."""
+    """Handle /stop through canonical cancellation, with one gated legacy fallback."""
     assert update.message is not None
     chat_id = _chat_id(update)
     execution = _get_core_services(context).private_text_execution
-    if execution is not None and chat_id == _user_id(update):
+    if execution is not None:
         disposition = await execution.request_transport_cancellation(
             transport="telegram",
             sender_subject=str(_user_id(update)),
@@ -1641,6 +1642,17 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "Kai could not confirm a clean stop. The interrupted request will not be retried automatically."
             )
             return
+        await update.message.reply_text("No active response.")
+        return
+
+    # Removal gate: this process-level fallback exists only for single-user
+    # embeddings that do not construct the canonical execution service. A
+    # protected deployment must fail closed rather than let a transport-owned
+    # chat ID bypass canonical run authorization.
+    config: Config = context.bot_data["config"]
+    if config.deployment_mode is not DeploymentMode.SINGLE_USER:
+        await update.message.reply_text("Canonical cancellation is unavailable.")
+        return
     pool = _get_pool(context)
     stop_event = get_stop_event(sessions.execution_lane_key(chat_id))
     stop_event.set()
@@ -3314,7 +3326,11 @@ async def _handle_github_add(
     webhook_url = _derive_webhook_url(config.telegram_webhook_url) if config.telegram_webhook_url else None
 
     # Attempt automatic webhook registration if the user has a token
-    token = await sessions.get_github_token(chat_id)
+    token = (
+        await canonical[0].credential_for_automation(canonical[1])
+        if canonical is not None
+        else await sessions.get_github_token(chat_id)
+    )
     verb = "Re-subscribed" if is_readd else "Subscribed"
 
     if token:
@@ -3418,18 +3434,22 @@ async def _handle_github_remove(
         removed.append(repo)
         await sessions.set_github_removed_repos(chat_id, removed)
 
-    # Check if any other user is still subscribed to this repo.
-    # A linear scan of all users is fine for small deployments.
-    other_subscribers = False
-    for uid, uc in config.user_configs.items():
-        if uid == chat_id:
-            continue
-        uc_effective = await sessions.get_effective_repos(uc.telegram_id, uc.github_repos)
-        if repo in uc_effective:
-            other_subscribers = True
-            break
-
-    token = await sessions.get_github_token(chat_id)
+    # Canonical principals, not Telegram chat IDs, own repository policy.
+    if canonical is not None:
+        service, authority = canonical
+        other_subscribers = await service.has_other_repository_subscribers(authority, repo)
+        token = await service.credential_for_automation(authority)
+    else:
+        # Single-user compatibility remains isolated from protected authority.
+        other_subscribers = False
+        for uid, uc in config.user_configs.items():
+            if uid == chat_id:
+                continue
+            uc_effective = await sessions.get_effective_repos(uc.telegram_id, uc.github_repos)
+            if repo in uc_effective:
+                other_subscribers = True
+                break
+        token = await sessions.get_github_token(chat_id)
 
     if other_subscribers:
         await update.message.reply_text(f"Unsubscribed from `{repo}`. Webhook kept (other users are still subscribed).")
@@ -3469,11 +3489,13 @@ async def _show_github(
     assert update.message is not None
     user_config = config.get_user_config(chat_id)
 
-    effective = await sessions.resolve_github_settings(chat_id, config)
     canonical_snapshot = None
     if canonical is not None:
         service, authority = canonical
         canonical_snapshot = await service.inspect(authority)
+        effective = None
+    else:
+        effective = await sessions.resolve_github_settings(chat_id, config)
     github_user = (
         canonical_snapshot.github_login
         if canonical_snapshot is not None
@@ -3495,6 +3517,7 @@ async def _show_github(
         github_delivery = next(item for item in preference_snapshot.preferences if item.integration_class == "github")
         lines.append(f"Notifications: {github_delivery.destination_name} ({github_delivery.source})")
     else:
+        assert effective is not None
         notify = effective["notify_chat_id"]
         if notify and notify != chat_id:
             lines.append(f"Notifications: {notify}")
@@ -3530,6 +3553,7 @@ async def _show_github(
         lines.append(f"PR reviews: {pr_state} ({canonical_snapshot.pr_review.source})")
         lines.append(f"Issue triage: {triage_state} ({canonical_snapshot.issue_triage.source})")
     else:
+        assert effective is not None
         lines.append(_toggle_line("PR reviews", "pr_review", yaml_pr, effective["pr_review"]))
         lines.append(_toggle_line("Issue triage", "issue_triage", yaml_triage, effective["issue_triage"]))
 
@@ -3543,6 +3567,8 @@ async def _show_github(
         [item.repository for item in canonical_snapshot.repositories]
         if canonical_snapshot is not None
         else effective["repos"]
+        if effective is not None
+        else []
     )
     if repos:
         lines.append("")

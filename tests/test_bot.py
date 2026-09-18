@@ -1425,6 +1425,56 @@ class TestHandleStop:
         pool.force_kill.assert_not_called()
         assert update.message.reply_text.await_args.args[0] == "Stopping..."
 
+    @pytest.mark.asyncio
+    async def test_canonical_not_active_never_falls_through_to_process_kill(self):
+        pool = _make_mock_claude()
+        update = _make_update(chat_id=1, user_id=1)
+        ctx = _make_context(claude=pool, config=_make_config(allowed_user_ids={1}))
+        execution = MagicMock()
+        execution.request_transport_cancellation = AsyncMock(return_value=CanonicalCancellationDisposition.NOT_ACTIVE)
+        ctx.application.core_services.private_text_execution = execution
+
+        await handle_stop(update, ctx)
+
+        pool.force_kill.assert_not_called()
+        assert update.message.reply_text.await_args.args[0] == "No active response."
+
+    @pytest.mark.asyncio
+    async def test_group_stop_uses_canonical_channel_binding(self):
+        pool = _make_mock_claude()
+        update = _make_update(chat_id=-1001, user_id=1)
+        ctx = _make_context(claude=pool, config=_make_config(allowed_user_ids={1}))
+        execution = MagicMock()
+        execution.request_transport_cancellation = AsyncMock(return_value=CanonicalCancellationDisposition.REQUESTED)
+        ctx.application.core_services.private_text_execution = execution
+
+        await handle_stop(update, ctx)
+
+        execution.request_transport_cancellation.assert_awaited_once_with(
+            transport="telegram",
+            sender_subject="1",
+            channel_subject="-1001",
+        )
+        pool.force_kill.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_protected_stop_fails_closed_without_canonical_service(self):
+        pool = _make_mock_claude()
+        update = _make_update(chat_id=1, user_id=1)
+        ctx = _make_context(
+            claude=pool,
+            config=_make_config(
+                allowed_user_ids={1},
+                deployment_mode=DeploymentMode.PROTECTED,
+            ),
+        )
+        ctx.application.core_services.private_text_execution = None
+
+        await handle_stop(update, ctx)
+
+        pool.force_kill.assert_not_called()
+        assert update.message.reply_text.await_args.args[0] == "Canonical cancellation is unavailable."
+
 
 # ── handle_stats ─────────────────────────────────────────────────────
 
@@ -4464,6 +4514,23 @@ class TestHandleSettings:
         service.set_timeout.assert_awaited_once_with(authority, 1800)
         assert "1800s" in update.message.reply_text.call_args[0][0]
 
+    @pytest.mark.asyncio
+    async def test_protected_reset_all_uses_existing_canonical_service_operation(self):
+        update = _make_update(text="/settings reset")
+        ctx = _make_context(args=["reset"])
+        authority = SimpleNamespace(runtime_profile_id=profile_id(12345))
+        service = MagicMock()
+        service.authority_for_principal_profile.return_value = authority
+        service.reset_settings = AsyncMock()
+        ctx.application.core_services.settings_workspaces = service
+
+        await handle_settings(update, ctx)
+
+        service.reset_settings.assert_awaited_once_with(authority)
+        assert update.message.reply_text.await_args.args[0] == (
+            "All settings cleared. Using defaults. Session restarted."
+        )
+
     # ── 7. Reject zero timeout ─────────────────────────────────────
 
     @pytest.mark.asyncio
@@ -4777,6 +4844,57 @@ class TestHandleGitHub:
         assert "Issue triage: on (user override)" in reply
         assert "alice/repo1" in reply
         assert "(users.yaml)" in reply
+        assert "GitHub token: stored" in reply
+
+    @pytest.mark.asyncio
+    async def test_canonical_show_does_not_read_chat_id_settings(self):
+        update = _make_update(text="/github")
+        config = _make_config()
+        github_service = MagicMock()
+        github_authority = object()
+        github_service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                github_login="daniel",
+                repositories=(SimpleNamespace(repository="dcellison/kai", source="operator"),),
+                pr_review=SimpleNamespace(enabled=True, source="user"),
+                issue_triage=SimpleNamespace(enabled=False, source="operator"),
+                token_stored=True,
+            )
+        )
+        notification_service = MagicMock()
+        notification_authority = object()
+        notification_service.inspect = AsyncMock(
+            return_value=SimpleNamespace(
+                preferences=(
+                    SimpleNamespace(
+                        integration_class="github",
+                        destination_name="Notifications",
+                        source="personal override",
+                    ),
+                ),
+            )
+        )
+
+        with (
+            patch("kai.bot.sessions.resolve_github_settings", new_callable=AsyncMock) as legacy_settings,
+            patch("kai.bot.sessions.get_github_db_settings", new_callable=AsyncMock) as legacy_toggles,
+            patch("kai.bot.sessions.get_github_added_repos", new_callable=AsyncMock) as legacy_repos,
+            patch("kai.bot.sessions.get_github_token", new_callable=AsyncMock) as legacy_token,
+        ):
+            await _show_github(
+                update,
+                12345,
+                config,
+                canonical=(github_service, github_authority),
+                notification_preferences=(notification_service, notification_authority),
+            )
+
+        legacy_settings.assert_not_awaited()
+        legacy_toggles.assert_not_awaited()
+        legacy_repos.assert_not_awaited()
+        legacy_token.assert_not_awaited()
+        reply = update.message.reply_text.await_args.args[0]
+        assert "dcellison/kai" in reply
         assert "GitHub token: stored" in reply
 
     # ── 3. /github notify <number> ───────────────────────────────

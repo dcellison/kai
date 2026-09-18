@@ -14,8 +14,10 @@ from kai.capability_registry import (
     AdapterId,
     AuthorityScope,
     CapabilityContext,
+    CompatibilityRemovalGate,
     ConfirmationPolicy,
     ContextRequirement,
+    ImplementationState,
     WorkshopSurface,
     capability_availability,
     capability_by_id,
@@ -81,6 +83,46 @@ def test_registry_definitions_have_complete_adapter_and_authority_metadata() -> 
         assert capability.authority_scope in AuthorityScope
         if capability.mutates_state:
             assert capability.idempotency.value != "none"
+
+
+def test_reconciled_shared_operations_name_the_service_the_adapters_invoke() -> None:
+    expected = {
+        "conversation.run.cancel": "private_text_execution",
+        "conversation.session.reset": "runtime_lane_status",
+        "runtime.model.manage": "settings_workspaces",
+        "runtime.backend.manage": "settings_workspaces",
+        "runtime.settings.manage": "settings_workspaces",
+        "workspace.catalogue.manage": "settings_workspaces",
+        "workspace.memory_project.manage": "settings_workspaces",
+        "integration.github.manage": "github_settings",
+        "notification.delivery.manage": "notification_preferences",
+        "preferences.manage": "preference_documents",
+        "voice.manage": "client_preferences",
+    }
+
+    assert {operation_id: capability_by_id(operation_id).canonical_service for operation_id in expected} == expected
+
+
+def test_single_user_compatibility_paths_have_an_explicit_removal_gate() -> None:
+    for operation_id in {
+        "conversation.run.cancel",
+        "runtime.model.manage",
+        "runtime.backend.manage",
+        "runtime.settings.manage",
+        "workspace.catalogue.manage",
+        "integration.github.manage",
+    }:
+        capability = capability_by_id(operation_id)
+        assert capability.implementation_state == ImplementationState.MIXED_COMPATIBILITY
+        assert capability.compatibility_removal_gate == CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED
+
+
+def test_reset_all_is_one_runtime_settings_operation_not_a_duplicate_capability() -> None:
+    runtime_settings = capability_by_id("runtime.settings.manage")
+
+    assert runtime_settings.presentations[AdapterId.TELEGRAM].input_shape.value == "runtime_settings"
+    assert runtime_settings.presentations[AdapterId.WORKSHOP].input_shape.value == "runtime_settings"
+    assert not any(capability.operation_id == "runtime.settings.reset_all" for capability in CAPABILITY_REGISTRY)
 
 
 def test_contextual_availability_is_redacted_and_excludes_admin_operations() -> None:
@@ -185,6 +227,26 @@ def test_registry_rejects_missing_adapter_disposition() -> None:
     )
 
     with pytest.raises(ValueError, match="define every adapter disposition"):
+        validate_capability_registry((capability,))
+
+
+def test_registry_rejects_mixed_compatibility_without_removal_gate() -> None:
+    capability = replace(
+        capability_by_id("conversation.run.cancel"),
+        compatibility_removal_gate=None,
+    )
+
+    with pytest.raises(ValueError, match="lacks a removal gate"):
+        validate_capability_registry((capability,))
+
+
+def test_registry_rejects_removal_gate_on_canonical_capability() -> None:
+    capability = replace(
+        capability_by_id("preferences.manage"),
+        compatibility_removal_gate=CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED,
+    )
+
+    with pytest.raises(ValueError, match="declares a compatibility removal gate"):
         validate_capability_registry((capability,))
 
 

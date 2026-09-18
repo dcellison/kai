@@ -196,6 +196,46 @@ class WorkshopGitHubSettingsService:
         async with self._lock(authority):
             return self._snapshot(authority, await self._read_row(authority.principal_id))
 
+    async def credential_for_automation(self, authority: GitHubSettingsAuthority) -> str | None:
+        """Return the owner's credential to trusted host automation only."""
+        async with (
+            self._lock(authority),
+            self._connection.execute(
+                "SELECT github_token FROM principal_github_subscriptions WHERE principal_id = ?",
+                (authority.principal_id,),
+            ) as cursor,
+        ):
+            rows = tuple(await cursor.fetchall())
+        if len(rows) != 1:
+            raise WorkshopGitHubSettingsStorageError("Canonical GitHub settings have no unique owner")
+        return str(rows[0][0]) if rows[0][0] else None
+
+    async def has_other_repository_subscribers(
+        self,
+        authority: GitHubSettingsAuthority,
+        repository: str,
+    ) -> bool:
+        """Report whether another canonical principal subscribes to a repository."""
+        normalized = repository.strip().lower()
+        if _REPOSITORY_PATTERN.fullmatch(normalized) is None:
+            raise WorkshopGitHubSettingsValidationError("Repository must use owner/name format")
+        async with (
+            self._lock(authority),
+            self._connection.execute(
+                "SELECT baseline_repos_json, added_repos_json, removed_repos_json "
+                "FROM principal_github_subscriptions WHERE principal_id != ?",
+                (authority.principal_id,),
+            ) as cursor,
+        ):
+            rows = tuple(await cursor.fetchall())
+        for row in rows:
+            baseline = set(_repository_list(row[0], field="baseline repository"))
+            added = set(_repository_list(row[1], field="added repository"))
+            removed = set(_repository_list(row[2], field="removed repository"))
+            if normalized in (baseline | added) - removed:
+                return True
+        return False
+
     async def set_repository_subscription(
         self,
         authority: GitHubSettingsAuthority,
