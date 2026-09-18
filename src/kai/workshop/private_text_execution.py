@@ -330,14 +330,14 @@ class WorkshopPrivateTextExecutionService:
         sender_subject: str,
         channel_subject: str,
     ) -> CanonicalCancellationDisposition:
-        """Resolve an authenticated adapter identity to a canonical run."""
+        """Cancel active runs requested through one authenticated adapter binding."""
         if not transport or not sender_subject or not channel_subject:
             return CanonicalCancellationDisposition.NOT_ACTIVE
         async with (
             self._database_lock,
             self._store.connection.execute(
                 "SELECT r.id FROM runs r "
-                "JOIN channels c ON c.id = r.channel_id AND c.kind = 'direct' "
+                "JOIN channels c ON c.id = r.channel_id "
                 "JOIN external_identities ei ON ei.principal_id = r.requested_by_principal_id "
                 "AND ei.provider = ? AND ei.external_subject = ? "
                 "JOIN channel_bindings cb ON cb.channel_id = r.channel_id "
@@ -350,9 +350,16 @@ class WorkshopPrivateTextExecutionService:
             rows = list(await cursor.fetchall())
         if not rows:
             return CanonicalCancellationDisposition.NOT_ACTIVE
-        if len(rows) > 1:
-            raise RuntimeError("Canonical private channel has multiple nonterminal runs")
-        return await self._coordinator.request_cancellation(RunId(str(rows[0][0])))
+        dispositions: list[CanonicalCancellationDisposition] = []
+        for row in rows:
+            dispositions.append(await self.request_run_cancellation(RunId(str(row[0]))))
+        if CanonicalCancellationDisposition.INTERRUPTED in dispositions:
+            return CanonicalCancellationDisposition.INTERRUPTED
+        if CanonicalCancellationDisposition.REQUESTED in dispositions:
+            return CanonicalCancellationDisposition.REQUESTED
+        if CanonicalCancellationDisposition.ALREADY_TERMINAL in dispositions:
+            return CanonicalCancellationDisposition.ALREADY_TERMINAL
+        return CanonicalCancellationDisposition.NOT_ACTIVE
 
     async def wait(self) -> None:
         task = self._task
