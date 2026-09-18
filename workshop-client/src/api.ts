@@ -5048,6 +5048,7 @@ export async function registerMemoryProject(
   session: WorkshopSession,
   revision: string,
   name: string,
+  workspacePath?: string,
 ): Promise<WorkshopMemoryProjectRegistry> {
   const response = await authorizedFetch(
     session,
@@ -5055,7 +5056,11 @@ export async function registerMemoryProject(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ revision, name }),
+      body: JSON.stringify({
+        revision,
+        name,
+        ...(workspacePath ? { workspace_path: workspacePath } : {}),
+      }),
     },
   );
   const payload = await responsePayload(response);

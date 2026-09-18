@@ -37,6 +37,7 @@ import {
   loadNavigation,
   loadNotificationPreferences,
   loadMemoryDetail,
+  loadMemoryProjects,
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
@@ -51,6 +52,7 @@ import {
   loadThreadTimeline,
   loadThreadUnread,
   loadWorkspaceConfig,
+  loadWorkspaceGrants,
   provisionAgent,
   redeemEnrollment,
   restoreChannel,
@@ -123,6 +125,7 @@ vi.mock("./api", async (importOriginal) => {
     loadNavigation: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadMemoryDetail: vi.fn(),
+    loadMemoryProjects: vi.fn(),
     loadMemoryRecords: vi.fn(),
     loadMemorySource: vi.fn(),
     loadMemoryStats: vi.fn(),
@@ -137,6 +140,7 @@ vi.mock("./api", async (importOriginal) => {
     loadSettingsWorkspace: vi.fn(),
     loadStandingParticipation: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
+    loadWorkspaceGrants: vi.fn(),
     provisionAgent: vi.fn(),
     redeemEnrollment: vi.fn(),
     restoreChannel: vi.fn(),
@@ -947,6 +951,42 @@ describe("Workshop React client", () => {
       runtimeProfileId,
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
+    vi.mocked(loadWorkspaceGrants).mockResolvedValue({
+      grants: [
+        {
+          available: true,
+          current: true,
+          name: "kai",
+          path: settingsWorkspace.workspace,
+          provenance: "legacy_migrated",
+          removable: false,
+        },
+      ],
+      mutation: null,
+      principalId: settingsWorkspace.principalId,
+      runtimeProfileId: settingsWorkspace.runtimeProfileId,
+      workspaceBase: "/Users/daniel/work",
+    });
+    vi.mocked(loadMemoryProjects).mockResolvedValue({
+      activeProjectId: "project-kai",
+      currentWorkspace: settingsWorkspace.workspace,
+      mutation: null,
+      principalId: settingsWorkspace.principalId,
+      projects: [
+        {
+          available: true,
+          current: true,
+          displayName: "Kai",
+          projectId: "project-kai",
+          provenance: "operator_pinned",
+          removable: false,
+          stateVersion: null,
+          workspaceRoots: [settingsWorkspace.workspace],
+        },
+      ],
+      revision: "mpr_current",
+      runtimeProfileId: settingsWorkspace.runtimeProfileId,
+    });
     vi.mocked(loadStandingParticipation).mockResolvedValue(standingParticipation);
     vi.mocked(updateStandingParticipation).mockResolvedValue(standingParticipation);
     vi.mocked(resumeStandingObservation).mockResolvedValue(standingParticipation);
@@ -1832,6 +1872,27 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
   });
 
+  it("opens the principal Workspaces destination from the Workspace navigation", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Workspaces" }));
+    expect(await screen.findByRole("heading", { name: "Workspaces", level: 1 })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Authorized workspaces" })).toBeVisible();
+    expect(loadWorkspaceGrants).toHaveBeenCalledTimes(1);
+    expect(loadMemoryProjects).toHaveBeenCalledTimes(1);
+    expect(window.location.search).toBe("?view=workspaces");
+
+    await user.click(screen.getByRole("button", { name: "Back to conversation" }));
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    expect(window.location.search).toBe("");
+  });
+
   it("keeps session forgetting in the profile menu and confirms it", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
@@ -1931,6 +1992,32 @@ describe("Workshop React client", () => {
         "/var/lib/kai/home/principal",
       ),
     );
+  });
+
+  it("keeps operator runtime diagnostics in the Run inspector", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadRuntimeLaneStatus).mockResolvedValue({
+      ...runtimeLaneStatus,
+      operatorDiagnostics: {
+        contextThroughEventPosition: 42,
+        lastRunId: completedRun.runId,
+        providerSessionPresent: true,
+        providerSessionRevision: "session-revision",
+        runtimeProfileId,
+      },
+    });
+
+    render(<App />);
+
+    const runtimeSection = await openContextSection("Runtime and workspace");
+    expect(within(runtimeSection).queryByText("Runtime diagnostics")).toBeNull();
+    const runInspector = await openContextSection("Run inspector");
+    expect(within(runInspector).getByText("Runtime diagnostics")).toBeVisible();
+    expect(within(runInspector).getByText(runtimeProfileId)).toBeVisible();
+    expect(within(runInspector).getByText("session-revision")).toBeVisible();
   });
 
   it("shows a non-owner the agent owner's effective runtime without edit controls", async () => {
