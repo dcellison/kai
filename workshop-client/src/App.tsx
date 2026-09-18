@@ -5726,9 +5726,6 @@ function WorkshopView({
                         <small>
                           Sponsored by {agent.sponsorDisplayName ?? "unknown"} · shared-channel memory
                         </small>
-                        {agent.runtimeProfileId && (
-                          <code title={agent.runtimeProfileId}>{agent.runtimeProfileId}</code>
-                        )}
                       </span>
                       {observation ? (
                         <button
@@ -5836,32 +5833,25 @@ function WorkshopView({
             {runtimeLaneStatuses.length > 0 ? (
               <div className="runtime-lane-statuses">
                 {runtimeLaneStatuses.map((status) => {
-                  const workspaceInputId = `workspace-${channelId}-${status.agentId}`;
                   return <div className="runtime-settings" key={status.agentId}>
-                    {channel.kind === "group" && (
-                      <p className="settings-source">{status.agentName}</p>
-                    )}
                     {status.workspaceMode === "neutral" ? (
                       <p className="settings-source">No shared workspace</p>
                     ) : (
-                      <>
-                        <label htmlFor={workspaceInputId}>Your workspace</label>
-                        <div className="runtime-workspace-select">
-                          <select
-                            id={workspaceInputId}
-                            value={status.workspace ?? ""}
-                            disabled={switchingWorkspace || activeResponseRuns.length > 0}
-                            onChange={(event) => void selectWorkspace(event.target.value)}
-                          >
-                            {status.workspaces.map((workspaceOption) => (
-                              <option key={workspaceOption.path} value={workspaceOption.path}>
-                                {workspaceOption.name}
-                              </option>
-                            ))}
-                          </select>
-                          <span aria-hidden="true"><SelectChevronIcon /></span>
-                        </div>
-                      </>
+                      <div className="runtime-workspace-select">
+                        <select
+                          aria-label="Your workspace"
+                          value={status.workspace ?? ""}
+                          disabled={switchingWorkspace || activeResponseRuns.length > 0}
+                          onChange={(event) => void selectWorkspace(event.target.value)}
+                        >
+                          {status.workspaces.map((workspaceOption) => (
+                            <option key={workspaceOption.path} value={workspaceOption.path}>
+                              {workspaceOption.name}
+                            </option>
+                          ))}
+                        </select>
+                        <span aria-hidden="true"><SelectChevronIcon /></span>
+                      </div>
                     )}
                   </div>;
                 })}
