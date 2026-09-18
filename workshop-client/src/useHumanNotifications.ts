@@ -20,6 +20,7 @@ const EMPTY_COUNTS: WorkshopHumanNotificationCounts = {
   unread: 0,
   unreadByChannel: {},
 };
+const MENTION_FILTER = { kind: "mention" as const };
 
 function operationId(prefix: string): string {
   const bytes = new Uint8Array(8);
@@ -76,12 +77,12 @@ export function useHumanNotifications(
   const subscribePrincipalEvents = principalEvents.subscribe;
 
   const refreshCounts = useCallback(async (signal?: AbortSignal): Promise<void> => {
-    const counts = await loadHumanNotificationCounts(token, signal);
+    const counts = await loadHumanNotificationCounts(token, MENTION_FILTER, signal);
     setState((current) => ({ ...current, counts }));
   }, [token]);
 
   const reload = useCallback(async (signal?: AbortSignal): Promise<number> => {
-    const page = await loadHumanNotifications(token, { limit: 50 }, signal);
+    const page = await loadHumanNotifications(token, { ...MENTION_FILTER, limit: 50 }, signal);
     cursorRef.current = page.nextCursor;
     setState((current) => ({
       ...current,
@@ -133,6 +134,7 @@ export function useHumanNotifications(
       let changed = false;
       for (const change of event.batch.changes) {
         for (const { notification } of change.notificationChanges) {
+          if (notification.kind !== "mention") continue;
           changed = true;
           setState((current) => ({
             ...current,
@@ -158,7 +160,7 @@ export function useHumanNotifications(
     if (!cursor || loadMorePendingRef.current) return;
     loadMorePendingRef.current = true;
     setState((current) => ({ ...current, loadingMore: true }));
-    void loadHumanNotifications(token, { cursor, limit: 50 }).then(
+    void loadHumanNotifications(token, { ...MENTION_FILTER, cursor, limit: 50 }).then(
       (page) => {
         cursorRef.current = page.nextCursor;
         setState((current) => {
@@ -211,7 +213,7 @@ export function useHumanNotifications(
             notification.stateVersion,
             operationId("mention-unread"),
           );
-      const counts = await loadHumanNotificationCounts(token);
+      const counts = await loadHumanNotificationCounts(token, MENTION_FILTER);
       setState((current) => ({
         ...current,
         counts,
@@ -234,7 +236,11 @@ export function useHumanNotifications(
   const markAllRead = useCallback(async (): Promise<void> => {
     setState((current) => ({ ...current, error: null, pending: true }));
     try {
-      const unread = await loadHumanNotifications(token, { limit: 100, unreadOnly: true });
+      const unread = await loadHumanNotifications(token, {
+        ...MENTION_FILTER,
+        limit: 100,
+        unreadOnly: true,
+      });
       if (unread.notifications.length > 0) {
         const mutations = await markHumanNotificationsRead(
           token,
@@ -252,7 +258,7 @@ export function useHumanNotifications(
           ),
         }));
       }
-      const counts = await loadHumanNotificationCounts(token);
+      const counts = await loadHumanNotificationCounts(token, MENTION_FILTER);
       setState((current) => ({ ...current, counts, pending: false }));
     } catch (caught) {
       if (caught instanceof AuthenticationError) {
@@ -289,7 +295,7 @@ export function useHumanNotifications(
           operationId("mention-viewed"),
         )),
       );
-      const counts = await loadHumanNotificationCounts(token);
+      const counts = await loadHumanNotificationCounts(token, MENTION_FILTER);
       setState((current) => ({
         ...current,
         counts,

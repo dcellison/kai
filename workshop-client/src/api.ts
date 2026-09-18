@@ -6001,11 +6001,17 @@ function parseHumanNotificationPage(payload: unknown): WorkshopHumanNotification
 
 export async function loadHumanNotifications(
   token: string,
-  options: { cursor?: string; limit?: number; unreadOnly?: boolean } = {},
+  options: {
+    cursor?: string;
+    kind?: WorkshopHumanNotification["kind"];
+    limit?: number;
+    unreadOnly?: boolean;
+  } = {},
   signal?: AbortSignal,
 ): Promise<WorkshopHumanNotificationPage> {
   const query = new URLSearchParams();
   if (options.cursor) query.set("cursor", options.cursor);
+  if (options.kind) query.set("kind", options.kind);
   query.set("limit", String(options.limit ?? 50));
   if (options.unreadOnly) query.set("unread", "1");
   const response = await authorizedFetch(
@@ -6022,11 +6028,15 @@ export async function loadHumanNotifications(
 
 export async function loadHumanNotificationCounts(
   token: string,
+  options: { kind?: WorkshopHumanNotification["kind"] } = {},
   signal?: AbortSignal,
 ): Promise<WorkshopHumanNotificationCounts> {
+  const query = new URLSearchParams();
+  if (options.kind) query.set("kind", options.kind);
+  const suffix = query.size > 0 ? `?${query}` : "";
   const response = await authorizedFetch(
     { channelId: "", token },
-    "/v1/client/notifications/counts",
+    `/v1/client/notifications/counts${suffix}`,
     { signal },
   );
   const payload = await responsePayload(response);
