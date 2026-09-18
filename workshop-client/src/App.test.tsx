@@ -1594,7 +1594,7 @@ describe("Workshop React client", () => {
         heading.textContent?.trim(),
       ),
     ).toEqual([
-      "Workspace",
+      "Personal",
       "Channels",
       "Direct messages",
       "Notifications",
@@ -1882,7 +1882,8 @@ describe("Workshop React client", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "Workspaces" }));
-    expect(await screen.findByRole("heading", { name: "Workspaces", level: 1 })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Your workspaces", level: 1 })).toBeVisible();
+    expect(screen.getByText("Personal", { selector: ".nav-heading" })).toBeVisible();
     expect(screen.getByRole("region", { name: "Authorized workspaces" })).toBeVisible();
     expect(loadWorkspaceGrants).toHaveBeenCalledTimes(1);
     expect(loadMemoryProjects).toHaveBeenCalledTimes(1);

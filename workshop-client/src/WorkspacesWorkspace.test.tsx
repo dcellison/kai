@@ -175,7 +175,8 @@ describe("Workspaces workspace", () => {
     const user = userEvent.setup();
     renderWorkspace();
 
-    expect(await screen.findByRole("heading", { name: "Workspaces", level: 1 })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Your workspaces", level: 1 })).toBeVisible();
+    expect(screen.queryByText("Workspace", { selector: ".overline" })).not.toBeInTheDocument();
     expect(screen.getAllByText("/srv/kai")[0].closest("button")).toBeVisible();
     await user.click(screen.getByRole("button", { name: /qualification-1520/ }));
     expect(screen.getByRole("heading", { name: "qualification-1520", level: 2 })).toBeVisible();

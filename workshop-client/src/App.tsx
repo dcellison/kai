@@ -4463,7 +4463,7 @@ function WorkshopView({
         </header>
 
         <nav>
-          <p className="nav-heading">Workspace</p>
+          <p className="nav-heading">Personal</p>
           <button
             className={`channel-link workspaces-link ${workspacesOpen ? "active" : ""}`}
             type="button"
