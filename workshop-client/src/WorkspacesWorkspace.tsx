@@ -329,8 +329,7 @@ export function WorkspacesWorkspace({
     <main className="workspaces-workspace" aria-label="Workspaces">
       <header className="workspaces-header">
         <div>
-          <p className="overline">Workspace</p>
-          <h1>Workspaces</h1>
+          <h1>Your workspaces</h1>
           <p>Directories you have authorized Kai to use.</p>
         </div>
         <div className="workspaces-header-actions">
