@@ -349,8 +349,8 @@ export function WorkspacesWorkspace({
       <section className="workspaces-browser-pane">
         <header className="workspaces-header">
           <div>
-            <h1>Your workspaces</h1>
-            <p>Directories you have authorized Kai to use.</p>
+            <p className="breadcrumbs">Kai Workshop / Workspaces</p>
+            <h1>Workspaces</h1>
           </div>
           <div className="workspaces-header-actions">
             <button className="panel-icon-button" type="button" aria-label="Create workspace" title="Create private workspace" disabled={busy} onClick={() => setCreateOpen(true)}><WorkspaceAddIcon /></button>

@@ -285,8 +285,6 @@ function SettingsWorkspaceContent({
   onNavigationChanged,
   onHumanAvatarChanged,
   isAdministrator,
-  principalName,
-  roleLabel,
   runtimeLabel,
   runActive,
   session,
@@ -1374,19 +1372,12 @@ function SettingsWorkspaceContent({
       {!nativeRuntime && (
       <header className="settings-header">
         <div>
-          <p className="overline">
-            {agentRuntime
-                ? "Agent runtime"
-                : "Personal workspace"}
+          <p className="breadcrumbs">
+            {agentRuntime ? "Agent runtime" : "Kai Workshop / Settings"}
           </p>
           <h1 id={titleId}>
             {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
           </h1>
-          <p>
-            {agentRuntime
-              ? `Policy-bounded controls for ${runtimeLabel}`
-              : `${principalName} · ${roleLabel}`}
-          </p>
         </div>
         {!nativeRuntime && (
           <button

@@ -188,6 +188,7 @@ describe("Workshop Memory explorer", () => {
     );
 
     expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
+    expect(screen.getByText("Kai Workshop / Memory")).toBeVisible();
     expect(screen.getByText("2")).toBeVisible();
     expect(await screen.findByText("Kai deployment episode")).toBeVisible();
     expect(await screen.findByText("Episode structure")).toBeVisible();
