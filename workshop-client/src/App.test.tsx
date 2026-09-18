@@ -4870,7 +4870,11 @@ describe("Workshop React client", () => {
     await user.click(screen.getByRole("button", { name: "Collapse navigation" }));
 
     expect(navigationPanel).toHaveClass("collapsed");
-    expect(screen.getByRole("button", { name: "Kai" })).toBeVisible();
+    const kaiDirectMessage = screen.getByRole("button", { name: "Kai" });
+    expect(kaiDirectMessage).toBeVisible();
+    expect(within(kaiDirectMessage).getByText("K")).toHaveClass("channel-agent-avatar");
+    expect(within(screen.getByRole("button", { name: "Manage Kai" })).getByText("K"))
+      .toHaveClass("mini-avatar");
     expect(screen.getByRole("button", { name: "Scott" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Create channel" })).toBeNull();
     expect(sessionStorage.getItem("kai.workshop.sidebar-layout.v4")).toContain(
