@@ -28,6 +28,7 @@ from kai.workshop.store import AppendResult, StoredEvent, WorkshopEventStore
 MAX_NOTIFICATION_PAGE_SIZE = 100
 MAX_NOTIFICATION_MUTATION_BATCH = 100
 HUMAN_NOTIFICATION_DELIVERY_MODE = "human_notification"
+HUMAN_NOTIFICATION_KINDS = frozenset({"mention", "reply", "message"})
 
 
 class WorkshopHumanNotificationError(RuntimeError):
@@ -124,6 +125,14 @@ def _bounded_operation_id(value: object) -> str:
 def _state_version(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise WorkshopHumanNotificationValidationError("expected_state_version must be a non-negative integer")
+    return value
+
+
+def _notification_kind(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in HUMAN_NOTIFICATION_KINDS:
+        raise WorkshopHumanNotificationValidationError("Invalid notification kind")
     return value
 
 
@@ -482,14 +491,26 @@ class WorkshopHumanNotificationService:
     def __init__(self, store: WorkshopEventStore) -> None:
         self._store = store
 
-    async def counts(self, principal_id: PrincipalId) -> HumanNotificationCounts:
+    async def counts(
+        self,
+        principal_id: PrincipalId,
+        *,
+        kind: str | None = None,
+    ) -> HumanNotificationCounts:
         self._validate_principal(principal_id)
+        normalized_kind = _notification_kind(kind)
+        kind_clause = "AND n.kind = ? " if normalized_kind is not None else ""
+        parameters: tuple[object, ...] = (
+            (principal_id, principal_id, normalized_kind)
+            if normalized_kind is not None
+            else (principal_id, principal_id)
+        )
         async with self._store.connection.execute(
             "SELECT COUNT(*), SUM(CASE WHEN n.read_at IS NULL THEN 1 ELSE 0 END) "
             "FROM human_notifications n JOIN channel_memberships cm "
             "ON cm.channel_id = n.source_channel_id AND cm.principal_id = ? "
-            "WHERE n.recipient_principal_id = ?",
-            (principal_id, principal_id),
+            "WHERE n.recipient_principal_id = ? " + kind_clause,
+            parameters,
         ) as cursor:
             row = await cursor.fetchone()
         total = int(row[0] or 0) if row is not None else 0
@@ -498,9 +519,10 @@ class WorkshopHumanNotificationService:
             "SELECT n.source_channel_id, COUNT(*) FROM human_notifications n "
             "JOIN channel_memberships cm ON cm.channel_id = n.source_channel_id "
             "AND cm.principal_id = ? WHERE n.recipient_principal_id = ? "
-            "AND n.read_at IS NULL GROUP BY n.source_channel_id "
+            + kind_clause
+            + "AND n.read_at IS NULL GROUP BY n.source_channel_id "
             "ORDER BY n.source_channel_id",
-            (principal_id, principal_id),
+            parameters,
         ) as cursor:
             channel_rows = list(await cursor.fetchall())
         return HumanNotificationCounts(
@@ -517,8 +539,10 @@ class WorkshopHumanNotificationService:
         limit: int = 50,
         cursor: str | None = None,
         unread_only: bool = False,
+        kind: str | None = None,
     ) -> HumanNotificationPage:
         self._validate_principal(principal_id)
+        normalized_kind = _notification_kind(kind)
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_NOTIFICATION_PAGE_SIZE:
             raise WorkshopHumanNotificationValidationError(
                 f"limit must be an integer from 1 through {MAX_NOTIFICATION_PAGE_SIZE}"
@@ -530,6 +554,10 @@ class WorkshopHumanNotificationService:
         through_position = int(tip_row[0]) if tip_row is not None else 0
         cursor_clause = ""
         parameters: list[object] = [principal_id, principal_id, through_position]
+        kind_clause = ""
+        if normalized_kind is not None:
+            kind_clause = "AND n.kind = ? "
+            parameters.append(normalized_kind)
         if cursor is not None:
             position, notification_id = _decode_cursor(cursor)
             cursor_clause = "AND (n.created_event_position < ? OR (n.created_event_position = ? AND n.id < ?)) "
@@ -543,6 +571,7 @@ class WorkshopHumanNotificationService:
             "JOIN principals p ON p.id = m.author_principal_id "
             "JOIN channels c ON c.id = n.source_channel_id "
             "WHERE n.recipient_principal_id = ? AND n.created_event_position <= ? "
+            + kind_clause
             + unread_clause
             + cursor_clause
             + "ORDER BY n.created_event_position DESC, n.id DESC LIMIT ?",
@@ -558,7 +587,7 @@ class WorkshopHumanNotificationService:
             next_cursor = _encode_cursor(last.created_event_position, last.notification_id)
         return HumanNotificationPage(
             notifications,
-            await self.counts(principal_id),
+            await self.counts(principal_id, kind=normalized_kind),
             next_cursor,
             through_position,
         )

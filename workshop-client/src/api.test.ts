@@ -3664,8 +3664,8 @@ describe("Workshop client API", () => {
       }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const page = await loadHumanNotifications("session-secret", { limit: 25 });
-    const loadedCounts = await loadHumanNotificationCounts("session-secret");
+    const page = await loadHumanNotifications("session-secret", { kind: "mention", limit: 25 });
+    const loadedCounts = await loadHumanNotificationCounts("session-secret", { kind: "mention" });
     const mutation = await markHumanNotificationRead(
       "session-secret",
       notification.notification_id,
@@ -3686,8 +3686,8 @@ describe("Workshop client API", () => {
     expect(loadedCounts.unread).toBe(3);
     expect(mutation.notification.read).toBe(true);
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
-      "/v1/client/notifications?limit=25",
-      "/v1/client/notifications/counts",
+      "/v1/client/notifications?kind=mention&limit=25",
+      "/v1/client/notifications/counts?kind=mention",
       `/v1/client/notifications/${notification.notification_id}/read`,
     ]);
   });

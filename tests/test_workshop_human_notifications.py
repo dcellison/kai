@@ -32,6 +32,7 @@ from kai.workshop.human_notifications import (
     WorkshopHumanNotificationAccessDenied,
     WorkshopHumanNotificationConflict,
     WorkshopHumanNotificationService,
+    WorkshopHumanNotificationValidationError,
 )
 from kai.workshop.inbound import ClientInboundMessage, record_client_inbound_message_in_transaction
 from kai.workshop.outbound import OutboundMessage, record_outbound_message
@@ -703,6 +704,26 @@ class TestHumanNotificationAuthority:
             page = await inbox.list(scott_id)
             assert page.notifications[0].kind == "mention"
             assert page.counts.total == 3
+
+            await _record(store, daniel_id, channel_id, "muted-override-2", "@scott second override")
+            first_mentions = await inbox.list(scott_id, kind="mention", limit=1)
+            assert [item.kind for item in first_mentions.notifications] == ["mention"]
+            assert first_mentions.counts.total == 2
+            assert first_mentions.counts.unread == 2
+            assert first_mentions.next_cursor is not None
+            second_mentions = await inbox.list(
+                scott_id,
+                kind="mention",
+                limit=1,
+                cursor=first_mentions.next_cursor,
+            )
+            assert [item.kind for item in second_mentions.notifications] == ["mention"]
+            assert second_mentions.counts.total == 2
+            assert second_mentions.next_cursor is None
+            assert (await inbox.counts(scott_id, kind="reply")).total == 1
+            assert (await inbox.counts(scott_id, kind="message")).total == 1
+            with pytest.raises(WorkshopHumanNotificationValidationError):
+                await inbox.list(scott_id, kind="future")
         finally:
             await policy.close()
             await store.close()
@@ -959,6 +980,57 @@ class TestHumanNotificationAuthority:
 
 
 class TestHumanNotificationApi:
+    async def test_inbox_kind_filter_applies_to_pages_and_counts(self, tmp_path: Path) -> None:
+        store, daniel_id, scott_id, channel_id, _ = await _notification_context(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"scott": scott_id}))
+        try:
+            root_id = await _record(store, scott_id, channel_id, "api-root", "Scott root")
+            await _record(
+                store,
+                daniel_id,
+                channel_id,
+                "api-reply",
+                "Plain reply",
+                thread_root_id=root_id,
+            )
+            await _record(store, daniel_id, channel_id, "api-mention", "@scott explicit mention")
+
+            response = await client.get(
+                "/v1/client/notifications?kind=mention&limit=1",
+                headers={"Authorization": "Bearer scott"},
+            )
+            assert response.status == 200
+            payload = await response.json()
+            assert [item["kind"] for item in payload["notifications"]] == ["mention"]
+            assert payload["counts"]["total"] == 1
+            assert payload["counts"]["unread"] == 1
+
+            counts = await client.get(
+                "/v1/client/notifications/counts?kind=mention",
+                headers={"Authorization": "Bearer scott"},
+            )
+            assert counts.status == 200
+            assert (await counts.json())["total"] == 1
+
+            invalid = await client.get(
+                "/v1/client/notifications?kind=future",
+                headers={"Authorization": "Bearer scott"},
+            )
+            assert invalid.status == 400
+            invalid_counts = await client.get(
+                "/v1/client/notifications/counts?kind=future",
+                headers={"Authorization": "Bearer scott"},
+            )
+            assert invalid_counts.status == 400
+            duplicate_counts = await client.get(
+                "/v1/client/notifications/counts?kind=mention&kind=reply",
+                headers={"Authorization": "Bearer scott"},
+            )
+            assert duplicate_counts.status == 400
+        finally:
+            await client.close()
+            await store.close()
+
     async def test_principal_stream_starts_with_checkpoint_and_rejects_future_resume(
         self,
         tmp_path: Path,

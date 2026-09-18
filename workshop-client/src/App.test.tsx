@@ -1852,6 +1852,59 @@ describe("Workshop React client", () => {
     expect(screen.getAllByRole("button", { name: /Scott mentioned you/ })).toHaveLength(1);
   });
 
+  it("excludes live reply notifications from the Mentions surface", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    render(<App />);
+    await waitFor(() => expect(streamPrincipalEvents).toHaveBeenCalled());
+    await waitFor(() => expect(loadHumanNotifications).toHaveBeenCalledWith(
+      "session-secret",
+      { kind: "mention", limit: 50 },
+      expect.any(AbortSignal),
+    ));
+
+    const reply: WorkshopHumanNotification = {
+      channelName: "Wake policy qualification",
+      createdAt: "2026-08-31T15:00:00Z",
+      createdEventPosition: 42,
+      kind: "reply",
+      lastEventPosition: 42,
+      notificationId: "ntf_00000000000000000000000000000005",
+      read: false,
+      readAt: null,
+      sourceAuthorDisplayName: "Scott",
+      sourceAuthorPrincipalId: "prn_00000000000000000000000000000003",
+      sourceChannelId: secondChannelId,
+      sourceMessageId: "msg_00000000000000000000000000000042",
+      sourceThreadRootId: "msg_00000000000000000000000000000040",
+      stateVersion: 0,
+    };
+    act(() => {
+      principalEventHandlers?.onBatch({
+        changes: [{
+          agentChanges: [],
+          threadChanges: [],
+          eventPosition: 42,
+          notificationChanges: [{
+            eventPosition: 42,
+            notification: reply,
+            transition: "human_notification.created",
+          }],
+          unreadChanges: [],
+        }],
+        throughPosition: 42,
+      }, "42");
+    });
+
+    await user.click(screen.getByRole("button", { name: "Mentions" }));
+    expect(screen.queryByRole("button", { name: /Scott mentioned you/ })).toBeNull();
+    expect(screen.getByText("No mentions yet.")).toBeVisible();
+  });
+
   it("opens the personal Settings workspace from the profile menu", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(

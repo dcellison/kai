@@ -7763,10 +7763,11 @@ async def _handle_human_notifications(
         response = _error_response(status=401, code="authentication_required", message="Authentication required")
         response.headers["WWW-Authenticate"] = "Bearer"
         return response
-    if request.can_read_body or not set(request.query).issubset({"cursor", "limit", "unread"}):
+    if request.can_read_body or not set(request.query).issubset({"cursor", "kind", "limit", "unread"}):
         return _error_response(status=400, code="invalid_request", message="Invalid notification request")
     try:
         cursor = _single_query_value(request, "cursor")
+        kind = _single_query_value(request, "kind")
         raw_limit = _single_query_value(request, "limit")
         raw_unread = _single_query_value(request, "unread")
         if raw_limit is not None and not _DECIMAL_INTEGER.fullmatch(raw_limit):
@@ -7779,6 +7780,7 @@ async def _handle_human_notifications(
             limit=limit,
             cursor=cursor,
             unread_only=raw_unread == "1",
+            kind=kind,
         )
     except (TypeError, ValueError, WorkshopHumanNotificationValidationError):
         return _error_response(status=400, code="invalid_request", message="Invalid notification request")
@@ -7810,9 +7812,12 @@ async def _handle_human_notification_counts(
         response = _error_response(status=401, code="authentication_required", message="Authentication required")
         response.headers["WWW-Authenticate"] = "Bearer"
         return response
-    if request.query or request.can_read_body:
+    if request.can_read_body or not set(request.query).issubset({"kind"}):
         return _error_response(status=400, code="invalid_request", message="Invalid notification count request")
-    counts = await service.counts(principal_id)
+    try:
+        counts = await service.counts(principal_id, kind=_single_query_value(request, "kind"))
+    except (TypeError, ValueError, WorkshopHumanNotificationValidationError):
+        return _error_response(status=400, code="invalid_request", message="Invalid notification count request")
     return _json_response(
         {
             "version": 1,
