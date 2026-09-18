@@ -5485,7 +5485,8 @@ function WorkshopView({
               <p className="overline">Channel context</p>
               <h2>{symbol} {channelName}</h2>
             </div>
-            {channel.kind === "group" && channel.role === "owner" && (
+            {channel.kind === "group" &&
+              (!channelIsArchived(channel) || channel.role === "owner") && (
               <div className="context-channel-actions">
                 {!channelIsArchived(channel) && (
                   <button
@@ -5498,20 +5499,22 @@ function WorkshopView({
                     <SettingsIcon />
                   </button>
                 )}
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
-                  title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
-                  disabled={channelLifecycleBusy !== null || activeResponseRuns.length > 0}
-                  onClick={() => void (
-                    !channelIsArchived(channel)
-                      ? archiveSelectedChannel()
-                      : restoreArchivedChannel(channelId)
-                  )}
-                >
-                  {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
-                </button>
+                {channel.role === "owner" && (
+                  <button
+                    className="panel-icon-button"
+                    type="button"
+                    aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                    title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                    disabled={channelLifecycleBusy !== null || activeResponseRuns.length > 0}
+                    onClick={() => void (
+                      !channelIsArchived(channel)
+                        ? archiveSelectedChannel()
+                        : restoreArchivedChannel(channelId)
+                    )}
+                  >
+                    {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
+                  </button>
+                )}
               </div>
             )}
             {channel.kind === "direct" &&
