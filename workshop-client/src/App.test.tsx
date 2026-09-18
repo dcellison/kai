@@ -2121,7 +2121,8 @@ describe("Workshop React client", () => {
 
     await openContextSection("Runtime");
     expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
-    await openContextSection("Workspace");
+    const workspaceSection = await openContextSection("Workspace");
+    expect(within(workspaceSection).queryByText("Your workspace")).toBeNull();
     const selector = screen.getByLabelText("Your workspace");
     expect(selector).toHaveValue("/Users/kai/Projects/kai");
     expect(screen.getByRole("option", { name: "Home" })).toHaveValue(
@@ -2142,6 +2143,34 @@ describe("Workshop React client", () => {
         "/var/lib/kai/home/principal",
       ),
     );
+  });
+
+  it("keeps channel workspace and agent internals out of the context panel", async () => {
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+    vi.mocked(loadRuntimeLaneStatus).mockResolvedValue({
+      ...runtimeLaneStatus,
+      channelId: secondChannelId,
+      workspaceMode: "neutral",
+      workspace: null,
+      workspaceRevision: null,
+      workspaces: [],
+    });
+
+    render(<App />);
+
+    const workspaceSection = await openContextSection("Workspace");
+    expect(
+      await within(workspaceSection).findByText("No shared workspace"),
+    ).toBeVisible();
+    expect(within(workspaceSection).queryByText("Kai")).toBeNull();
+
+    const agentsSection = await openContextSection("Agents");
+    expect(within(agentsSection).getByText("Kai")).toBeVisible();
+    expect(within(agentsSection).queryByText(runtimeProfileId)).toBeNull();
   });
 
   it("keeps operator runtime diagnostics in the Inspector", async () => {
