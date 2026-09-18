@@ -5478,7 +5478,26 @@ button:disabled {
 }
 
 .memory-project-registration input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 2rem;
   min-width: 0;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.4rem 0.55rem;
+  background: var(--color-canvas-inset);
+  color: var(--color-text-strong);
+  font: 0.66rem/1.2 var(--sans);
+}
+
+.memory-project-registration input::placeholder {
+  color: var(--color-text-muted);
+  opacity: 0.78;
+}
+
+.memory-project-registration input:disabled {
+  cursor: wait;
+  opacity: 0.66;
 }
 
 .workspace-creation-header {
