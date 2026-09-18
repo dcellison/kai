@@ -3402,6 +3402,10 @@ class CanonicalConversationProjection:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Workshop channel-agent detachment has no matching active attachment")
+            await connection.execute(
+                "DELETE FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+                (channel_id, agent_id),
+            )
         elif envelope.event_type == WorkshopEventType.CHANNEL_AGENT_DISMISSED:
             _require_exact_payload(payload, {"agent_id", "thread_root_message_id"})
             agent_id = AgentId(_required_text(payload, "agent_id"))

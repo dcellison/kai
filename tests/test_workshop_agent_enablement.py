@@ -522,6 +522,116 @@ async def test_archival_retires_runtime_lane_but_preserves_direct_channel(tmp_pa
         await store.close()
 
 
+async def test_group_detachment_retires_runtime_session_on_write_restart_and_rebuild(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "kai.db"
+    store, service, _execution, _contexts, _runtime_pool = await _service(path)
+    try:
+        daniel = await _principal(store, "101")
+        definition_id = await _active_specialist(store, daniel)
+        enabled = await service.enable(
+            daniel,
+            definition_id,
+            profile_id(101),
+            idempotency_key="detach-runtime-enable",
+        )
+        assert enabled.direct_channel_id is not None
+        group = await WorkshopChannelLifecycleService(store).create_group(
+            daniel,
+            name="Detach cleanup qualification",
+            agent_ids=[enabled.agent_id],
+            origin_channel_id=enabled.direct_channel_id,
+        )
+        async with store.connection.execute("SELECT MAX(position) FROM event_log") as cursor:
+            context_position = int((await cursor.fetchone())[0])
+
+        async def seed_session(channel_id: ChannelId, suffix: str) -> None:
+            await store.connection.execute("BEGIN IMMEDIATE")
+            await settle_runtime_session_in_transaction(
+                store,
+                RuntimeSessionSettlement(
+                    channel_id=channel_id,
+                    agent_id=enabled.agent_id,
+                    runtime_profile_id=profile_id(101),
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol", "openai"),
+                    workspace="/private/tmp/detach-cleanup",
+                    provider_session_id=f"detach-provider-session-{suffix}",
+                    run_id=RunId.new(),
+                ),
+                result_message_id=MessageId.new(),
+                context_through_event_position=context_position,
+                occurred_at=datetime.now(UTC),
+            )
+            await store.connection.commit()
+
+        await seed_session(enabled.direct_channel_id, "direct")
+        await seed_session(group.channel_id, "group")
+        async with store.connection.execute(
+            "SELECT channel_id, agent_id, runtime_profile_id, backend, provider, model, "
+            "workspace, provider_session_id, last_run_id, last_result_message_id, "
+            "context_through_event_position, created_at, updated_at "
+            "FROM channel_agent_runtime_sessions WHERE channel_id = ? AND agent_id = ?",
+            (group.channel_id, enabled.agent_id),
+        ) as cursor:
+            group_session_row = await cursor.fetchone()
+        assert group_session_row is not None
+
+        async def seed_detached_residue() -> None:
+            await store.connection.execute(
+                "INSERT INTO channel_agent_runtime_sessions ("
+                "channel_id, agent_id, runtime_profile_id, backend, provider, model, workspace, "
+                "provider_session_id, last_run_id, last_result_message_id, "
+                "context_through_event_position, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(group_session_row),
+            )
+            await store.connection.commit()
+
+        lifecycle = WorkshopChannelLifecycleService(store)
+        detached = await lifecycle.detach_agent(
+            daniel,
+            group.channel_id,
+            enabled.agent_id,
+            client_operation_id="detach-runtime-group",
+        )
+        replayed = await lifecycle.detach_agent(
+            daniel,
+            group.channel_id,
+            enabled.agent_id,
+            client_operation_id="detach-runtime-group",
+        )
+
+        assert detached.changed is True
+        assert replayed.changed is False
+        assert replayed.channel_id == detached.channel_id
+        assert replayed.agent_id == detached.agent_id
+        assert await load_runtime_session(store, group.channel_id, enabled.agent_id) is None
+        assert await load_runtime_session(store, enabled.direct_channel_id, enabled.agent_id) is not None
+
+        # Installed pre-fix residue is removed by ordinary startup authority
+        # reconciliation without disturbing an active direct lane.
+        await seed_detached_residue()
+        reconciliation = await reconcile_single_owner_agent_authority(
+            store,
+            profile_registry(101, 202),
+        )
+        assert reconciliation.retired_sessions == 1
+        assert await load_runtime_session(store, group.channel_id, enabled.agent_id) is None
+        assert await load_runtime_session(store, enabled.direct_channel_id, enabled.agent_id) is not None
+
+        # Projection replay independently converges the same pre-fix residue.
+        await seed_detached_residue()
+        await store.rebuild_projection(CanonicalConversationProjection())
+        assert await load_runtime_session(store, group.channel_id, enabled.agent_id) is None
+        assert await load_runtime_session(store, enabled.direct_channel_id, enabled.agent_id) is not None
+        assert workshop_runtime_session_status(path).startswith(
+            "Workshop conversation continuity: active; successful lanes=0, sessions=1"
+        )
+    finally:
+        await store.close()
+
+
 async def test_version_fifty_seven_archived_enablement_is_retired_on_upgrade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

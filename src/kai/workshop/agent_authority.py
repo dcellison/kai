@@ -73,6 +73,7 @@ async def reconcile_single_owner_agent_authority(
                 captured += 1
 
         retired_attachments, retired_sessions = await _retire_archived_agent_lanes(store)
+        retired_sessions += await _retire_detached_agent_sessions(store)
 
         async with connection.execute(
             "SELECT d.id, d.workshop_id, d.owner_principal_id, e.actor_principal_id "
@@ -211,6 +212,18 @@ async def _retire_archived_agent_lanes(store: WorkshopEventStore) -> tuple[int, 
         )
         retired_sessions += session_cursor.rowcount
     return retired_attachments, retired_sessions
+
+
+async def _retire_detached_agent_sessions(store: WorkshopEventStore) -> int:
+    """Remove provider continuity retained by pre-fix detached attachments."""
+    cursor = await store.connection.execute(
+        "DELETE FROM channel_agent_runtime_sessions WHERE EXISTS ("
+        "SELECT 1 FROM channel_agents ca "
+        "WHERE ca.channel_id = channel_agent_runtime_sessions.channel_id "
+        "AND ca.agent_id = channel_agent_runtime_sessions.agent_id "
+        "AND ca.detached_at IS NOT NULL)"
+    )
+    return cursor.rowcount
 
 
 async def _resolve_initial_owner(
