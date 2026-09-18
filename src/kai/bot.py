@@ -5228,6 +5228,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ── Application factory ─────────────────────────────────────────────
 
 
+_TELEGRAM_COMMAND_HANDLERS = (
+    ("start", handle_start),
+    ("new", handle_new),
+    ("models", handle_models),
+    ("model", handle_model),
+    ("backends", handle_backends),
+    ("backend", handle_backend),
+    ("stats", handle_stats),
+    ("help", handle_help),
+    ("job", handle_job),
+    ("jobs", handle_jobs),
+    ("settings", handle_settings),
+    ("project", handle_project),
+    ("workspace", handle_workspace),
+    ("ws", handle_workspace),
+    ("workspaces", handle_workspaces),
+    ("voice", handle_voice_command),
+    ("voices", handle_voices),
+    ("webhooks", handle_webhooks),
+    ("github", handle_github),
+    ("notifications", handle_notifications),
+    ("preferences", handle_preferences),
+    ("review", handle_review_command),
+    ("memory", memory_command.handle_memory_command),
+    ("stop", handle_stop),
+)
+
+
 def create_bot(
     config: Config,
     *,
@@ -5283,34 +5311,8 @@ def create_bot(
     # get recovery guidance before authenticating. Adding a future command to
     # this table automatically puts it behind TOTP unless it is deliberately
     # added to the narrow exemption set.
-    command_handlers = [
-        ("start", handle_start),
-        ("new", handle_new),
-        ("models", handle_models),
-        ("model", handle_model),
-        ("backends", handle_backends),
-        ("backend", handle_backend),
-        ("stats", handle_stats),
-        ("help", handle_help),
-        ("job", handle_job),
-        ("jobs", handle_jobs),
-        ("settings", handle_settings),
-        ("project", handle_project),
-        ("workspace", handle_workspace),
-        ("ws", handle_workspace),
-        ("workspaces", handle_workspaces),
-        ("voice", handle_voice_command),
-        ("voices", handle_voices),
-        ("webhooks", handle_webhooks),
-        ("github", handle_github),
-        ("notifications", handle_notifications),
-        ("preferences", handle_preferences),
-        ("review", handle_review_command),
-        ("memory", memory_command.handle_memory_command),
-        ("stop", handle_stop),
-    ]
     totp_exempt_commands = {"start", "help"}
-    for command, callback in command_handlers:
+    for command, callback in _TELEGRAM_COMMAND_HANDLERS:
         registered_callback = (
             callback if command in totp_exempt_commands else _require_sensitive_authentication(callback)
         )
