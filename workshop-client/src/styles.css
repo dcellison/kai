@@ -2574,9 +2574,9 @@ button:disabled {
 }
 
 .context-section-toggle {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  display: flex;
   align-items: center;
+  gap: 0.35rem;
   min-height: 2.7rem;
   padding: 0.5rem 1rem;
   color: var(--color-text-strong);
@@ -2590,6 +2590,8 @@ button:disabled {
 }
 
 .context-section-toggle .context-section-title {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   margin: 0;
   font-family: var(--serif);
@@ -2597,6 +2599,20 @@ button:disabled {
   font-weight: 540;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.context-section-header-action {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+}
+
+.context-section-header-action .panel-icon-button svg {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
 }
 
 .context-section-body {
@@ -2628,20 +2644,6 @@ button:disabled {
   font-size: 0.65rem;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.context-section-body-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  min-height: 2rem;
-  margin: -0.15rem 0 0.25rem;
-}
-
-.context-section-body-actions .panel-icon-button svg {
-  width: 1rem;
-  height: 1rem;
-  flex: none;
 }
 
 .agent-attention-section ul {
