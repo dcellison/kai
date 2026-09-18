@@ -1141,13 +1141,13 @@ describe("Workshop React client", () => {
     expect(screen.queryByText("Canonical Workshop command")).toBeNull();
     const channelContext = screen.getByLabelText("Channel context");
     expect(within(channelContext).queryByText("Canonical identity")).toBeNull();
-    const numberedSections = Array.from(
+    const contextSections = Array.from(
       channelContext.querySelectorAll<HTMLDetailsElement>("details.context-section"),
     );
-    expect(numberedSections).toHaveLength(4);
-    expect(numberedSections.every((section) => !section.open)).toBe(true);
+    expect(contextSections).toHaveLength(4);
+    expect(contextSections.every((section) => !section.open)).toBe(true);
     expect(
-      numberedSections.every(
+      contextSections.every(
         (section) => section.querySelector("summary")?.querySelector("svg") === null,
       ),
     ).toBe(true);
@@ -1159,11 +1159,7 @@ describe("Workshop React client", () => {
     expect(within(channelContext).getByText(
       "You can read and send messages in this channel. Mention an agent to direct a request to it.",
     )).toBeVisible();
-    expect(
-      Array.from(channelContext.querySelectorAll(".section-number"), (section) =>
-        section.textContent,
-      ),
-    ).toEqual(["01", "02", "03", "04"]);
+    expect(channelContext.querySelector(".section-number")).toBeNull();
     const navigationPanel = screen.getByLabelText("Workshop navigation");
     expect(navigationPanel).toBeVisible();
     expect(navigationPanel.querySelector(".sidebar-title")).toHaveTextContent(

@@ -2509,9 +2509,8 @@ button:disabled {
 
 .context-section-toggle {
   display: grid;
-  grid-template-columns: 2rem minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
-  gap: 0.45rem;
   min-height: 2.7rem;
   padding: 0.5rem 1rem;
   color: var(--color-text-strong);
@@ -2522,10 +2521,6 @@ button:disabled {
 .context-section-toggle:focus-visible {
   background: color-mix(in srgb, var(--color-text) 4%, transparent);
   outline: none;
-}
-
-.context-section-toggle .section-number {
-  margin: 0;
 }
 
 .context-section-toggle .context-section-title {
