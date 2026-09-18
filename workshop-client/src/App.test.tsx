@@ -3867,6 +3867,41 @@ describe("Workshop React client", () => {
     );
   });
 
+  it("shows non-owner members read-only channel settings", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(
+      navigationWithGroup({ role: "participant" }),
+    );
+    vi.mocked(loadStandingParticipation).mockResolvedValue({
+      ...standingParticipation,
+      policy: {
+        ...standingParticipation.policy,
+        canManage: false,
+      },
+    });
+    vi.mocked(loadTimeline).mockResolvedValue({
+      messages: [{ ...historyMessage, channelId: secondChannelId }],
+      throughPosition: 25,
+      previousCursor: null,
+    });
+
+    render(<App />);
+    const settingsButton = await screen.findByRole("button", {
+      name: "Channel settings",
+    });
+    expect(screen.queryByRole("button", { name: "Archive channel" })).toBeNull();
+    await user.click(settingsButton);
+    const settings = await screen.findByRole("dialog", { name: "Channel settings" });
+    expect(within(settings).getByRole("checkbox", {
+      name: /Standing participation/,
+    })).toBeDisabled();
+    expect(within(settings).getByText(/Only a channel owner/)).toBeVisible();
+  });
+
   it("lets a channel owner manage explicit sponsored agent attachments", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
