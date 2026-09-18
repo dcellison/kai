@@ -2577,8 +2577,8 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 0.35rem;
-  min-height: 1.35rem;
-  padding: 0.08rem 1rem;
+  min-height: 2rem;
+  padding: 0.25rem 1rem;
   color: var(--color-text-strong);
   cursor: pointer;
 }
@@ -2616,8 +2616,8 @@ button:disabled {
 }
 
 .context-section-header-action .panel-icon-button {
-  width: 1.35rem;
-  height: 1.35rem;
+  width: 1.5rem;
+  height: 1.5rem;
 }
 
 .context-section-body {
