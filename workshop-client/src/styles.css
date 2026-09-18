@@ -969,10 +969,11 @@ button:disabled {
 .channel-agent-avatar {
   width: 1.05rem;
   height: 1.05rem;
+  border-radius: 0.28rem;
   background: color-mix(in srgb, var(--color-success) 15%, transparent);
   color: var(--color-success);
   font-family: var(--serif);
-  font-size: 0.56rem;
+  font-size: 0.6rem;
 }
 
 .agent-link strong,
@@ -1127,13 +1128,8 @@ button:disabled {
   padding: 0.62rem 0.4rem;
 }
 
-.channel-sidebar.collapsed .channel-link > span:first-child {
+.channel-sidebar.collapsed .channel-link > span:first-child:not(.channel-agent-avatar) {
   font-size: 0.92rem;
-}
-
-.channel-sidebar.collapsed .channel-link > .channel-agent-avatar {
-  border-radius: 0.28rem;
-  font-size: 0.6rem;
 }
 
 .channel-sidebar.collapsed .channel-link .mention-count {
