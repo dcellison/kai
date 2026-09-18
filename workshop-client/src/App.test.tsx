@@ -1401,7 +1401,14 @@ describe("Workshop React client", () => {
     expect(mentionsButton).toBeVisible();
     expect(screen.getByRole("button", { name: /Wake policy qualification/ })).toHaveTextContent("1");
     await user.click(mentionsButton);
-    expect(await screen.findByRole("heading", { name: "Mentions" })).toBeVisible();
+    const mentionsHeading = await screen.findByRole("heading", { name: "Mentions" });
+    expect(mentionsHeading).toBeVisible();
+    const mentionsHeader = mentionsHeading.closest("header");
+    expect(mentionsHeader).toHaveClass("conversation-header");
+    expect(within(mentionsHeader!).getByText("Kai Workshop / Activity")).toBeVisible();
+    expect(within(mentionsHeader!).getByRole("status")).toHaveTextContent("Live");
+    expect(within(mentionsHeader!).queryByRole("button", { name: "Back to conversation" }))
+      .toBeNull();
     expect(within(mentionsButton).getByLabelText("Open")).toHaveClass("live-pip");
     const sourceButton = screen.getByRole("button", { name: /Scott mentioned you/ });
     expect(sourceButton).toBeVisible();
@@ -1547,7 +1554,14 @@ describe("Workshop React client", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "Following, 1 unread" }));
-    expect(await screen.findByRole("heading", { name: "Following" })).toBeVisible();
+    const followingHeading = await screen.findByRole("heading", { name: "Following" });
+    expect(followingHeading).toBeVisible();
+    const followingHeader = followingHeading.closest("header");
+    expect(followingHeader).toHaveClass("conversation-header");
+    expect(within(followingHeader!).getByText("Kai Workshop / Activity")).toBeVisible();
+    expect(within(followingHeader!).getByRole("status")).toHaveTextContent("Live");
+    expect(within(followingHeader!).queryByRole("button", { name: "Back to conversation" }))
+      .toBeNull();
     expect(screen.getByText("Please review the qualification output.")).toBeVisible();
     expect(screen.getByText("1 unread")).toBeVisible();
     await user.click(screen.getByRole("button", { name: /Please review the qualification output/ }));

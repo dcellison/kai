@@ -1,7 +1,8 @@
 import { useState } from "react";
 
-import type { WorkshopHumanNotification } from "./types";
+import type { ConnectionState, WorkshopHumanNotification } from "./types";
 import type { HumanNotificationState } from "./useHumanNotifications";
+import { ActivityWorkspaceHeader } from "./ActivityWorkspaceHeader";
 import { HumanAvatar } from "./HumanAvatar";
 
 const INACTIVE_HUMAN_AVATAR = { active: false, stateVersion: 0, url: null } as const;
@@ -17,29 +18,27 @@ function formatMentionTime(value: string): string {
 }
 
 export function MentionsInbox({
+  connection,
   inbox,
-  onClose,
   onOpen,
+  workshopName,
 }: {
+  connection: ConnectionState;
   inbox: HumanNotificationState & {
     loadMore: () => void;
     markAllRead: () => Promise<void>;
     markVisibleRead: (messageId: string) => Promise<void>;
     setRead: (notification: WorkshopHumanNotification, read: boolean) => Promise<void>;
   };
-  onClose: () => void;
   onOpen: (notification: WorkshopHumanNotification) => boolean;
+  workshopName: string;
 }): React.JSX.Element {
   const [navigationError, setNavigationError] = useState<string | null>(null);
   return (
     <section className="mentions-workspace" aria-label="Mentions">
-      <header className="mentions-header">
-        <div>
-          <p className="overline">Personal inbox</p>
-          <h1>Mentions</h1>
-        </div>
-        <div className="mentions-header-actions">
-          {inbox.counts.unread > 0 && (
+      <ActivityWorkspaceHeader
+        actions={
+          inbox.counts.unread > 0 ? (
             <button
               className="quiet-button"
               type="button"
@@ -48,18 +47,13 @@ export function MentionsInbox({
             >
               {inbox.counts.unread > 100 ? "Mark next 100 read" : "Mark all read"}
             </button>
-          )}
-          <button
-            className="panel-icon-button"
-            type="button"
-            aria-label="Back to conversation"
-            title="Back to conversation"
-            onClick={onClose}
-          >
-            <span aria-hidden="true">←</span>
-          </button>
-        </div>
-      </header>
+          ) : null
+        }
+        connection={connection}
+        symbol="@"
+        title="Mentions"
+        workshopName={workshopName}
+      />
 
       <div className="mentions-summary" aria-live="polite">
         <strong>{inbox.counts.unread}</strong>
