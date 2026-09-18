@@ -3130,11 +3130,23 @@ button:disabled {
 
 .workspaces-workspace {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-columns:
+    minmax(17rem, 1fr)
+    min(
+      var(--context-pane-width, 19rem),
+      max(10rem, calc(100% - 17rem))
+    );
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--color-canvas);
+}
+
+.workspaces-browser-pane {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
 }
 
 .workspaces-header {
@@ -3184,16 +3196,9 @@ button:disabled {
   margin: 0;
 }
 
-.workspaces-body {
-  display: grid;
-  grid-template-columns: minmax(17rem, 0.72fr) minmax(22rem, 1.28fr);
-  min-height: 0;
-}
-
 .workspace-catalogue {
   min-width: 0;
   overflow-y: auto;
-  border-right: 1px solid var(--color-border);
 }
 
 .workspace-catalogue ul {
@@ -3270,14 +3275,19 @@ button:disabled {
 }
 
 .workspace-detail {
+  position: relative;
   min-width: 0;
-  overflow-y: auto;
-  padding: clamp(1.1rem, 3vw, 2.5rem);
+  overflow: hidden;
 }
 
-.workspace-detail > * {
-  max-width: 46rem;
-  margin-inline: auto;
+.workspace-detail-scroll {
+  height: 100%;
+  overflow-y: auto;
+  padding: 1rem;
+}
+
+.workspace-detail-scroll > * {
+  margin-inline: 0;
 }
 
 .workspace-detail-heading {
@@ -3308,8 +3318,8 @@ button:disabled {
 
 .workspace-detail dl div {
   display: grid;
-  grid-template-columns: 6.5rem minmax(0, 1fr);
-  gap: 0.8rem;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.18rem;
 }
 
 .workspace-detail dt,
@@ -3348,6 +3358,11 @@ button:disabled {
   font-size: 0.78rem;
 }
 
+.workspace-detail-actions {
+  display: grid;
+  gap: 0.45rem;
+}
+
 .workspace-project-detail p {
   margin-top: 0.35rem;
   color: var(--color-text-muted);
@@ -3359,8 +3374,9 @@ button:disabled {
   margin-top: 0.65rem;
 }
 
-.workspace-detail-actions .danger-button {
-  margin-left: 0.45rem;
+.workspace-detail-actions button {
+  width: 100%;
+  margin-top: 0;
 }
 
 .workspaces-empty {
@@ -6561,8 +6577,13 @@ button:disabled {
       );
   }
 
-  .workspaces-body {
-    grid-template-columns: minmax(16rem, 0.75fr) minmax(20rem, 1.25fr);
+  .workspaces-workspace {
+    grid-template-columns:
+      minmax(16rem, 1fr)
+      min(
+        var(--context-pane-width, 19rem),
+        max(10rem, calc(100% - 16rem))
+      );
   }
 }
 
@@ -6600,19 +6621,10 @@ button:disabled {
       min(var(--context-pane-width, 19rem), 44vw);
   }
 
-  .workspaces-body {
-    display: block;
-    overflow-y: auto;
-  }
-
-  .workspace-catalogue,
-  .workspace-detail {
-    overflow: visible;
-  }
-
-  .workspace-catalogue {
-    border-right: 0;
-    border-bottom: 1px solid var(--color-border);
+  .workspaces-workspace {
+    grid-template-columns:
+      minmax(0, 1fr)
+      min(var(--context-pane-width, 19rem), 44vw);
   }
 
   .workshop-app.agents-open,

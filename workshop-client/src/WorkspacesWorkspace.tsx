@@ -1,4 +1,12 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import {
   AuthenticationError,
@@ -82,12 +90,23 @@ type CatalogueEntry = {
   project: WorkshopMemoryProject | null;
 };
 
+interface WorkspacesDetailPanelLayout {
+  width: number;
+  minimumWidth: number;
+  maximumWidth: number;
+  onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
+  onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onPointerMove: (event: ReactPointerEvent<HTMLDivElement>) => void;
+}
+
 export function WorkspacesWorkspace({
+  detailPanelLayout,
   onAuthenticationFailure,
   onChannelAccessFailure,
   onClose,
   session,
 }: {
+  detailPanelLayout?: WorkspacesDetailPanelLayout;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
   onClose: () => void;
@@ -327,24 +346,24 @@ export function WorkspacesWorkspace({
 
   return (
     <main className="workspaces-workspace" aria-label="Workspaces">
-      <header className="workspaces-header">
-        <div>
-          <h1>Your workspaces</h1>
-          <p>Directories you have authorized Kai to use.</p>
-        </div>
-        <div className="workspaces-header-actions">
-          <button className="panel-icon-button" type="button" aria-label="Create workspace" title="Create private workspace" disabled={busy} onClick={() => setCreateOpen(true)}><WorkspaceAddIcon /></button>
-          <button className="panel-icon-button" type="button" aria-label="Add existing workspace" title="Add existing workspace" disabled={busy} onClick={() => setAddOpen(true)}><ExistingWorkspaceIcon /></button>
-          <button className="panel-icon-button" type="button" aria-label="Back to conversation" title="Back to conversation" onClick={onClose}><span aria-hidden="true">←</span></button>
-        </div>
-      </header>
+      <section className="workspaces-browser-pane">
+        <header className="workspaces-header">
+          <div>
+            <h1>Your workspaces</h1>
+            <p>Directories you have authorized Kai to use.</p>
+          </div>
+          <div className="workspaces-header-actions">
+            <button className="panel-icon-button" type="button" aria-label="Create workspace" title="Create private workspace" disabled={busy} onClick={() => setCreateOpen(true)}><WorkspaceAddIcon /></button>
+            <button className="panel-icon-button" type="button" aria-label="Add existing workspace" title="Add existing workspace" disabled={busy} onClick={() => setAddOpen(true)}><ExistingWorkspaceIcon /></button>
+            <button className="panel-icon-button" type="button" aria-label="Back to conversation" title="Back to conversation" onClick={onClose}><span aria-hidden="true">←</span></button>
+          </div>
+        </header>
 
-      {(notice || error) && <div className="workspaces-notices" aria-live="polite">
-        {notice && <p className="settings-notice" role="status">{notice}</p>}
-        {error && <p className="settings-error" role="alert">{error}</p>}
-      </div>}
+        {(notice || error) && <div className="workspaces-notices" aria-live="polite">
+          {notice && <p className="settings-notice" role="status">{notice}</p>}
+          {error && <p className="settings-error" role="alert">{error}</p>}
+        </div>}
 
-      <div className="workspaces-body">
         <section className="workspace-catalogue" aria-label="Authorized workspaces">
           {loading ? <p className="workspaces-empty">Loading workspaces…</p> : entries.length === 0 ? <p className="workspaces-empty">No authorized workspaces.</p> : (
             <ul>
@@ -360,8 +379,25 @@ export function WorkspacesWorkspace({
             </ul>
           )}
         </section>
+      </section>
 
-        <aside className="workspace-detail" aria-live="polite">
+      <aside className="context-pane workspace-detail" aria-label="Workspace detail">
+        {detailPanelLayout && (
+          <div
+            className="context-resize-handle"
+            role="separator"
+            aria-label="Resize workspace detail"
+            aria-orientation="vertical"
+            aria-valuemin={detailPanelLayout.minimumWidth}
+            aria-valuemax={detailPanelLayout.maximumWidth}
+            aria-valuenow={detailPanelLayout.width}
+            tabIndex={0}
+            onKeyDown={detailPanelLayout.onKeyDown}
+            onPointerDown={detailPanelLayout.onPointerDown}
+            onPointerMove={detailPanelLayout.onPointerMove}
+          />
+        )}
+        <div className="workspace-detail-scroll" aria-live="polite">
           {selected ? (
             <>
               <div className="workspace-detail-heading">
@@ -398,8 +434,8 @@ export function WorkspacesWorkspace({
               </section>}
             </>
           ) : <p className="workspaces-empty">Select a workspace.</p>}
-        </aside>
-      </div>
+        </div>
+      </aside>
 
       {createOpen && runtime && <div className="modal-backdrop" role="presentation"><section className="channel-creation-dialog workspace-creation-dialog" role="dialog" aria-modal="true" aria-labelledby="create-workspace-title"><header className="workspace-creation-header"><div><p className="overline">Private workspace</p><h2 id="create-workspace-title">Create workspace</h2></div><button className="panel-icon-button" type="button" aria-label="Close workspace creation" title="Close workspace creation" disabled={busy} onClick={() => { setCreateOpen(false); setCreateName(""); }}><span aria-hidden="true">×</span></button></header><p>This creates a private directory inside your Kai home.</p><form onSubmit={(event) => void createPrivateWorkspace(event)}><label htmlFor="workspace-name">Workspace name</label><input id="workspace-name" type="text" autoFocus maxLength={64} value={createName} disabled={busy} onChange={(event) => setCreateName(event.target.value)} /><div className="form-actions"><button className="primary-button" type="submit" disabled={busy || !createName.trim()}>{busy ? "Creating…" : "Create workspace"}</button></div></form></section></div>}
 
