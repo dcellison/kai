@@ -6052,6 +6052,9 @@ class TestWorkshopTimelineEventStreamHTTPContract:
                 "run": {
                     "run_id": accepted.run.run_id,
                     "channel_id": alice_channel,
+                    "agent_id": str(accepted.run.agent_id),
+                    "inbound_message_id": str(accepted.run.inbound_message_id),
+                    "kind": accepted.run.kind.value,
                     "status": "accepted",
                     "accepted_at": "2026-08-11T14:00:01Z",
                     "started_at": None,
@@ -6508,7 +6511,8 @@ class TestWorkshopRunPreviewEventStream:
         store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
         previews = WorkshopRunPreviewRegistry()
         run_id = RunId.new()
-        previews.publish(run_id, ChannelId(alice_channel), "First sentence.")
+        agent_id = AgentId.new()
+        previews.publish(run_id, ChannelId(alice_channel), agent_id, "First sentence.")
         client = await _open_client(
             store,
             _Authenticator({"alice-token": alice_id}),
@@ -6529,11 +6533,17 @@ class TestWorkshopRunPreviewEventStream:
                 "version": 1,
                 "channel_id": alice_channel,
                 "run_id": str(run_id),
+                "agent_id": str(agent_id),
                 "sequence": 1,
                 "text": "First sentence.",
             }
 
-            previews.publish(run_id, ChannelId(alice_channel), "First sentence. Second sentence.")
+            previews.publish(
+                run_id,
+                ChannelId(alice_channel),
+                agent_id,
+                "First sentence. Second sentence.",
+            )
             event = await _read_sse_event(response)
             while event["event"] != "run.preview.updated":
                 event = await _read_sse_event(response)
@@ -6552,7 +6562,12 @@ class TestWorkshopRunPreviewEventStream:
     async def test_preview_events_are_scoped_to_their_channel(self, tmp_path: Path):
         store, _, alice_channel, bob_id, bob_channel = await _open_store(tmp_path / "kai.db")
         previews = WorkshopRunPreviewRegistry()
-        previews.publish(RunId.new(), ChannelId(alice_channel), "Private to the other channel.")
+        previews.publish(
+            RunId.new(),
+            ChannelId(alice_channel),
+            AgentId.new(),
+            "Private to the other channel.",
+        )
         client = await _open_client(
             store,
             _Authenticator({"bob-token": bob_id}),
@@ -6565,7 +6580,13 @@ class TestWorkshopRunPreviewEventStream:
                 headers={"Authorization": "Bearer bob-token"},
             )
             bob_run = RunId.new()
-            previews.publish(bob_run, ChannelId(bob_channel), "Visible in this channel.")
+            bob_agent = AgentId.new()
+            previews.publish(
+                bob_run,
+                ChannelId(bob_channel),
+                bob_agent,
+                "Visible in this channel.",
+            )
             event = await _read_sse_event(response)
             while event["event"] != "run.preview.updated":
                 event = await _read_sse_event(response)
@@ -6574,7 +6595,53 @@ class TestWorkshopRunPreviewEventStream:
             # connection; the first preview this stream ever sees must be the
             # one published for its own channel.
             assert event["data"]["run_id"] == str(bob_run)
+            assert event["data"]["agent_id"] == str(bob_agent)
             assert event["data"]["channel_id"] == bob_channel
+        finally:
+            if response is not None:
+                response.close()
+            await client.close()
+            await store.close()
+
+    async def test_concurrent_agent_previews_are_delivered_independently(self, tmp_path: Path):
+        store, alice_id, alice_channel, _, _ = await _open_store(tmp_path / "kai.db")
+        previews = WorkshopRunPreviewRegistry()
+        first_run = RunId.new()
+        second_run = RunId.new()
+        first_agent = AgentId.new()
+        second_agent = AgentId.new()
+        previews.publish(
+            first_run,
+            ChannelId(alice_channel),
+            first_agent,
+            "First agent text.",
+        )
+        previews.publish(
+            second_run,
+            ChannelId(alice_channel),
+            second_agent,
+            "Second agent text.",
+        )
+        client = await _open_client(
+            store,
+            _Authenticator({"alice-token": alice_id}),
+            run_previews=previews,
+        )
+        response = None
+        try:
+            response = await client.get(
+                f"/v1/channels/{alice_channel}/events",
+                headers={"Authorization": "Bearer alice-token"},
+            )
+            delivered: list[dict[str, object]] = []
+            while len(delivered) < 2:
+                event = await _read_sse_event(response)
+                if event["event"] == "run.preview.updated":
+                    delivered.append(event["data"])
+
+            assert [item["run_id"] for item in delivered] == [str(first_run), str(second_run)]
+            assert [item["agent_id"] for item in delivered] == [str(first_agent), str(second_agent)]
+            assert [item["text"] for item in delivered] == ["First agent text.", "Second agent text."]
         finally:
             if response is not None:
                 response.close()

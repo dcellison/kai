@@ -312,6 +312,26 @@ function navigationWithGroup({
     ],
   };
 }
+
+function navigationWithTwoAgentGroup(): WorkshopNavigation {
+  const result = navigationWithGroup();
+  const groupChannel = result.workshops[0].channels.find(
+    (candidate) => candidate.channelId === secondChannelId,
+  );
+  if (!groupChannel) throw new Error("Group fixture is missing.");
+  groupChannel.agents = [
+    ...groupChannel.agents,
+    {
+      ...groupChannel.agents[0],
+      agentId: "agt_00000000000000000000000000000002",
+      handle: "nova",
+      name: "Nova",
+      principalId: "prn_00000000000000000000000000000004",
+    },
+  ];
+  return result;
+}
+
 const historyMessage: TimelineMessage = {
   artifacts: [],
   authorDisplayName: "Kai",
@@ -572,8 +592,11 @@ const memoryRecord: WorkshopMemoryRecord = {
 
 const completedRun: WorkshopRun = {
   acceptedAt: "2026-08-13T09:00:00Z",
+  agentId: "agt_00000000000000000000000000000001",
   cancellationRequestedAt: null,
   channelId,
+  inboundMessageId: "msg_00000000000000000000000000000030",
+  kind: "respond",
   resultMessageId: "msg_00000000000000000000000000000031",
   runId: "run_00000000000000000000000000000030",
   startedAt: "2026-08-13T09:00:01Z",
@@ -1096,7 +1119,7 @@ describe("Workshop React client", () => {
     vi.mocked(submitCommand).mockResolvedValue({
       acceptance: "newly_accepted",
       messageId: "msg_00000000000000000000000000000030",
-      run: completedRun,
+      runs: [completedRun],
     });
     vi.mocked(streamTimeline).mockImplementation(
       async (_session, _position, streamHandlers, signal) => {
@@ -2282,6 +2305,7 @@ describe("Workshop React client", () => {
 
     act(() =>
       handlers?.onRunPreview({
+        agentId: "agt_00000000000000000000000000000001",
         runId: "run_00000000000000000000000000000030",
         sequence: 1,
         text: "First sentence.",
@@ -2292,6 +2316,7 @@ describe("Workshop React client", () => {
 
     act(() =>
       handlers?.onRunPreview({
+        agentId: "agt_00000000000000000000000000000001",
         runId: "run_00000000000000000000000000000030",
         sequence: 2,
         text: "First sentence. Second sentence.",
@@ -2302,6 +2327,7 @@ describe("Workshop React client", () => {
     // A stale lower-sequence event must not roll the bubble backwards.
     act(() =>
       handlers?.onRunPreview({
+        agentId: "agt_00000000000000000000000000000001",
         runId: "run_00000000000000000000000000000030",
         sequence: 1,
         text: "First sentence.",
@@ -2314,6 +2340,7 @@ describe("Workshop React client", () => {
       body: "First sentence. Second sentence. Final answer.",
       eventPosition: 31,
       messageId: "msg_00000000000000000000000000000031",
+      sourceRunId: "run_00000000000000000000000000000030",
     };
     act(() => handlers?.onMessage(canonicalAnswer, "31"));
 
@@ -2644,7 +2671,7 @@ describe("Workshop React client", () => {
     scrollHeight = 1300;
     await user.type(screen.getByLabelText("Message Kai"), "Show activity");
     await user.click(screen.getByRole("button", { name: "Send" }));
-    expect(await screen.findByLabelText("Agent run activity")).toBeVisible();
+    expect(await screen.findByLabelText("Agent activity")).toBeVisible();
     await waitFor(() => expect(timeline.scrollTop).toBe(1300));
 
     timeline.scrollTop = 100;
@@ -5134,7 +5161,7 @@ describe("Workshop React client", () => {
       .mockResolvedValueOnce({
         acceptance: "ready_replay",
         messageId: "msg_00000000000000000000000000000030",
-        run: completedRun,
+        runs: [completedRun],
       });
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
@@ -5290,7 +5317,7 @@ describe("Workshop React client", () => {
     vi.mocked(submitCommand).mockResolvedValueOnce({
       acceptance: "newly_accepted",
       messageId: "msg_00000000000000000000000000000030",
-      run: acceptedRun,
+      runs: [acceptedRun],
     });
     vi.mocked(cancelRun).mockResolvedValueOnce({
       ...acceptedRun,
@@ -5324,6 +5351,243 @@ describe("Workshop React client", () => {
     );
   });
 
+  it("keeps concurrent agent runs and previews independently attributed", async () => {
+    const user = userEvent.setup();
+    const groupNavigation = navigationWithTwoAgentGroup();
+    const secondAgentId = "agt_00000000000000000000000000000002";
+    vi.mocked(loadNavigation).mockResolvedValue(groupNavigation);
+    vi.mocked(loadRuntimeLaneStatus).mockImplementation(async (_session, requestedAgentId) => ({
+      ...runtimeLaneStatus,
+      agentHandle: requestedAgentId === secondAgentId ? "nova" : "kai",
+      agentId: requestedAgentId ?? completedRun.agentId,
+      agentName: requestedAgentId === secondAgentId ? "Nova" : "Kai",
+    }));
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    const inboundMessageId = "msg_00000000000000000000000000000030";
+    const kaiRun: WorkshopRun = {
+      ...completedRun,
+      channelId: secondChannelId,
+      inboundMessageId,
+      resultMessageId: null,
+      startedAt: null,
+      status: "accepted",
+      terminalAt: null,
+    };
+    const novaRun: WorkshopRun = {
+      ...kaiRun,
+      acceptedAt: "2026-08-13T09:00:00.100Z",
+      agentId: secondAgentId,
+      runId: "run_00000000000000000000000000000032",
+    };
+    vi.mocked(submitCommand).mockResolvedValueOnce({
+      acceptance: "newly_accepted",
+      messageId: inboundMessageId,
+      runs: [kaiRun, novaRun],
+    });
+    vi.mocked(cancelRun).mockResolvedValueOnce({
+      ...novaRun,
+      cancellationRequestedAt: "2026-08-13T09:00:03Z",
+      status: "cancelled",
+      terminalAt: "2026-08-13T09:00:03Z",
+      terminalCode: "requested_by_human",
+    });
+
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await user.type(
+      screen.getByLabelText("Message Wake policy qualification"),
+      "Ask both agents",
+    );
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const dock = await screen.findByLabelText("Agent activity");
+    expect(within(dock).getByText("Kai")).toBeVisible();
+    expect(within(dock).getByText("Nova")).toBeVisible();
+    expect(screen.getByLabelText("Message Wake policy qualification")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop all agent runs" })).toBeVisible();
+
+    act(() => {
+      handlers?.onRunPreview({
+        agentId: secondAgentId,
+        runId: novaRun.runId,
+        sequence: 1,
+        text: "Nova draft.",
+      });
+      handlers?.onRunPreview({
+        agentId: kaiRun.agentId,
+        runId: kaiRun.runId,
+        sequence: 2,
+        text: "Kai draft.",
+      });
+    });
+    expect(await screen.findByText("Nova draft.")).toBeVisible();
+    expect(screen.getByText("Kai draft.")).toBeVisible();
+
+    const startedNova = {
+      ...novaRun,
+      startedAt: "2026-08-13T09:00:01Z",
+      status: "started" as const,
+    };
+    const startedKai = {
+      ...kaiRun,
+      startedAt: "2026-08-13T09:00:02Z",
+      status: "started" as const,
+    };
+    act(() => {
+      handlers?.onRunActivity(
+        {
+          eventPosition: 31,
+          occurredAt: "2026-08-13T09:00:01Z",
+          run: startedNova,
+          transition: "run.started",
+        },
+        "31",
+      );
+      handlers?.onRunActivity(
+        {
+          eventPosition: 32,
+          occurredAt: "2026-08-13T09:00:02Z",
+          run: startedKai,
+          transition: "run.started",
+        },
+        "32",
+      );
+    });
+    const kaiAnswer: TimelineMessage = {
+      ...historyMessage,
+      body: "Kai answer.",
+      channelId: secondChannelId,
+      eventPosition: 33,
+      messageId: "msg_00000000000000000000000000000033",
+      sourceRunId: kaiRun.runId,
+    };
+    act(() => handlers?.onMessage(kaiAnswer, "33"));
+    expect(await screen.findByText("Kai answer.")).toBeVisible();
+    expect(screen.queryByText("Kai draft.")).toBeNull();
+    expect(screen.getByText("Nova draft.")).toBeVisible();
+
+    act(() =>
+      handlers?.onRunActivity(
+        {
+          eventPosition: 34,
+          occurredAt: "2026-08-13T09:00:03Z",
+          run: { ...startedKai, resultMessageId: kaiAnswer.messageId, status: "completed", terminalAt: "2026-08-13T09:00:03Z" },
+          transition: "run.completed",
+        },
+        "34",
+      ),
+    );
+    expect(screen.getByLabelText("Message Wake policy qualification")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop agent run" })).toBeVisible();
+    expect(within(dock).getByRole("button", { name: "Stop Nova" })).toBeVisible();
+
+    await user.click(within(dock).getByRole("button", { name: "Stop Nova" }));
+    expect(cancelRun).toHaveBeenCalledWith(
+      { channelId: secondChannelId, token: "existing-session" },
+      novaRun.runId,
+    );
+    expect(screen.getByLabelText("Message Wake policy qualification")).toBeEnabled();
+  });
+
+  it("keeps a failed multi-run cancellation available for retry", async () => {
+    const user = userEvent.setup();
+    const secondAgentId = "agt_00000000000000000000000000000002";
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithTwoAgentGroup());
+    vi.mocked(loadRuntimeLaneStatus).mockImplementation(async (_session, requestedAgentId) => ({
+      ...runtimeLaneStatus,
+      agentHandle: requestedAgentId === secondAgentId ? "nova" : "kai",
+      agentId: requestedAgentId ?? completedRun.agentId,
+      agentName: requestedAgentId === secondAgentId ? "Nova" : "Kai",
+    }));
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId: secondChannelId, token: "existing-session" }),
+    );
+    const firstRun: WorkshopRun = {
+      ...completedRun,
+      channelId: secondChannelId,
+      resultMessageId: null,
+      startedAt: null,
+      status: "accepted",
+      terminalAt: null,
+    };
+    const secondRun: WorkshopRun = {
+      ...firstRun,
+      agentId: secondAgentId,
+      runId: "run_00000000000000000000000000000032",
+    };
+    vi.mocked(submitCommand).mockResolvedValueOnce({
+      acceptance: "newly_accepted",
+      messageId: firstRun.inboundMessageId,
+      runs: [firstRun, secondRun],
+    });
+    vi.mocked(cancelRun)
+      .mockResolvedValueOnce({
+        ...firstRun,
+        cancellationRequestedAt: "2026-08-13T09:00:01Z",
+        status: "cancelled",
+        terminalAt: "2026-08-13T09:00:01Z",
+        terminalCode: "requested_by_human",
+      })
+      .mockRejectedValueOnce(new Error("Nova could not be stopped."));
+
+    render(<App />);
+    expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
+    await user.type(
+      screen.getByLabelText("Message Wake policy qualification"),
+      "Ask both agents",
+    );
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: "Stop all agent runs" }));
+
+    expect(
+      await screen.findByText("Stopped 1 agent run; 1 could not be stopped."),
+    ).toBeVisible();
+    expect(cancelRun).toHaveBeenCalledTimes(2);
+    expect(screen.getByLabelText("Message Wake policy qualification")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop agent run" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Stop Nova" })).toBeEnabled();
+  });
+
+  it("restores every persisted nonterminal run for a channel", async () => {
+    const firstRun = {
+      ...completedRun,
+      resultMessageId: null,
+      startedAt: null,
+      status: "accepted" as const,
+      terminalAt: null,
+    };
+    const secondRun = {
+      ...firstRun,
+      agentId: "agt_00000000000000000000000000000002",
+      runId: "run_00000000000000000000000000000032",
+    };
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    sessionStorage.setItem(
+      "kai.workshop.active-runs.v2",
+      JSON.stringify({ [channelId]: [firstRun.runId, secondRun.runId] }),
+    );
+    vi.mocked(loadRun).mockImplementation(async (_session, runId) =>
+      runId === firstRun.runId ? firstRun : secondRun
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(loadRun).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(loadRun).mock.calls.map((call) => call[1])).toEqual([
+      firstRun.runId,
+      secondRun.runId,
+    ]);
+    expect(await screen.findByLabelText("Agent activity")).toBeVisible();
+    expect(screen.getByLabelText("Message Kai")).toBeDisabled();
+  });
+
   it("updates run activity from the live stream without polling run state", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
@@ -5340,7 +5604,7 @@ describe("Workshop React client", () => {
     vi.mocked(submitCommand).mockResolvedValueOnce({
       acceptance: "newly_accepted",
       messageId: "msg_00000000000000000000000000000030",
-      run: acceptedRun,
+      runs: [acceptedRun],
     });
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
@@ -5449,7 +5713,7 @@ describe("Workshop React client", () => {
       resolveSubmission?.({
         acceptance: "newly_accepted",
         messageId: "msg_00000000000000000000000000000030",
-        run: acceptedRun,
+        runs: [acceptedRun],
       }),
     );
     await submitting;

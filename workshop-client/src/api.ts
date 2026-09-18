@@ -527,8 +527,11 @@ function parseRun(value: unknown, channelId: string): WorkshopRun | null {
   }
   const {
     accepted_at: acceptedAt,
+    agent_id: agentId,
     cancellation_requested_at: cancellationRequestedAt,
     channel_id: runChannelId,
+    inbound_message_id: inboundMessageId,
+    kind,
     result_message_id: resultMessageId,
     run_id: runId,
     started_at: startedAt,
@@ -538,8 +541,13 @@ function parseRun(value: unknown, channelId: string): WorkshopRun | null {
   } = value;
   if (
     typeof acceptedAt !== "string" ||
+    typeof agentId !== "string" ||
+    !AGENT_PATTERN.test(agentId) ||
     (cancellationRequestedAt !== null && typeof cancellationRequestedAt !== "string") ||
     runChannelId !== channelId ||
+    typeof inboundMessageId !== "string" ||
+    !MESSAGE_PATTERN.test(inboundMessageId) ||
+    (kind !== "respond" && kind !== "observe") ||
     (resultMessageId !== null && typeof resultMessageId !== "string") ||
     typeof runId !== "string" ||
     (startedAt !== null && typeof startedAt !== "string") ||
@@ -552,8 +560,11 @@ function parseRun(value: unknown, channelId: string): WorkshopRun | null {
   }
   return {
     acceptedAt,
+    agentId,
     cancellationRequestedAt,
     channelId,
+    inboundMessageId,
+    kind,
     resultMessageId,
     runId,
     startedAt,
@@ -5520,7 +5531,7 @@ export async function submitCommand(
     return {
       acceptance: payload.acceptance,
       messageId: payload.message_id,
-      run: (runs as WorkshopRun[])[0] ?? null,
+      runs: runs as WorkshopRun[],
     };
   }
   if (
@@ -5540,7 +5551,7 @@ export async function submitCommand(
   return {
     acceptance: payload.acceptance,
     messageId: payload.message_id,
-    run,
+    runs: [run],
   };
 }
 
@@ -7164,6 +7175,8 @@ export async function streamTimeline(
           !isRecord(previewPayload) ||
           previewPayload.version !== 1 ||
           previewPayload.channel_id !== session.channelId ||
+          typeof previewPayload.agent_id !== "string" ||
+          !AGENT_PATTERN.test(previewPayload.agent_id) ||
           typeof previewPayload.run_id !== "string" ||
           typeof previewPayload.text !== "string" ||
           typeof previewPayload.sequence !== "number" ||
@@ -7172,6 +7185,7 @@ export async function streamTimeline(
           continue;
         }
         handlers.onRunPreview({
+          agentId: previewPayload.agent_id,
           runId: previewPayload.run_id,
           sequence: previewPayload.sequence,
           text: previewPayload.text,

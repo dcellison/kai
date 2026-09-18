@@ -127,7 +127,8 @@ import {
 const BROWSER_CREDENTIAL_KEY = "kai.workshop.client-credential.v1";
 const TAB_CHANNEL_KEY = "kai.workshop.active-channel.v1";
 const LEGACY_SESSION_KEY = "kai.workshop.read-session.v1";
-const ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
+const ACTIVE_RUNS_KEY = "kai.workshop.active-runs.v2";
+const LEGACY_ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
 const DRAFTS_KEY = "kai.workshop.drafts.v1";
 const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
 const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v4";
@@ -510,7 +511,8 @@ function storeWorkshopAccess(session: WorkshopSession): void {
 function clearTabSessionState(): void {
   sessionStorage.removeItem(TAB_CHANNEL_KEY);
   sessionStorage.removeItem(LEGACY_SESSION_KEY);
-  sessionStorage.removeItem(ACTIVE_RUN_KEY);
+  sessionStorage.removeItem(ACTIVE_RUNS_KEY);
+  sessionStorage.removeItem(LEGACY_ACTIVE_RUN_KEY);
   sessionStorage.removeItem(DRAFTS_KEY);
   sessionStorage.removeItem(VIEWPORTS_KEY);
 }
@@ -520,44 +522,60 @@ function forgetStoredSession(): void {
   clearTabSessionState();
 }
 
-function restoreActiveRunId(channelId: string): string | null {
+function restoreActiveRunIds(channelId: string): string[] {
   try {
-    const stored: unknown = JSON.parse(sessionStorage.getItem(ACTIVE_RUN_KEY) ?? "null");
+    const stored: unknown = JSON.parse(sessionStorage.getItem(ACTIVE_RUNS_KEY) ?? "null");
     if (
       typeof stored === "object" &&
       stored !== null &&
       channelId in stored &&
-      typeof (stored as Record<string, unknown>)[channelId] === "string" &&
-      String((stored as Record<string, unknown>)[channelId]).startsWith("run_")
+      Array.isArray((stored as Record<string, unknown>)[channelId])
     ) {
-      return String((stored as Record<string, unknown>)[channelId]);
+      return ((stored as Record<string, unknown[]>)[channelId] ?? []).filter(
+        (runId): runId is string => typeof runId === "string" && runId.startsWith("run_"),
+      );
     }
   } catch {
     // Malformed tab-local state has no authority.
   }
-  return null;
+  try {
+    const legacy: unknown = JSON.parse(sessionStorage.getItem(LEGACY_ACTIVE_RUN_KEY) ?? "null");
+    if (typeof legacy === "object" && legacy !== null) {
+      const runId = (legacy as Record<string, unknown>)[channelId];
+      if (typeof runId === "string" && runId.startsWith("run_")) return [runId];
+    }
+  } catch {
+    // Malformed legacy state has no authority.
+  }
+  return [];
 }
 
-function storeActiveRun(channelId: string, runId: string | null): void {
-  let stored: Record<string, string> = {};
+function storeActiveRunIds(channelId: string, runIds: string[]): void {
+  let stored: Record<string, string[]> = {};
   try {
-    const value: unknown = JSON.parse(sessionStorage.getItem(ACTIVE_RUN_KEY) ?? "{}");
+    const value: unknown = JSON.parse(sessionStorage.getItem(ACTIVE_RUNS_KEY) ?? "{}");
     if (typeof value === "object" && value !== null && !Array.isArray(value)) {
       stored = Object.fromEntries(
-        Object.entries(value).filter((entry): entry is [string, string] =>
-          typeof entry[1] === "string" && entry[1].startsWith("run_"),
-        ),
+        Object.entries(value).flatMap(([storedChannelId, candidate]) => {
+          if (!Array.isArray(candidate)) return [];
+          const valid = candidate.filter(
+            (runId): runId is string => typeof runId === "string" && runId.startsWith("run_"),
+          );
+          return valid.length > 0 ? [[storedChannelId, valid]] : [];
+        }),
       );
     }
   } catch {
     // Replace malformed tab-local state with the current channel state.
   }
-  if (runId) {
-    stored[channelId] = runId;
+  const unique = [...new Set(runIds.filter((runId) => runId.startsWith("run_")))];
+  if (unique.length > 0) {
+    stored[channelId] = unique;
   } else {
     delete stored[channelId];
   }
-  sessionStorage.setItem(ACTIVE_RUN_KEY, JSON.stringify(stored));
+  sessionStorage.setItem(ACTIVE_RUNS_KEY, JSON.stringify(stored));
+  sessionStorage.removeItem(LEGACY_ACTIVE_RUN_KEY);
 }
 
 function restoreDraft(channelId: string): string {
@@ -2896,8 +2914,8 @@ function WorkshopView({
   settingsRuntimeLabel,
   settingsSession,
   navigation,
-  runActivity,
-  runPreview,
+  runActivities,
+  runPreviews,
   runTrace,
   standingParticipationVersion,
   reactionUpdates,
@@ -2984,8 +3002,8 @@ function WorkshopView({
   settingsRuntimeLabel: string;
   settingsSession: WorkshopSession;
   navigation: WorkshopNavigation;
-  runActivity: WorkshopRunActivity | null;
-  runPreview: WorkshopRunPreview | null;
+  runActivities: WorkshopRunActivity[];
+  runPreviews: WorkshopRunPreview[];
   runTrace: WorkshopRunTraceSignal | null;
   standingParticipationVersion: number;
   reactionUpdates: Record<string, TimelineMessage["reactions"]>;
@@ -3108,8 +3126,8 @@ function WorkshopView({
   const [submissionError, setSubmissionError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [selectedArtifact, setSelectedArtifact] = useState<File | null>(null);
-  const [stopping, setStopping] = useState(false);
-  const [activeRun, setActiveRun] = useState<WorkshopRun | null>(null);
+  const [stoppingRunIds, setStoppingRunIds] = useState<Set<string>>(() => new Set());
+  const [runsById, setRunsById] = useState<Record<string, WorkshopRun>>({});
   const [runClock, setRunClock] = useState(() => Date.now());
   const [unseenMessageCount, setUnseenMessageCount] = useState(0);
   // Render-state mirror of timelineFollowRef's negation. The ref is
@@ -3127,6 +3145,28 @@ function WorkshopView({
     useState<string | null>(null);
   const [runtimeLaneStatuses, setRuntimeLaneStatuses] =
     useState<WorkshopRuntimeLaneStatus[]>([]);
+  const orderedRuns = useMemo(
+    () => Object.values(runsById).sort((left, right) =>
+      left.acceptedAt.localeCompare(right.acceptedAt) || left.runId.localeCompare(right.runId)
+    ),
+    [runsById],
+  );
+  const activeRuns = useMemo(() => orderedRuns.filter(isRunActive), [orderedRuns]);
+  const activeResponseRuns = useMemo(
+    () => activeRuns.filter((run) => run.kind === "respond"),
+    [activeRuns],
+  );
+  const displayedRuns = useMemo(() => {
+    if (orderedRuns.length === 0) return [];
+    const activeGroups = new Set(activeRuns.map((run) => run.inboundMessageId));
+    const visibleGroups = activeGroups.size > 0
+      ? activeGroups
+      : new Set([orderedRuns[orderedRuns.length - 1].inboundMessageId]);
+    return orderedRuns.filter((run) => visibleGroups.has(run.inboundMessageId));
+  }, [activeRuns, orderedRuns]);
+  const runStateRevision = orderedRuns
+    .map((run) => `${run.runId}:${run.status}:${run.cancellationRequestedAt ?? ""}`)
+    .join("|");
   const [freshSessionBusyAgentId, setFreshSessionBusyAgentId] = useState<string | null>(null);
   const [freshSessionNotice, setFreshSessionNotice] = useState<string | null>(null);
   const effectiveAgentRuntime = runtimeLaneStatuses.length === 1
@@ -3203,7 +3243,6 @@ function WorkshopView({
     timelineRef.current = element;
     timelineInitializedRef.current = false;
   }, [channelId]);
-  const latestRunActivityRef = useRef<WorkshopRunActivity | null>(runActivity);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
   const threadRootMessage = useMemo(
@@ -3513,10 +3552,9 @@ function WorkshopView({
     showSilentObservations,
     standingParticipationVersion,
   ]);
-  // The inspected run: the channel's active run when one exists, else
-  // the most recently settled run (activeRun keeps its terminal value
-  // and is seeded from replayed lifecycle events on mount).
-  const inspectedRunId = activeRun?.runId ?? null;
+  // The inspector follows the newest run in the currently visible response
+  // group. Every run remains independently represented in the activity card.
+  const inspectedRunId = displayedRuns.at(-1)?.runId ?? null;
   const {
     collaborationActivity,
     entries: traceEntries,
@@ -3926,7 +3964,7 @@ function WorkshopView({
     channelId,
     humanDirect,
     onLoadRuntimeLaneStatus,
-    activeRun?.status,
+    runStateRevision,
     auxiliaryWorkspaceOpen,
   ]);
 
@@ -3953,7 +3991,7 @@ function WorkshopView({
         workspaceRevision: snapshot.revision,
         workspaces: snapshot.workspaces,
       })));
-      setActiveRun(null);
+      setRunsById({});
     } catch (caught) {
       setSettingsWorkspaceError(
         caught instanceof Error ? caught.message : "Could not switch workspace.",
@@ -3985,7 +4023,9 @@ function WorkshopView({
       setRuntimeLaneStatuses((current) => current.map((item) =>
         item.agentId === status.agentId ? refreshed : item
       ));
-      setActiveRun(null);
+      setRunsById((current) => Object.fromEntries(
+        Object.entries(current).filter(([, run]) => run.agentId !== status.agentId),
+      ));
       setFreshSessionNotice(
         `Fresh provider session ready for ${status.agentName}. Revision ${result.revision.slice(0, 12)}.`,
       );
@@ -4136,23 +4176,25 @@ function WorkshopView({
   };
 
   useEffect(() => {
-    const restoredRunId = restoreActiveRunId(channelId);
-    if (!restoredRunId) {
+    setRunsById({});
+    setStoppingRunIds(new Set());
+    const restoredRunIds = restoreActiveRunIds(channelId);
+    if (restoredRunIds.length === 0) {
       return;
     }
     let cancelled = false;
-    void onLoadRun(restoredRunId)
-      .then((run) => {
+    void Promise.allSettled(restoredRunIds.map((runId) => onLoadRun(runId)))
+      .then((results) => {
         if (!cancelled) {
-          setActiveRun(run);
-        }
-      })
-      .catch((caught: unknown) => {
-        if (!cancelled) {
-          storeActiveRun(channelId, null);
-          setSubmissionError(
-            caught instanceof Error ? caught.message : "Could not restore the active run.",
+          const restored = results.flatMap((result) =>
+            result.status === "fulfilled" && result.value.channelId === channelId
+              ? [result.value]
+              : []
           );
+          setRunsById(Object.fromEntries(restored.map((run) => [run.runId, run])));
+          if (results.some((result) => result.status === "rejected")) {
+            setSubmissionError("Could not restore every active agent run.");
+          }
         }
       });
     return () => {
@@ -4161,31 +4203,30 @@ function WorkshopView({
   }, [channelId, onLoadRun]);
 
   useEffect(() => {
-    latestRunActivityRef.current = runActivity;
-    if (!runActivity) {
+    if (runActivities.length === 0) {
       return;
     }
-    setActiveRun(runActivity.run);
-  }, [runActivity]);
+    setRunsById((current) => {
+      const next = { ...current };
+      for (const activity of runActivities) {
+        if (activity.run.channelId === channelId) next[activity.run.runId] = activity.run;
+      }
+      return next;
+    });
+  }, [channelId, runActivities]);
 
   useEffect(() => {
-    if (isRunActive(activeRun)) {
-      storeActiveRun(channelId, activeRun.runId);
-      return;
-    }
-    if (activeRun) {
-      storeActiveRun(channelId, null);
-    }
-  }, [activeRun, channelId]);
+    storeActiveRunIds(channelId, activeRuns.map((run) => run.runId));
+  }, [activeRuns, channelId]);
 
   useEffect(() => {
-    if (!isRunActive(activeRun)) {
+    if (activeRuns.length === 0) {
       return;
     }
     setRunClock(Date.now());
     const timer = window.setInterval(() => setRunClock(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [activeRun]);
+  }, [activeRuns.length]);
 
   useLayoutEffect(() => {
     const timeline = timelineRef.current;
@@ -4309,7 +4350,7 @@ function WorkshopView({
       follow: true,
       scrollTop: timeline.scrollTop,
     });
-  }, [activeRun, channelId, draft, runPreview]);
+  }, [channelId, draft, runPreviews]);
 
   const handleTimelineScroll = (): void => {
     const timeline = timelineRef.current;
@@ -4376,7 +4417,7 @@ function WorkshopView({
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const body = draft.trim();
-    if ((!body && !selectedArtifact) || submitting || isRunActive(activeRun)) {
+    if ((!body && !selectedArtifact) || submitting || activeResponseRuns.length > 0) {
       return;
     }
     setSubmissionError(null);
@@ -4392,11 +4433,17 @@ function WorkshopView({
       if (artifactInputRef.current) {
         artifactInputRef.current.value = "";
       }
-      const streamed = latestRunActivityRef.current;
-      if (result.run) {
-        setActiveRun(
-          streamed?.run.runId === result.run.runId ? streamed.run : result.run,
-        );
+      if (result.runs.length > 0) {
+        setRunsById((current) => {
+          const next = { ...current };
+          for (const run of result.runs) {
+            // A lifecycle event can settle a very fast run before the
+            // submission response arrives. Never replace that newer state
+            // with the response's accepted snapshot.
+            if (!(run.runId in next)) next[run.runId] = run;
+          }
+          return next;
+        });
       }
     } catch (caught) {
       setSubmissionError(
@@ -4407,22 +4454,42 @@ function WorkshopView({
     }
   };
 
-  const stopRun = async (): Promise<void> => {
-    if (!activeRun || !isRunActive(activeRun) || stopping) {
-      return;
-    }
+  const stopRuns = async (runs: WorkshopRun[]): Promise<void> => {
+    const targets = runs.filter(
+      (run) => isRunActive(run) && !stoppingRunIds.has(run.runId),
+    );
+    if (targets.length === 0) return;
     setSubmissionError(null);
-    setStopping(true);
+    setStoppingRunIds((current) => new Set([...current, ...targets.map((run) => run.runId)]));
     try {
-      setActiveRun(await onCancelRun(activeRun.runId));
-    } catch (caught) {
-      setSubmissionError(
-        caught instanceof Error ? caught.message : "Could not stop this run.",
+      const results = await Promise.allSettled(targets.map((run) => onCancelRun(run.runId)));
+      const updated = results.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : []
       );
+      if (updated.length > 0) {
+        setRunsById((current) => ({
+          ...current,
+          ...Object.fromEntries(updated.map((run) => [run.runId, run])),
+        }));
+      }
+      const failures = results.filter((result) => result.status === "rejected");
+      if (failures.length > 0) {
+        setSubmissionError(
+          failures.length === targets.length
+            ? "Could not stop the selected agent run."
+            : `Stopped ${updated.length} agent ${updated.length === 1 ? "run" : "runs"}; ${failures.length} could not be stopped.`,
+        );
+      }
     } finally {
-      setStopping(false);
+      const targetIds = new Set(targets.map((run) => run.runId));
+      setStoppingRunIds((current) => new Set(
+        [...current].filter((runId) => !targetIds.has(runId)),
+      ));
     }
   };
+
+  const stopRun = (run: WorkshopRun): Promise<void> => stopRuns([run]);
+  const stopActiveResponseRuns = (): Promise<void> => stopRuns(activeResponseRuns);
 
   return (
     <main
@@ -4841,7 +4908,7 @@ function WorkshopView({
           principalId={navigation.principal.principalId}
           principalName={humanName}
           principalEvents={principalEvents}
-          runActive={isRunActive(activeRun)}
+          runActive={activeResponseRuns.length > 0}
           token={agentToken}
           workshopName={workshop.name}
         />
@@ -4872,7 +4939,7 @@ function WorkshopView({
           principalName={humanName}
           roleLabel={humanRole}
           runtimeLabel={settingsRuntimeLabel}
-          runActive={isRunActive(activeRun)}
+          runActive={activeResponseRuns.length > 0}
           session={settingsSession}
         />
       ) : memoryDestination ? (
@@ -5034,23 +5101,31 @@ function WorkshopView({
                   />
                 </Fragment>
               ))}
-              {runPreview && channel.kind !== "notification" && !humanDirect && (
-                /* The preview payload carries no author; direct channels
-                   have a single agent today, so the first agent's name is
-                   the correct attribution until previews learn authorship. */
-                <li className="message-row agent run-preview">
-                  <span className="message-avatar" aria-hidden="true">
-                    {(channel.agents[0]?.name ?? "Agent").slice(0, 1).toUpperCase()}
-                  </span>
-                  <article>
-                    <header className="message-meta">
-                      <strong>{channel.agents[0]?.name ?? "Agent"}</strong>
-                      <span className="run-preview-label">writing</span>
-                    </header>
-                    <MarkdownMessage body={runPreview.text} />
-                  </article>
-                </li>
-              )}
+              {channel.kind !== "notification" && !humanDirect &&
+                [...runPreviews]
+                  .sort((left, right) =>
+                    left.sequence - right.sequence || left.runId.localeCompare(right.runId)
+                  )
+                  .map((preview) => {
+                    const agent = channel.agents.find(
+                      (candidate) => candidate.agentId === preview.agentId,
+                    );
+                    const agentName = agent?.name ?? "Agent";
+                    return (
+                      <li className="message-row agent run-preview" key={preview.runId}>
+                        <span className="message-avatar" aria-hidden="true">
+                          {agentName.slice(0, 1).toUpperCase()}
+                        </span>
+                        <article>
+                          <header className="message-meta">
+                            <strong>{agentName}</strong>
+                            <span className="run-preview-label">writing</span>
+                          </header>
+                          <MarkdownMessage body={preview.text} />
+                        </article>
+                      </li>
+                    );
+                  })}
             </ol>
           )}
           {later.available && (
@@ -5085,22 +5160,6 @@ function WorkshopView({
                   : `${unseenMessageCount} new messages`}
             </button>
           )}
-          {activeRun && !humanDirect && (
-            <section
-              className={`run-activity ${activeRun.status}`}
-              aria-label="Agent run activity"
-              aria-live="polite"
-            >
-              <div>
-                <p className="run-activity-title">Agent run</p>
-                <p className="run-activity-copy">{runStatusCopy(activeRun)}</p>
-              </div>
-              <div className="run-activity-state">
-                <strong>{activeRun.status}</strong>
-                <span>{formatRunDuration(activeRun, runClock)}</span>
-              </div>
-            </section>
-          )}
           {channel.canSubmitCommands ? (
             <form className="composer-form" onSubmit={(event) => void submit(event)}>
               <input
@@ -5118,7 +5177,7 @@ function WorkshopView({
                 type="button"
                 aria-label="Attach"
                 title="Attach a file"
-                disabled={submitting || isRunActive(activeRun)}
+                disabled={submitting || activeResponseRuns.length > 0}
                 onClick={() => artifactInputRef.current?.click()}
               >
                 <PaperclipIcon />
@@ -5126,7 +5185,7 @@ function WorkshopView({
               <textarea
                 ref={composerRef}
                 aria-label={`Message ${channelName}`}
-                disabled={submitting || isRunActive(activeRun)}
+                disabled={submitting || activeResponseRuns.length > 0}
                 value={draft}
                 onChange={(event) => {
                   const nextDraft = event.target.value;
@@ -5214,15 +5273,15 @@ function WorkshopView({
                   ))}
                 </div>
               )}
-              {isRunActive(activeRun) ? (
+              {activeResponseRuns.length > 0 ? (
                 <button
                   className="stop-button composer-icon-button"
                   type="button"
-                  aria-busy={stopping}
-                  aria-label={stopping ? "Stopping agent run…" : "Stop agent run"}
-                  title={stopping ? "Stopping agent run…" : "Stop agent run"}
-                  disabled={stopping}
-                  onClick={() => void stopRun()}
+                  aria-busy={activeResponseRuns.every((run) => stoppingRunIds.has(run.runId))}
+                  aria-label={activeResponseRuns.length === 1 ? "Stop agent run" : "Stop all agent runs"}
+                  title={activeResponseRuns.length === 1 ? "Stop agent run" : "Stop all agent runs"}
+                  disabled={activeResponseRuns.every((run) => stoppingRunIds.has(run.runId))}
+                  onClick={() => void stopActiveResponseRuns()}
                 >
                   <StopIcon />
                 </button>
@@ -5313,7 +5372,7 @@ function WorkshopView({
             principalEvents={principalEvents}
             readOnly={conversationReadOnly}
             rootMessage={threadRootMessage}
-            runActive={isRunActive(activeRun)}
+            runActive={activeResponseRuns.length > 0}
           />
         ) : (
         <div className="context-scroll">
@@ -5328,7 +5387,7 @@ function WorkshopView({
                 type="button"
                 aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
                 title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
-                disabled={channelLifecycleBusy !== null || isRunActive(activeRun)}
+                disabled={channelLifecycleBusy !== null || activeResponseRuns.length > 0}
                 onClick={() => void (
                   !channelIsArchived(channel)
                     ? archiveSelectedChannel()
@@ -5349,7 +5408,7 @@ function WorkshopView({
                 title={directMessageArchived
                   ? "Restore direct message"
                   : "Archive direct message"}
-                disabled={directMessageArchiveBusy !== null || isRunActive(activeRun)}
+                disabled={directMessageArchiveBusy !== null || activeResponseRuns.length > 0}
                 onClick={() => void (
                   directMessageArchived
                     ? restoreArchivedDirectMessage(channelId)
@@ -5637,7 +5696,7 @@ function WorkshopView({
                           <select
                             id={`workspace-${channelId}`}
                             value={status.workspace ?? ""}
-                            disabled={switchingWorkspace || isRunActive(activeRun)}
+                            disabled={switchingWorkspace || activeResponseRuns.length > 0}
                             onChange={(event) => void selectWorkspace(event.target.value)}
                           >
                             {status.workspaces.map((workspaceOption) => (
@@ -5752,6 +5811,50 @@ function WorkshopView({
           </ContextSection>}
 
         </div>
+        )}
+        {displayedRuns.length > 0 && !humanDirect && (
+          <section className="agent-activity-dock" aria-label="Agent activity" aria-live="polite">
+            <header>
+              <h2>Agent activity</h2>
+              <span>{displayedRuns.length}</span>
+            </header>
+            <ol>
+              {displayedRuns.map((run) => {
+                const agent = channel.agents.find(
+                  (candidate) => candidate.agentId === run.agentId,
+                );
+                const agentName = agent?.name ?? "Agent";
+                const stopping = stoppingRunIds.has(run.runId);
+                return (
+                  <li className={`agent-activity-row ${run.status}`} key={run.runId}>
+                    <span className="agent-activity-avatar" aria-hidden="true">
+                      {agentName.slice(0, 1).toUpperCase()}
+                    </span>
+                    <span className="agent-activity-description">
+                      <strong>{agentName}</strong>
+                      <small>{runStatusCopy(run)}</small>
+                    </span>
+                    <span className="agent-activity-state">
+                      <strong>{run.status}</strong>
+                      <small>{formatRunDuration(run, runClock)}</small>
+                    </span>
+                    {isRunActive(run) && run.kind === "respond" && (
+                      <button
+                        className="panel-icon-button agent-activity-stop"
+                        type="button"
+                        aria-label={`Stop ${agentName}`}
+                        title={`Stop ${agentName}`}
+                        disabled={stopping}
+                        onClick={() => void stopRun(run)}
+                      >
+                        <StopIcon />
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          </section>
         )}
       </aside>
       {archivedChannelsOpen && (
@@ -6054,8 +6157,8 @@ function ActiveWorkshopClient({
     messages,
     threadMessages,
     reactionUpdates,
-    runActivity,
-    runPreview,
+    runActivities,
+    runPreviews,
     runTrace,
     standingParticipationVersion,
     earlier,
@@ -6353,8 +6456,8 @@ function ActiveWorkshopClient({
       onLoadArtifact={loadSelectedArtifact}
       onLoadChannelMembers={loadSelectedChannelMembers}
       onLoadHumanPeers={loadSelectedHumanPeers}
-      runActivity={runActivity}
-      runPreview={runPreview}
+      runActivities={runActivities}
+      runPreviews={runPreviews}
       runTrace={runTrace}
       standingParticipationVersion={standingParticipationVersion}
       reactionUpdates={reactionUpdates}

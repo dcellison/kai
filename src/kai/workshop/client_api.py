@@ -5118,6 +5118,9 @@ def _serialize_run(run: DurableRun) -> dict[str, object]:
     return {
         "run_id": str(run.run_id),
         "channel_id": str(run.channel_id),
+        "agent_id": str(run.agent_id),
+        "inbound_message_id": str(run.inbound_message_id),
+        "kind": run.kind.value,
         "status": run.status.value,
         "accepted_at": _format_timestamp(run.accepted_at),
         "started_at": _format_timestamp(run.started_at) if run.started_at is not None else None,
@@ -6837,6 +6840,7 @@ def _serialize_run_preview_event(preview: RunPreview) -> bytes:
             "version": 1,
             "channel_id": str(preview.channel_id),
             "run_id": str(preview.run_id),
+            "agent_id": str(preview.agent_id),
             "sequence": preview.sequence,
             "text": preview.text,
         },
@@ -8166,9 +8170,10 @@ async def _handle_channel_event_stream(
         batch = initial_batch
         last_heartbeat = time.monotonic()
         last_authentication_check = last_heartbeat
-        # (run_id, sequence) of the preview most recently written to this
-        # connection, so an unchanged preview is not re-sent every poll.
-        last_preview_sent: tuple[str, int] | None = None
+        # Latest sequence written for each run. Agent execution is serialized
+        # by (channel, agent), so several agents may stream concurrently in
+        # one channel and every preview must advance independently.
+        last_preview_sent: dict[str, int] = {}
         # (run_id, seq) of the trace doorbell most recently written, so
         # the signal fires at most once per poll interval per run and
         # only when the durable trace actually advanced.
@@ -8181,12 +8186,11 @@ async def _handle_channel_event_stream(
             if transport is None or transport.is_closing():
                 break
             if run_previews is not None:
-                preview = run_previews.channel_preview(channel_id)
-                if preview is not None:
-                    preview_key = (str(preview.run_id), preview.sequence)
-                    if preview_key != last_preview_sent:
+                for preview in run_previews.channel_previews(channel_id):
+                    preview_run_id = str(preview.run_id)
+                    if preview.sequence > last_preview_sent.get(preview_run_id, 0):
                         await response.write(_serialize_run_preview_event(preview))
-                        last_preview_sent = preview_key
+                        last_preview_sent[preview_run_id] = preview.sequence
                         last_heartbeat = time.monotonic()
             async with request_lock:
                 trace_key = await _latest_channel_trace(store, channel_id)

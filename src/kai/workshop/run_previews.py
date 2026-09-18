@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from kai.workshop.domain import ChannelId, RunId
+from kai.workshop.domain import AgentId, ChannelId, RunId
 
 # Previews for runs that never settle (a crashed task, an expired lease)
 # must not linger forever in the reader's view. The TTL comfortably
@@ -29,6 +29,7 @@ class RunPreview:
 
     run_id: RunId
     channel_id: ChannelId
+    agent_id: AgentId
     text: str
     sequence: int
     updated_at: float
@@ -39,8 +40,8 @@ class WorkshopRunPreviewRegistry:
 
     The executor publishes from the run's owned execution path, so a
     superseded attempt cannot write here. Readers (the client event
-    stream) look up by channel; lane serialization means at most one run
-    per channel streams at a time.
+    stream) look up every active preview by channel; execution is serialized
+    per agent lane, so different agents may stream concurrently.
     """
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
@@ -53,7 +54,13 @@ class WorkshopRunPreviewRegistry:
         # sequence than one already delivered from this process.
         self._sequence = 0
 
-    def publish(self, run_id: RunId, channel_id: ChannelId, text: str) -> None:
+    def publish(
+        self,
+        run_id: RunId,
+        channel_id: ChannelId,
+        agent_id: AgentId,
+        text: str,
+    ) -> None:
         """Record `text` as the run's newest preview if it changed."""
         current = self._previews.get(run_id)
         if current is not None and current.text == text:
@@ -62,6 +69,7 @@ class WorkshopRunPreviewRegistry:
         self._previews[run_id] = RunPreview(
             run_id=run_id,
             channel_id=channel_id,
+            agent_id=agent_id,
             text=text,
             sequence=self._sequence,
             updated_at=self._clock(),
@@ -72,17 +80,21 @@ class WorkshopRunPreviewRegistry:
         self._previews.pop(run_id, None)
 
     def channel_preview(self, channel_id: ChannelId) -> RunPreview | None:
-        """Return the channel's newest live preview, expiring stale ones."""
+        """Return the channel's newest live preview for compatibility."""
+        previews = self.channel_previews(channel_id)
+        return previews[-1] if previews else None
+
+    def channel_previews(self, channel_id: ChannelId) -> tuple[RunPreview, ...]:
+        """Return every live preview in a channel, oldest update first."""
         now = self._clock()
         expired = [
             run_id for run_id, preview in self._previews.items() if now - preview.updated_at > _PREVIEW_TTL_SECONDS
         ]
         for run_id in expired:
             del self._previews[run_id]
-        newest: RunPreview | None = None
-        for preview in self._previews.values():
-            if preview.channel_id != channel_id:
-                continue
-            if newest is None or preview.updated_at > newest.updated_at:
-                newest = preview
-        return newest
+        return tuple(
+            sorted(
+                (preview for preview in self._previews.values() if preview.channel_id == channel_id),
+                key=lambda preview: (preview.updated_at, preview.sequence),
+            )
+        )

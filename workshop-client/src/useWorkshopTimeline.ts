@@ -109,8 +109,8 @@ export function useWorkshopTimeline(
   messages: TimelineMessage[];
   threadMessages: TimelineMessage[];
   reactionUpdates: Record<string, WorkshopMessageReaction[]>;
-  runActivity: WorkshopRunActivity | null;
-  runPreview: WorkshopRunPreview | null;
+  runActivities: WorkshopRunActivity[];
+  runPreviews: WorkshopRunPreview[];
   runTrace: WorkshopRunTraceSignal | null;
   standingParticipationVersion: number;
   earlier: EarlierHistoryState;
@@ -128,8 +128,8 @@ export function useWorkshopTimeline(
   const [reactionUpdates, setReactionUpdates] = useState<
     Record<string, WorkshopMessageReaction[]>
   >({});
-  const [runActivity, setRunActivity] = useState<WorkshopRunActivity | null>(null);
-  const [runPreview, setRunPreview] = useState<WorkshopRunPreview | null>(null);
+  const [runActivities, setRunActivities] = useState<Record<string, WorkshopRunActivity>>({});
+  const [runPreviews, setRunPreviews] = useState<Record<string, WorkshopRunPreview>>({});
   const [runTrace, setRunTrace] = useState<WorkshopRunTraceSignal | null>(null);
   const [standingParticipationVersion, setStandingParticipationVersion] = useState(0);
   const [connection, setConnection] = useState<ConnectionState>({
@@ -261,8 +261,8 @@ export function useWorkshopTimeline(
       setMessages([]);
       setThreadMessages([]);
       setReactionUpdates({});
-      setRunActivity(null);
-      setRunPreview(null);
+      setRunActivities({});
+      setRunPreviews({});
       setRunTrace(null);
       setConnection({ label: "Waiting", tone: "connecting" });
       return;
@@ -270,8 +270,8 @@ export function useWorkshopTimeline(
 
     const controller = new AbortController();
     const { signal } = controller;
-    setRunActivity(null);
-    setRunPreview(null);
+    setRunActivities({});
+    setRunPreviews({});
     setRunTrace(null);
     // Runs already seen terminal on this connection. A preview event that
     // races the terminal batch must never resurrect a finished bubble.
@@ -337,7 +337,7 @@ export function useWorkshopTimeline(
           // high-water mark held here would silently discard every preview
           // from the new process. Each connection attempt starts clean; the
           // stream re-sends the current preview immediately on connect.
-          setRunPreview(null);
+          setRunPreviews({});
           await streamTimeline(
             session,
             lastEventId,
@@ -359,8 +359,14 @@ export function useWorkshopTimeline(
                 knownMessageIds.add(message.messageId);
                 // The canonical assistant message replaces any streaming
                 // preview; SQLite remains authoritative.
-                if (message.authorKind === "agent") {
-                  setRunPreview(null);
+                if (message.authorKind === "agent" && message.sourceRunId) {
+                  const sourceRunId = message.sourceRunId;
+                  setRunPreviews((current) => {
+                    if (!(sourceRunId in current)) return current;
+                    const next = { ...current };
+                    delete next[sourceRunId];
+                    return next;
+                  });
                 }
                 if (message.threadRootId === null) {
                   setMessages((current) => appendUnique(current, message));
@@ -376,23 +382,28 @@ export function useWorkshopTimeline(
                 lastEventId = eventId;
                 if (activity.run.terminalAt !== null) {
                   terminalRunIds.add(activity.run.runId);
-                  setRunPreview((current) =>
-                    current && current.runId === activity.run.runId ? null : current,
-                  );
+                  setRunPreviews((current) => {
+                    if (!(activity.run.runId in current)) return current;
+                    const next = { ...current };
+                    delete next[activity.run.runId];
+                    return next;
+                  });
                 }
-                setRunActivity(activity);
+                setRunActivities((current) => ({
+                  ...current,
+                  [activity.run.runId]: activity,
+                }));
               },
               onRunPreview: (preview) => {
                 if (terminalRunIds.has(preview.runId)) {
                   return;
                 }
-                setRunPreview((current) =>
-                  current &&
-                  current.runId === preview.runId &&
-                  current.sequence >= preview.sequence
+                setRunPreviews((current) => {
+                  const held = current[preview.runId];
+                  return held && held.sequence >= preview.sequence
                     ? current
-                    : preview,
-                );
+                    : { ...current, [preview.runId]: preview };
+                });
               },
               // Unlike previews, traces are durable, so a doorbell for a
               // terminal run is meaningful; the card decides whether it
@@ -457,8 +468,8 @@ export function useWorkshopTimeline(
     messages,
     threadMessages,
     reactionUpdates,
-    runActivity,
-    runPreview,
+    runActivities: Object.values(runActivities),
+    runPreviews: Object.values(runPreviews),
     runTrace,
     standingParticipationVersion,
     earlier,

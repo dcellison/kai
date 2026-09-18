@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from kai.workshop.client_commands import WorkshopClientCommandExecutor
-from kai.workshop.domain import ChannelId, RunId
+from kai.workshop.domain import AgentId, ChannelId, RunId
 from kai.workshop.execution_coordinator import (
     CanonicalExecutionDisposition,
     CanonicalExecutionResult,
@@ -20,11 +20,12 @@ class TestRunPreviewRegistry:
         registry = WorkshopRunPreviewRegistry()
         run_id = RunId.new()
         channel_id = ChannelId.new()
+        agent_id = AgentId.new()
 
-        registry.publish(run_id, channel_id, "First sentence.")
-        registry.publish(run_id, channel_id, "First sentence.")
+        registry.publish(run_id, channel_id, agent_id, "First sentence.")
+        registry.publish(run_id, channel_id, agent_id, "First sentence.")
         first = registry.channel_preview(channel_id)
-        registry.publish(run_id, channel_id, "First sentence. Second sentence.")
+        registry.publish(run_id, channel_id, agent_id, "First sentence. Second sentence.")
         second = registry.channel_preview(channel_id)
 
         assert first is not None and first.sequence == 1
@@ -35,7 +36,7 @@ class TestRunPreviewRegistry:
         registry = WorkshopRunPreviewRegistry()
         run_id = RunId.new()
         channel_id = ChannelId.new()
-        registry.publish(run_id, channel_id, "Partial text.")
+        registry.publish(run_id, channel_id, AgentId.new(), "Partial text.")
 
         registry.clear(run_id)
 
@@ -49,9 +50,9 @@ class TestRunPreviewRegistry:
         stale_channel = ChannelId.new()
         live_channel = ChannelId.new()
 
-        registry.publish(stale_run, stale_channel, "Stale text.")
+        registry.publish(stale_run, stale_channel, AgentId.new(), "Stale text.")
         clock.now = 700.0
-        registry.publish(live_run, live_channel, "Live text.")
+        registry.publish(live_run, live_channel, AgentId.new(), "Live text.")
 
         live = registry.channel_preview(live_channel)
         assert live is not None and live.run_id == live_run
@@ -62,14 +63,15 @@ class TestRunPreviewRegistry:
         registry = WorkshopRunPreviewRegistry(clock=lambda: clock.now)
         run_id = RunId.new()
         channel_id = ChannelId.new()
+        agent_id = AgentId.new()
 
-        registry.publish(run_id, channel_id, "Before the quiet period.")
+        registry.publish(run_id, channel_id, agent_id, "Before the quiet period.")
         before = registry.channel_preview(channel_id)
         # A long silent tool call outlives the TTL; the entry expires while
         # the run is still alive, then publishing resumes.
         clock.now = 700.0
         assert registry.channel_preview(channel_id) is None
-        registry.publish(run_id, channel_id, "After the quiet period.")
+        registry.publish(run_id, channel_id, agent_id, "After the quiet period.")
         after = registry.channel_preview(channel_id)
 
         # A reader keeping a per-run high-water mark must never see the
@@ -77,25 +79,32 @@ class TestRunPreviewRegistry:
         assert before is not None and after is not None
         assert after.sequence > before.sequence
 
-    def test_newest_preview_wins_within_a_channel(self):
+    def test_channel_lookup_preserves_every_concurrent_preview(self):
         clock = SimpleNamespace(now=0.0)
         registry = WorkshopRunPreviewRegistry(clock=lambda: clock.now)
         channel_id = ChannelId.new()
         older = RunId.new()
         newer = RunId.new()
 
-        registry.publish(older, channel_id, "Older run text.")
+        older_agent = AgentId.new()
+        newer_agent = AgentId.new()
+        registry.publish(older, channel_id, older_agent, "Older run text.")
         clock.now = 1.0
-        registry.publish(newer, channel_id, "Newer run text.")
+        registry.publish(newer, channel_id, newer_agent, "Newer run text.")
 
-        preview = registry.channel_preview(channel_id)
-        assert preview is not None and preview.run_id == newer
+        previews = registry.channel_previews(channel_id)
+        assert [(preview.run_id, preview.agent_id) for preview in previews] == [
+            (older, older_agent),
+            (newer, newer_agent),
+        ]
+        assert registry.channel_preview(channel_id) == previews[-1]
 
 
 async def test_executor_publishes_stable_prefixes_and_clears_at_settlement():
     registry = WorkshopRunPreviewRegistry()
     run_id = RunId.new()
     channel_id = ChannelId.new()
+    agent_id = AgentId.new()
     observed_during_run: list[str] = []
 
     async def execute(_run_id, *, stream_observer=None):
@@ -114,7 +123,7 @@ async def test_executor_publishes_stable_prefixes_and_clears_at_settlement():
 
     execution = SimpleNamespace(
         execute=AsyncMock(side_effect=execute),
-        run_state=AsyncMock(return_value=SimpleNamespace(channel_id=channel_id)),
+        run_state=AsyncMock(return_value=SimpleNamespace(channel_id=channel_id, agent_id=agent_id)),
         recoverable_client_runs=AsyncMock(return_value=()),
         request_run_cancellation=AsyncMock(),
     )

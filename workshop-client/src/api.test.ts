@@ -396,8 +396,11 @@ function message(position: number, body = `Message ${position}`): Record<string,
 function run(status = "accepted"): Record<string, unknown> {
   return {
     accepted_at: "2026-08-13T09:00:00Z",
+    agent_id: agentId,
     cancellation_requested_at: null,
     channel_id: channelId,
+    inbound_message_id: "msg_00000000000000000000000000000001",
+    kind: "respond",
     result_message_id: null,
     run_id: "run_00000000000000000000000000000001",
     started_at: null,
@@ -2599,17 +2602,20 @@ describe("Workshop client API", () => {
     ).resolves.toEqual({
       acceptance: "newly_accepted",
       messageId: "msg_00000000000000000000000000000001",
-      run: {
+      runs: [{
         acceptedAt: "2026-08-13T09:00:00Z",
+        agentId,
         cancellationRequestedAt: null,
         channelId,
+        inboundMessageId: "msg_00000000000000000000000000000001",
+        kind: "respond",
         resultMessageId: null,
         runId: "run_00000000000000000000000000000001",
         startedAt: null,
         status: "accepted",
         terminalAt: null,
         terminalCode: null,
-      },
+      }],
     });
     const [path, options] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(path).toBe(`/v1/channels/${channelId}/commands`);
@@ -2654,14 +2660,17 @@ describe("Workshop client API", () => {
     ).resolves.toEqual({
       acceptance: "message_only",
       messageId: "msg_00000000000000000000000000000001",
-      run: null,
+      runs: [],
     });
     await expect(
       submitCommand(session, "browser-command-3", "@Kai and @Nova hello"),
     ).resolves.toMatchObject({
       acceptance: "newly_accepted",
       messageId: "msg_00000000000000000000000000000002",
-      run: { runId: "run_00000000000000000000000000000001" },
+      runs: [
+        { runId: "run_00000000000000000000000000000001" },
+        { runId: "run_00000000000000000000000000000002" },
+      ],
     });
   });
 
@@ -3058,6 +3067,7 @@ describe("Workshop client API", () => {
         version: 1,
         channel_id: channelId,
         run_id: "run_00000000000000000000000000000030",
+        agent_id: agentId,
         sequence: 2,
         text: "First sentence.",
       }),
@@ -3066,6 +3076,7 @@ describe("Workshop client API", () => {
         version: 1,
         channel_id: channelId,
         run_id: "run_00000000000000000000000000000030",
+        agent_id: agentId,
         sequence: 3,
       }),
       // Foreign channel: must never reach the handler.
@@ -3073,6 +3084,7 @@ describe("Workshop client API", () => {
         version: 1,
         channel_id: "chn_99999999999999999999999999999999",
         run_id: "run_00000000000000000000000000000031",
+        agent_id: agentId,
         sequence: 4,
         text: "Private to another channel.",
       }),
@@ -3107,6 +3119,7 @@ describe("Workshop client API", () => {
 
     expect(onRunPreview).toHaveBeenCalledOnce();
     expect(onRunPreview).toHaveBeenCalledWith({
+      agentId,
       runId: "run_00000000000000000000000000000030",
       sequence: 2,
       text: "First sentence.",

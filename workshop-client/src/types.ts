@@ -1238,7 +1238,7 @@ export interface ThreadTimelineSnapshot {
 export interface CommandSubmissionResult {
   acceptance: string;
   messageId: string;
-  run: WorkshopRun | null;
+  runs: WorkshopRun[];
 }
 
 export type WorkshopRunStatus =
@@ -1250,8 +1250,11 @@ export type WorkshopRunStatus =
 
 export interface WorkshopRun {
   acceptedAt: string;
+  agentId: string;
   cancellationRequestedAt: string | null;
   channelId: string;
+  inboundMessageId: string;
+  kind: "respond" | "observe";
   resultMessageId: string | null;
   runId: string;
   startedAt: string | null;
@@ -1270,6 +1273,7 @@ export type WorkshopRunTransition =
   | "run.cancelled";
 
 export interface WorkshopRunPreview {
+  agentId: string;
   runId: string;
   sequence: number;
   text: string;
