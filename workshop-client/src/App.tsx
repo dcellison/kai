@@ -4846,6 +4846,7 @@ function WorkshopView({
           principalEvents={principalEvents}
           runActive={isRunActive(activeRun)}
           token={agentToken}
+          workshopName={workshop.name}
         />
       ) : workspacesOpen ? (
         <WorkspacesWorkspace
@@ -4914,7 +4915,7 @@ function WorkshopView({
           <div>
             <p className="breadcrumbs">
               {workshop.name} / {channel.kind === "notification"
-                ? "Notifications"
+                ? "Activity"
                 : channel.kind === "direct"
                   ? "Direct messages"
                   : "Channels"}
