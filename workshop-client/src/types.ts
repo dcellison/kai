@@ -240,10 +240,21 @@ export interface WorkshopThreadUnreadSignal {
     | "thread_read_position.advanced";
 }
 
+export interface WorkshopScheduledJobSignal {
+  eventPosition: number;
+  jobId: number;
+  transition:
+    | "scheduled_job.created"
+    | "scheduled_job.updated"
+    | "scheduled_job.cancelled"
+    | "scheduled_job.deactivated";
+}
+
 export interface WorkshopPrincipalChange {
   agentChanges: WorkshopAgentChangeSignal[];
   eventPosition: number;
   notificationChanges: WorkshopHumanNotificationSignal[];
+  jobChanges: WorkshopScheduledJobSignal[];
   unreadChanges: WorkshopChannelUnreadSignal[];
   threadChanges: WorkshopThreadUnreadSignal[];
 }
@@ -251,6 +262,31 @@ export interface WorkshopPrincipalChange {
 export interface WorkshopPrincipalEventBatch {
   changes: WorkshopPrincipalChange[];
   throughPosition: number;
+}
+
+export interface WorkshopScheduledJob {
+  id: number;
+  name: string;
+  jobType: "reminder" | "agent";
+  prompt: string;
+  scheduleType: "once" | "interval" | "daily";
+  scheduleData: string;
+  createdAt: string;
+  active: boolean;
+  autoRemove: boolean;
+  notifyOnCheck: boolean;
+  agentName: string;
+  channelName: string;
+  deliveryTransports: string[];
+  nextRunAt: string | null;
+}
+
+export interface WorkshopScheduledJobCancellation {
+  jobId: number;
+  cancelled: boolean;
+  changed: boolean;
+  replayed: boolean;
+  eventPosition: number;
 }
 
 export type WorkshopAgentCapability =

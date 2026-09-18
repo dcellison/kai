@@ -3264,6 +3264,7 @@ button:disabled {
 /* Read-only memory workspace */
 
 .workshop-app.workspaces-open,
+.workshop-app.scheduled-jobs-open,
 .workshop-app.memory-open,
 .workshop-app.mentions-open,
 .workshop-app.following-open {
@@ -3446,6 +3447,131 @@ button:disabled {
 .workspace-detail-heading h2,
 .workspace-detail-heading p {
   margin: 0;
+}
+
+/* Principal-owned scheduled jobs */
+
+.scheduled-job-catalogue {
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.scheduled-job-group h2 {
+  margin: 0;
+  padding: 0.7rem 1rem 0.35rem;
+  color: var(--color-text-muted);
+  font: 650 0.58rem var(--sans);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.scheduled-job-group ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.scheduled-job-group li {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.scheduled-job-group button {
+  display: grid;
+  gap: 0.22rem;
+  width: 100%;
+  border: 0;
+  padding: 0.72rem 1rem;
+  background: transparent;
+  color: var(--color-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.scheduled-job-group button:hover,
+.scheduled-job-group button:focus-visible {
+  background: color-mix(in srgb, var(--color-text) 5%, transparent);
+  outline: none;
+}
+
+.scheduled-job-group button.selected {
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  box-shadow: inset 3px 0 var(--color-accent);
+}
+
+.scheduled-job-group button > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.scheduled-job-group strong {
+  overflow: hidden;
+  color: var(--color-text-strong);
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scheduled-job-group small {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 0.61rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scheduled-job-status {
+  flex: none;
+  color: var(--color-success);
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.scheduled-jobs-empty {
+  display: grid;
+  justify-items: center;
+  gap: 0.45rem;
+  padding: 3rem 1.5rem;
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
+.scheduled-jobs-empty svg,
+.scheduled-job-detail .panel-icon-button svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.scheduled-jobs-empty h2,
+.scheduled-jobs-empty p {
+  margin: 0;
+}
+
+.scheduled-jobs-empty h2 {
+  color: var(--color-text-strong);
+  font: 560 0.88rem var(--serif);
+}
+
+.scheduled-jobs-empty p {
+  max-width: 28rem;
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.scheduled-job-prompt {
+  margin-top: 1rem;
+}
+
+.scheduled-job-prompt h3 {
+  margin: 0 0 0.35rem;
+}
+
+.scheduled-job-prompt p {
+  margin: 0;
+  white-space: pre-wrap;
 }
 
 .workspace-detail-heading h2 {
@@ -6724,6 +6850,7 @@ button:disabled {
   }
 
   .workshop-app.workspaces-open,
+  .workshop-app.scheduled-jobs-open,
   .workshop-app.memory-open,
   .workshop-app.mentions-open,
   .workshop-app.following-open {
@@ -6771,6 +6898,7 @@ button:disabled {
   }
 
   .workshop-app.workspaces-open,
+  .workshop-app.scheduled-jobs-open,
   .workshop-app.memory-open,
   .workshop-app.mentions-open,
   .workshop-app.following-open {
@@ -6799,6 +6927,7 @@ button:disabled {
   }
 
   .agent-workspace,
+  .scheduled-jobs-workspace,
   .workspaces-workspace,
   .mentions-workspace,
   .following-workspace,

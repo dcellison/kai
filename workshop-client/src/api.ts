@@ -102,6 +102,8 @@ import type {
   WorkshopPrincipalEventBatch,
   WorkshopReplyParticipant,
   WorkshopCollaborationActivity,
+  WorkshopScheduledJob,
+  WorkshopScheduledJobCancellation,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -6954,6 +6956,94 @@ export async function streamHumanNotifications(
   }
 }
 
+function parseScheduledJob(value: unknown): WorkshopScheduledJob | null {
+  if (
+    !isRecord(value) ||
+    !Number.isSafeInteger(value.id) ||
+    (value.id as number) < 1 ||
+    typeof value.name !== "string" ||
+    !["reminder", "agent"].includes(String(value.job_type)) ||
+    typeof value.prompt !== "string" ||
+    !["once", "interval", "daily"].includes(String(value.schedule_type)) ||
+    typeof value.schedule_data !== "string" ||
+    typeof value.created_at !== "string" ||
+    typeof value.active !== "boolean" ||
+    typeof value.auto_remove !== "boolean" ||
+    typeof value.notify_on_check !== "boolean" ||
+    typeof value.agent_name !== "string" ||
+    typeof value.channel_name !== "string" ||
+    !Array.isArray(value.delivery_transports) ||
+    !value.delivery_transports.every((item) => typeof item === "string") ||
+    (value.next_run_at !== null && typeof value.next_run_at !== "string")
+  ) return null;
+  return {
+    active: value.active,
+    agentName: value.agent_name,
+    autoRemove: value.auto_remove,
+    channelName: value.channel_name,
+    createdAt: value.created_at,
+    deliveryTransports: value.delivery_transports as string[],
+    id: value.id as number,
+    jobType: value.job_type as WorkshopScheduledJob["jobType"],
+    name: value.name,
+    nextRunAt: value.next_run_at,
+    notifyOnCheck: value.notify_on_check,
+    prompt: value.prompt,
+    scheduleData: value.schedule_data,
+    scheduleType: value.schedule_type as WorkshopScheduledJob["scheduleType"],
+  };
+}
+
+export async function loadScheduledJobs(session: WorkshopSession): Promise<WorkshopScheduledJob[]> {
+  const response = await authorizedFetch(session, "/v1/client/scheduled-jobs");
+  const payload = await responsePayload(response);
+  const jobs = isRecord(payload) && payload.version === 1 && Array.isArray(payload.jobs)
+    ? payload.jobs.map(parseScheduledJob)
+    : [];
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load scheduled jobs."));
+  if (!isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.jobs) || jobs.some((job) => job === null)) {
+    throw new Error("Kai returned an unsupported scheduled-job list.");
+  }
+  return jobs as WorkshopScheduledJob[];
+}
+
+export async function cancelScheduledJob(
+  session: WorkshopSession,
+  jobId: number,
+  clientOperationId: string,
+): Promise<WorkshopScheduledJobCancellation> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/client/scheduled-jobs/${jobId}/cancel`,
+    {
+      body: JSON.stringify({ client_operation_id: clientOperationId }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  const payload = await responsePayload(response);
+  const result = isRecord(payload) && payload.version === 1 && isRecord(payload.result)
+    ? payload.result
+    : null;
+  if (!response.ok || !result) {
+    throw new Error(safeErrorMessage(payload, "Could not cancel scheduled job."));
+  }
+  if (
+    result.job_id !== jobId ||
+    result.cancelled !== true ||
+    typeof result.changed !== "boolean" ||
+    typeof result.replayed !== "boolean" ||
+    !Number.isSafeInteger(result.event_position)
+  ) throw new Error("Kai returned an unsupported scheduled-job cancellation.");
+  return {
+    cancelled: true,
+    changed: result.changed,
+    eventPosition: result.event_position as number,
+    jobId,
+    replayed: result.replayed,
+  };
+}
+
 export async function streamPrincipalEvents(
   token: string,
   lastEventId: string | null,
@@ -7019,6 +7109,7 @@ export async function streamPrincipalEvents(
           (rawChange.event_position as number) > throughPosition ||
           !Array.isArray(rawChange.agent_changes) ||
           !Array.isArray(rawChange.notification_changes) ||
+          (rawChange.job_changes !== undefined && !Array.isArray(rawChange.job_changes)) ||
           !Array.isArray(rawChange.unread_changes) ||
           !Array.isArray(rawChange.thread_changes)
         ) {
@@ -7059,6 +7150,29 @@ export async function streamPrincipalEvents(
                 : "enablement",
             occurredAt: item.occurred_at,
             revisionId: item.revision_id as string | null,
+          });
+        }
+        if (!valid) break;
+        const jobChanges: WorkshopPrincipalEventBatch["changes"][number]["jobChanges"] = [];
+        for (const item of rawChange.job_changes ?? []) {
+          if (
+            !isRecord(item) ||
+            !Number.isSafeInteger(item.job_id) ||
+            (item.job_id as number) < 1 ||
+            ![
+              "scheduled_job.created",
+              "scheduled_job.updated",
+              "scheduled_job.cancelled",
+              "scheduled_job.deactivated",
+            ].includes(String(item.event_type))
+          ) {
+            valid = false;
+            break;
+          }
+          jobChanges.push({
+            eventPosition,
+            jobId: item.job_id as number,
+            transition: item.event_type as WorkshopPrincipalEventBatch["changes"][number]["jobChanges"][number]["transition"],
           });
         }
         if (!valid) break;
@@ -7119,7 +7233,7 @@ export async function streamPrincipalEvents(
           });
         }
         if (!valid) break;
-        changes.push({ agentChanges, eventPosition, notificationChanges, threadChanges, unreadChanges });
+        changes.push({ agentChanges, eventPosition, jobChanges, notificationChanges, threadChanges, unreadChanges });
       }
       if (!valid) continue;
       handlers.onBatch({ changes, throughPosition }, event.eventId);

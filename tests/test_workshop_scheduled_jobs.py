@@ -59,6 +59,58 @@ async def scheduled_jobs(tmp_path: Path):
 
 
 class TestWorkshopScheduledJobStore:
+    async def test_principal_listing_and_cancellation_are_isolated_and_replay_safe(self, scheduled_jobs):
+        store, authorities = scheduled_jobs
+        daniel = authorities[101]
+        scott = authorities[202]
+        created = await store.create(
+            daniel,
+            name="Daily status",
+            job_type="agent",
+            prompt="Report status",
+            schedule_type="daily",
+            schedule_data='{"times":["09:00"]}',
+        )
+
+        views = await store.list_active_for_principal(daniel.principal_id)
+        assert [(view.job.job_id, view.agent_name) for view in views] == [
+            (created.job_id, "Kai"),
+        ]
+        assert await store.list_active_for_principal(scott.principal_id) == ()
+        assert (
+            await store.cancel_for_principal(
+                created.job_id,
+                scott.principal_id,
+                "cancel-1",
+            )
+            is None
+        )
+
+        first = await store.cancel_for_principal(
+            created.job_id,
+            daniel.principal_id,
+            "cancel-1",
+        )
+        assert first is not None
+        assert first.changed is True
+        assert first.replayed is False
+        replay = await store.cancel_for_principal(
+            created.job_id,
+            daniel.principal_id,
+            "cancel-1",
+        )
+        assert replay is not None
+        assert replay.changed is False
+        assert replay.replayed is True
+        assert replay.event_position == first.event_position
+        retained = await store.get_for_principal(
+            created.job_id,
+            daniel.principal_id,
+            active_only=False,
+        )
+        assert retained is not None
+        assert retained.active is False
+
     async def test_crud_is_scoped_to_one_canonical_execution_lane(self, scheduled_jobs):
         store, authorities = scheduled_jobs
         daniel = authorities[101]

@@ -1058,6 +1058,9 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
             list_jobs=AsyncMock(return_value=[]),
             get_job=AsyncMock(return_value=None),
             delete_job=AsyncMock(return_value=False),
+            list_principal_jobs=AsyncMock(return_value=[]),
+            get_principal_job=AsyncMock(return_value=None),
+            cancel_principal_job=AsyncMock(return_value=None),
         ),
         client_preferences=client_preferences,
         runtime_lane_status=MagicMock(),
@@ -1567,7 +1570,7 @@ class TestHandleJob:
                 "schedule_data": json.dumps({"seconds": 7200}),
             }
         ]
-        ctx.application.core_services.scheduler.list_jobs.return_value = jobs
+        ctx.application.core_services.scheduler.list_principal_jobs.return_value = jobs
         await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "2h" in reply
@@ -1587,7 +1590,7 @@ class TestHandleJob:
                 "schedule_data": json.dumps({"seconds": 300}),
             }
         ]
-        ctx.application.core_services.scheduler.list_jobs.return_value = jobs
+        ctx.application.core_services.scheduler.list_principal_jobs.return_value = jobs
         await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "5m" in reply
@@ -1606,7 +1609,7 @@ class TestHandleJob:
                 "schedule_data": json.dumps({"times": ["14:00"]}),
             }
         ]
-        ctx.application.core_services.scheduler.list_jobs.return_value = jobs
+        ctx.application.core_services.scheduler.list_principal_jobs.return_value = jobs
         await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "14:00" in reply
@@ -1628,7 +1631,7 @@ class TestHandleJob:
             "auto_remove": False,
             "notify_on_check": False,
         }
-        ctx.application.core_services.scheduler.get_job.return_value = job
+        ctx.application.core_services.scheduler.get_principal_job.return_value = job
         await handle_job(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "Job #4" in reply
@@ -1680,9 +1683,12 @@ class TestHandleJob:
         """Deletes from DB and removes the core scheduler task."""
         update = _make_update()
         ctx = _make_context(args=["cancel", "5"])
-        ctx.application.core_services.scheduler.delete_job.return_value = True
+        ctx.application.core_services.scheduler.cancel_principal_job.return_value = {
+            "job_id": 5,
+            "cancelled": True,
+        }
         await handle_job(update, ctx)
-        ctx.application.core_services.scheduler.delete_job.assert_awaited_once()
+        ctx.application.core_services.scheduler.cancel_principal_job.assert_awaited_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "cancelled" in reply.lower()
 
