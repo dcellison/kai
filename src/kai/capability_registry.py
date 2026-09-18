@@ -90,6 +90,37 @@ class ContextRequirement(StrEnum):
     ADMINISTRATOR = "administrator"
 
 
+class CapabilityInputShape(StrEnum):
+    """Typed interaction shape a native adapter should present."""
+
+    NONE = "none"
+    OPTIONAL_AGENT = "optional_agent"
+    MODEL_SELECTION = "model_selection"
+    BACKEND_SELECTION = "backend_selection"
+    RUNTIME_SETTINGS = "runtime_settings"
+    WORKSPACE_OPERATION = "workspace_operation"
+    MEMORY_PROJECT_OPERATION = "memory_project_operation"
+    GITHUB_SETTINGS = "github_settings"
+    NOTIFICATION_SETTINGS = "notification_settings"
+    PULL_REQUEST_REFERENCE = "pull_request_reference"
+    MEMORY_OPERATION = "memory_operation"
+    PREFERENCE_OPERATION = "preference_operation"
+    VOICE_PREFERENCE = "voice_preference"
+    SCHEDULED_JOB_OPERATION = "scheduled_job_operation"
+    MESSAGE = "message"
+    CHANNEL_OPERATION = "channel_operation"
+    DIRECT_MESSAGE_PEER = "direct_message_peer"
+    AGENT_DEFINITION = "agent_definition"
+    CHANNEL_PARTICIPANT = "channel_participant"
+    STANDING_PARTICIPATION_POLICY = "standing_participation_policy"
+    THREAD_OPERATION = "thread_operation"
+    REACTION = "reaction"
+    ACTIVITY_STATE = "activity_state"
+    PROFILE = "profile"
+    APPEARANCE = "appearance"
+    ARTIFACT_REFERENCE = "artifact_reference"
+
+
 class WorkshopSurface(StrEnum):
     """Stable identifiers for current or deliberately planned Workshop surfaces."""
 
@@ -115,6 +146,15 @@ class WorkshopSurface(StrEnum):
     APPEARANCE = "appearance"
     RUN_INSPECTOR = "run_inspector"
     ARTIFACTS = "artifacts"
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramHelpEntry:
+    """One adapter-native help line backed by a registered operation."""
+
+    usage: str
+    description: str
+    commands: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +190,11 @@ class AdapterPresentation:
     primary_command: str | None = None
     aliases: tuple[str, ...] = ()
     palette_entry: bool = False
+    input_shape: CapabilityInputShape = CapabilityInputShape.NONE
+    implemented: bool = True
+    help_group: int | None = None
+    help_entries: tuple[TelegramHelpEntry, ...] = ()
+    help_discoverable: bool = False
 
     @property
     def commands(self) -> tuple[str, ...]:
@@ -187,6 +232,8 @@ class CapabilityAvailability:
     disposition: AdapterDisposition
     surface: str | None
     palette_entry: bool
+    authority_scope: AuthorityScope
+    input_shape: CapabilityInputShape
     mutates_state: bool
     confirmation: ConfirmationPolicy
     available: bool
@@ -200,6 +247,8 @@ class CapabilityAvailability:
             "disposition": self.disposition.value,
             "surface": self.surface,
             "palette_entry": self.palette_entry,
+            "scope": self.authority_scope.value,
+            "input_shape": self.input_shape.value,
             "mutates_state": self.mutates_state,
             "confirmation": self.confirmation.value,
             "available": self.available,
@@ -219,8 +268,21 @@ def _telegram(
     *,
     aliases: tuple[str, ...] = (),
     disposition: AdapterDisposition = AdapterDisposition.NATIVE_SURFACE,
+    input_shape: CapabilityInputShape = CapabilityInputShape.NONE,
+    help_group: int | None = None,
+    help_entries: tuple[TelegramHelpEntry, ...] = (),
+    help_discoverable: bool | None = None,
 ) -> AdapterPresentation:
-    return AdapterPresentation(disposition, primary_command=command, aliases=aliases)
+    return AdapterPresentation(
+        disposition,
+        primary_command=command,
+        aliases=aliases,
+        input_shape=input_shape,
+        implemented=disposition != AdapterDisposition.UNSUPPORTED_BY_DESIGN,
+        help_group=help_group,
+        help_entries=help_entries,
+        help_discoverable=(command is not None if help_discoverable is None else help_discoverable),
+    )
 
 
 def _workshop(
@@ -228,12 +290,21 @@ def _workshop(
     *,
     disposition: AdapterDisposition = AdapterDisposition.NATIVE_SURFACE,
     palette: bool = False,
+    input_shape: CapabilityInputShape = CapabilityInputShape.NONE,
+    implemented: bool | None = None,
 ) -> AdapterPresentation:
     return AdapterPresentation(
         disposition,
         surface=None if surface is None else surface.value,
         palette_entry=palette,
+        input_shape=input_shape,
+        implemented=(disposition != AdapterDisposition.UNSUPPORTED_BY_DESIGN if implemented is None else implemented),
+        help_discoverable=False,
     )
+
+
+def _help(usage: str, description: str, *commands: str) -> TelegramHelpEntry:
+    return TelegramHelpEntry(usage, description, commands)
 
 
 def _capability(
@@ -282,7 +353,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Begin or recover access to Kai.",
         "enrollment",
         AuthorityScope.PUBLIC,
-        telegram=_telegram("start"),
+        telegram=_telegram("start", help_discoverable=False),
         workshop=_workshop(WorkshopSurface.ENROLLMENT),
     ),
     _capability(
@@ -291,7 +362,11 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Interrupt the active agent response in this conversation.",
         "conversation_execution",
         AuthorityScope.CONVERSATION,
-        telegram=_telegram("stop"),
+        telegram=_telegram(
+            "stop",
+            help_group=1,
+            help_entries=(_help("/stop", "Interrupt current response", "stop"),),
+        ),
         workshop=_workshop(WorkshopSurface.CONVERSATION),
         mutates_state=True,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -304,8 +379,17 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Replace one agent's provider session without removing conversation history or memory.",
         "runtime_sessions",
         AuthorityScope.PRINCIPAL_AGENT,
-        telegram=_telegram("new"),
-        workshop=_workshop(WorkshopSurface.CONVERSATION_CONTEXT, palette=True),
+        telegram=_telegram(
+            "new",
+            input_shape=CapabilityInputShape.OPTIONAL_AGENT,
+            help_group=1,
+            help_entries=(_help("/new [@agent]", "Start a fresh provider session", "new"),),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.CONVERSATION_CONTEXT,
+            palette=True,
+            input_shape=CapabilityInputShape.OPTIONAL_AGENT,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.REQUIRED,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -318,8 +402,21 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect, refresh, and select models for an authorized runtime.",
         "runtime_settings",
         AuthorityScope.PRINCIPAL_AGENT,
-        telegram=_telegram("model", aliases=("models",)),
-        workshop=_workshop(WorkshopSurface.AGENT_SETTINGS, palette=True),
+        telegram=_telegram(
+            "model",
+            aliases=("models",),
+            input_shape=CapabilityInputShape.MODEL_SELECTION,
+            help_group=2,
+            help_entries=(
+                _help("/models [refresh]", "Choose or refresh models", "models"),
+                _help("/model <name>", "Switch model directly", "model"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.AGENT_SETTINGS,
+            palette=True,
+            input_shape=CapabilityInputShape.MODEL_SELECTION,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         continuity_effect=ContinuityEffect.MAY_RESTART_RUNTIME,
@@ -331,8 +428,21 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect and select an authorized backend for an agent runtime.",
         "runtime_settings",
         AuthorityScope.PRINCIPAL_AGENT,
-        telegram=_telegram("backend", aliases=("backends",)),
-        workshop=_workshop(WorkshopSurface.AGENT_SETTINGS, palette=True),
+        telegram=_telegram(
+            "backend",
+            aliases=("backends",),
+            input_shape=CapabilityInputShape.BACKEND_SELECTION,
+            help_group=2,
+            help_entries=(
+                _help("/backends", "Choose a backend", "backends"),
+                _help("/backend [backend:provider]", "Show or switch backend", "backend"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.AGENT_SETTINGS,
+            palette=True,
+            input_shape=CapabilityInputShape.BACKEND_SELECTION,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         continuity_effect=ContinuityEffect.MAY_RESTART_RUNTIME,
@@ -344,8 +454,21 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect or change policy-bounded runtime and workspace settings.",
         "settings_workspaces",
         AuthorityScope.PRINCIPAL_AGENT,
-        telegram=_telegram("settings"),
-        workshop=_workshop(WorkshopSurface.AGENT_SETTINGS),
+        telegram=_telegram(
+            "settings",
+            input_shape=CapabilityInputShape.RUNTIME_SETTINGS,
+            help_group=3,
+            help_entries=(
+                _help("/settings", "Show your settings", "settings"),
+                _help("/settings model <name>", "Set the default model", "settings"),
+                _help("/settings timeout <n>", "Set response timeout in seconds", "settings"),
+                _help("/settings reset [field]", "Clear overrides", "settings"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.AGENT_SETTINGS,
+            input_shape=CapabilityInputShape.RUNTIME_SETTINGS,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
@@ -358,7 +481,12 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect the current agent, backend, model, workspace, and continuity state.",
         "runtime_lane_status",
         AuthorityScope.PRINCIPAL_AGENT,
-        telegram=_telegram("stats"),
+        telegram=_telegram(
+            "stats",
+            input_shape=CapabilityInputShape.OPTIONAL_AGENT,
+            help_group=8,
+            help_entries=(_help("/stats [@agent]", "Show canonical runtime status", "stats"),),
+        ),
         workshop=_workshop(WorkshopSurface.RUN_INSPECTOR, palette=True),
         requirements=(*_AUTHENTICATED, ContextRequirement.AGENT),
     ),
@@ -368,8 +496,41 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect, authorize, create, select, remove, or delete eligible workspaces.",
         "workspace_grants",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("workspace", aliases=("ws", "workspaces")),
-        workshop=_workshop(WorkshopSurface.WORKSPACES, palette=True),
+        telegram=_telegram(
+            "workspace",
+            aliases=("ws", "workspaces"),
+            input_shape=CapabilityInputShape.WORKSPACE_OPERATION,
+            help_group=4,
+            help_entries=(
+                _help("/workspace (or /ws)", "Show current workspace", "workspace", "ws"),
+                _help("/workspace <name>", "Switch by name", "workspace"),
+                _help("/workspace home", "Return to default", "workspace"),
+                _help("/workspace new <name>", "Create, initialize Git, and switch", "workspace"),
+                _help(
+                    "/workspace delete <name> confirm <name>",
+                    "Permanently delete an eligible workspace",
+                    "workspace",
+                ),
+                _help("/workspace allow <path>", "Add an allowed workspace", "workspace"),
+                _help("/workspace deny <path>", "Remove an allowed workspace", "workspace"),
+                _help("/workspace allowed", "List your workspaces", "workspace"),
+                _help("/workspace config", "Show workspace settings", "workspace"),
+                _help(
+                    "/workspace config <field> <value>",
+                    "Override a workspace setting",
+                    "workspace",
+                ),
+                _help("/workspace config env KEY=VALUE", "Set an environment variable", "workspace"),
+                _help("/workspace config prompt <text>", "Set system prompt", "workspace"),
+                _help("/workspace config reset [field]", "Clear workspace overrides", "workspace"),
+                _help("/workspaces", "Switch workspace with inline buttons", "workspaces"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.WORKSPACES,
+            palette=True,
+            input_shape=CapabilityInputShape.WORKSPACE_OPERATION,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
@@ -381,8 +542,20 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect or change the memory-project registration for an authorized workspace.",
         "memory_project_registry",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("project"),
-        workshop=_workshop(WorkshopSurface.WORKSPACES),
+        telegram=_telegram(
+            "project",
+            input_shape=CapabilityInputShape.MEMORY_PROJECT_OPERATION,
+            help_group=4,
+            help_entries=(
+                _help("/project", "List memory projects", "project"),
+                _help("/project register [name]", "Register the current workspace", "project"),
+                _help("/project unregister <name>", "Remove a chat-registered project", "project"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.WORKSPACES,
+            input_shape=CapabilityInputShape.MEMORY_PROJECT_OPERATION,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
@@ -394,8 +567,29 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect or change personal GitHub automation and notification settings.",
         "github_settings",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("github"),
-        workshop=_workshop(WorkshopSurface.GITHUB_SETTINGS, palette=True),
+        telegram=_telegram(
+            "github",
+            input_shape=CapabilityInputShape.GITHUB_SETTINGS,
+            help_group=5,
+            help_entries=(
+                _help("/github", "Show GitHub settings", "github"),
+                _help(
+                    "/github notify [number|reset]",
+                    "View, route, or reset notifications",
+                    "github",
+                ),
+                _help("/github reviews [on|off]", "Toggle pull-request reviews", "github"),
+                _help("/github triage [on|off]", "Toggle issue triage", "github"),
+                _help("/github token [<token>]", "Manage access token", "github"),
+                _help("/github add <repo>", "Watch a repository", "github"),
+                _help("/github remove <repo>", "Unwatch a repository", "github"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.GITHUB_SETTINGS,
+            palette=True,
+            input_shape=CapabilityInputShape.GITHUB_SETTINGS,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
@@ -407,8 +601,23 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect or change personal notification destinations and delivery preferences.",
         "notification_preferences",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("notifications"),
-        workshop=_workshop(WorkshopSurface.NOTIFICATION_SETTINGS),
+        telegram=_telegram(
+            "notifications",
+            input_shape=CapabilityInputShape.NOTIFICATION_SETTINGS,
+            help_group=5,
+            help_entries=(
+                _help("/notifications", "Show personal notification destinations", "notifications"),
+                _help(
+                    "/notifications <github|generic> [number|reset]",
+                    "Route notifications",
+                    "notifications",
+                ),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.NOTIFICATION_SETTINGS,
+            input_shape=CapabilityInputShape.NOTIFICATION_SETTINGS,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
@@ -420,11 +629,26 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Start a durable review of an authorized GitHub pull request.",
         "review_jobs",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("review", disposition=AdapterDisposition.COMPATIBILITY_ONLY),
+        telegram=_telegram(
+            "review",
+            disposition=AdapterDisposition.COMPATIBILITY_ONLY,
+            input_shape=CapabilityInputShape.PULL_REQUEST_REFERENCE,
+            help_group=5,
+            help_entries=(
+                _help("/review <pr-number>", "Review a pull request on the inferred repository", "review"),
+                _help(
+                    "/review <owner/repo> <pr-number>",
+                    "Review an explicit pull request",
+                    "review",
+                ),
+            ),
+        ),
         workshop=_workshop(
             WorkshopSurface.ACTION_PALETTE,
             disposition=AdapterDisposition.ACTION_PALETTE,
             palette=True,
+            input_shape=CapabilityInputShape.PULL_REQUEST_REFERENCE,
+            implemented=False,
         ),
         implementation_state=ImplementationState.TELEGRAM_COMPATIBILITY,
         mutates_state=True,
@@ -438,8 +662,23 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Browse, search, add, edit, re-scope, or remove personal memory records.",
         "memory_queries",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("memory", disposition=AdapterDisposition.COMPATIBILITY_ONLY),
-        workshop=_workshop(WorkshopSurface.MEMORY, palette=True),
+        telegram=_telegram(
+            "memory",
+            disposition=AdapterDisposition.COMPATIBILITY_ONLY,
+            input_shape=CapabilityInputShape.MEMORY_OPERATION,
+            help_group=6,
+            help_entries=(
+                _help("/memory", "Browse remembered facts and episodes", "memory"),
+                _help("/memory search <q>", "Semantic search over memories", "memory"),
+                _help("/memory stats", "Show counts and confidence distribution", "memory"),
+                _help("/memory help", "Show memory subcommand reference", "memory"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.MEMORY,
+            palette=True,
+            input_shape=CapabilityInputShape.MEMORY_OPERATION,
+        ),
         implementation_state=ImplementationState.MIXED_COMPATIBILITY,
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
@@ -452,8 +691,25 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect, replace, or restore the principal's preference document.",
         "preference_documents",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("preferences"),
-        workshop=_workshop(WorkshopSurface.PERSONAL_SETTINGS),
+        telegram=_telegram(
+            "preferences",
+            input_shape=CapabilityInputShape.PREFERENCE_OPERATION,
+            help_group=6,
+            help_entries=(
+                _help("/preferences", "Show your preference document", "preferences"),
+                _help("/preferences set <text>", "Replace your preference document", "preferences"),
+                _help("/preferences history", "List previous preference revisions", "preferences"),
+                _help(
+                    "/preferences restore <number>",
+                    "Restore a displayed revision",
+                    "preferences",
+                ),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.PERSONAL_SETTINGS,
+            input_shape=CapabilityInputShape.PREFERENCE_OPERATION,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
@@ -465,8 +721,24 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect or change personal voice-output preferences.",
         "client_preferences",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("voice", aliases=("voices",)),
-        workshop=_workshop(WorkshopSurface.CLIENT_SETTINGS),
+        telegram=_telegram(
+            "voice",
+            aliases=("voices",),
+            input_shape=CapabilityInputShape.VOICE_PREFERENCE,
+            help_group=7,
+            help_entries=(
+                _help("/voice", "Toggle voice off / voice-only", "voice"),
+                _help("/voice only", "Use voice only without text", "voice"),
+                _help("/voice on", "Use text and voice", "voice"),
+                _help("/voice off", "Use text only", "voice"),
+                _help("/voice <name>", "Set voice", "voice"),
+                _help("/voices", "Choose a voice with inline buttons", "voices"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.CLIENT_SETTINGS,
+            input_shape=CapabilityInputShape.VOICE_PREFERENCE,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
@@ -478,8 +750,22 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "List, inspect, and cancel active scheduled jobs.",
         "canonical_scheduler",
         AuthorityScope.PRINCIPAL,
-        telegram=_telegram("job", aliases=("jobs",)),
-        workshop=_workshop(WorkshopSurface.SCHEDULED_JOBS, palette=True),
+        telegram=_telegram(
+            "job",
+            aliases=("jobs",),
+            input_shape=CapabilityInputShape.SCHEDULED_JOB_OPERATION,
+            help_group=8,
+            help_entries=(
+                _help("/job", "List scheduled jobs", "job", "jobs"),
+                _help("/job info <id>", "Show job details", "job"),
+                _help("/job cancel <id>", "Cancel a job", "job"),
+            ),
+        ),
+        workshop=_workshop(
+            WorkshopSurface.SCHEDULED_JOBS,
+            palette=True,
+            input_shape=CapabilityInputShape.SCHEDULED_JOB_OPERATION,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -491,10 +777,16 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Inspect redacted host webhook and integration readiness.",
         "webhook_diagnostics",
         AuthorityScope.ADMINISTRATOR,
-        telegram=_telegram("webhooks", disposition=AdapterDisposition.COMPATIBILITY_ONLY),
+        telegram=_telegram(
+            "webhooks",
+            disposition=AdapterDisposition.COMPATIBILITY_ONLY,
+            help_group=8,
+            help_entries=(_help("/webhooks", "Show webhook server status", "webhooks"),),
+        ),
         workshop=_workshop(
             WorkshopSurface.ADMINISTRATION,
             disposition=AdapterDisposition.ADMINISTRATOR_ONLY,
+            implemented=False,
         ),
         implementation_state=ImplementationState.TELEGRAM_COMPATIBILITY,
         requirements=(*_AUTHENTICATED, ContextRequirement.ADMINISTRATOR),
@@ -505,7 +797,12 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Discover operations available in the current adapter and context.",
         "capability_registry",
         AuthorityScope.PUBLIC,
-        telegram=_telegram("help", disposition=AdapterDisposition.COMPATIBILITY_ONLY),
+        telegram=_telegram(
+            "help",
+            disposition=AdapterDisposition.COMPATIBILITY_ONLY,
+            help_group=8,
+            help_entries=(_help("/help", "Show this message", "help"),),
+        ),
         workshop=_workshop(
             WorkshopSurface.ACTION_PALETTE,
             disposition=AdapterDisposition.ACTION_PALETTE,
@@ -519,8 +816,11 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "Send a message in an authorized conversation.",
         "conversation_commands",
         AuthorityScope.CHANNEL_MEMBER,
-        telegram=_telegram(),
-        workshop=_workshop(WorkshopSurface.CONVERSATION),
+        telegram=_telegram(input_shape=CapabilityInputShape.MESSAGE),
+        workshop=_workshop(
+            WorkshopSurface.CONVERSATION,
+            input_shape=CapabilityInputShape.MESSAGE,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.REQUIRED,
         requirements=_CONVERSATION,
@@ -532,7 +832,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "channel_lifecycle",
         AuthorityScope.CHANNEL_OWNER,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.CHANNELS),
+        workshop=_workshop(
+            WorkshopSurface.CHANNELS,
+            input_shape=CapabilityInputShape.CHANNEL_OPERATION,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -545,7 +848,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "direct_message_lifecycle",
         AuthorityScope.PRINCIPAL,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.DIRECT_MESSAGES),
+        workshop=_workshop(
+            WorkshopSurface.DIRECT_MESSAGES,
+            input_shape=CapabilityInputShape.DIRECT_MESSAGE_PEER,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -558,7 +864,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "agent_definitions",
         AuthorityScope.AGENT_OWNER,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.AGENTS),
+        workshop=_workshop(
+            WorkshopSurface.AGENTS,
+            input_shape=CapabilityInputShape.AGENT_DEFINITION,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -572,7 +881,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "channel_membership",
         AuthorityScope.CHANNEL_OWNER,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.CONVERSATION_CONTEXT),
+        workshop=_workshop(
+            WorkshopSurface.CONVERSATION_CONTEXT,
+            input_shape=CapabilityInputShape.CHANNEL_PARTICIPANT,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -585,7 +897,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "standing_participation",
         AuthorityScope.CHANNEL_OWNER,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.CONVERSATION_CONTEXT),
+        workshop=_workshop(
+            WorkshopSurface.CONVERSATION_CONTEXT,
+            input_shape=CapabilityInputShape.STANDING_PARTICIPATION_POLICY,
+        ),
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,
@@ -598,7 +913,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "thread_service",
         AuthorityScope.CHANNEL_MEMBER,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.THREADS),
+        workshop=_workshop(
+            WorkshopSurface.THREADS,
+            input_shape=CapabilityInputShape.THREAD_OPERATION,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.REQUIRED,
         requirements=_CONVERSATION,
@@ -610,7 +928,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "message_reactions",
         AuthorityScope.CHANNEL_MEMBER,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.CONVERSATION),
+        workshop=_workshop(
+            WorkshopSurface.CONVERSATION,
+            input_shape=CapabilityInputShape.REACTION,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.REQUIRED,
         requirements=_CONVERSATION,
@@ -622,7 +943,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "activity_service",
         AuthorityScope.PRINCIPAL,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.ACTIVITY),
+        workshop=_workshop(
+            WorkshopSurface.ACTIVITY,
+            input_shape=CapabilityInputShape.ACTIVITY_STATE,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.REQUIRED,
         requirements=_AUTHENTICATED,
@@ -634,7 +958,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "human_profile",
         AuthorityScope.PRINCIPAL,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.PROFILE),
+        workshop=_workshop(
+            WorkshopSurface.PROFILE,
+            input_shape=CapabilityInputShape.PROFILE,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
@@ -647,7 +974,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "appearance_preferences",
         AuthorityScope.PRINCIPAL,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.APPEARANCE),
+        workshop=_workshop(
+            WorkshopSurface.APPEARANCE,
+            input_shape=CapabilityInputShape.APPEARANCE,
+        ),
         mutates_state=True,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
         revision_check=True,
@@ -670,7 +1000,10 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         "artifact_service",
         AuthorityScope.CHANNEL_MEMBER,
         telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
-        workshop=_workshop(WorkshopSurface.ARTIFACTS),
+        workshop=_workshop(
+            WorkshopSurface.ARTIFACTS,
+            input_shape=CapabilityInputShape.ARTIFACT_REFERENCE,
+        ),
         requirements=_CONVERSATION,
     ),
 )
@@ -713,6 +1046,27 @@ def validate_capability_registry(
                     raise ValueError(f"Telegram capability {item.operation_id} declares a Workshop surface")
                 if presentation.primary_command is None and presentation.aliases:
                     raise ValueError(f"Telegram capability {item.operation_id} has aliases without a primary command")
+                if presentation.help_entries and presentation.help_group is None:
+                    raise ValueError(f"Telegram capability {item.operation_id} has help entries without a help group")
+                if presentation.help_group is not None and not presentation.help_entries:
+                    raise ValueError(f"Telegram capability {item.operation_id} has a help group without help entries")
+                if presentation.help_discoverable and not presentation.help_entries:
+                    raise ValueError(f"Telegram capability {item.operation_id} is discoverable without help entries")
+                help_commands: set[str] = set()
+                for entry in presentation.help_entries:
+                    if not entry.usage.startswith("/") or not entry.description.strip() or not entry.commands:
+                        raise ValueError(f"Capability {item.operation_id} has invalid Telegram help metadata")
+                    help_commands.update(entry.commands)
+                unknown_help_commands = help_commands - set(presentation.commands)
+                if unknown_help_commands:
+                    raise ValueError(
+                        f"Capability {item.operation_id} advertises unregistered Telegram commands: "
+                        f"{sorted(unknown_help_commands)}"
+                    )
+                if presentation.help_discoverable and help_commands != set(presentation.commands):
+                    raise ValueError(
+                        f"Capability {item.operation_id} does not advertise every registered Telegram command"
+                    )
                 for command in presentation.commands:
                     if not command.isidentifier() or command.lower() != command:
                         raise ValueError(f"Capability {item.operation_id} has an invalid Telegram command")
@@ -722,6 +1076,8 @@ def validate_capability_registry(
             else:
                 if presentation.primary_command is not None or presentation.aliases:
                     raise ValueError(f"Workshop capability {item.operation_id} declares Telegram commands")
+                if presentation.help_group is not None or presentation.help_entries or presentation.help_discoverable:
+                    raise ValueError(f"Workshop capability {item.operation_id} declares Telegram help metadata")
                 if (
                     presentation.disposition
                     in {
@@ -736,6 +1092,8 @@ def validate_capability_registry(
                 presentation.surface is not None
                 or presentation.primary_command is not None
                 or presentation.palette_entry
+                or presentation.implemented
+                or presentation.help_entries
             ):
                 raise ValueError(f"Unsupported capability {item.operation_id} declares an adapter surface")
             if presentation.disposition == AdapterDisposition.ACTION_PALETTE and not presentation.palette_entry:
@@ -773,6 +1131,25 @@ def telegram_command_dispositions() -> Mapping[str, AdapterDisposition]:
     return _TELEGRAM_COMMAND_DISPOSITIONS
 
 
+def render_telegram_help(*, administrator: bool) -> str:
+    """Render Telegram-native help from the canonical capability registry."""
+    grouped: dict[int, list[str]] = {}
+    for item in CAPABILITY_REGISTRY:
+        presentation = item.presentations[AdapterId.TELEGRAM]
+        if (
+            not presentation.implemented
+            or not presentation.help_discoverable
+            or presentation.disposition == AdapterDisposition.UNSUPPORTED_BY_DESIGN
+            or (item.authority_scope == AuthorityScope.ADMINISTRATOR and not administrator)
+        ):
+            continue
+        assert presentation.help_group is not None
+        grouped.setdefault(presentation.help_group, []).extend(
+            f"{entry.usage} - {entry.description}" for entry in presentation.help_entries
+        )
+    return "\n\n".join("\n".join(grouped[group]) for group in sorted(grouped))
+
+
 def capability_availability(
     adapter: AdapterId,
     context: CapabilityContext,
@@ -783,7 +1160,7 @@ def capability_availability(
     results: list[CapabilityAvailability] = []
     for item in CAPABILITY_REGISTRY:
         presentation = item.presentations[adapter]
-        if presentation.disposition == AdapterDisposition.UNSUPPORTED_BY_DESIGN:
+        if not presentation.implemented or presentation.disposition == AdapterDisposition.UNSUPPORTED_BY_DESIGN:
             continue
         missing = tuple(requirement for requirement in item.requirements if not context.satisfies(requirement))
         if ContextRequirement.ADMINISTRATOR in missing:
@@ -801,6 +1178,8 @@ def capability_availability(
                 disposition=presentation.disposition,
                 surface=presentation.surface,
                 palette_entry=presentation.palette_entry,
+                authority_scope=item.authority_scope,
+                input_shape=presentation.input_shape,
                 mutates_state=item.mutates_state,
                 confirmation=item.confirmation,
                 available=available,

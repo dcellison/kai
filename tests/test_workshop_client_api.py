@@ -2447,6 +2447,113 @@ class TestWorkshopNavigationHTTPContract:
             await store.close()
 
 
+class TestWorkshopCapabilityMetadataHTTPContract:
+    async def test_returns_only_safe_capabilities_available_to_authenticated_principal(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        client = await _open_client(store, _Authenticator({"alice": alice_id, "bob": bob_id}))
+        try:
+            unauthenticated = await client.get("/v1/client/capabilities")
+            response = await client.get(
+                "/v1/client/capabilities",
+                headers={"Authorization": "Bearer bob"},
+            )
+            malformed = await client.get(
+                "/v1/client/capabilities?channel_id=one&channel_id=two",
+                headers={"Authorization": "Bearer bob"},
+            )
+
+            assert unauthenticated.status == 401
+            assert malformed.status == 400
+            assert response.status == 200
+            payload = await response.json()
+            assert payload["version"] == 1
+            assert payload["context"] == {
+                "conversation": False,
+                "agent": False,
+                "agent_owner": False,
+                "workspace": False,
+                "channel_owner": False,
+                "administrator": False,
+            }
+            operation_ids = {item["operation_id"] for item in payload["capabilities"]}
+            assert "profile.manage" in operation_ids
+            assert "conversation.message.send" not in operation_ids
+            assert "administration.webhook_status.read" not in operation_ids
+            assert all(item["available"] is True for item in payload["capabilities"])
+            assert all("input_shape" in item and "scope" in item for item in payload["capabilities"])
+            serialized = json.dumps(payload)
+            assert "prn_" not in serialized
+            assert "rtp_" not in serialized
+            assert "/Users/" not in serialized
+            assert "secret" not in serialized.lower()
+        finally:
+            await client.close()
+            await store.close()
+
+    async def test_context_metadata_requires_channel_access_and_resolves_agent_authority(
+        self,
+        tmp_path: Path,
+    ):
+        store, alice_id, alice_channel, bob_id, _ = await _open_store(tmp_path / "kai.db")
+        async with store.connection.execute(
+            "SELECT agent_id FROM channel_agents WHERE channel_id = ?",
+            (alice_channel,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        agent_id = AgentId(str(row[0]))
+        runtime_lane_status = SimpleNamespace(
+            authority_for_principal_channel=AsyncMock(
+                return_value=SimpleNamespace(
+                    owns_agent=True,
+                    workspace_runtime_profile_id=RuntimeProfileId.new(),
+                )
+            )
+        )
+        client = await _open_client(
+            store,
+            _Authenticator({"alice": alice_id, "bob": bob_id}),
+            runtime_lane_status=runtime_lane_status,
+        )
+        try:
+            response = await client.get(
+                f"/v1/client/capabilities?channel_id={alice_channel}&agent_id={agent_id}",
+                headers={"Authorization": "Bearer alice"},
+            )
+            denied = await client.get(
+                f"/v1/client/capabilities?channel_id={alice_channel}",
+                headers={"Authorization": "Bearer bob"},
+            )
+
+            assert response.status == 200
+            payload = await response.json()
+            assert payload["context"] == {
+                "conversation": True,
+                "agent": True,
+                "agent_owner": True,
+                "workspace": True,
+                "channel_owner": True,
+                "administrator": True,
+            }
+            operation_ids = {item["operation_id"] for item in payload["capabilities"]}
+            assert "conversation.message.send" in operation_ids
+            assert "conversation.session.reset" in operation_ids
+            assert "agents.manage" in operation_ids
+            assert denied.status == 403
+            assert (await denied.json())["error"]["code"] == "access_denied"
+            runtime_lane_status.authority_for_principal_channel.assert_awaited_once_with(
+                alice_id,
+                alice_channel,
+                agent_id=agent_id,
+            )
+        finally:
+            await client.close()
+            await store.close()
+
+
 @dataclass
 class _CollaborationPolicy:
     owner_id: PrincipalId

@@ -21,6 +21,7 @@ from urllib.parse import quote
 from aiohttp import BodyPartReader, web
 
 from kai.backend import FOREIGN_WORKSPACE_REMINDER, USER_MESSAGE_MARKER
+from kai.capability_registry import AdapterId, CapabilityContext, capability_availability
 from kai.context_authority import CONTEXT_AUTHORITY_CONTRACT
 from kai.workshop.agent_creation_options import (
     AgentCreationBlocker,
@@ -389,6 +390,7 @@ _TIMELINE_EVENTS_PATH = "/v1/channels/{channel_id}/events"
 _MESSAGE_REACTIONS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions"
 _MESSAGE_REACTORS_PATH = "/v1/channels/{channel_id}/messages/{message_id}/reactions/{reaction}/reactors"
 _CLIENT_NAVIGATION_PATH = "/v1/client/navigation"
+_CLIENT_CAPABILITIES_PATH = "/v1/client/capabilities"
 _CHANNEL_CREATION_PATH = "/v1/channels"
 _CHANNEL_ARCHIVAL_PATH = "/v1/channels/{channel_id}/archive"
 _CHANNEL_RESTORATION_PATH = "/v1/channels/{channel_id}/restore"
@@ -5483,6 +5485,109 @@ async def _handle_client_navigation(
     )
 
 
+async def _handle_client_capabilities(
+    request: web.Request,
+    *,
+    store: WorkshopEventStore,
+    authenticator: WorkshopClientAuthenticator,
+    runtime_lane_status: WorkshopRuntimeLaneStatusService | None,
+) -> web.Response:
+    """Return redacted capability metadata available in the caller's context."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if (
+        not set(request.query) <= {"channel_id", "agent_id"}
+        or any(len(request.query.getall(key, ())) != 1 for key in request.query)
+        or request.can_read_body
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid capability request")
+
+    raw_channel_id = request.query.get("channel_id")
+    raw_agent_id = request.query.get("agent_id")
+    if raw_agent_id is not None and raw_channel_id is None:
+        return _error_response(status=400, code="invalid_request", message="A channel is required with an agent")
+
+    administrator = await _principal_is_workshop_admin(store, principal_id)
+    conversation = False
+    agent = False
+    agent_owner = False
+    workspace = False
+    channel_owner = False
+    if raw_channel_id is not None:
+        try:
+            channel_id = ChannelId(raw_channel_id)
+            requested_agent_id = AgentId(raw_agent_id) if raw_agent_id is not None else None
+        except (TypeError, ValueError):
+            return _error_response(status=400, code="invalid_request", message="Invalid capability context")
+        authorizer = CanonicalChannelAuthorizer(store)
+        if not await authorizer.can_read_channel(principal_id, channel_id):
+            return _error_response(status=403, code="access_denied", message="Access denied")
+        conversation = await authorizer.can_submit_command(principal_id, channel_id)
+        async with store.connection.execute(
+            "SELECT 1 FROM channel_memberships WHERE principal_id = ? AND channel_id = ? AND role = 'owner' LIMIT 1",
+            (principal_id, channel_id),
+        ) as cursor:
+            channel_owner = await cursor.fetchone() is not None
+        if requested_agent_id is not None and runtime_lane_status is None:
+            return _error_response(
+                status=503,
+                code="capabilities_unavailable",
+                message="Capability context is temporarily unavailable",
+            )
+        if runtime_lane_status is not None:
+            try:
+                authority = await runtime_lane_status.authority_for_principal_channel(
+                    principal_id,
+                    channel_id,
+                    agent_id=requested_agent_id,
+                )
+            except WorkshopRuntimeLaneStatusAccessDenied:
+                return _error_response(status=403, code="access_denied", message="Access denied")
+            except (WorkshopRuntimeLaneStatusAmbiguous, WorkshopRuntimeLaneStatusUnavailable):
+                if requested_agent_id is not None:
+                    return _error_response(status=403, code="access_denied", message="Access denied")
+            except WorkshopRuntimeLaneStatusError:
+                return _error_response(status=400, code="invalid_request", message="Invalid capability context")
+            else:
+                agent = True
+                agent_owner = authority.owns_agent
+                workspace = authority.workspace_runtime_profile_id is not None
+
+    context = CapabilityContext(
+        authenticated=True,
+        conversation=conversation,
+        agent=agent,
+        agent_owner=agent_owner,
+        workspace=workspace,
+        channel_owner=channel_owner,
+        administrator=administrator,
+    )
+    return _json_response(
+        {
+            "version": 1,
+            "context": {
+                "conversation": conversation,
+                "agent": agent,
+                "agent_owner": agent_owner,
+                "workspace": workspace,
+                "channel_owner": channel_owner,
+                "administrator": administrator,
+            },
+            "capabilities": [
+                capability.as_dict() for capability in capability_availability(AdapterId.WORKSHOP, context)
+            ],
+        },
+        status=200,
+    )
+
+
 async def _handle_channel_creation(
     request: web.Request,
     *,
@@ -9414,6 +9519,15 @@ def register_workshop_read_routes(
                 authenticator=authenticator,
             )
 
+    async def handle_client_capabilities(request: web.Request) -> web.Response:
+        async with request_lock:
+            return await _handle_client_capabilities(
+                request,
+                store=store,
+                authenticator=authenticator,
+                runtime_lane_status=runtime_lane_status,
+            )
+
     async def handle_channel_creation(request: web.Request) -> web.Response:
         async with request_lock:
             return await _handle_channel_creation(
@@ -9830,6 +9944,7 @@ def register_workshop_read_routes(
         app.router.add_post(_SCHEDULED_JOB_CANCEL_PATH, handle_scheduled_job_cancel)
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
+    app.router.add_get(_CLIENT_CAPABILITIES_PATH, handle_client_capabilities)
     app.router.add_get(_PRINCIPAL_EVENTS_PATH, handle_principal_event_stream)
     app.router.add_get(_CHANNEL_UNREAD_PATH, handle_channel_unread_snapshot)
     app.router.add_get(_CHANNEL_UNREAD_EVENTS_PATH, handle_channel_unread_event_stream)
