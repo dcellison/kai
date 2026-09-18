@@ -5558,7 +5558,7 @@ function WorkshopView({
             <p>History and new messages are synchronized directly with Kai.</p>
           </ContextSection>
 
-          <ContextSection title="Channel authority">
+          <ContextSection title="Authority">
             <p>
               {humanDirect
                 ? `Only you and ${channelName} can read and send messages here.`
@@ -5731,7 +5731,7 @@ function WorkshopView({
 
           {!humanDirect && <ContextSection
             className="trace-section"
-            title="Runtime and workspace"
+            title="Runtime"
           >
             {runtimeLaneStatuses.length > 0 ? (
               <div className="runtime-lane-statuses">
@@ -5771,14 +5771,42 @@ function WorkshopView({
                       Session: {status.providerSessionState.replaceAll("_", " ")}
                       {displayedRun ? ` · Last run: ${displayedRun.status}` : " · No runs yet"}
                     </p>
+                  </div>;
+                })}
+              </div>
+            ) : settingsWorkspaceError ? (
+              <p className="settings-error">{settingsWorkspaceError}</p>
+            ) : channel.canSubmitCommands ? (
+              <p>Loading runtime status…</p>
+            ) : (
+              <p>No agent runtime is assigned to this channel.</p>
+            )}
+            {settingsWorkspaceError && runtimeLaneStatuses.length > 0 && (
+              <p className="settings-error" role="alert">{settingsWorkspaceError}</p>
+            )}
+            {freshSessionNotice && <p className="settings-success" role="status">{freshSessionNotice}</p>}
+          </ContextSection>}
+
+          {!humanDirect && <ContextSection
+            className="trace-section"
+            title="Workspace"
+          >
+            {runtimeLaneStatuses.length > 0 ? (
+              <div className="runtime-lane-statuses">
+                {runtimeLaneStatuses.map((status) => {
+                  const workspaceInputId = `workspace-${channelId}-${status.agentId}`;
+                  return <div className="runtime-settings" key={status.agentId}>
+                    {channel.kind === "group" && (
+                      <p className="settings-source">{status.agentName}</p>
+                    )}
                     {status.workspaceMode === "neutral" ? (
                       <p className="settings-source">No shared workspace</p>
                     ) : (
                       <>
-                        <label htmlFor={`workspace-${channelId}`}>Your workspace</label>
+                        <label htmlFor={workspaceInputId}>Your workspace</label>
                         <div className="runtime-workspace-select">
                           <select
-                            id={`workspace-${channelId}`}
+                            id={workspaceInputId}
                             value={status.workspace ?? ""}
                             disabled={switchingWorkspace || activeResponseRuns.length > 0}
                             onChange={(event) => void selectWorkspace(event.target.value)}
@@ -5799,19 +5827,18 @@ function WorkshopView({
             ) : settingsWorkspaceError ? (
               <p className="settings-error">{settingsWorkspaceError}</p>
             ) : channel.canSubmitCommands ? (
-              <p>Loading runtime status…</p>
+              <p>Loading workspace status…</p>
             ) : (
-              <p>No agent runtime is assigned to this channel.</p>
+              <p>No agent workspace is assigned to this channel.</p>
             )}
             {settingsWorkspaceError && runtimeLaneStatuses.length > 0 && (
               <p className="settings-error" role="alert">{settingsWorkspaceError}</p>
             )}
-            {freshSessionNotice && <p className="settings-success" role="status">{freshSessionNotice}</p>}
           </ContextSection>}
 
           {!humanDirect && <ContextSection
             className="trace-section"
-            title="Run inspector"
+            title="Inspector"
           >
             {runtimeLaneStatuses.some((status) => status.operatorDiagnostics) && (
               <div className="runtime-lane-diagnostics">

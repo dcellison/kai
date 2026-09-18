@@ -1167,7 +1167,7 @@ describe("Workshop React client", () => {
     const contextSections = Array.from(
       channelContext.querySelectorAll<HTMLDetailsElement>("details.context-section"),
     );
-    expect(contextSections).toHaveLength(4);
+    expect(contextSections).toHaveLength(5);
     expect(contextSections.every((section) => !section.open)).toBe(true);
     expect(
       contextSections.every(
@@ -1175,7 +1175,7 @@ describe("Workshop React client", () => {
       ),
     ).toBe(true);
     await user.click(
-      within(channelContext).getByText("Channel authority", {
+      within(channelContext).getByText("Authority", {
         selector: ".context-section-title",
       }),
     );
@@ -2088,8 +2088,9 @@ describe("Workshop React client", () => {
 
     render(<App />);
 
-    await openContextSection("Runtime and workspace");
+    await openContextSection("Runtime");
     expect(await screen.findByText("gpt-5.6-sol")).toBeVisible();
+    await openContextSection("Workspace");
     const selector = screen.getByLabelText("Your workspace");
     expect(selector).toHaveValue("/Users/kai/Projects/kai");
     expect(screen.getByRole("option", { name: "Home" })).toHaveValue(
@@ -2112,7 +2113,7 @@ describe("Workshop React client", () => {
     );
   });
 
-  it("keeps operator runtime diagnostics in the Run inspector", async () => {
+  it("keeps operator runtime diagnostics in the Inspector", async () => {
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "existing-session" }),
@@ -2130,9 +2131,9 @@ describe("Workshop React client", () => {
 
     render(<App />);
 
-    const runtimeSection = await openContextSection("Runtime and workspace");
+    const runtimeSection = await openContextSection("Runtime");
     expect(within(runtimeSection).queryByText("Runtime diagnostics")).toBeNull();
-    const runInspector = await openContextSection("Run inspector");
+    const runInspector = await openContextSection("Inspector");
     expect(within(runInspector).getByText("Runtime diagnostics")).toBeVisible();
     expect(within(runInspector).getByText(runtimeProfileId)).toBeVisible();
     expect(within(runInspector).getByText("session-revision")).toBeVisible();
@@ -2163,10 +2164,11 @@ describe("Workshop React client", () => {
 
     render(<App />);
 
-    await openContextSection("Runtime and workspace");
+    await openContextSection("Runtime");
     expect(await screen.findByText("Sponsored by Daniel")).toBeVisible();
     expect(screen.getByText("codex")).toBeVisible();
     expect(screen.getByText("· openai")).toBeVisible();
+    await openContextSection("Workspace");
     expect(screen.queryByText("/Users/kai/Projects/kai")).toBeNull();
     expect(screen.getByText("No shared workspace")).toBeVisible();
     expect(screen.queryByLabelText("Your workspace")).toBeNull();
@@ -2195,7 +2197,7 @@ describe("Workshop React client", () => {
       .mockResolvedValueOnce({ collaborationActivity: [], entries: [traceEntry(3)], hasMore: false });
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
-    await openContextSection("Run inspector");
+    await openContextSection("Inspector");
 
     const startedRun: WorkshopRun = {
       ...completedRun,
@@ -2264,7 +2266,7 @@ describe("Workshop React client", () => {
       .mockResolvedValueOnce(page);
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
-    await openContextSection("Run inspector");
+    await openContextSection("Inspector");
 
     const startedRun: WorkshopRun = {
       ...completedRun,
@@ -3024,7 +3026,7 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${notificationChannelId}`),
     ).toBeVisible();
-    await openContextSection("Channel authority");
+    await openContextSection("Authority");
     expect(screen.getByText("GitHub")).toBeVisible();
     expect(screen.getByText("Durable notification feed")).toBeVisible();
     expect(screen.getByText("Kai Workshop / Activity")).toBeVisible();
@@ -3100,7 +3102,7 @@ describe("Workshop React client", () => {
     expect(
       await screen.findByText(`History for ${secondChannelId}`),
     ).toBeVisible();
-    await openContextSection("Runtime and workspace");
+    await openContextSection("Runtime");
     await openContextSection("Agents");
     expect(await screen.findByText("Qualification")).toBeVisible();
     expect(screen.queryByLabelText("Workspace")).toBeNull();
@@ -4010,8 +4012,9 @@ describe("Workshop React client", () => {
     expect(directPeople).not.toBeNull();
     expect(directPeople?.querySelectorAll(".context-person-avatar")).toHaveLength(2);
     expect(await screen.findByRole("button", { name: "Reply to message" })).toBeVisible();
-    expect(screen.queryByRole("heading", { name: "Runtime and workspace" })).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Run inspector" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Runtime" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Workspace" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Inspector" })).toBeNull();
   });
 
   it("discovers a human from Direct messages and reuses the canonical conversation", async () => {
@@ -5066,7 +5069,8 @@ describe("Workshop React client", () => {
     expect(screen.queryByText("Personal preferences")).toBeNull();
     expect(screen.queryByRole("button", { name: "Back to agent" })).toBeNull();
     expect(screen.queryByText("Your runtime")).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Runtime and workspace" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Runtime" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Workspace" })).toBeNull();
     expect(screen.getByText(/These controls apply only to Qualification agent/)).toBeVisible();
     await waitFor(() => expect(loadSettingsWorkspace).toHaveBeenCalledWith({
       channelId: qualificationChannelId,
