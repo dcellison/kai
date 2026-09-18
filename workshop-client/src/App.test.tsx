@@ -1292,9 +1292,22 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("?view=memory&memory=memory-1");
     expect(window.location.href).not.toContain("session-secret");
 
-    await user.click(screen.getByRole("button", { name: "Back to conversation" }));
+    const memoryBack = screen.getByRole("button", { name: "Back to conversation" });
+    expect(memoryBack).toHaveClass("panel-icon-button");
+    expect(memoryBack).toHaveTextContent("←");
+    const memoryResize = screen.getByRole("separator", { name: "Resize memory detail" });
+    expect(memoryResize).toHaveAttribute("aria-valuenow", "360");
+    fireEvent.keyDown(memoryResize, { key: "ArrowLeft" });
+    expect(memoryResize).toHaveAttribute("aria-valuenow", "384");
+    expect(
+      JSON.parse(sessionStorage.getItem("kai.workshop.context-layout.v4") ?? "null"),
+    ).toEqual({ width: 384 });
+
+    await user.click(memoryBack);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
+    expect(screen.getByRole("separator", { name: "Resize channel context" }))
+      .toHaveAttribute("aria-valuenow", "384");
 
     await user.click(screen.getByRole("button", { name: "Daniel profile" }));
     await user.click(screen.getByRole("menuitem", { name: /Memory/ }));

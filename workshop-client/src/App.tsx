@@ -4871,6 +4871,14 @@ function WorkshopView({
         />
       ) : memoryDestination ? (
         <MemoryExplorer
+          detailPanelLayout={{
+            maximumWidth: MAX_CONTEXT_WIDTH_PX,
+            minimumWidth: MIN_CONTEXT_WIDTH_PX,
+            onKeyDown: resizeContextFromKeyboard,
+            onPointerDown: beginContextResize,
+            onPointerMove: resizeContext,
+            width: contextWidth,
+          }}
           initialMemoryId={memoryDestination.memoryId}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onClose={() => onSelectChannel(channelId)}
