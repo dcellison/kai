@@ -732,7 +732,8 @@ describe("Settings workspace", () => {
     expect(controls).not.toHaveClass("settings-workspace");
     expect(controls?.querySelector(".settings-scroll")).toBeNull();
     expect(screen.queryByText("Your runtime")).toBeNull();
-    expect(screen.queryByRole("heading", { name: "Runtime and workspace" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Runtime" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Workspace" })).toBeNull();
     expect(screen.queryByText("01")).toBeNull();
     expect(screen.getByRole("heading", { name: "Workspace settings" })).toBeVisible();
     expect(screen.queryByText("02")).toBeNull();

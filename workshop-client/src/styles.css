@@ -2939,10 +2939,23 @@ button:disabled {
   gap: 0.8rem;
 }
 
+.context-channel-header > div:first-child {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.context-channel-header h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .context-channel-actions {
   display: flex;
   flex: none;
   align-items: center;
+  align-self: flex-end;
   gap: 0.15rem;
 }
 
@@ -3071,6 +3084,13 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+}
+
+.runtime-lane-heading > p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .runtime-fresh-session {
