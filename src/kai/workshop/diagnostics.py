@@ -3403,7 +3403,7 @@ def workshop_channel_notification_policy_status(db_path: Path) -> str:
                 connection,
                 "SELECT COUNT(*) FROM principal_human_notification_policies WHERE dnd_enabled = 1",
             )
-            invalid = _scalar(
+            orphaned_channel_policies = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM principal_channel_notification_policies p "
                 "LEFT JOIN principals owner ON owner.id = p.principal_id "
@@ -3411,8 +3411,24 @@ def workshop_channel_notification_policy_status(db_path: Path) -> str:
                 "LEFT JOIN channel_memberships cm ON cm.principal_id = p.principal_id "
                 "AND cm.channel_id = p.channel_id "
                 "WHERE owner.kind IS NULL OR owner.kind != 'human' OR c.kind IS NULL "
-                "OR c.kind != 'group' OR cm.principal_id IS NULL "
-                "OR p.level NOT IN ('all', 'mentions_replies', 'muted')",
+                "OR c.kind != 'group' OR cm.principal_id IS NULL",
+            )
+            orphaned_human_policies = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_human_notification_policies policy "
+                "LEFT JOIN principals owner ON owner.id = policy.principal_id "
+                "WHERE owner.kind IS NULL OR owner.kind != 'human'",
+            )
+            orphaned_adapter_preferences = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_human_notification_adapter_preferences preference "
+                "LEFT JOIN principals owner ON owner.id = preference.principal_id "
+                "WHERE owner.kind IS NULL OR owner.kind != 'human'",
+            )
+            invalid = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM principal_channel_notification_policies "
+                "WHERE level NOT IN ('all', 'mentions_replies', 'muted')",
             )
             timezone_rows = connection.execute(
                 "SELECT dnd_timezone FROM principal_human_notification_policies"
@@ -3449,6 +3465,7 @@ def workshop_channel_notification_policy_status(db_path: Path) -> str:
                 "JOIN channel_memberships cm ON cm.channel_id = c.id "
                 "AND cm.principal_id = ei.principal_id) "
                 "SELECT COUNT(*) FROM principal_human_notification_adapter_preferences preference "
+                "JOIN principals owner ON owner.id = preference.principal_id AND owner.kind = 'human' "
                 "LEFT JOIN bound ON bound.principal_id = preference.principal_id "
                 "AND bound.transport = preference.transport "
                 "WHERE bound.principal_id IS NULL",
@@ -3457,7 +3474,8 @@ def workshop_channel_notification_policy_status(db_path: Path) -> str:
             connection.close()
     except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
-    state = "active" if invalid == 0 else "INCOMPLETE"
+    orphaned = orphaned_channel_policies + orphaned_human_policies + orphaned_adapter_preferences
+    state = "active" if invalid == 0 and orphaned == 0 else "INCOMPLETE"
     adapter_bindings = (
         tuple(int(value or 0) for value in adapter_totals) if adapter_totals is not None else (0, 0, 0, 0)
     )
@@ -3466,7 +3484,7 @@ def workshop_channel_notification_policy_status(db_path: Path) -> str:
         f"DND enabled={dnd_enabled}, adapter bindings={adapter_bindings[0]} "
         f"(enabled={adapter_bindings[1]}, disabled={adapter_bindings[2]}, "
         f"explicit={adapter_bindings[3]}, stale={stale_adapter_preferences}), "
-        f"invalid={invalid}; authority=canonical, Workshop=in-app immediate"
+        f"invalid={invalid}, orphaned={orphaned}; authority=canonical, Workshop=in-app immediate"
     )
 
 

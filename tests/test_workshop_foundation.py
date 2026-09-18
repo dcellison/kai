@@ -592,6 +592,7 @@ class TestWorkshopSchema:
                     82,
                     83,
                     84,
+                    85,
                 ]
         finally:
             await upgraded.close()

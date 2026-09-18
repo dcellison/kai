@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 84
+WORKSHOP_SCHEMA_VERSION = 85
 
 
 @dataclass(frozen=True, slots=True)
@@ -3785,6 +3785,90 @@ _CANONICAL_PROVIDER_SESSION_RESET_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_DURABLE_CHANNEL_NOTIFICATION_POLICY_SCHEMA = SchemaMigration(
+    version=85,
+    name="isolate_channel_notification_policy_from_projection_rebuilds",
+    statements=(
+        """
+        CREATE TABLE principal_human_notification_policies_v85 (
+            -- principal_id is deliberately not a foreign key. Principals are
+            -- replayed collaboration projections, while notification policy
+            -- is mutable principal state that must survive projection reset.
+            principal_id TEXT PRIMARY KEY,
+            muted_mentions_notify INTEGER NOT NULL DEFAULT 1
+                CHECK (muted_mentions_notify IN (0, 1)),
+            dnd_enabled INTEGER NOT NULL DEFAULT 0 CHECK (dnd_enabled IN (0, 1)),
+            dnd_timezone TEXT NOT NULL DEFAULT 'UTC' CHECK (length(dnd_timezone) BETWEEN 1 AND 100),
+            dnd_start_minute INTEGER NOT NULL DEFAULT 1320
+                CHECK (dnd_start_minute BETWEEN 0 AND 1439),
+            dnd_end_minute INTEGER NOT NULL DEFAULT 420
+                CHECK (dnd_end_minute BETWEEN 0 AND 1439),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            CHECK (dnd_start_minute != dnd_end_minute)
+        )
+        """,
+        """
+        INSERT INTO principal_human_notification_policies_v85 (
+            principal_id, muted_mentions_notify, dnd_enabled, dnd_timezone,
+            dnd_start_minute, dnd_end_minute, updated_at
+        ) SELECT
+            principal_id, muted_mentions_notify, dnd_enabled, dnd_timezone,
+            dnd_start_minute, dnd_end_minute, updated_at
+        FROM principal_human_notification_policies
+        """,
+        "DROP TABLE principal_human_notification_policies",
+        "ALTER TABLE principal_human_notification_policies_v85 RENAME TO principal_human_notification_policies",
+        """
+        CREATE TABLE principal_channel_notification_policies_v85 (
+            -- Both identifiers refer to replayed projections and therefore
+            -- cannot be cascading foreign keys from durable mutable state.
+            principal_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            level TEXT NOT NULL CHECK (level IN ('all', 'mentions_replies', 'muted')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (principal_id, channel_id)
+        )
+        """,
+        """
+        INSERT INTO principal_channel_notification_policies_v85 (
+            principal_id, channel_id, level, updated_at
+        ) SELECT principal_id, channel_id, level, updated_at
+        FROM principal_channel_notification_policies
+        """,
+        "DROP TABLE principal_channel_notification_policies",
+        "ALTER TABLE principal_channel_notification_policies_v85 RENAME TO principal_channel_notification_policies",
+        "CREATE INDEX principal_channel_notification_policies_channel_idx "
+        "ON principal_channel_notification_policies (channel_id, principal_id)",
+        """
+        CREATE TABLE principal_human_notification_adapter_preferences_v85 (
+            -- principal_id deliberately remains a stable opaque owner key
+            -- while the principal projection is reset and replayed.
+            principal_id TEXT NOT NULL,
+            transport TEXT NOT NULL CHECK (
+                length(transport) BETWEEN 1 AND 32
+                AND transport NOT GLOB '*[^a-z0-9_]*'
+                AND transport GLOB '[a-z]*'
+            ),
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (principal_id, transport)
+        )
+        """,
+        """
+        INSERT INTO principal_human_notification_adapter_preferences_v85 (
+            principal_id, transport, enabled, updated_at
+        ) SELECT principal_id, transport, enabled, updated_at
+        FROM principal_human_notification_adapter_preferences
+        """,
+        "DROP TABLE principal_human_notification_adapter_preferences",
+        "ALTER TABLE principal_human_notification_adapter_preferences_v85 "
+        "RENAME TO principal_human_notification_adapter_preferences",
+        "CREATE INDEX principal_human_notification_adapter_preferences_transport_idx "
+        "ON principal_human_notification_adapter_preferences (transport, enabled, principal_id)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3870,6 +3954,7 @@ _MIGRATIONS = (
     _WORKSPACE_ENVIRONMENT_SECRET_AUDIT_SCHEMA,
     _CANONICAL_MEMORY_PROJECT_REGISTRY_SCHEMA,
     _CANONICAL_PROVIDER_SESSION_RESET_SCHEMA,
+    _DURABLE_CHANNEL_NOTIFICATION_POLICY_SCHEMA,
 )
 
 
