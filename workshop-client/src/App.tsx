@@ -5481,65 +5481,67 @@ function WorkshopView({
         ) : (
         <div className="context-scroll">
           <header className="context-channel-header">
-            <div>
+            <div className="context-channel-heading">
               <p className="overline">Channel context</p>
-              <h2>{symbol} {channelName}</h2>
-            </div>
-            {channel.kind === "group" &&
-              (!channelIsArchived(channel) || channel.role === "owner") && (
-              <div className="context-channel-actions">
-                {!channelIsArchived(channel) && (
-                  <button
-                    className="panel-icon-button"
-                    type="button"
-                    aria-label="Channel settings"
-                    title="Channel settings"
-                    onClick={() => setChannelSettingsOpen(true)}
-                  >
-                    <SettingsIcon />
-                  </button>
-                )}
-                {channel.role === "owner" && (
-                  <button
-                    className="panel-icon-button"
-                    type="button"
-                    aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
-                    title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
-                    disabled={channelLifecycleBusy !== null || activeResponseRuns.length > 0}
-                    onClick={() => void (
-                      !channelIsArchived(channel)
-                        ? archiveSelectedChannel()
-                        : restoreArchivedChannel(channelId)
+              <div className="context-channel-title-row">
+                <h2>{symbol} {channelName}</h2>
+                {channel.kind === "group" &&
+                  (!channelIsArchived(channel) || channel.role === "owner") && (
+                  <div className="context-channel-actions">
+                    {!channelIsArchived(channel) && (
+                      <button
+                        className="panel-icon-button"
+                        type="button"
+                        aria-label="Channel settings"
+                        title="Channel settings"
+                        onClick={() => setChannelSettingsOpen(true)}
+                      >
+                        <SettingsIcon />
+                      </button>
                     )}
-                  >
-                    {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
-                  </button>
+                    {channel.role === "owner" && (
+                      <button
+                        className="panel-icon-button"
+                        type="button"
+                        aria-label={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                        title={!channelIsArchived(channel) ? "Archive channel" : "Restore channel"}
+                        disabled={channelLifecycleBusy !== null || activeResponseRuns.length > 0}
+                        onClick={() => void (
+                          !channelIsArchived(channel)
+                            ? archiveSelectedChannel()
+                            : restoreArchivedChannel(channelId)
+                        )}
+                      >
+                        {!channelIsArchived(channel) ? <ArchiveIcon /> : <RestoreIcon />}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {channel.kind === "direct" &&
+                  !channel.agents.some((agent) => agent.lifecycleState === "archived") && (
+                  <div className="context-channel-actions">
+                    <button
+                      className="panel-icon-button"
+                      type="button"
+                      aria-label={directMessageArchived
+                        ? "Restore direct message"
+                        : "Archive direct message"}
+                      title={directMessageArchived
+                        ? "Restore direct message"
+                        : "Archive direct message"}
+                      disabled={directMessageArchiveBusy !== null || activeResponseRuns.length > 0}
+                      onClick={() => void (
+                        directMessageArchived
+                          ? restoreArchivedDirectMessage(channelId)
+                          : archiveSelectedDirectMessage()
+                      )}
+                    >
+                      {directMessageArchived ? <RestoreIcon /> : <ArchiveIcon />}
+                    </button>
+                  </div>
                 )}
               </div>
-            )}
-            {channel.kind === "direct" &&
-              !channel.agents.some((agent) => agent.lifecycleState === "archived") && (
-              <div className="context-channel-actions">
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label={directMessageArchived
-                    ? "Restore direct message"
-                    : "Archive direct message"}
-                  title={directMessageArchived
-                    ? "Restore direct message"
-                    : "Archive direct message"}
-                  disabled={directMessageArchiveBusy !== null || activeResponseRuns.length > 0}
-                  onClick={() => void (
-                    directMessageArchived
-                      ? restoreArchivedDirectMessage(channelId)
-                      : archiveSelectedDirectMessage()
-                  )}
-                >
-                  {directMessageArchived ? <RestoreIcon /> : <ArchiveIcon />}
-                </button>
-              </div>
-            )}
+            </div>
           </header>
 
           {channelIsArchived(channel) && (
