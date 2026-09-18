@@ -1079,13 +1079,23 @@ button:disabled {
 }
 
 .profile-menu button:hover,
-.profile-menu button:focus-visible {
+.profile-menu button:focus-visible,
+.profile-menu button[aria-current="page"] {
   background: color-mix(in srgb, var(--color-accent) 10%, transparent);
   outline: none;
 }
 
 .profile-menu button > span:first-child {
+  display: grid;
+  width: 1.3rem;
+  height: 1.3rem;
+  place-items: center;
   color: var(--color-accent);
+}
+
+.profile-menu button > span:first-child svg {
+  width: 1rem;
+  height: 1rem;
 }
 
 .profile-menu-separator {

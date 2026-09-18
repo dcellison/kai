@@ -4463,74 +4463,6 @@ function WorkshopView({
         </header>
 
         <nav>
-          <p className="nav-heading">Personal</p>
-          <button
-            className={`channel-link workspaces-link ${workspacesOpen ? "active" : ""}`}
-            type="button"
-            aria-label="Workspaces"
-            title="Workspaces"
-            onClick={onOpenWorkspaces}
-          >
-            <span className="workspace-nav-icon workspaces-nav-icon" aria-hidden="true">
-              <WorkspacesIcon />
-            </span>
-            <span>Workspaces</span>
-            {workspacesOpen && <span className="live-pip" aria-label="Open" />}
-          </button>
-          <button
-            className={`channel-link memory-link ${memoryOpen ? "active" : ""}`}
-            type="button"
-            aria-label="Memory"
-            title="Memory"
-            onClick={onOpenMemory}
-          >
-            <span className="workspace-nav-icon memory-nav-icon" aria-hidden="true">◇</span>
-            <span>Memory</span>
-            {memoryOpen && <span className="live-pip" aria-label="Open" />}
-          </button>
-          <button
-            className={`channel-link mentions-link ${mentionsOpen ? "active" : ""}`}
-            type="button"
-            aria-label={`Mentions${inbox.counts.unread > 0 ? `, ${inbox.counts.unread} unread` : ""}`}
-            title="Mentions"
-            onClick={onOpenMentions}
-          >
-            <span className="workspace-nav-icon mentions-nav-icon" aria-hidden="true">@</span>
-            <span>Mentions</span>
-            {(inbox.counts.unread > 0 || mentionsOpen) && (
-              <span className="channel-link-status">
-                {inbox.counts.unread > 0 && (
-                  <span className="mention-count" aria-hidden="true">
-                    {inbox.counts.unread > 99 ? "99+" : inbox.counts.unread}
-                  </span>
-                )}
-                {mentionsOpen && <span className="live-pip" aria-label="Open" />}
-              </span>
-            )}
-          </button>
-          <button
-            className={`channel-link following-link ${followingOpen ? "active" : ""}`}
-            type="button"
-            aria-label={`Following${following.totalUnread > 0 ? `, ${following.totalUnread} unread` : ""}`}
-            title="Following"
-            onClick={onOpenFollowing}
-          >
-            <span className="workspace-nav-icon following-nav-icon" aria-hidden="true">
-              <ThreadFollowIcon followed={false} />
-            </span>
-            <span>Following</span>
-            {(following.totalUnread > 0 || followingOpen) && (
-              <span className="channel-link-status">
-                {following.totalUnread > 0 && (
-                  <span className="mention-count" aria-hidden="true">
-                    {following.totalUnread > 99 ? "99+" : following.totalUnread}
-                  </span>
-                )}
-                {followingOpen && <span className="live-pip" aria-label="Open" />}
-              </span>
-            )}
-          </button>
-
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
               <p className="nav-heading">Channels</p>
@@ -4676,39 +4608,75 @@ function WorkshopView({
                   );
                 })}
 
-          {workshop.channels.some(
-            (availableChannel) => availableChannel.kind === "notification",
-          ) && (
-            <>
-              <p className="nav-heading">Notifications</p>
-              {workshop.channels
-                .filter((availableChannel) => availableChannel.kind === "notification")
-                .map((availableChannel) => {
-                  const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
-                  return (
-                  <button
-                    className={`channel-link notification ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
-                    type="button"
-                    aria-label={`${channelDisplayName(availableChannel)}${channelUnreadLabel(unread.byChannel[availableChannel.channelId])}`}
-                    title={channelDisplayName(availableChannel)}
-                    onClick={() => onSelectChannel(availableChannel.channelId)}
-                    key={availableChannel.channelId}
-                  >
-                    <span>!</span>
-                    <span>{channelDisplayName(availableChannel)}</span>
-                    {(unreadCount > 0 || (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
-                      <span className="channel-link-status">
-                        {unreadCount > 0 && <span className="unread-pip" aria-hidden="true" />}
-                        {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
-                          <span className="live-pip" aria-label="Live" />
-                        )}
-                      </span>
+          <p className="nav-heading">Activity</p>
+          {workshop.channels
+            .filter((availableChannel) => availableChannel.kind === "notification")
+            .map((availableChannel) => {
+              const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
+              return (
+              <button
+                className={`channel-link notification ${unreadCount > 0 ? "unread" : ""} ${!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId ? "active" : ""}`}
+                type="button"
+                aria-label={`${channelDisplayName(availableChannel)}${channelUnreadLabel(unread.byChannel[availableChannel.channelId])}`}
+                title={channelDisplayName(availableChannel)}
+                onClick={() => onSelectChannel(availableChannel.channelId)}
+                key={availableChannel.channelId}
+              >
+                <span>!</span>
+                <span>{channelDisplayName(availableChannel)}</span>
+                {(unreadCount > 0 || (!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId)) && (
+                  <span className="channel-link-status">
+                    {unreadCount > 0 && <span className="unread-pip" aria-hidden="true" />}
+                    {!auxiliaryWorkspaceOpen && availableChannel.channelId === channelId && (
+                      <span className="live-pip" aria-label="Live" />
                     )}
-                  </button>
-                  );
-                })}
-            </>
-          )}
+                  </span>
+                )}
+              </button>
+              );
+            })}
+          <button
+            className={`channel-link mentions-link ${mentionsOpen ? "active" : ""}`}
+            type="button"
+            aria-label={`Mentions${inbox.counts.unread > 0 ? `, ${inbox.counts.unread} unread` : ""}`}
+            title="Mentions"
+            onClick={onOpenMentions}
+          >
+            <span className="workspace-nav-icon mentions-nav-icon" aria-hidden="true">@</span>
+            <span>Mentions</span>
+            {(inbox.counts.unread > 0 || mentionsOpen) && (
+              <span className="channel-link-status">
+                {inbox.counts.unread > 0 && (
+                  <span className="mention-count" aria-hidden="true">
+                    {inbox.counts.unread > 99 ? "99+" : inbox.counts.unread}
+                  </span>
+                )}
+                {mentionsOpen && <span className="live-pip" aria-label="Open" />}
+              </span>
+            )}
+          </button>
+          <button
+            className={`channel-link following-link ${followingOpen ? "active" : ""}`}
+            type="button"
+            aria-label={`Following${following.totalUnread > 0 ? `, ${following.totalUnread} unread` : ""}`}
+            title="Following"
+            onClick={onOpenFollowing}
+          >
+            <span className="workspace-nav-icon following-nav-icon" aria-hidden="true">
+              <ThreadFollowIcon followed={false} />
+            </span>
+            <span>Following</span>
+            {(following.totalUnread > 0 || followingOpen) && (
+              <span className="channel-link-status">
+                {following.totalUnread > 0 && (
+                  <span className="mention-count" aria-hidden="true">
+                    {following.totalUnread > 99 ? "99+" : following.totalUnread}
+                  </span>
+                )}
+                {followingOpen && <span className="live-pip" aria-label="Open" />}
+              </span>
+            )}
+          </button>
 
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
@@ -4765,21 +4733,46 @@ function WorkshopView({
 
         <footer
           ref={profileMenuRef}
-          className={`sidebar-footer ${settingsOpen ? "active" : ""}`}
+          className={`sidebar-footer ${workspacesOpen || memoryOpen || settingsOpen ? "active" : ""}`}
         >
           {profileMenuOpen && (
-            <div className="profile-menu" role="menu" aria-label="Profile menu">
-              <p className="overline">Personal</p>
+            <div className="profile-menu" role="menu" aria-label="Your Kai menu">
+              <p className="overline">Your Kai</p>
               <button
                 type="button"
                 role="menuitem"
+                aria-current={workspacesOpen ? "page" : undefined}
+                onClick={() => {
+                  setProfileMenuOpen(false);
+                  onOpenWorkspaces();
+                }}
+              >
+                <span aria-hidden="true"><WorkspacesIcon /></span>
+                <span><strong>Workspaces</strong><small>Authorized directories</small></span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                aria-current={memoryOpen ? "page" : undefined}
+                onClick={() => {
+                  setProfileMenuOpen(false);
+                  onOpenMemory();
+                }}
+              >
+                <span aria-hidden="true">◇</span>
+                <span><strong>Memory</strong><small>Facts and episodes</small></span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                aria-current={settingsOpen ? "page" : undefined}
                 onClick={() => {
                   setProfileMenuOpen(false);
                   onOpenSettings();
                 }}
               >
                 <span aria-hidden="true">⚙</span>
-                <span><strong>Settings</strong><small>Preferences and runtime</small></span>
+                <span><strong>Settings</strong><small>Profile and preferences</small></span>
               </button>
               <div className="profile-menu-separator" />
               <button

@@ -1296,7 +1296,8 @@ describe("Workshop React client", () => {
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
 
-    await user.click(screen.getByRole("button", { name: "Memory" }));
+    await user.click(screen.getByRole("button", { name: "Daniel profile" }));
+    await user.click(screen.getByRole("menuitem", { name: /Memory/ }));
     expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
     expect(window.location.search).toContain("view=memory");
   });
@@ -1579,7 +1580,7 @@ describe("Workshop React client", () => {
     expect(screen.getByRole("button", { name: "Following" })).toBeVisible();
   });
 
-  it("orders channels before direct messages in Workshop navigation", async () => {
+  it("orders conversation, activity, and agent navigation by usage priority", async () => {
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "session-secret" }),
@@ -1594,17 +1595,18 @@ describe("Workshop React client", () => {
         heading.textContent?.trim(),
       ),
     ).toEqual([
-      "Personal",
       "Channels",
       "Direct messages",
-      "Notifications",
+      "Activity",
       "Agents",
     ]);
-    for (const name of ["Memory", "Mentions", "Following"]) {
+    for (const name of ["Mentions", "Following"]) {
       expect(
         within(navigationPanel).getByRole("button", { name }).querySelector(".workspace-nav-icon"),
       ).toBeInTheDocument();
     }
+    expect(within(navigationPanel).queryByRole("button", { name: "Workspaces" })).toBeNull();
+    expect(within(navigationPanel).queryByRole("button", { name: "Memory" })).toBeNull();
     expect(
       within(navigationPanel).getByRole("button", { name: "Following" }).querySelector("svg"),
     ).toHaveAttribute("fill", "none");
@@ -1834,8 +1836,10 @@ describe("Workshop React client", () => {
 
     const profile = await screen.findByRole("button", { name: "Daniel profile" });
     await user.click(profile);
-    const menu = screen.getByRole("menu", { name: "Profile menu" });
+    const menu = screen.getByRole("menu", { name: "Your Kai menu" });
     expect(menu).toBeVisible();
+    expect(within(menu).getByRole("menuitem", { name: /Workspaces/ })).toBeVisible();
+    expect(within(menu).getByRole("menuitem", { name: /Memory/ })).toBeVisible();
     await user.click(screen.getByRole("menuitem", { name: /Settings/ }));
 
     expect(await screen.findByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
@@ -1872,7 +1876,7 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
   });
 
-  it("opens the principal Workspaces destination from the Workspace navigation", async () => {
+  it("opens the principal Workspaces destination from the Your Kai menu", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
@@ -1881,9 +1885,10 @@ describe("Workshop React client", () => {
 
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: "Workspaces" }));
+    await user.click(await screen.findByRole("button", { name: "Daniel profile" }));
+    await user.click(screen.getByRole("menuitem", { name: /Workspaces/ }));
     expect(await screen.findByRole("heading", { name: "Your workspaces", level: 1 })).toBeVisible();
-    expect(screen.getByText("Personal", { selector: ".nav-heading" })).toBeVisible();
+    expect(screen.queryByText("Personal", { selector: ".nav-heading" })).toBeNull();
     expect(screen.getByRole("region", { name: "Authorized workspaces" })).toBeVisible();
     expect(loadWorkspaceGrants).toHaveBeenCalledTimes(1);
     expect(loadMemoryProjects).toHaveBeenCalledTimes(1);
@@ -1927,9 +1932,9 @@ describe("Workshop React client", () => {
 
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "Daniel profile" }));
-    expect(screen.getByRole("menu", { name: "Profile menu" })).toBeVisible();
+    expect(screen.getByRole("menu", { name: "Your Kai menu" })).toBeVisible();
     await user.keyboard("{Escape}");
-    expect(screen.queryByRole("menu", { name: "Profile menu" })).toBeNull();
+    expect(screen.queryByRole("menu", { name: "Your Kai menu" })).toBeNull();
   });
 
   it("protects unsaved preferences before leaving Settings", async () => {
@@ -2601,7 +2606,8 @@ describe("Workshop React client", () => {
       expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
       await waitFor(() => expect(initialTimeline.scrollTop).toBe(1000));
 
-      await user.click(screen.getByRole("button", { name: "Memory" }));
+      await user.click(screen.getByRole("button", { name: "Daniel profile" }));
+      await user.click(screen.getByRole("menuitem", { name: /Memory/ }));
       await user.click(screen.getByRole("button", { name: "Back to conversation" }));
       const followedTimeline = await screen.findByLabelText("Conversation timeline");
       expect(followedTimeline).not.toBe(initialTimeline);
@@ -2612,7 +2618,8 @@ describe("Workshop React client", () => {
 
       followedTimeline.scrollTop = 100;
       fireEvent.scroll(followedTimeline);
-      await user.click(screen.getByRole("button", { name: "Memory" }));
+      await user.click(screen.getByRole("button", { name: "Daniel profile" }));
+      await user.click(screen.getByRole("menuitem", { name: /Memory/ }));
       await user.click(screen.getByRole("button", { name: "Back to conversation" }));
       const historicalTimeline = await screen.findByLabelText("Conversation timeline");
       expect(historicalTimeline).not.toBe(followedTimeline);
@@ -3082,7 +3089,8 @@ describe("Workshop React client", () => {
     render(<App />);
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
 
-    await user.click(screen.getByRole("button", { name: "Memory" }));
+    await user.click(screen.getByRole("button", { name: "Daniel profile" }));
+    await user.click(screen.getByRole("menuitem", { name: /Memory/ }));
     expect(
       await screen.findByRole("heading", { name: "Memory", level: 1 }),
     ).toBeVisible();
