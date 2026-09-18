@@ -541,6 +541,7 @@ describe("Settings workspace", () => {
     const user = userEvent.setup();
     renderSettings();
     const editor = await screen.findByLabelText("Preference Markdown");
+    expect(screen.getByText("Kai Workshop / Settings")).toBeVisible();
     const navigation = screen.getByRole("navigation", { name: "Settings sections" });
     const sectionLabels = [
       "Personal preferences",

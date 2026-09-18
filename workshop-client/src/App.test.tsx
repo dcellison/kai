@@ -1914,7 +1914,8 @@ describe("Workshop React client", () => {
 
     await user.click(await screen.findByRole("button", { name: "Daniel profile" }));
     await user.click(screen.getByRole("menuitem", { name: /Workspaces/ }));
-    expect(await screen.findByRole("heading", { name: "Your workspaces", level: 1 })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Workspaces", level: 1 })).toBeVisible();
+    expect(screen.getByText("Kai Workshop / Workspaces")).toBeVisible();
     expect(screen.queryByText("Personal", { selector: ".nav-heading" })).toBeNull();
     expect(screen.getByRole("region", { name: "Authorized workspaces" })).toBeVisible();
     expect(loadWorkspaceGrants).toHaveBeenCalledTimes(1);
