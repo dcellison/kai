@@ -106,6 +106,7 @@ import type { EarlierHistoryState, LaterHistoryState } from "./useWorkshopTimeli
 import { MarkdownMessage } from "./MarkdownMessage";
 import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
+import { WorkspacesWorkspace } from "./WorkspacesWorkspace";
 import { SettingsWorkspace } from "./SettingsWorkspace";
 import { AgentWorkspace } from "./AgentWorkspace";
 import { MentionsInbox } from "./MentionsInbox";
@@ -191,6 +192,7 @@ type WorkshopDestination =
       section: "runtime" | null;
     }
   | { kind: "memory"; memoryId: string | null }
+  | { kind: "workspaces" }
   | { kind: "mentions" }
   | { kind: "following" }
   | {
@@ -200,6 +202,9 @@ type WorkshopDestination =
 
 function destinationFromLocation(): WorkshopDestination {
   const parameters = new URLSearchParams(window.location.search);
+  if (parameters.get("view") === "workspaces") {
+    return { kind: "workspaces" };
+  }
   if (parameters.get("view") === "mentions") {
     return { kind: "mentions" };
   }
@@ -280,6 +285,8 @@ function writeDestination(
     if (destination.memoryId) {
       url.searchParams.set("memory", destination.memoryId);
     }
+  } else if (destination.kind === "workspaces") {
+    url.searchParams.set("view", "workspaces");
   } else if (destination.kind === "settings") {
     url.searchParams.set("view", "settings");
     if (destination.runtimeChannelId) {
@@ -2377,6 +2384,19 @@ function FreshSessionIcon(): React.JSX.Element {
   );
 }
 
+function WorkspacesIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path
+        d="M3.5 6.5h6l2 2h9v10h-17z"
+        stroke="currentColor"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
 function ContextSection({
   children,
   className = "",
@@ -2860,6 +2880,7 @@ function WorkshopView({
   later,
   messages,
   threadMessages,
+  workspacesDestination,
   memoryDestination,
   memoryToken,
   mentionsDestination,
@@ -2911,6 +2932,7 @@ function WorkshopView({
   onSetThreadFollowed,
   onChangeChannelMember,
   onMemoryAuthenticationFailure,
+  onOpenWorkspaces,
   onOpenMemory,
   onOpenMentions,
   onOpenFollowing,
@@ -2946,6 +2968,7 @@ function WorkshopView({
   later: LaterHistoryState;
   messages: TimelineMessage[];
   threadMessages: TimelineMessage[];
+  workspacesDestination: boolean;
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
   mentionsDestination: boolean;
@@ -3029,6 +3052,7 @@ function WorkshopView({
     clientOperationId: string,
   ) => Promise<number>;
   onMemoryAuthenticationFailure: (message: string) => void;
+  onOpenWorkspaces: () => void;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
   onOpenFollowing: () => void;
@@ -3070,12 +3094,13 @@ function WorkshopView({
   const setHumanAvatarOverride = useHumanAvatarOverride();
   const channelId = channel.channelId;
   const agentsOpen = agentDestination !== null;
+  const workspacesOpen = workspacesDestination;
   const memoryOpen = memoryDestination !== null;
   const mentionsOpen = mentionsDestination;
   const followingOpen = followingDestination;
   const settingsOpen = settingsDestination;
   const auxiliaryWorkspaceOpen =
-    agentsOpen || memoryOpen || mentionsOpen || followingOpen || settingsOpen;
+    agentsOpen || workspacesOpen || memoryOpen || mentionsOpen || followingOpen || settingsOpen;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const humanDirect = channelIsHumanDirect(channel);
@@ -4404,7 +4429,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${followingOpen ? "following-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${workspacesOpen ? "workspaces-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${followingOpen ? "following-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -4439,6 +4464,19 @@ function WorkshopView({
 
         <nav>
           <p className="nav-heading">Workspace</p>
+          <button
+            className={`channel-link workspaces-link ${workspacesOpen ? "active" : ""}`}
+            type="button"
+            aria-label="Workspaces"
+            title="Workspaces"
+            onClick={onOpenWorkspaces}
+          >
+            <span className="workspace-nav-icon workspaces-nav-icon" aria-hidden="true">
+              <WorkspacesIcon />
+            </span>
+            <span>Workspaces</span>
+            {workspacesOpen && <span className="live-pip" aria-label="Open" />}
+          </button>
           <button
             className={`channel-link memory-link ${memoryOpen ? "active" : ""}`}
             type="button"
@@ -4815,6 +4853,13 @@ function WorkshopView({
           principalEvents={principalEvents}
           runActive={isRunActive(activeRun)}
           token={agentToken}
+        />
+      ) : workspacesOpen ? (
+        <WorkspacesWorkspace
+          onAuthenticationFailure={onMemoryAuthenticationFailure}
+          onChannelAccessFailure={onSettingsAccessFailure}
+          onClose={() => onSelectChannel(channelId)}
+          session={settingsSession}
         />
       ) : settingsOpen ? (
         <SettingsWorkspace
@@ -5574,16 +5619,7 @@ function WorkshopView({
                     <p className="settings-source">
                       Session: {status.providerSessionState.replaceAll("_", " ")}
                       {displayedRun ? ` · Last run: ${displayedRun.status}` : " · No runs yet"}
-                      {status.sessionUpdatedAt ? ` · ${formatTimestamp(status.sessionUpdatedAt)}` : ""}
                     </p>
-                    {status.freshSessionRevision && (
-                      <p className="settings-source">
-                        Fresh-session revision: <code>{status.freshSessionRevision.slice(0, 12)}</code>
-                        {status.freshSessionGeneration !== null
-                          ? ` · generation ${status.freshSessionGeneration}`
-                          : ""}
-                      </p>
-                    )}
                     {status.workspaceMode === "neutral" ? (
                       <p className="settings-source">No shared workspace</p>
                     ) : (
@@ -5606,17 +5642,6 @@ function WorkshopView({
                         </div>
                       </>
                     )}
-                    {status.operatorDiagnostics && (
-                      <details className="runtime-diagnostics">
-                        <summary>Runtime diagnostics</summary>
-                        <dl>
-                          <div><dt>Process</dt><dd>{status.processState}</dd></div>
-                          <div><dt>Continuity</dt><dd>{status.continuityState.replaceAll("_", " ")}</dd></div>
-                          <div><dt>Profile</dt><dd><code>{status.operatorDiagnostics.runtimeProfileId}</code></dd></div>
-                          <div><dt>Context boundary</dt><dd>{status.operatorDiagnostics.contextThroughEventPosition ?? "none"}</dd></div>
-                        </dl>
-                      </details>
-                    )}
                   </div>;
                 })}
               </div>
@@ -5638,6 +5663,23 @@ function WorkshopView({
             number={channel.kind === "group" ? "06" : "04"}
             title="Run inspector"
           >
+            {runtimeLaneStatuses.some((status) => status.operatorDiagnostics) && (
+              <div className="runtime-lane-diagnostics">
+                <h3>Runtime diagnostics</h3>
+                {runtimeLaneStatuses.map((status) => status.operatorDiagnostics && (
+                  <dl key={status.agentId}>
+                    <div><dt>Agent</dt><dd>{status.agentName}</dd></div>
+                    <div><dt>Process</dt><dd>{status.processState}</dd></div>
+                    <div><dt>Continuity</dt><dd>{status.continuityState.replaceAll("_", " ")}</dd></div>
+                    <div><dt>Profile</dt><dd><code>{status.operatorDiagnostics.runtimeProfileId}</code></dd></div>
+                    <div><dt>Context boundary</dt><dd>{status.operatorDiagnostics.contextThroughEventPosition ?? "none"}</dd></div>
+                    <div><dt>Session updated</dt><dd>{status.sessionUpdatedAt ? formatTimestamp(status.sessionUpdatedAt) : "not started"}</dd></div>
+                    <div><dt>Provider session revision</dt><dd><code>{status.operatorDiagnostics.providerSessionRevision ?? "none"}</code></dd></div>
+                    <div><dt>Fresh-session revision</dt><dd><code>{status.freshSessionRevision ?? "none"}</code>{status.freshSessionGeneration !== null ? ` · generation ${status.freshSessionGeneration}` : ""}</dd></div>
+                  </dl>
+                ))}
+              </div>
+            )}
             {standingParticipation && (
               <details className="standing-run-inspector">
                 <summary>
@@ -5859,6 +5901,7 @@ function ActiveWorkshopClient({
   onOpenAgentDefinition,
   onOpenAgentSetup,
   onOpenAgentChannel,
+  onOpenWorkspaces,
   onOpenMemory,
   onOpenMentions,
   onOpenFollowing,
@@ -5891,6 +5934,7 @@ function ActiveWorkshopClient({
   onOpenAgentDefinition: (definitionId: string) => Promise<void>;
   onOpenAgentSetup: (definitionId: string | null, setupId: string | null) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
+  onOpenWorkspaces: () => void;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
   onOpenFollowing: () => void;
@@ -6272,6 +6316,7 @@ function ActiveWorkshopClient({
       later={later}
       messages={messages}
       threadMessages={threadMessages}
+      workspacesDestination={destination.kind === "workspaces"}
       memoryDestination={destination.kind === "memory" ? destination : null}
       mentionsDestination={destination.kind === "mentions"}
       followingDestination={destination.kind === "following"}
@@ -6330,6 +6375,7 @@ function ActiveWorkshopClient({
       onOpenAgentChannel={onOpenAgentChannel}
       onOpenAgentDefinition={onOpenAgentDefinition}
       onOpenAgentSetup={onOpenAgentSetup}
+      onOpenWorkspaces={onOpenWorkspaces}
       onOpenMemory={onOpenMemory}
       onOpenMentions={onOpenMentions}
       onOpenFollowing={onOpenFollowing}
@@ -6566,6 +6612,19 @@ function WorkshopApp(): React.JSX.Element {
     storeWorkshopAccess(nextSession);
     setSession(nextSession);
     const nextDestination: WorkshopDestination = { kind: "conversation" };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
+  const openWorkspaces = async (): Promise<void> => {
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !await confirm("Discard unsaved preference changes?")
+    ) {
+      return;
+    }
+    const nextDestination: WorkshopDestination = { kind: "workspaces" };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");
   };
@@ -6939,6 +6998,7 @@ function WorkshopApp(): React.JSX.Element {
         onOpenAgentChannel={openAgentChannel}
         onOpenAgentDefinition={openAgentDefinition}
         onOpenAgentSetup={openAgentSetup}
+        onOpenWorkspaces={() => void openWorkspaces()}
         onOpenMemory={() => void openMemory()}
         onOpenMentions={() => void openMentions()}
         onOpenFollowing={() => void openFollowing()}

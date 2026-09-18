@@ -840,6 +840,11 @@ button:disabled {
   height: 1.05rem;
 }
 
+.workspaces-nav-icon svg {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
 .channel-link.active {
   background: color-mix(in srgb, var(--color-accent) 10%, transparent);
   color: var(--color-text-strong);
@@ -2965,7 +2970,8 @@ button:disabled {
   font-size: 0.66rem;
 }
 
-.runtime-diagnostics {
+.runtime-diagnostics,
+.runtime-lane-diagnostics {
   color: var(--color-text-muted);
   font-size: 0.66rem;
 }
@@ -2990,6 +2996,43 @@ button:disabled {
 .runtime-diagnostics dt,
 .runtime-diagnostics dd {
   margin: 0;
+}
+
+.runtime-lane-diagnostics {
+  margin-bottom: 0.8rem;
+}
+
+.runtime-lane-diagnostics > h3 {
+  margin-bottom: 0.45rem;
+}
+
+.runtime-lane-diagnostics dl {
+  display: grid;
+  gap: 0.28rem;
+  margin: 0;
+}
+
+.runtime-lane-diagnostics dl + dl {
+  margin-top: 0.65rem;
+  border-top: 1px solid var(--color-border);
+  padding-top: 0.65rem;
+}
+
+.runtime-lane-diagnostics dl div {
+  display: grid;
+  grid-template-columns: minmax(5.5rem, 0.42fr) minmax(0, 1fr);
+  gap: 0.5rem;
+}
+
+.runtime-lane-diagnostics dt,
+.runtime-lane-diagnostics dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.runtime-lane-diagnostics dd,
+.runtime-lane-diagnostics code {
+  overflow-wrap: anywhere;
 }
 
 .runtime-settings p {
@@ -3066,10 +3109,255 @@ button:disabled {
 
 /* Read-only memory workspace */
 
+.workshop-app.workspaces-open,
 .workshop-app.memory-open,
 .workshop-app.mentions-open,
 .workshop-app.following-open {
   grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(0, 1fr);
+}
+
+/* Principal-owned workspace catalogue */
+
+.workspaces-workspace {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--color-canvas);
+}
+
+.workspaces-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-height: 4.55rem;
+  border-bottom: 1px solid var(--color-border);
+  padding: 0.72rem 1.25rem;
+}
+
+.workspaces-header h1,
+.workspaces-header p {
+  margin: 0;
+}
+
+.workspaces-header h1 {
+  margin-top: 0.14rem;
+  color: var(--color-text-strong);
+  font: 560 1.35rem var(--serif);
+}
+
+.workspaces-header > div:first-child > p:last-child {
+  margin-top: 0.18rem;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.workspaces-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+
+.workspaces-header-actions svg,
+.workspaces-workspace .workspace-project-detail svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.workspaces-notices {
+  padding: 0.5rem 1.25rem 0;
+}
+
+.workspaces-notices p {
+  margin: 0;
+}
+
+.workspaces-body {
+  display: grid;
+  grid-template-columns: minmax(17rem, 0.72fr) minmax(22rem, 1.28fr);
+  min-height: 0;
+}
+
+.workspace-catalogue {
+  min-width: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--color-border);
+}
+
+.workspace-catalogue ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workspace-catalogue li {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.workspace-catalogue button {
+  display: grid;
+  gap: 0.22rem;
+  width: 100%;
+  border: 0;
+  padding: 0.8rem 1rem;
+  background: transparent;
+  color: var(--color-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.workspace-catalogue button:hover,
+.workspace-catalogue button:focus-visible {
+  background: color-mix(in srgb, var(--color-text) 5%, transparent);
+  outline: none;
+}
+
+.workspace-catalogue button.selected {
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  box-shadow: inset 3px 0 var(--color-accent);
+}
+
+.workspace-catalogue button > span:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.workspace-catalogue strong {
+  overflow: hidden;
+  color: var(--color-text-strong);
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-catalogue small {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 0.61rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-catalogue small:first-of-type {
+  font-family: var(--mono);
+}
+
+.workspace-current,
+.workspace-status {
+  flex: none;
+  border: 1px solid color-mix(in srgb, var(--color-success) 45%, transparent);
+  border-radius: 999px;
+  padding: 0.12rem 0.38rem;
+  color: var(--color-success);
+  font-size: 0.52rem;
+  font-weight: 720;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workspace-detail {
+  min-width: 0;
+  overflow-y: auto;
+  padding: clamp(1.1rem, 3vw, 2.5rem);
+}
+
+.workspace-detail > * {
+  max-width: 46rem;
+  margin-inline: auto;
+}
+
+.workspace-detail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.workspace-detail-heading h2,
+.workspace-detail-heading p {
+  margin: 0;
+}
+
+.workspace-detail-heading h2 {
+  margin-top: 0.18rem;
+  color: var(--color-text-strong);
+  font: 560 1.4rem var(--serif);
+}
+
+.workspace-detail dl {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 1rem;
+}
+
+.workspace-detail dl div {
+  display: grid;
+  grid-template-columns: 6.5rem minmax(0, 1fr);
+  gap: 0.8rem;
+}
+
+.workspace-detail dt,
+.workspace-detail dd {
+  min-width: 0;
+  margin: 0;
+  font-size: 0.7rem;
+}
+
+.workspace-detail dt {
+  color: var(--color-text-muted);
+}
+
+.workspace-detail dd code {
+  overflow-wrap: anywhere;
+}
+
+.workspace-project-detail,
+.workspace-detail-actions {
+  margin-top: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.45rem;
+  padding: 0.85rem;
+  background: var(--color-panel);
+}
+
+.workspace-project-detail h3,
+.workspace-detail-actions h3,
+.workspace-project-detail p {
+  margin: 0;
+}
+
+.workspace-project-detail h3,
+.workspace-detail-actions h3 {
+  color: var(--color-text-strong);
+  font-size: 0.78rem;
+}
+
+.workspace-project-detail p {
+  margin-top: 0.35rem;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+}
+
+.workspace-project-detail .quiet-button,
+.workspace-detail-actions button {
+  margin-top: 0.65rem;
+}
+
+.workspace-detail-actions .danger-button {
+  margin-left: 0.45rem;
+}
+
+.workspaces-empty {
+  margin: 0;
+  padding: 2rem 1.25rem;
+  color: var(--color-text-muted);
+  text-align: center;
 }
 
 .workshop-app.agents-open,
@@ -4975,7 +5263,7 @@ button:disabled {
 
 .workspace-settings-heading {
   display: grid;
-  grid-template-columns: minmax(10rem, 0.35fr) minmax(14rem, 1fr) auto;
+  grid-template-columns: minmax(10rem, 0.35fr) minmax(14rem, 1fr);
   align-items: center;
   gap: 1rem;
 }
@@ -6247,6 +6535,7 @@ button:disabled {
       min(var(--context-pane-width, 34rem), 36vw);
   }
 
+  .workshop-app.workspaces-open,
   .workshop-app.memory-open,
   .workshop-app.mentions-open,
   .workshop-app.following-open {
@@ -6255,6 +6544,10 @@ button:disabled {
 
   .memory-workspace {
     grid-template-columns: minmax(20rem, 0.85fr) minmax(22rem, 1.15fr);
+  }
+
+  .workspaces-body {
+    grid-template-columns: minmax(16rem, 0.75fr) minmax(20rem, 1.25fr);
   }
 }
 
@@ -6309,10 +6602,26 @@ button:disabled {
       min(var(--context-pane-width, 34rem), 44vw);
   }
 
+  .workshop-app.workspaces-open,
   .workshop-app.memory-open,
   .workshop-app.mentions-open,
   .workshop-app.following-open {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspaces-body {
+    display: block;
+    overflow-y: auto;
+  }
+
+  .workspace-catalogue,
+  .workspace-detail {
+    overflow: visible;
+  }
+
+  .workspace-catalogue {
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
   }
 
   .workshop-app.agents-open,
@@ -6325,6 +6634,7 @@ button:disabled {
   }
 
   .agent-workspace,
+  .workspaces-workspace,
   .mentions-workspace,
   .following-workspace,
   .memory-workspace,

@@ -321,6 +321,7 @@ class _SettingsWorkspaces:
     added_workspace_grants: list[str] = field(default_factory=list)
     removed_workspace_grants: list[str] = field(default_factory=list)
     registered_memory_projects: list[str] = field(default_factory=list)
+    registered_memory_project_workspaces: list[str | None] = field(default_factory=list)
     removed_memory_projects: list[str] = field(default_factory=list)
     workspace_config_changes: list[tuple[str, str]] = field(default_factory=list)
     workspace_environment_changes: list[tuple[str, str]] = field(default_factory=list)
@@ -507,7 +508,15 @@ class _SettingsWorkspaces:
     async def inspect_memory_projects(self, _authority):
         return self._memory_project_snapshot()
 
-    async def register_memory_project(self, _authority, name: str, *, expected_revision=None):
+    async def register_memory_project(
+        self,
+        _authority,
+        name: str,
+        *,
+        workspace_path=None,
+        expected_revision=None,
+    ):
+        self.registered_memory_project_workspaces.append(workspace_path)
         self._check_revision(expected_revision, "mpr_current")
         project_id = name.lower()
         changed = project_id not in self.registered_memory_projects
@@ -4755,12 +4764,20 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             created = await client.post(
                 path,
                 headers=mutation_headers,
-                json={"name": "research", "revision": "mpr_current"},
+                json={
+                    "name": "research",
+                    "revision": "mpr_current",
+                    "workspace_path": "/srv/home/workspaces/research",
+                },
             )
             replay = await client.post(
                 path,
                 headers=mutation_headers,
-                json={"name": "research", "revision": "mpr_current"},
+                json={
+                    "name": "research",
+                    "revision": "mpr_current",
+                    "workspace_path": "/srv/home/workspaces/research",
+                },
             )
             removed = await client.delete(
                 f"{path}/research",
@@ -4791,6 +4808,10 @@ class TestWorkshopSettingsWorkspaceHTTPContract:
             assert malformed.status == 400
             assert foreign.status == 403
             assert service.registered_memory_projects == ["research"]
+            assert service.registered_memory_project_workspaces == [
+                "/srv/home/workspaces/research",
+                "/srv/home/workspaces/research",
+            ]
             assert service.removed_memory_projects == ["research"]
         finally:
             await client.close()

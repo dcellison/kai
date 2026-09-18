@@ -4417,14 +4417,26 @@ async def _handle_memory_projects(
         payload = json.loads(raw) if len(raw) <= _MAX_WORKSPACE_CREATION_BODY_BYTES else None
     except (UnicodeDecodeError, ValueError):
         payload = None
-    if not isinstance(payload, dict) or set(payload) != {"revision", "name"}:
+    if (
+        not isinstance(payload, dict)
+        or not set(payload).issubset({"revision", "name", "workspace_path"})
+        or not {
+            "revision",
+            "name",
+        }.issubset(payload)
+    ):
         return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
-    if not isinstance(payload.get("revision"), str) or not isinstance(payload.get("name"), str):
+    if (
+        not isinstance(payload.get("revision"), str)
+        or not isinstance(payload.get("name"), str)
+        or ("workspace_path" in payload and not isinstance(payload["workspace_path"], str))
+    ):
         return _error_response(status=400, code="invalid_request", message="Invalid memory-project request")
     try:
         result = await service.register_memory_project(
             authority,
             payload["name"],
+            workspace_path=payload.get("workspace_path"),
             expected_revision=payload["revision"],
         )
     except WorkshopSettingsWorkspaceConflict as exc:

@@ -10,10 +10,7 @@ import {
 
 import {
   AuthenticationError,
-  addExistingWorkspace,
   ChannelAccessError,
-  createWorkspace,
-  deleteWorkspace,
   deactivateOperatorModel,
   clearHumanAvatar,
   loadAppearancePreferences,
@@ -26,16 +23,12 @@ import {
   loadChannelNotificationPolicy,
   loadClientPreferences,
   loadModelCatalogue,
-  loadMemoryProjects,
   loadSettingsWorkspace,
   loadWorkspaceConfig,
-  loadWorkspaceGrants,
   PreferenceRevisionConflictError,
   refreshAllModelCatalogues,
   restorePreferenceRevision,
   removeWorkspaceEnvironmentSecret,
-  removeExistingWorkspace,
-  registerMemoryProject,
   refreshModelCatalogue,
   savePreferenceDocument,
   setWorkspaceEnvironmentSecret,
@@ -51,7 +44,6 @@ import {
   updateHumanDisplayName,
   uploadHumanAvatar,
   updateWorkspaceConfig,
-  unregisterMemoryProject,
 } from "./api";
 import type {
   WorkshopEditableCapability,
@@ -70,13 +62,11 @@ import type {
   WorkshopHumanProfile,
   WorkshopHumanAvatar,
   WorkshopHumanAvatarDescriptor,
-  WorkshopMemoryProjectRegistry,
   WorkshopRuntimeSettingsChange,
   WorkshopSession,
   WorkshopSettingsMutation,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
-  WorkshopWorkspaceGrants,
   WorkshopWorkspaceSettingChange,
 } from "./types";
 import { applyWorkshopTheme } from "./theme";
@@ -130,15 +120,6 @@ function WorkspaceDeleteIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24">
       <path d="M5 7h14M9 7V4h6v3m2 0-1 13H8L7 7m3 4v5m4-5v5" />
-    </svg>
-  );
-}
-
-function ExistingWorkspaceIcon(): React.JSX.Element {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 24 24">
-      <path d="M3.5 7.5h6l2 2h9v10h-17z" />
-      <path d="M12 12v5m-2.5-2.5h5" />
     </svg>
   );
 }
@@ -272,27 +253,6 @@ function errorText(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
 
-function workspaceProvenanceLabel(provenance: string): string {
-  const labels: Record<string, string> = {
-    legacy_migrated: "Migrated personal access",
-    operator: "Operator policy",
-    principal_added: "Added by you",
-    principal_created: "Created by Kai",
-    profile: "Runtime profile",
-  };
-  return labels[provenance] ?? provenance.replaceAll("_", " ");
-}
-
-function memoryProjectProvenanceLabel(provenance: string): string {
-  const labels: Record<string, string> = {
-    legacy_migrated: "Migrated project",
-    operator_pinned: "Operator pinned",
-    principal_created: "Created with workspace",
-    principal_registered: "Registered by you",
-  };
-  return labels[provenance] ?? provenance.replaceAll("_", " ");
-}
-
 type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
   executionProfileControl?: ReactNode;
@@ -373,34 +333,12 @@ function SettingsWorkspaceContent({
   const [workspaceModel, setWorkspaceModel] = useState("");
   const [workspaceTimeout, setWorkspaceTimeout] = useState("");
   const [workspacePrompt, setWorkspacePrompt] = useState("");
-  const [workspaceCreationOpen, setWorkspaceCreationOpen] = useState(false);
-  const [workspaceName, setWorkspaceName] = useState("");
-  const [workspaceCreationBusy, setWorkspaceCreationBusy] = useState(false);
-  const [workspaceCreationError, setWorkspaceCreationError] = useState<string | null>(null);
-  const [workspaceDeletionOpen, setWorkspaceDeletionOpen] = useState(false);
-  const [workspaceDeletionName, setWorkspaceDeletionName] = useState("");
-  const [workspaceDeletionConfirmation, setWorkspaceDeletionConfirmation] = useState("");
-  const [workspaceDeletionBusy, setWorkspaceDeletionBusy] = useState(false);
-  const [workspaceDeletionError, setWorkspaceDeletionError] = useState<string | null>(null);
-  const [workspaceGrants, setWorkspaceGrants] = useState<WorkshopWorkspaceGrants | null>(null);
-  const [workspaceGrantsLoading, setWorkspaceGrantsLoading] = useState(true);
-  const [workspaceGrantsBusy, setWorkspaceGrantsBusy] = useState(false);
-  const [workspaceGrantsError, setWorkspaceGrantsError] = useState<string | null>(null);
-  const [workspaceGrantsNotice, setWorkspaceGrantsNotice] = useState<string | null>(null);
-  const [workspaceGrantOpen, setWorkspaceGrantOpen] = useState(false);
-  const [workspaceGrantPath, setWorkspaceGrantPath] = useState("");
-  const [workspaceGrantFormError, setWorkspaceGrantFormError] = useState<string | null>(null);
   const [workspaceSecretOpen, setWorkspaceSecretOpen] = useState(false);
   const [workspaceSecretKey, setWorkspaceSecretKey] = useState("");
   const [workspaceSecretValue, setWorkspaceSecretValue] = useState("");
   const [workspaceSecretEditing, setWorkspaceSecretEditing] = useState(false);
   const [workspaceSecretBusy, setWorkspaceSecretBusy] = useState(false);
   const [workspaceSecretError, setWorkspaceSecretError] = useState<string | null>(null);
-  const [memoryProjects, setMemoryProjects] = useState<WorkshopMemoryProjectRegistry | null>(null);
-  const [memoryProjectName, setMemoryProjectName] = useState("");
-  const [memoryProjectsBusy, setMemoryProjectsBusy] = useState(false);
-  const [memoryProjectsError, setMemoryProjectsError] = useState<string | null>(null);
-  const [memoryProjectsNotice, setMemoryProjectsNotice] = useState<string | null>(null);
 
   const [github, setGitHub] = useState<WorkshopGitHubSettings | null>(null);
   const [githubLoading, setGitHubLoading] = useState(true);
@@ -584,25 +522,10 @@ function SettingsWorkspaceContent({
     setWorkspacePrompt(snapshot.prompt ?? "");
   }, []);
 
-  const refreshMemoryProjects = useCallback(async (): Promise<void> => {
-    setMemoryProjectsError(null);
-    try {
-      setMemoryProjects(await loadMemoryProjects(session));
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setMemoryProjectsError(errorText(caught, "Could not load memory projects."));
-      }
-      setMemoryProjects(null);
-    }
-  }, [handleAccessFailure, session]);
-
   const refreshRuntime = useCallback(async (): Promise<void> => {
     setRuntimeLoading(true);
-    setWorkspaceGrantsLoading(true);
     setRuntimeError(null);
     setWorkspaceError(null);
-    setWorkspaceGrantsError(null);
-    setMemoryProjectsError(null);
     try {
       const settings = await loadSettingsWorkspace(session);
       adoptRuntime(settings);
@@ -612,10 +535,7 @@ function SettingsWorkspaceContent({
       }
       setRuntime(null);
       setWorkspaceConfig(null);
-      setWorkspaceGrants(null);
-      setMemoryProjects(null);
       setRuntimeLoading(false);
-      setWorkspaceGrantsLoading(false);
       return;
     }
     try {
@@ -634,23 +554,11 @@ function SettingsWorkspaceContent({
     } finally {
       setRuntimeLoading(false);
     }
-    try {
-      setWorkspaceGrants(await loadWorkspaceGrants(session));
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setWorkspaceGrantsError(errorText(caught, "Could not load workspace access."));
-      }
-      setWorkspaceGrants(null);
-    } finally {
-      setWorkspaceGrantsLoading(false);
-    }
-    await refreshMemoryProjects();
   }, [
     adoptRuntime,
     adoptWorkspace,
     handleAccessFailure,
     onAuthenticationFailure,
-    refreshMemoryProjects,
     session,
   ]);
 
@@ -1077,7 +985,6 @@ function SettingsWorkspaceContent({
       );
       adoptRuntime(changed);
       adoptWorkspace(await loadWorkspaceConfig(session));
-      await refreshMemoryProjects();
       setRuntimeNotice(mutationMessage(changed.mutation));
     } catch (caught) {
       if (change.field === "backend") {
@@ -1401,7 +1308,6 @@ function SettingsWorkspaceContent({
       const changed = await switchWorkspace(session, path, runtime.revision);
       adoptRuntime(changed);
       adoptWorkspace(await loadWorkspaceConfig(session));
-      await refreshMemoryProjects();
       setRuntimeNotice(mutationMessage(changed.mutation));
     } catch (caught) {
       if (caught instanceof SettingsRevisionConflictError) {
@@ -1412,211 +1318,6 @@ function SettingsWorkspaceContent({
       }
     } finally {
       setRuntimeBusy(false);
-    }
-  };
-
-  const addWorkspace = async (): Promise<void> => {
-    if (!runtime || workspaceCreationBusy || !workspaceName.trim()) {
-      return;
-    }
-    setWorkspaceCreationBusy(true);
-    setWorkspaceCreationError(null);
-    setRuntimeError(null);
-    setRuntimeNotice(null);
-    try {
-      const created = await createWorkspace(
-        session,
-        workspaceName,
-        runtime.revision,
-      );
-      adoptRuntime(created.settings);
-      await refreshMemoryProjects();
-      const notices = [
-        created.directoryCreated
-          ? "Workspace created and selected. The conversation session was cleared."
-          : "That workspace already existed and is now selected.",
-      ];
-      if (!created.gitReady) {
-        notices.push("Git initialization failed; the workspace is still usable.");
-      }
-      if (!created.memoryProjectRegistered) {
-        notices.push(created.memoryProjectNote);
-      }
-      setRuntimeNotice(notices.join(" "));
-      setWorkspaceName("");
-      setWorkspaceCreationOpen(false);
-    } catch (caught) {
-      if (caught instanceof SettingsRevisionConflictError) {
-        await refreshRuntime();
-        setWorkspaceCreationError(
-          "Workspace settings changed elsewhere. The latest state has been reloaded.",
-        );
-      } else if (!handleAccessFailure(caught)) {
-        setWorkspaceCreationError(errorText(caught, "Could not create workspace."));
-      }
-    } finally {
-      setWorkspaceCreationBusy(false);
-    }
-  };
-
-  const workspaceDeletionTarget = runtime?.workspaces.find(
-    (item) => item.name === workspaceDeletionName && item.deletable,
-  );
-
-  const removeWorkspace = async (): Promise<void> => {
-    if (
-      !runtime ||
-      workspaceDeletionBusy ||
-      !workspaceDeletionTarget ||
-      workspaceDeletionConfirmation !== workspaceDeletionName
-    ) {
-      return;
-    }
-    setWorkspaceDeletionBusy(true);
-    setWorkspaceDeletionError(null);
-    setRuntimeError(null);
-    setRuntimeNotice(null);
-    try {
-      const deleted = await deleteWorkspace(
-        session,
-        workspaceDeletionName,
-        workspaceDeletionConfirmation,
-        runtime.revision,
-      );
-      adoptRuntime(deleted.settings);
-      await refreshMemoryProjects();
-      setRuntimeNotice(
-        deleted.directoryDeleted
-          ? `Workspace ${workspaceDeletionName} was permanently deleted.`
-          : `Workspace ${workspaceDeletionName} was already absent; its Kai records were cleaned.`,
-      );
-      setWorkspaceDeletionOpen(false);
-      setWorkspaceDeletionName("");
-      setWorkspaceDeletionConfirmation("");
-    } catch (caught) {
-      if (caught instanceof SettingsRevisionConflictError) {
-        await refreshRuntime();
-        setWorkspaceDeletionError(
-          "Workspace settings changed elsewhere. The latest state has been reloaded.",
-        );
-      } else if (!handleAccessFailure(caught)) {
-        setWorkspaceDeletionError(errorText(caught, "Could not delete workspace."));
-      }
-    } finally {
-      setWorkspaceDeletionBusy(false);
-    }
-  };
-
-  const grantExistingWorkspace = async (): Promise<void> => {
-    const path = workspaceGrantPath.trim();
-    if (!path || workspaceGrantsBusy) {
-      return;
-    }
-    setWorkspaceGrantsBusy(true);
-    setWorkspaceGrantFormError(null);
-    setWorkspaceGrantsError(null);
-    setWorkspaceGrantsNotice(null);
-    try {
-      const changed = await addExistingWorkspace(session, path);
-      setWorkspaceGrants(changed);
-      adoptRuntime(await loadSettingsWorkspace(session));
-      setWorkspaceGrantsNotice(
-        changed.mutation?.changed
-          ? "Existing workspace access added."
-          : "That workspace was already available.",
-      );
-      setWorkspaceGrantPath("");
-      setWorkspaceGrantOpen(false);
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setWorkspaceGrantFormError(errorText(caught, "Could not add workspace access."));
-      }
-    } finally {
-      setWorkspaceGrantsBusy(false);
-    }
-  };
-
-  const addMemoryProject = async (): Promise<void> => {
-    if (!memoryProjects || !memoryProjectName.trim() || memoryProjectsBusy) {
-      return;
-    }
-    setMemoryProjectsBusy(true);
-    setMemoryProjectsError(null);
-    setMemoryProjectsNotice(null);
-    try {
-      const changed = await registerMemoryProject(
-        session,
-        memoryProjects.revision,
-        memoryProjectName.trim(),
-      );
-      setMemoryProjects(changed);
-      setMemoryProjectName("");
-      setMemoryProjectsNotice(changed.mutation?.note ?? "Memory project registered.");
-    } catch (caught) {
-      if (caught instanceof SettingsRevisionConflictError) {
-        await refreshRuntime();
-        setMemoryProjectsError("Memory projects changed elsewhere. The latest list has been loaded.");
-      } else if (!handleAccessFailure(caught)) {
-        setMemoryProjectsError(errorText(caught, "Could not register memory project."));
-      }
-    } finally {
-      setMemoryProjectsBusy(false);
-    }
-  };
-
-  const removeMemoryProject = async (projectId: string): Promise<void> => {
-    if (!memoryProjects || memoryProjectsBusy || !await confirm(
-      `Unregister memory project ${projectId}? Existing memories will not be deleted.`,
-    )) {
-      return;
-    }
-    setMemoryProjectsBusy(true);
-    setMemoryProjectsError(null);
-    setMemoryProjectsNotice(null);
-    try {
-      const changed = await unregisterMemoryProject(
-        session,
-        memoryProjects.revision,
-        projectId,
-      );
-      setMemoryProjects(changed);
-      setMemoryProjectsNotice(changed.mutation?.note ?? "Memory project unregistered.");
-    } catch (caught) {
-      if (caught instanceof SettingsRevisionConflictError) {
-        await refreshRuntime();
-        setMemoryProjectsError("Memory projects changed elsewhere. The latest list has been loaded.");
-      } else if (!handleAccessFailure(caught)) {
-        setMemoryProjectsError(errorText(caught, "Could not unregister memory project."));
-      }
-    } finally {
-      setMemoryProjectsBusy(false);
-    }
-  };
-
-  const revokeWorkspaceGrant = async (path: string, name: string): Promise<void> => {
-    if (workspaceGrantsBusy || !await confirm(
-      `Remove access to ${name}? The directory and its files will not be deleted.`,
-    )) {
-      return;
-    }
-    setWorkspaceGrantsBusy(true);
-    setWorkspaceGrantsError(null);
-    setWorkspaceGrantsNotice(null);
-    try {
-      const changed = await removeExistingWorkspace(session, path);
-      setWorkspaceGrants(changed);
-      adoptRuntime(await loadSettingsWorkspace(session));
-      setWorkspaceGrantsNotice(
-        changed.mutation?.changed
-          ? `Access to ${name} was removed. The directory was not deleted.`
-          : `Access to ${name} was already absent.`,
-      );
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setWorkspaceGrantsError(errorText(caught, "Could not remove workspace access."));
-      }
-    } finally {
-      setWorkspaceGrantsBusy(false);
     }
   };
 
@@ -2188,7 +1889,7 @@ function SettingsWorkspaceContent({
           <section className="settings-section" id="settings-section-workspace">
             <div>
               <h2>Workspace settings</h2>
-              <p>Choose or create an authorized workspace and manage overrides that apply only within it.</p>
+              <p>Choose the workspace this agent uses and manage overrides that apply only within it.</p>
             </div>
             <div className="workspace-settings-heading">
               <label htmlFor="settings-workspace">Active workspace</label>
@@ -2207,206 +1908,7 @@ function SettingsWorkspaceContent({
                   <option key={item.path} value={String(index)}>{item.name}</option>
                 ))}
               </select>
-              <div className="workspace-settings-actions">
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label="Create workspace"
-                  title="Create private workspace"
-                  disabled={runtimeBusy}
-                  onClick={() => {
-                    setWorkspaceCreationError(null);
-                    setWorkspaceCreationOpen(true);
-                  }}
-                >
-                  <WorkspaceAddIcon />
-                </button>
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label="Add existing workspace"
-                  title="Add existing workspace"
-                  disabled={runtimeBusy || workspaceGrantsBusy}
-                  onClick={() => {
-                    setWorkspaceGrantFormError(null);
-                    setWorkspaceGrantOpen(true);
-                  }}
-                >
-                  <ExistingWorkspaceIcon />
-                </button>
-              </div>
             </div>
-            <div className="workspace-grant-list">
-              <div className="workspace-grant-list-heading">
-                <p>Workspace access</p>
-                {workspaceGrants?.workspaceBase && (
-                  <small>Base: {workspaceGrants.workspaceBase}</small>
-                )}
-              </div>
-              {workspaceGrantsLoading ? (
-                <p role="status">Loading workspace access…</p>
-              ) : workspaceGrants ? (
-                workspaceGrants.grants.length > 0 ? (
-                  <ul>
-                    {workspaceGrants.grants.map((item) => (
-                      <li key={item.path}>
-                        <span>
-                          <strong>{item.name}</strong>
-                          <small>{item.path}</small>
-                          <small>
-                            {workspaceProvenanceLabel(item.provenance)}
-                            {item.current ? " · current" : ""}
-                            {!item.available ? " · unavailable" : ""}
-                          </small>
-                        </span>
-                        {item.removable && (
-                          <button
-                            className="panel-icon-button"
-                            type="button"
-                            aria-label={`Remove access to ${item.name}`}
-                            title={`Remove access to ${item.name}`}
-                            disabled={workspaceGrantsBusy}
-                            onClick={() => void revokeWorkspaceGrant(item.path, item.name)}
-                          >
-                            <WorkspaceDeleteIcon />
-                          </button>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p>No individually authorized workspaces.</p>
-                )
-              ) : (
-                <div className="settings-failure">
-                  <p role="alert">{workspaceGrantsError ?? "Workspace access is unavailable."}</p>
-                  <button className="quiet-button" type="button" onClick={() => void refreshRuntime()}>
-                    Retry
-                  </button>
-                </div>
-              )}
-              {workspaceGrantsNotice && (
-                <p className="settings-notice" role="status">{workspaceGrantsNotice}</p>
-              )}
-              {workspaceGrantsError && workspaceGrants && (
-                <p className="settings-error" role="alert">{workspaceGrantsError}</p>
-              )}
-            </div>
-            <div className="workspace-grant-list memory-project-list">
-              <div className="workspace-grant-list-heading">
-                <p>Memory project</p>
-                <small>
-                  {memoryProjects?.activeProjectId
-                    ? `Current: ${memoryProjects.activeProjectId}`
-                    : "The active workspace is not registered"}
-                </small>
-              </div>
-              {memoryProjects ? (
-                <>
-                  {!memoryProjects.activeProjectId && (
-                    <form
-                      className="memory-project-registration"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void addMemoryProject();
-                      }}
-                    >
-                      <label htmlFor="memory-project-name">Register active workspace</label>
-                      <div>
-                        <input
-                          id="memory-project-name"
-                          type="text"
-                          maxLength={64}
-                          pattern="[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}"
-                          placeholder="project-name"
-                          value={memoryProjectName}
-                          disabled={memoryProjectsBusy}
-                          onChange={(event) => setMemoryProjectName(event.target.value)}
-                        />
-                        <button
-                          className="panel-icon-button"
-                          type="submit"
-                          aria-label="Register memory project"
-                          title="Register memory project"
-                          disabled={memoryProjectsBusy || !memoryProjectName.trim()}
-                        >
-                          <WorkspaceAddIcon />
-                        </button>
-                      </div>
-                    </form>
-                  )}
-                  {memoryProjects.projects.length > 0 ? (
-                    <ul>
-                      {memoryProjects.projects.map((project) => (
-                        <li key={project.projectId}>
-                          <span>
-                            <strong>{project.displayName}</strong>
-                            <small>{project.workspaceRoots.join(", ")}</small>
-                            <small>
-                              {memoryProjectProvenanceLabel(project.provenance)}
-                              {project.current ? " · current" : ""}
-                              {!project.available ? " · unavailable" : ""}
-                            </small>
-                          </span>
-                          {project.removable && (
-                            <button
-                              className="panel-icon-button"
-                              type="button"
-                              aria-label={`Unregister ${project.displayName}`}
-                              title={`Unregister ${project.displayName}`}
-                              disabled={memoryProjectsBusy}
-                              onClick={() => void removeMemoryProject(project.projectId)}
-                            >
-                              <WorkspaceDeleteIcon />
-                            </button>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p>No memory projects registered.</p>
-                  )}
-                </>
-              ) : (
-                <p role="alert">{memoryProjectsError ?? "Memory projects are unavailable."}</p>
-              )}
-              {memoryProjectsNotice && (
-                <p className="settings-notice" role="status">{memoryProjectsNotice}</p>
-              )}
-              {memoryProjectsError && memoryProjects && (
-                <p className="settings-error" role="alert">{memoryProjectsError}</p>
-              )}
-            </div>
-            {runtime.workspaces.some((item) => item.deletable) && (
-              <div className="workspace-deletion-list">
-                <p>Workspaces available for deletion</p>
-                <ul>
-                  {runtime.workspaces.filter((item) => item.deletable).map((item) => (
-                    <li key={item.path}>
-                      <span>
-                        <strong>{item.name}</strong>
-                        <small>{item.path}</small>
-                      </span>
-                      <button
-                        className="panel-icon-button"
-                        type="button"
-                        aria-label={`Delete ${item.name}`}
-                        title={`Delete ${item.name}`}
-                        disabled={runtimeBusy}
-                        onClick={() => {
-                          setWorkspaceDeletionName(item.name);
-                          setWorkspaceDeletionConfirmation("");
-                          setWorkspaceDeletionError(null);
-                          setWorkspaceDeletionOpen(true);
-                        }}
-                      >
-                        <WorkspaceDeleteIcon />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
             <div className="settings-card-stack workspace-overrides">
               <div className="settings-card-columns">
                 <div className="settings-card-column">
@@ -2583,186 +2085,6 @@ function SettingsWorkspaceContent({
                     }
                   >
                     {workspaceSecretBusy ? "Saving…" : workspaceSecretEditing ? "Replace secret" : "Add secret"}
-                  </button>
-                </div>
-              </form>
-            </section>
-          </div>
-        )}
-        {workspaceCreationOpen && runtime && (
-          <div className="modal-backdrop" role="presentation">
-            <section
-              className="channel-creation-dialog workspace-creation-dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="create-workspace-title"
-            >
-              <header className="workspace-creation-header">
-                <div>
-                  <p className="overline">Private workspace</p>
-                  <h2 id="create-workspace-title">Create workspace</h2>
-                </div>
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label="Close workspace creation"
-                  title="Close workspace creation"
-                  disabled={workspaceCreationBusy}
-                  onClick={() => {
-                    setWorkspaceCreationOpen(false);
-                    setWorkspaceCreationError(null);
-                    setWorkspaceName("");
-                  }}
-                >
-                  <span aria-hidden="true">×</span>
-                </button>
-              </header>
-              <p>This creates a private directory inside your Kai home.</p>
-              <form onSubmit={(event) => { event.preventDefault(); void addWorkspace(); }}>
-                <label htmlFor="workspace-name">Workspace name</label>
-                <input
-                  id="workspace-name"
-                  type="text"
-                  autoFocus
-                  maxLength={64}
-                  value={workspaceName}
-                  disabled={workspaceCreationBusy}
-                  onChange={(event) => setWorkspaceName(event.target.value)}
-                />
-                {workspaceCreationError && (
-                  <p className="form-error" role="alert">{workspaceCreationError}</p>
-                )}
-                <div className="form-actions">
-                  <button
-                    className="primary-button"
-                    type="submit"
-                    disabled={workspaceCreationBusy || !workspaceName.trim()}
-                  >
-                    {workspaceCreationBusy ? "Creating…" : "Create workspace"}
-                  </button>
-                </div>
-              </form>
-            </section>
-          </div>
-        )}
-        {workspaceGrantOpen && runtime && (
-          <div className="modal-backdrop" role="presentation">
-            <section
-              className="channel-creation-dialog workspace-creation-dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="add-existing-workspace-title"
-            >
-              <header className="workspace-creation-header">
-                <div>
-                  <p className="overline">Existing directory</p>
-                  <h2 id="add-existing-workspace-title">Add existing workspace</h2>
-                </div>
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label="Close existing workspace"
-                  title="Close existing workspace"
-                  disabled={workspaceGrantsBusy}
-                  onClick={() => {
-                    setWorkspaceGrantOpen(false);
-                    setWorkspaceGrantFormError(null);
-                    setWorkspaceGrantPath("");
-                  }}
-                >
-                  <span aria-hidden="true">×</span>
-                </button>
-              </header>
-              <p>
-                This grants Kai access to a directory that already exists. It does not create,
-                move, or delete any files.
-              </p>
-              <form onSubmit={(event) => { event.preventDefault(); void grantExistingWorkspace(); }}>
-                <label htmlFor="workspace-existing-path">Absolute directory path</label>
-                <input
-                  id="workspace-existing-path"
-                  type="text"
-                  autoFocus
-                  value={workspaceGrantPath}
-                  disabled={workspaceGrantsBusy}
-                  placeholder="/Users/you/projects/example"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  onChange={(event) => setWorkspaceGrantPath(event.target.value)}
-                />
-                {workspaceGrantFormError && (
-                  <p className="form-error" role="alert">{workspaceGrantFormError}</p>
-                )}
-                <div className="form-actions">
-                  <button
-                    className="primary-button"
-                    type="submit"
-                    disabled={workspaceGrantsBusy || !workspaceGrantPath.trim()}
-                  >
-                    {workspaceGrantsBusy ? "Adding…" : "Add workspace access"}
-                  </button>
-                </div>
-              </form>
-            </section>
-          </div>
-        )}
-        {workspaceDeletionOpen && runtime && (
-          <div className="modal-backdrop" role="presentation">
-            <section
-              className="channel-creation-dialog workspace-creation-dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="delete-workspace-title"
-            >
-              <header className="workspace-creation-header">
-                <div>
-                  <p className="overline">Permanent deletion</p>
-                  <h2 id="delete-workspace-title">Delete workspace</h2>
-                </div>
-                <button
-                  className="panel-icon-button"
-                  type="button"
-                  aria-label="Close workspace deletion"
-                  title="Close workspace deletion"
-                  disabled={workspaceDeletionBusy}
-                  onClick={() => {
-                    setWorkspaceDeletionOpen(false);
-                    setWorkspaceDeletionError(null);
-                    setWorkspaceDeletionConfirmation("");
-                  }}
-                >
-                  <span aria-hidden="true">×</span>
-                </button>
-              </header>
-              <p>
-                This permanently deletes <strong>{workspaceDeletionName}</strong> and removes it from Kai.
-              </p>
-              <form onSubmit={(event) => { event.preventDefault(); void removeWorkspace(); }}>
-                <label htmlFor="workspace-delete-confirmation">
-                  Type <strong>{workspaceDeletionName}</strong> to confirm
-                </label>
-                <input
-                  id="workspace-delete-confirmation"
-                  type="text"
-                  autoFocus
-                  value={workspaceDeletionConfirmation}
-                  disabled={workspaceDeletionBusy}
-                  onChange={(event) => setWorkspaceDeletionConfirmation(event.target.value)}
-                />
-                {workspaceDeletionError && (
-                  <p className="form-error" role="alert">{workspaceDeletionError}</p>
-                )}
-                <div className="form-actions">
-                  <button
-                    className="danger-button"
-                    type="submit"
-                    disabled={
-                      workspaceDeletionBusy ||
-                      !workspaceDeletionTarget ||
-                      workspaceDeletionConfirmation !== workspaceDeletionName
-                    }
-                  >
-                    {workspaceDeletionBusy ? "Deleting…" : "Delete permanently"}
                   </button>
                 </div>
               </form>

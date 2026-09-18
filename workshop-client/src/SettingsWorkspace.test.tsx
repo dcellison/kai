@@ -4,9 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ChannelAccessError,
-  addExistingWorkspace,
-  createWorkspace,
-  deleteWorkspace,
   deactivateOperatorModel,
   loadAppearancePreferences,
   loadGitHubSettings,
@@ -28,8 +25,6 @@ import {
   refreshModelCatalogue,
   restorePreferenceRevision,
   removeWorkspaceEnvironmentSecret,
-  removeExistingWorkspace,
-  registerMemoryProject,
   savePreferenceDocument,
   setWorkspaceEnvironmentSecret,
   switchWorkspace,
@@ -44,7 +39,6 @@ import {
   updateAppearancePreference,
   updateRuntimeSettings,
   updateWorkspaceConfig,
-  unregisterMemoryProject,
 } from "./api";
 import { AgentRuntimeControls, SettingsWorkspace } from "./SettingsWorkspace";
 import { HumanAvatarCacheProvider } from "./HumanAvatar";
@@ -61,8 +55,6 @@ import type {
   WorkshopHumanAvatar,
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
-  WorkshopWorkspaceGrants,
-  WorkshopMemoryProjectRegistry,
 } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
@@ -83,11 +75,6 @@ vi.mock("./api", async (importOriginal) => {
     loadWorkspaceConfig: vi.fn(),
     loadWorkspaceGrants: vi.fn(),
     loadMemoryProjects: vi.fn(),
-    addExistingWorkspace: vi.fn(),
-    createWorkspace: vi.fn(),
-    deleteWorkspace: vi.fn(),
-    removeExistingWorkspace: vi.fn(),
-    registerMemoryProject: vi.fn(),
     restorePreferenceRevision: vi.fn(),
     removeWorkspaceEnvironmentSecret: vi.fn(),
     refreshAllModelCatalogues: vi.fn(),
@@ -107,7 +94,6 @@ vi.mock("./api", async (importOriginal) => {
     updateAppearancePreference: vi.fn(),
     updateRuntimeSettings: vi.fn(),
     updateWorkspaceConfig: vi.fn(),
-    unregisterMemoryProject: vi.fn(),
   };
 });
 
@@ -320,62 +306,6 @@ const workspaceConfig: WorkshopWorkspaceConfig = {
   workspace: runtime.workspace,
 };
 
-const workspaceGrants: WorkshopWorkspaceGrants = {
-  grants: [
-    {
-      available: true,
-      current: true,
-      name: "Kai",
-      path: "/srv/kai",
-      provenance: "profile",
-      removable: false,
-    },
-    {
-      available: true,
-      current: false,
-      name: "notes",
-      path: "/srv/alice/notes",
-      provenance: "principal_added",
-      removable: true,
-    },
-  ],
-  mutation: null,
-  principalId: runtime.principalId,
-  runtimeProfileId: runtime.runtimeProfileId,
-  workspaceBase: "/srv/home",
-};
-
-const memoryProjects: WorkshopMemoryProjectRegistry = {
-  activeProjectId: "kai",
-  currentWorkspace: "/srv/kai",
-  mutation: null,
-  principalId: runtime.principalId,
-  projects: [
-    {
-      available: true,
-      current: true,
-      displayName: "Kai",
-      projectId: "kai",
-      provenance: "operator_pinned",
-      removable: false,
-      stateVersion: null,
-      workspaceRoots: ["/srv/kai"],
-    },
-    {
-      available: true,
-      current: false,
-      displayName: "Notes",
-      projectId: "notes",
-      provenance: "principal_registered",
-      removable: true,
-      stateVersion: 0,
-      workspaceRoots: ["/srv/alice/notes"],
-    },
-  ],
-  revision: "mpr_current",
-  runtimeProfileId: runtime.runtimeProfileId,
-};
-
 const githubSettings: WorkshopGitHubSettings = {
   githubLogin: "dcellison",
   issueTriage: { enabled: false, resettable: true, source: "user" },
@@ -560,8 +490,6 @@ describe("Settings workspace", () => {
     vi.mocked(loadClientPreferences).mockResolvedValue(clientPreferences);
     vi.mocked(loadAppearancePreferences).mockResolvedValue(appearancePreferences);
     vi.mocked(loadWorkspaceConfig).mockResolvedValue(workspaceConfig);
-    vi.mocked(loadWorkspaceGrants).mockResolvedValue(workspaceGrants);
-    vi.mocked(loadMemoryProjects).mockResolvedValue(memoryProjects);
     vi.mocked(savePreferenceDocument).mockResolvedValue({
       ...preference,
       content: "# Preferences\n\nUse examples.\n",
@@ -601,75 +529,6 @@ describe("Settings workspace", () => {
         ...item,
         current: item.home,
       })),
-    });
-    vi.mocked(createWorkspace).mockResolvedValue({
-      directoryCreated: true,
-      gitReady: true,
-      memoryProjectNote: "Registered memory project 'research-notes' for this workspace.",
-      memoryProjectRegistered: true,
-      path: "/srv/home/workspaces/Research Notes",
-      settings: {
-        ...runtime,
-        mutation: {
-          changed: true,
-          operation: "create_workspace",
-          providerSessionInvalidated: true,
-          runtimeAction: "restarted",
-        },
-        workspace: "/srv/home/workspaces/Research Notes",
-        workspaces: [
-          ...runtime.workspaces.map((item) => ({ ...item, current: false })),
-          {
-            current: true,
-            home: false,
-            name: "Research Notes",
-            path: "/srv/home/workspaces/Research Notes",
-          },
-        ],
-      },
-    });
-    vi.mocked(addExistingWorkspace).mockResolvedValue({
-      ...workspaceGrants,
-      grants: [
-        ...workspaceGrants.grants,
-        {
-          available: true,
-          current: false,
-          name: "existing-project",
-          path: "/srv/alice/existing-project",
-          provenance: "principal_added",
-          removable: true,
-        },
-      ],
-      mutation: { changed: true, path: "/srv/alice/existing-project" },
-    });
-    vi.mocked(removeExistingWorkspace).mockResolvedValue({
-      ...workspaceGrants,
-      grants: workspaceGrants.grants.filter((item) => item.path !== "/srv/alice/notes"),
-      mutation: { changed: true, path: "/srv/alice/notes" },
-    });
-    vi.mocked(registerMemoryProject).mockResolvedValue({
-      ...memoryProjects,
-      mutation: {
-        changed: true,
-        note: "Registered memory project 'research'.",
-        projectId: "research",
-      },
-    });
-    vi.mocked(unregisterMemoryProject).mockResolvedValue({
-      ...memoryProjects,
-      projects: memoryProjects.projects.filter((item) => item.projectId !== "notes"),
-      mutation: {
-        changed: true,
-        note: "Unregistered memory project 'notes'.",
-        projectId: "notes",
-      },
-    });
-    vi.mocked(deleteWorkspace).mockResolvedValue({
-      directoryDeleted: true,
-      memoryProjectUnregistered: "qualification-1520",
-      path: "/srv/home/workspaces/qualification-1520",
-      settings: runtime,
     });
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
@@ -1010,12 +869,13 @@ describe("Settings workspace", () => {
     expect(screen.getByRole("option", { name: "Home" })).toBeVisible();
     expect(screen.getByRole("option", { name: "Kai" })).toHaveValue("0");
     expect(screen.getByRole("option", { name: "Home" })).toHaveValue("1");
+    expect(screen.getByLabelText("Active workspace")).toHaveValue("0");
     expect(screen.getByText("PROTECTED_KEY")).toBeVisible();
     expect(screen.getByText("Operator managed")).toBeVisible();
     expect(screen.queryByText(runtime.principalId)).not.toBeInTheDocument();
     expect(screen.queryByText(runtime.runtimeProfileId)).not.toBeInTheDocument();
-    expect(screen.getAllByText("/srv/kai")[0]).toBeVisible();
-    expect(screen.getAllByText("/srv/alice/notes")[0]).toBeVisible();
+    expect(screen.queryByText("Authorized workspaces")).not.toBeInTheDocument();
+    expect(screen.queryByText("Memory projects")).not.toBeInTheDocument();
   });
 
   it("saves preference Markdown and reports dirty state", async () => {
@@ -1150,123 +1010,15 @@ describe("Settings workspace", () => {
     );
   });
 
-  it("creates, initializes, registers, and selects a private workspace", async () => {
-    const user = userEvent.setup();
+  it("keeps principal-owned workspace management out of agent settings", async () => {
     renderAgentRuntime();
-
-    await user.click(await screen.findByRole("button", { name: "Create workspace" }));
-    const dialog = screen.getByRole("dialog", { name: "Create workspace" });
-    expect(within(dialog).getByText("This creates a private directory inside your Kai home.")).toBeVisible();
-    await user.type(within(dialog).getByLabelText("Workspace name"), "Research Notes");
-    await user.click(within(dialog).getByRole("button", { name: "Create workspace" }));
-
-    await waitFor(() => expect(createWorkspace).toHaveBeenCalledWith(
-      session,
-      "Research Notes",
-      "sws_current",
-    ));
-    expect(
-      await screen.findByText("Workspace created and selected. The conversation session was cleared."),
-    ).toBeVisible();
-    expect(screen.getByLabelText("Active workspace")).toHaveValue("2");
-    expect(screen.getByRole("option", { name: "Research Notes" })).toBeVisible();
-    expect(switchWorkspace).not.toHaveBeenCalled();
-  });
-
-  it("adds and removes existing workspace access without presenting directory deletion", async () => {
-    const user = userEvent.setup();
-    renderAgentRuntime();
-
-    await user.click(await screen.findByRole("button", { name: "Add existing workspace" }));
-    const dialog = screen.getByRole("dialog", { name: "Add existing workspace" });
-    expect(within(dialog).getByText(/does not create, move, or delete any files/)).toBeVisible();
-    await user.type(
-      within(dialog).getByLabelText("Absolute directory path"),
-      "/srv/alice/existing-project",
-    );
-    await user.click(within(dialog).getByRole("button", { name: "Add workspace access" }));
-
-    await waitFor(() => expect(addExistingWorkspace).toHaveBeenCalledWith(
-      session,
-      "/srv/alice/existing-project",
-    ));
-    expect(await screen.findByText("Existing workspace access added.")).toBeVisible();
-    expect(screen.getByText("existing-project")).toBeVisible();
-
-    await user.click(screen.getByRole("button", { name: "Remove access to notes" }));
-    await acceptConfirmation(user, /The directory and its files will not be deleted/);
-    await waitFor(() => expect(removeExistingWorkspace).toHaveBeenCalledWith(
-      session,
-      "/srv/alice/notes",
-    ));
-    expect(await screen.findByText("Access to notes was removed. The directory was not deleted.")).toBeVisible();
-    expect(screen.queryByRole("button", { name: "Remove access to Kai" })).not.toBeInTheDocument();
-  });
-
-  it("registers and unregisters memory projects through the active agent runtime", async () => {
-    const user = userEvent.setup();
-    vi.mocked(loadMemoryProjects).mockResolvedValueOnce({
-      ...memoryProjects,
-      activeProjectId: null,
-      currentWorkspace: "/srv/home",
-      projects: memoryProjects.projects.map((item) => ({ ...item, current: false })),
-    });
-    renderAgentRuntime();
-
-    const name = await screen.findByLabelText("Register active workspace");
-    await user.type(name, "research");
-    await user.click(screen.getByRole("button", { name: "Register memory project" }));
-    await waitFor(() => expect(registerMemoryProject).toHaveBeenCalledWith(
-      session,
-      "mpr_current",
-      "research",
-    ));
-    expect(await screen.findByText("Registered memory project 'research'.")).toBeVisible();
-
-    await user.click(screen.getByRole("button", { name: "Unregister Notes" }));
-    await acceptConfirmation(user, /Unregister memory project notes/);
-    await waitFor(() => expect(unregisterMemoryProject).toHaveBeenCalledWith(
-      session,
-      "mpr_current",
-      "notes",
-    ));
-  });
-
-  it("requires the exact workspace name before permanent deletion", async () => {
-    const user = userEvent.setup();
-    vi.mocked(loadSettingsWorkspace).mockResolvedValueOnce({
-      ...runtime,
-      workspaces: [
-        ...runtime.workspaces,
-        {
-          current: false,
-          deletable: true,
-          home: false,
-          name: "qualification-1520",
-          path: "/srv/home/workspaces/qualification-1520",
-        },
-      ],
-    });
-    renderAgentRuntime();
-
-    expect(screen.queryByRole("button", { name: "Delete Kai" })).not.toBeInTheDocument();
-    await user.click(await screen.findByRole("button", { name: "Delete qualification-1520" }));
-    const dialog = screen.getByRole("dialog", { name: "Delete workspace" });
-    const submit = within(dialog).getByRole("button", { name: "Delete permanently" });
-    expect(submit).toBeDisabled();
-    await user.type(
-      within(dialog).getByLabelText(/Type qualification-1520 to confirm/),
-      "qualification-1520",
-    );
-    await user.click(submit);
-
-    await waitFor(() => expect(deleteWorkspace).toHaveBeenCalledWith(
-      session,
-      "qualification-1520",
-      "qualification-1520",
-      "sws_current",
-    ));
-    expect(await screen.findByText("Workspace qualification-1520 was permanently deleted.")).toBeVisible();
+    expect(await screen.findByLabelText("Active workspace")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Create workspace" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add existing workspace" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Workspace access")).not.toBeInTheDocument();
+    expect(screen.queryByText("Memory project")).not.toBeInTheDocument();
+    expect(loadWorkspaceGrants).not.toHaveBeenCalled();
+    expect(loadMemoryProjects).not.toHaveBeenCalled();
   });
 
   it("switches only the authenticated principal's backend after confirmation", async () => {
