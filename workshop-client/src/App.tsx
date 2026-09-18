@@ -132,6 +132,7 @@ const LEGACY_ACTIVE_RUN_KEY = "kai.workshop.active-run.v1";
 const DRAFTS_KEY = "kai.workshop.drafts.v1";
 const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
 const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v4";
+const CONTEXT_SECTION_STATE_KEY = "kai.workshop.context-sections.v1";
 const TIMELINE_FOLLOW_DISTANCE_PX = 96;
 const UI_SCALE = 1.5;
 const MIN_SIDEBAR_WIDTH_PX = 176 * UI_SCALE;
@@ -2516,8 +2517,22 @@ function ContextSection({
   className?: string;
   title: string;
 }): React.JSX.Element {
+  const [open, setOpen] = useState(() => restoreContextSectionState()[title] ?? false);
+
+  useEffect(() => {
+    setOpen(restoreContextSectionState()[title] ?? false);
+  }, [title]);
+
   return (
-    <details className={`context-section${className ? ` ${className}` : ""}`}>
+    <details
+      className={`context-section${className ? ` ${className}` : ""}`}
+      open={open}
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open;
+        setOpen(nextOpen);
+        storeContextSectionState(title, nextOpen);
+      }}
+    >
       <summary className="context-section-toggle">
         <h3 className="context-section-title">{title}</h3>
         {action && (
@@ -2532,6 +2547,36 @@ function ContextSection({
       <div className="context-section-body">{children}</div>
     </details>
   );
+}
+
+function restoreContextSectionState(): Record<string, boolean> {
+  try {
+    const stored: unknown = JSON.parse(
+      localStorage.getItem(CONTEXT_SECTION_STATE_KEY) ?? "null",
+    );
+    if (
+      typeof stored === "object" &&
+      stored !== null &&
+      !Array.isArray(stored) &&
+      Object.values(stored).every((value) => typeof value === "boolean")
+    ) {
+      return stored as Record<string, boolean>;
+    }
+  } catch {
+    // Malformed browser state has no authority.
+  }
+  return {};
+}
+
+function storeContextSectionState(title: string, open: boolean): void {
+  try {
+    localStorage.setItem(
+      CONTEXT_SECTION_STATE_KEY,
+      JSON.stringify({ ...restoreContextSectionState(), [title]: open }),
+    );
+  } catch {
+    // Browser storage is an optional layout convenience.
+  }
 }
 
 function ViewIcon(): React.JSX.Element {

@@ -1223,6 +1223,36 @@ describe("Workshop React client", () => {
     expect(container.querySelector("img")).toBeNull();
   });
 
+  it("persists one context-section layout across conversation remounts", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    const firstRender = render(<App />);
+    const firstContext = await screen.findByLabelText("Channel context");
+    const authorityTitle = within(firstContext).getByText("Authority", {
+      selector: ".context-section-title",
+    });
+    const authoritySection = authorityTitle.closest("details");
+    expect(authoritySection).not.toHaveAttribute("open");
+
+    await user.click(authorityTitle);
+    expect(authoritySection).toHaveAttribute("open");
+    expect(
+      JSON.parse(localStorage.getItem("kai.workshop.context-sections.v1") ?? "null"),
+    ).toEqual({ Authority: true });
+
+    firstRender.unmount();
+    render(<App />);
+    const restoredContext = await screen.findByLabelText("Channel context");
+    expect(
+      within(restoredContext).getByText("Authority", {
+        selector: ".context-section-title",
+      }).closest("details"),
+    ).toHaveAttribute("open");
+  });
+
   it("opens a new tab from the browser-scoped credential", async () => {
     localStorage.setItem(
       "kai.workshop.client-credential.v1",
