@@ -4849,6 +4849,14 @@ function WorkshopView({
         />
       ) : workspacesOpen ? (
         <WorkspacesWorkspace
+          detailPanelLayout={{
+            maximumWidth: MAX_CONTEXT_WIDTH_PX,
+            minimumWidth: MIN_CONTEXT_WIDTH_PX,
+            onKeyDown: resizeContextFromKeyboard,
+            onPointerDown: beginContextResize,
+            onPointerMove: resizeContext,
+            width: contextWidth,
+          }}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onChannelAccessFailure={onSettingsAccessFailure}
           onClose={() => onSelectChannel(channelId)}

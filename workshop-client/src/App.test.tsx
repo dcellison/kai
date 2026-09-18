@@ -1907,9 +1907,21 @@ describe("Workshop React client", () => {
     expect(loadMemoryProjects).toHaveBeenCalledTimes(1);
     expect(window.location.search).toBe("?view=workspaces");
 
+    const workspaceResize = screen.getByRole("separator", {
+      name: "Resize workspace detail",
+    });
+    expect(workspaceResize).toHaveAttribute("aria-valuenow", "360");
+    fireEvent.keyDown(workspaceResize, { key: "ArrowLeft" });
+    expect(workspaceResize).toHaveAttribute("aria-valuenow", "384");
+    expect(
+      JSON.parse(sessionStorage.getItem("kai.workshop.context-layout.v4") ?? "null"),
+    ).toEqual({ width: 384 });
+
     await user.click(screen.getByRole("button", { name: "Back to conversation" }));
     expect(await screen.findByText("Canonical history is ready.")).toBeVisible();
     expect(window.location.search).toBe("");
+    expect(screen.getByRole("separator", { name: "Resize channel context" }))
+      .toHaveAttribute("aria-valuenow", "384");
   });
 
   it("keeps session forgetting in the profile menu and confirms it", async () => {
