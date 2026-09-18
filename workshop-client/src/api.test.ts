@@ -3892,6 +3892,7 @@ describe("Workshop client API", () => {
       {
         changes: [{
           agentChanges: [],
+          jobChanges: [],
           threadChanges: [expect.objectContaining({
             eventPosition,
             state: expect.objectContaining({ unreadCount: 1 }),

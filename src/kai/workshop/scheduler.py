@@ -193,6 +193,22 @@ class WorkshopCanonicalScheduler:
         """List active jobs owned by one canonical execution lane."""
         return [job.as_dict() for job in await self._jobs.list_active(authority)]
 
+    async def list_principal_jobs(self, principal_id: PrincipalId) -> list[dict[str, Any]]:
+        """List active scheduled work across every canonical lane owned by a principal."""
+        views = await self._jobs.list_active_for_principal(principal_id)
+        return [view.as_dict(next_run_at=self._next_run_at(view.job.job_id)) for view in views]
+
+    async def get_principal_job(
+        self,
+        job_id: int,
+        principal_id: PrincipalId,
+    ) -> dict[str, Any] | None:
+        """Inspect one active job without revealing another principal's jobs."""
+        return next(
+            (job for job in await self.list_principal_jobs(principal_id) if job["id"] == job_id),
+            None,
+        )
+
     async def get_job(
         self,
         job_id: int,
@@ -212,6 +228,26 @@ class WorkshopCanonicalScheduler:
         if deleted:
             await self.remove_job(job_id)
         return deleted
+
+    async def cancel_principal_job(
+        self,
+        job_id: int,
+        principal_id: PrincipalId,
+        client_operation_id: str,
+    ) -> dict[str, Any] | None:
+        """Replay-safely cancel one principal-owned job without deleting its history."""
+        result = await self._jobs.cancel_for_principal(job_id, principal_id, client_operation_id)
+        if result is None:
+            return None
+        if result.changed:
+            await self.remove_job(job_id)
+        return {
+            "job_id": job_id,
+            "cancelled": True,
+            "changed": result.changed,
+            "replayed": result.replayed,
+            "event_position": result.event_position,
+        }
 
     async def update_job(
         self,
@@ -268,6 +304,16 @@ class WorkshopCanonicalScheduler:
     async def remove_job(self, job_id: int) -> None:
         async with self._lock:
             self._remove_registered_job(job_id)
+
+    def _next_run_at(self, job_id: int) -> str | None:
+        next_times = [
+            scheduled.next_run_time
+            for scheduler_id in self._registered_jobs.get(job_id, ())
+            if (scheduled := self._scheduler.get_job(scheduler_id)) is not None and scheduled.next_run_time is not None
+        ]
+        if not next_times:
+            return None
+        return min(next_times).astimezone(UTC).isoformat()
 
     async def wait(self) -> None:
         task = self._reconcile_task

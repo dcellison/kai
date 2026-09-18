@@ -1708,6 +1708,7 @@ describe("Workshop React client", () => {
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
+        jobChanges: [],
         eventPosition: 32,
         notificationChanges: [],
         threadChanges: [{
@@ -1771,6 +1772,7 @@ describe("Workshop React client", () => {
       principalEventHandlers?.onBatch({
         changes: [{
           agentChanges: [],
+          jobChanges: [],
           threadChanges: [],
           eventPosition: historyMessage.eventPosition,
           notificationChanges: [{
@@ -1883,6 +1885,7 @@ describe("Workshop React client", () => {
       const batch = {
         changes: [{
           agentChanges: [],
+          jobChanges: [],
           threadChanges: [],
           eventPosition: 41,
           notificationChanges: [{
@@ -1937,6 +1940,7 @@ describe("Workshop React client", () => {
       principalEventHandlers?.onBatch({
         changes: [{
           agentChanges: [],
+          jobChanges: [],
           threadChanges: [],
           eventPosition: 42,
           notificationChanges: [{
@@ -2610,6 +2614,7 @@ describe("Workshop React client", () => {
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
+        jobChanges: [],
         threadChanges: [],
         eventPosition: 30,
         notificationChanges: [],
@@ -2626,6 +2631,7 @@ describe("Workshop React client", () => {
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
+        jobChanges: [],
         threadChanges: [],
         eventPosition: 30,
         notificationChanges: [],
@@ -2641,6 +2647,7 @@ describe("Workshop React client", () => {
     act(() => principalEventHandlers?.onBatch({
       changes: [{
         agentChanges: [],
+        jobChanges: [],
         threadChanges: [],
         eventPosition: 31,
         notificationChanges: [],

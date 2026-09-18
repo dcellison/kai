@@ -107,6 +107,7 @@ import { MarkdownMessage } from "./MarkdownMessage";
 import { startArtifactDownload } from "./artifactDownload";
 import { MemoryExplorer } from "./MemoryExplorer";
 import { WorkspacesWorkspace } from "./WorkspacesWorkspace";
+import { ScheduledJobsWorkspace } from "./ScheduledJobsWorkspace";
 import { SettingsWorkspace } from "./SettingsWorkspace";
 import { AgentWorkspace } from "./AgentWorkspace";
 import { MentionsInbox } from "./MentionsInbox";
@@ -195,6 +196,7 @@ type WorkshopDestination =
     }
   | { kind: "memory"; memoryId: string | null }
   | { kind: "workspaces" }
+  | { kind: "scheduled-jobs" }
   | { kind: "mentions" }
   | { kind: "following" }
   | {
@@ -206,6 +208,9 @@ function destinationFromLocation(): WorkshopDestination {
   const parameters = new URLSearchParams(window.location.search);
   if (parameters.get("view") === "workspaces") {
     return { kind: "workspaces" };
+  }
+  if (parameters.get("view") === "scheduled-jobs") {
+    return { kind: "scheduled-jobs" };
   }
   if (parameters.get("view") === "mentions") {
     return { kind: "mentions" };
@@ -289,6 +294,8 @@ function writeDestination(
     }
   } else if (destination.kind === "workspaces") {
     url.searchParams.set("view", "workspaces");
+  } else if (destination.kind === "scheduled-jobs") {
+    url.searchParams.set("view", "scheduled-jobs");
   } else if (destination.kind === "settings") {
     url.searchParams.set("view", "settings");
     if (destination.runtimeChannelId) {
@@ -2506,6 +2513,15 @@ function WorkspacesIcon(): React.JSX.Element {
   );
 }
 
+function ScheduledJobsIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.5" stroke="currentColor" strokeWidth="1.7" />
+      <path d="M12 7.5v5l3.2 2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+    </svg>
+  );
+}
+
 function ContextSection({
   action,
   children,
@@ -3041,6 +3057,7 @@ function WorkshopView({
   messages,
   threadMessages,
   workspacesDestination,
+  scheduledJobsDestination,
   memoryDestination,
   memoryToken,
   mentionsDestination,
@@ -3093,6 +3110,7 @@ function WorkshopView({
   onChangeChannelMember,
   onMemoryAuthenticationFailure,
   onOpenWorkspaces,
+  onOpenScheduledJobs,
   onOpenMemory,
   onOpenMentions,
   onOpenFollowing,
@@ -3129,6 +3147,7 @@ function WorkshopView({
   messages: TimelineMessage[];
   threadMessages: TimelineMessage[];
   workspacesDestination: boolean;
+  scheduledJobsDestination: boolean;
   memoryDestination: { memoryId: string | null } | null;
   memoryToken: string;
   mentionsDestination: boolean;
@@ -3213,6 +3232,7 @@ function WorkshopView({
   ) => Promise<number>;
   onMemoryAuthenticationFailure: (message: string) => void;
   onOpenWorkspaces: () => void;
+  onOpenScheduledJobs: () => void;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
   onOpenFollowing: () => void;
@@ -3255,6 +3275,7 @@ function WorkshopView({
   const channelId = channel.channelId;
   const agentsOpen = agentDestination !== null;
   const workspacesOpen = workspacesDestination;
+  const scheduledJobsOpen = scheduledJobsDestination;
   const memoryOpen = memoryDestination !== null;
   const mentionsOpen = mentionsDestination;
   const followingOpen = followingDestination;
@@ -4642,7 +4663,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${workspacesOpen ? "workspaces-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${followingOpen ? "following-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${workspacesOpen ? "workspaces-open" : ""} ${scheduledJobsOpen ? "scheduled-jobs-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${followingOpen ? "following-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -4946,7 +4967,7 @@ function WorkshopView({
 
         <footer
           ref={profileMenuRef}
-          className={`sidebar-footer ${workspacesOpen || memoryOpen || settingsOpen ? "active" : ""}`}
+          className={`sidebar-footer ${workspacesOpen || scheduledJobsOpen || memoryOpen || settingsOpen ? "active" : ""}`}
         >
           {profileMenuOpen && (
             <div className="profile-menu" role="menu" aria-label="Your Kai menu">
@@ -4962,6 +4983,18 @@ function WorkshopView({
               >
                 <span aria-hidden="true"><WorkspacesIcon /></span>
                 <span><strong>Workspaces</strong><small>Authorized directories</small></span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                aria-current={scheduledJobsOpen ? "page" : undefined}
+                onClick={() => {
+                  setProfileMenuOpen(false);
+                  onOpenScheduledJobs();
+                }}
+              >
+                <span aria-hidden="true"><ScheduledJobsIcon /></span>
+                <span><strong>Scheduled jobs</strong><small>Upcoming and recurring work</small></span>
               </button>
               <button
                 type="button"
@@ -5074,6 +5107,21 @@ function WorkshopView({
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onChannelAccessFailure={onSettingsAccessFailure}
           onClose={() => onSelectChannel(channelId)}
+          session={settingsSession}
+        />
+      ) : scheduledJobsOpen ? (
+        <ScheduledJobsWorkspace
+          detailPanelLayout={{
+            maximumWidth: MAX_CONTEXT_WIDTH_PX,
+            minimumWidth: MIN_CONTEXT_WIDTH_PX,
+            onKeyDown: resizeContextFromKeyboard,
+            onPointerDown: beginContextResize,
+            onPointerMove: resizeContext,
+            width: contextWidth,
+          }}
+          onAuthenticationFailure={onMemoryAuthenticationFailure}
+          onClose={() => onSelectChannel(channelId)}
+          principalEvents={principalEvents}
           session={settingsSession}
         />
       ) : settingsOpen ? (
@@ -6166,6 +6214,7 @@ function ActiveWorkshopClient({
   onOpenAgentSetup,
   onOpenAgentChannel,
   onOpenWorkspaces,
+  onOpenScheduledJobs,
   onOpenMemory,
   onOpenMentions,
   onOpenFollowing,
@@ -6199,6 +6248,7 @@ function ActiveWorkshopClient({
   onOpenAgentSetup: (definitionId: string | null, setupId: string | null) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
   onOpenWorkspaces: () => void;
+  onOpenScheduledJobs: () => void;
   onOpenMemory: () => void;
   onOpenMentions: () => void;
   onOpenFollowing: () => void;
@@ -6581,6 +6631,7 @@ function ActiveWorkshopClient({
       messages={messages}
       threadMessages={threadMessages}
       workspacesDestination={destination.kind === "workspaces"}
+      scheduledJobsDestination={destination.kind === "scheduled-jobs"}
       memoryDestination={destination.kind === "memory" ? destination : null}
       mentionsDestination={destination.kind === "mentions"}
       followingDestination={destination.kind === "following"}
@@ -6640,6 +6691,7 @@ function ActiveWorkshopClient({
       onOpenAgentDefinition={onOpenAgentDefinition}
       onOpenAgentSetup={onOpenAgentSetup}
       onOpenWorkspaces={onOpenWorkspaces}
+      onOpenScheduledJobs={onOpenScheduledJobs}
       onOpenMemory={onOpenMemory}
       onOpenMentions={onOpenMentions}
       onOpenFollowing={onOpenFollowing}
@@ -6889,6 +6941,17 @@ function WorkshopApp(): React.JSX.Element {
       return;
     }
     const nextDestination: WorkshopDestination = { kind: "workspaces" };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
+  const openScheduledJobs = async (): Promise<void> => {
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !await confirm("Discard unsaved preference changes?")
+    ) return;
+    const nextDestination: WorkshopDestination = { kind: "scheduled-jobs" };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");
   };
@@ -7263,6 +7326,7 @@ function WorkshopApp(): React.JSX.Element {
         onOpenAgentDefinition={openAgentDefinition}
         onOpenAgentSetup={openAgentSetup}
         onOpenWorkspaces={() => void openWorkspaces()}
+        onOpenScheduledJobs={() => void openScheduledJobs()}
         onOpenMemory={() => void openMemory()}
         onOpenMentions={() => void openMentions()}
         onOpenFollowing={() => void openFollowing()}

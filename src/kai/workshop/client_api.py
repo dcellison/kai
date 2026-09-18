@@ -320,6 +320,7 @@ from kai.workshop.runtime_lane_status import (
     WorkshopRuntimeLaneStatusUnavailable,
 )
 from kai.workshop.runtime_sessions import ProviderSessionResetResult
+from kai.workshop.scheduler import WorkshopCanonicalScheduler
 from kai.workshop.settings_workspaces import (
     MAX_WORKSPACE_ENVIRONMENT_KEY_CHARACTERS,
     MAX_WORKSPACE_ENVIRONMENT_KEYS,
@@ -458,6 +459,12 @@ _HUMAN_NOTIFICATION_READ_PATH = "/v1/client/notifications/{notification_id}/read
 _HUMAN_NOTIFICATION_UNREAD_PATH = "/v1/client/notifications/{notification_id}/unread"
 _HUMAN_NOTIFICATION_BULK_READ_PATH = "/v1/client/notifications/read"
 _PRINCIPAL_EVENTS_PATH = "/v1/client/events"
+_SCHEDULED_JOBS_PATH = "/v1/client/scheduled-jobs"
+_SCHEDULED_JOB_PATH = "/v1/client/scheduled-jobs/{job_id}"
+_SCHEDULED_JOB_CANCEL_PATH = "/v1/client/scheduled-jobs/{job_id}/cancel"
+_SCHEDULED_JOB_CANCEL_FIELDS = frozenset({"client_operation_id"})
+_MAX_SCHEDULED_JOB_CANCEL_BODY_BYTES = 1_024
+_CLIENT_OPERATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _CHANNEL_UNREAD_PATH = "/v1/client/unread"
 _CHANNEL_UNREAD_EVENTS_PATH = "/v1/client/unread/events"
 _CHANNEL_UNREAD_DETAIL_PATH = "/v1/channels/{channel_id}/unread"
@@ -7107,6 +7114,27 @@ async def _read_principal_client_events(
         after_position=after_position,
         limit=_EVENT_BATCH_SIZE,
     )
+    scheduled_event_types = (
+        WorkshopEventType.SCHEDULED_JOB_CREATED,
+        WorkshopEventType.SCHEDULED_JOB_UPDATED,
+        WorkshopEventType.SCHEDULED_JOB_CANCELLED,
+        WorkshopEventType.SCHEDULED_JOB_DEACTIVATED,
+    )
+    placeholders = ",".join("?" for _ in scheduled_event_types)
+    async with store.connection.execute(
+        "SELECT position, event_type, payload_json FROM event_log "
+        "WHERE position > ? AND workshop_id = ? AND aggregate_type = 'principal' "
+        f"AND aggregate_id = ? AND event_type IN ({placeholders}) "
+        "ORDER BY position LIMIT ?",
+        (
+            after_position,
+            workshop_id,
+            principal_id,
+            *(item.value for item in scheduled_event_types),
+            _EVENT_BATCH_SIZE,
+        ),
+    ) as cursor:
+        scheduled_rows = list(await cursor.fetchall())
 
     safe_position = tip
     if not agent_scan_complete:
@@ -7117,6 +7145,8 @@ async def _read_principal_client_events(
         safe_position = min(safe_position, unread_batch.next_position)
     if len(thread_batch.events) == _EVENT_BATCH_SIZE:
         safe_position = min(safe_position, thread_batch.next_position)
+    if len(scheduled_rows) == _EVENT_BATCH_SIZE:
+        safe_position = min(safe_position, int(scheduled_rows[-1][0]))
 
     positions = sorted(
         {
@@ -7124,6 +7154,7 @@ async def _read_principal_client_events(
             *(event.event_position for event in notification_batch.events if event.event_position <= safe_position),
             *(event.event_position for event in unread_batch.events if event.event_position <= safe_position),
             *(event.event_position for event in thread_batch.events if event.event_position <= safe_position),
+            *(int(row[0]) for row in scheduled_rows if int(row[0]) <= safe_position),
         }
     )
     if len(positions) > _EVENT_BATCH_SIZE:
@@ -7137,6 +7168,7 @@ async def _read_principal_client_events(
             "notification_changes": [],
             "unread_changes": [],
             "thread_changes": [],
+            "job_changes": [],
         }
         for position in positions
     }
@@ -7182,6 +7214,17 @@ async def _read_principal_client_events(
                 "state": _serialize_thread_unread(event.state),
             }
         )
+    for row in scheduled_rows:
+        position = int(row[0])
+        if position > safe_position:
+            continue
+        payload = json.loads(str(row[2]))
+        job_id = payload.get("job_id") if isinstance(payload, dict) else None
+        if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id < 1:
+            continue
+        job_changes = changes_by_position[position]["job_changes"]
+        assert isinstance(job_changes, list)
+        job_changes.append({"event_type": str(row[1]), "job_id": job_id})
     return _PrincipalClientEventBatch(
         tuple(changes_by_position[position] for position in positions),
         safe_position,
@@ -7200,6 +7243,96 @@ def _serialize_principal_client_event_batch(batch: _PrincipalClientEventBatch) -
         sort_keys=True,
     )
     return (f"id: {batch.through_position}\nevent: workshop.principal.changed\ndata: {payload}\n\n").encode()
+
+
+async def _scheduled_job_principal(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+) -> tuple[PrincipalId | None, web.Response | None]:
+    principal_id = await authenticator.authenticate(request)
+    if isinstance(principal_id, PrincipalId):
+        return principal_id, None
+    response = _error_response(
+        status=401,
+        code="authentication_required",
+        message="Authentication required",
+    )
+    response.headers["WWW-Authenticate"] = "Bearer"
+    return None, response
+
+
+async def _handle_scheduled_jobs(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    scheduler: WorkshopCanonicalScheduler,
+) -> web.Response:
+    principal_id, error = await _scheduled_job_principal(request, authenticator=authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid scheduled-job request")
+    jobs = await scheduler.list_principal_jobs(principal_id)
+    return _json_response({"version": 1, "jobs": jobs}, status=200)
+
+
+async def _handle_scheduled_job(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    scheduler: WorkshopCanonicalScheduler,
+) -> web.Response:
+    principal_id, error = await _scheduled_job_principal(request, authenticator=authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    raw_job_id = request.match_info.get("job_id", "")
+    if request.query or request.can_read_body or not raw_job_id.isdecimal():
+        return _error_response(status=400, code="invalid_request", message="Invalid scheduled-job request")
+    job_id = int(raw_job_id)
+    job = await scheduler.get_principal_job(job_id, principal_id)
+    if job is None:
+        return _error_response(status=404, code="job_not_found", message="Scheduled job not found")
+    return _json_response({"version": 1, "job": job}, status=200)
+
+
+async def _handle_scheduled_job_cancel(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    scheduler: WorkshopCanonicalScheduler,
+) -> web.Response:
+    principal_id, error = await _scheduled_job_principal(request, authenticator=authenticator)
+    if error is not None:
+        return error
+    assert principal_id is not None
+    raw_job_id = request.match_info.get("job_id", "")
+    if request.query or not raw_job_id.isdecimal() or request.content_type != "application/json":
+        return _error_response(status=400, code="invalid_request", message="Invalid cancellation request")
+    if request.content_length is not None and request.content_length > _MAX_SCHEDULED_JOB_CANCEL_BODY_BYTES:
+        return _error_response(status=400, code="invalid_request", message="Cancellation request is too large")
+    raw = await request.content.read(_MAX_SCHEDULED_JOB_CANCEL_BODY_BYTES + 1)
+    try:
+        payload = json.loads(raw) if len(raw) <= _MAX_SCHEDULED_JOB_CANCEL_BODY_BYTES else None
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    operation_id = payload.get("client_operation_id") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _SCHEDULED_JOB_CANCEL_FIELDS
+        or not isinstance(operation_id, str)
+        or not _CLIENT_OPERATION_ID_PATTERN.fullmatch(operation_id)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid cancellation request")
+    try:
+        result = await scheduler.cancel_principal_job(int(raw_job_id), principal_id, operation_id)
+    except ValueError as exc:
+        return _error_response(status=409, code="operation_conflict", message=str(exc))
+    if result is None:
+        return _error_response(status=404, code="job_not_found", message="Scheduled job not found or inactive")
+    return _json_response({"version": 1, "result": result}, status=200)
 
 
 async def _handle_principal_event_stream(
@@ -9234,6 +9367,7 @@ def register_workshop_read_routes(
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
     standing_participation: WorkshopStandingParticipationService | None = None,
+    scheduler: WorkshopCanonicalScheduler | None = None,
     invalidate_agent_context: Callable[[AgentId], Awaitable[tuple[int, int]]] | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
@@ -9664,6 +9798,36 @@ def register_workshop_read_routes(
                 store=store,
                 authenticator=authenticator,
             )
+
+    if scheduler is not None:
+
+        async def handle_scheduled_jobs(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_scheduled_jobs(
+                    request,
+                    authenticator=authenticator,
+                    scheduler=scheduler,
+                )
+
+        async def handle_scheduled_job(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_scheduled_job(
+                    request,
+                    authenticator=authenticator,
+                    scheduler=scheduler,
+                )
+
+        async def handle_scheduled_job_cancel(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_scheduled_job_cancel(
+                    request,
+                    authenticator=authenticator,
+                    scheduler=scheduler,
+                )
+
+        app.router.add_get(_SCHEDULED_JOBS_PATH, handle_scheduled_jobs)
+        app.router.add_get(_SCHEDULED_JOB_PATH, handle_scheduled_job)
+        app.router.add_post(_SCHEDULED_JOB_CANCEL_PATH, handle_scheduled_job_cancel)
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_PRINCIPAL_EVENTS_PATH, handle_principal_event_stream)

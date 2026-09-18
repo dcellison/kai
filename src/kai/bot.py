@@ -1501,7 +1501,8 @@ async def _list_jobs(
     """
     assert update.message is not None
     services = _get_core_services(context)
-    jobs = await services.scheduler.list_jobs(_scheduled_job_authority(context, runtime_config_id))
+    authority = _scheduled_job_authority(context, runtime_config_id)
+    jobs = await services.scheduler.list_principal_jobs(authority.principal_id)
     if not jobs:
         await update.message.reply_text("No active scheduled jobs.")
         return
@@ -1565,9 +1566,10 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except ValueError:
             await update.message.reply_text("Job ID must be a number.")
             return
-        job = await _get_core_services(context).scheduler.get_job(
+        authority = _scheduled_job_authority(context, runtime_config_id)
+        job = await _get_core_services(context).scheduler.get_principal_job(
             job_id,
-            _scheduled_job_authority(context, runtime_config_id),
+            authority.principal_id,
         )
         if job is None:
             await update.message.reply_text(f"Job #{job_id} not found.")
@@ -1593,11 +1595,13 @@ async def handle_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except ValueError:
             await update.message.reply_text("Job ID must be a number.")
             return
-        deleted = await _get_core_services(context).scheduler.delete_job(
+        authority = _scheduled_job_authority(context, runtime_config_id)
+        result = await _get_core_services(context).scheduler.cancel_principal_job(
             job_id,
-            _scheduled_job_authority(context, runtime_config_id),
+            authority.principal_id,
+            f"telegram:{update.update_id}:job-cancel",
         )
-        if not deleted:
+        if result is None:
             await update.message.reply_text(f"Job #{job_id} not found.")
             return
         await update.message.reply_text(f"Job #{job_id} cancelled.")

@@ -1251,6 +1251,7 @@ async def _open_client(
     collaboration_policy=None,
     standing_participation=None,
     runtime_lane_status=None,
+    scheduler=None,
     invalidate_agent_context=None,
 ) -> TestClient:
     app = web.Application()
@@ -1282,6 +1283,7 @@ async def _open_client(
         collaboration_policy=collaboration_policy,
         standing_participation=standing_participation,
         runtime_lane_status=runtime_lane_status,
+        scheduler=scheduler,
         invalidate_agent_context=invalidate_agent_context,
     )
     client = TestClient(TestServer(app))
@@ -7440,6 +7442,72 @@ async def test_human_profile_api_changes_only_the_authenticated_display_name(
         assert rebuilt_payload["display_name"] == "aLiCe Example"
         assert rebuilt_payload["handle"] == "alice"
         assert rebuilt_payload["state_version"] == 1
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_jobs_api_uses_authenticated_principal_and_replay_safe_cancel(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, bob_id, _ = await _open_store(tmp_path / "kai.db")
+    job = {
+        "id": 7,
+        "name": "Daily status",
+        "job_type": "agent",
+        "prompt": "Report status",
+        "schedule_type": "daily",
+        "schedule_data": '{"times":["13:00"]}',
+        "created_at": "2026-09-18T12:00:00Z",
+        "active": True,
+        "auto_remove": False,
+        "notify_on_check": False,
+        "agent_name": "Kai",
+        "channel_name": "Kai",
+        "delivery_transports": ["telegram", "workshop_client"],
+        "next_run_at": "2026-09-19T13:00:00Z",
+    }
+    scheduler = SimpleNamespace(
+        list_principal_jobs=AsyncMock(side_effect=lambda principal_id: [job] if principal_id == alice_id else []),
+        get_principal_job=AsyncMock(
+            side_effect=lambda job_id, principal_id: job if job_id == 7 and principal_id == alice_id else None
+        ),
+        cancel_principal_job=AsyncMock(
+            return_value={
+                "job_id": 7,
+                "cancelled": True,
+                "changed": True,
+                "replayed": False,
+                "event_position": 90,
+            }
+        ),
+    )
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        scheduler=scheduler,
+    )
+    try:
+        alice_headers = {"Authorization": "Bearer alice-token"}
+        listed = await client.get("/v1/client/scheduled-jobs", headers=alice_headers)
+        assert listed.status == 200
+        assert (await listed.json())["jobs"] == [job]
+        missing = await client.get(
+            "/v1/client/scheduled-jobs/7",
+            headers={"Authorization": "Bearer bob-token"},
+        )
+        assert missing.status == 404
+        cancelled = await client.post(
+            "/v1/client/scheduled-jobs/7/cancel",
+            headers=alice_headers,
+            json={"client_operation_id": "cancel-job-7"},
+        )
+        assert cancelled.status == 200
+        assert (await cancelled.json())["result"]["changed"] is True
+        scheduler.cancel_principal_job.assert_awaited_once_with(7, alice_id, "cancel-job-7")
+        anonymous = await client.get("/v1/client/scheduled-jobs")
+        assert anonymous.status == 401
     finally:
         await client.close()
         await store.close()

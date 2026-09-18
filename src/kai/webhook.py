@@ -140,7 +140,7 @@ from kai.workshop.scheduled_jobs import (
     WorkshopScheduledJobAuthority,
     WorkshopScheduledJobUpdate,
 )
-from kai.workshop.scheduler import WorkshopScheduledJobRegistrationError
+from kai.workshop.scheduler import WorkshopCanonicalScheduler, WorkshopScheduledJobRegistrationError
 from kai.workshop.settings_workspaces import WorkshopSettingsWorkspaceService
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.storage_namespaces import (
@@ -2224,6 +2224,7 @@ async def _register_workshop_client_api(
     human_avatars: WorkshopHumanAvatarService | None = None,
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
     standing_participation: WorkshopStandingParticipationService | None = None,
+    scheduler: WorkshopCanonicalScheduler | None = None,
     runtime_pool: WorkshopRuntimePool | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
@@ -2275,6 +2276,7 @@ async def _register_workshop_client_api(
             human_avatars=human_avatars,
             collaboration_policy=collaboration_policy,
             standing_participation=standing_participation,
+            scheduler=scheduler,
             invalidate_agent_context=(
                 runtime_pool.invalidate_agent_retained_context if runtime_pool is not None else None
             ),
@@ -2376,6 +2378,7 @@ async def start(
             human_avatars=getattr(core_services, "human_avatars", None),
             collaboration_policy=getattr(core_services, "collaboration_policy", None),
             standing_participation=getattr(core_services, "standing_participation", None),
+            scheduler=getattr(core_services, "scheduler", None),
             runtime_pool=getattr(core_services, "runtime_pool", None),
         )
 
