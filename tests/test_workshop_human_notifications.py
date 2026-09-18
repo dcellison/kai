@@ -534,6 +534,106 @@ class TestHumanNotificationAuthority:
             await reopened.close()
             await store.close()
 
+    async def test_all_notification_policy_survives_v85_upgrade_and_projection_rebuild(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from kai.workshop import schema
+
+        path = tmp_path / "kai.db"
+        with monkeypatch.context() as migration_context:
+            migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 84)
+            migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:-1])
+            store, _daniel_id, scott_id, channel_id, _agent_id = await _notification_context(path)
+            registry = await WorkshopExecutionStateRegistry.from_store(store, profile_registry(101, 202))
+            policy = await WorkshopChannelNotificationPolicyService.open(path, registry)
+            authority = policy.authority_for_principal(scott_id)
+            snapshot = await policy.inspect(authority)
+            snapshot = await policy.set_channel_level(
+                authority,
+                channel_id,
+                "muted",
+                expected_revision=snapshot.revision,
+            )
+            snapshot = await policy.set_muted_mentions_notify(
+                authority,
+                False,
+                expected_revision=snapshot.revision,
+            )
+            snapshot = await policy.set_do_not_disturb(
+                authority,
+                enabled=True,
+                timezone="America/Toronto",
+                start="21:30",
+                end="06:15",
+                expected_revision=snapshot.revision,
+            )
+            snapshot = await policy.set_adapter_delivery(
+                authority,
+                "desktop",
+                False,
+                expected_revision=snapshot.revision,
+            )
+            assert snapshot.adapter_deliveries[0].enabled is False
+            await policy.close()
+            await store.close()
+
+        upgraded = await WorkshopEventStore.open(path)
+        registry = await WorkshopExecutionStateRegistry.from_store(upgraded, profile_registry(101, 202))
+        policy = await WorkshopChannelNotificationPolicyService.open(path, registry)
+        try:
+            assert await upgraded.schema_version() == 85
+            authority = policy.authority_for_principal(scott_id)
+            migrated = await policy.inspect(authority)
+            assert [(item.channel_id, item.level, item.source) for item in migrated.channels] == [
+                (channel_id, "muted", "personal override")
+            ]
+            assert migrated.muted_mentions_notify is False
+            assert migrated.do_not_disturb.enabled is True
+            assert migrated.do_not_disturb.timezone == "America/Toronto"
+            assert migrated.do_not_disturb.start == "21:30"
+            assert migrated.do_not_disturb.end == "06:15"
+            assert [(item.transport, item.enabled, item.source) for item in migrated.adapter_deliveries] == [
+                ("desktop", False, "personal override")
+            ]
+            for table in (
+                "principal_human_notification_policies",
+                "principal_channel_notification_policies",
+                "principal_human_notification_adapter_preferences",
+            ):
+                async with upgraded.connection.execute(f"PRAGMA foreign_key_list({table})") as cursor:
+                    assert await cursor.fetchall() == []
+
+            await upgraded.rebuild_projection(CanonicalConversationProjection())
+            rebuilt = await policy.inspect(authority)
+            assert rebuilt == migrated
+            assert workshop_channel_notification_policy_status(path) == (
+                "Workshop channel notification policy: active; principals=1, channel overrides=1, "
+                "DND enabled=1, adapter bindings=2 (enabled=1, disabled=1, explicit=1, stale=0), "
+                "invalid=0, orphaned=0; authority=canonical, Workshop=in-app immediate"
+            )
+        finally:
+            await policy.close()
+            await upgraded.close()
+
+    async def test_notification_policy_diagnostics_report_orphaned_mutable_rows(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "kai.db"
+        store, _daniel_id, _scott_id, _channel_id, _agent_id = await _notification_context(path)
+        try:
+            await store.connection.execute(
+                "INSERT INTO principal_human_notification_adapter_preferences "
+                "(principal_id, transport, enabled) VALUES ('prn_orphaned', 'desktop', 0)"
+            )
+            await store.connection.commit()
+            assert "INCOMPLETE" in workshop_channel_notification_policy_status(path)
+            assert "orphaned=1" in workshop_channel_notification_policy_status(path)
+        finally:
+            await store.close()
+
     async def test_channel_policy_controls_ordinary_reply_and_muted_mentions(
         self,
         tmp_path: Path,
@@ -635,7 +735,7 @@ class TestHumanNotificationAuthority:
         assert workshop_channel_notification_policy_status(path) == (
             "Workshop channel notification policy: active; principals=1, channel overrides=0, "
             "DND enabled=1, adapter bindings=2 (enabled=2, disabled=0, explicit=0, stale=0), "
-            "invalid=0; authority=canonical, Workshop=in-app immediate"
+            "invalid=0, orphaned=0; authority=canonical, Workshop=in-app immediate"
         )
         assert (
             await policy.external_delivery_allowed(
