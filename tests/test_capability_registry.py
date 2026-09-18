@@ -19,6 +19,7 @@ from kai.capability_registry import (
     WorkshopSurface,
     capability_availability,
     capability_by_id,
+    render_telegram_help,
     telegram_command_dispositions,
     telegram_command_inventory,
     validate_capability_registry,
@@ -101,15 +102,25 @@ def test_contextual_availability_is_redacted_and_excludes_admin_operations() -> 
     assert "secret" not in serialized.lower()
 
 
-def test_administrator_availability_includes_admin_only_operation() -> None:
+def test_unimplemented_workshop_operations_are_not_advertised() -> None:
     results = capability_availability(
         AdapterId.WORKSHOP,
         CapabilityContext(authenticated=True, administrator=True),
     )
-    webhook_status = next(result for result in results if result.operation_id == "administration.webhook_status.read")
+    assert "administration.webhook_status.read" not in {result.operation_id for result in results}
 
-    assert webhook_status.available is True
-    assert webhook_status.disposition == AdapterDisposition.ADMINISTRATOR_ONLY
+
+def test_telegram_help_is_registry_backed_and_filters_administrator_operations() -> None:
+    member_help = render_telegram_help(administrator=False)
+    administrator_help = render_telegram_help(administrator=True)
+
+    assert "/stop - Interrupt current response" in member_help
+    assert "/start" not in member_help
+    assert "/webhooks" not in member_help
+    assert "/webhooks - Show webhook server status" in administrator_help
+    assert {
+        line.split()[0].removeprefix("/") for line in administrator_help.splitlines() if line.startswith("/")
+    } <= set(telegram_command_inventory())
 
 
 def test_unsupported_operations_do_not_appear_in_adapter_availability() -> None:
@@ -140,6 +151,10 @@ def test_registry_rejects_duplicate_telegram_command_owners() -> None:
     duplicate_presentation = replace(
         second.presentations[AdapterId.TELEGRAM],
         primary_command=first.presentations[AdapterId.TELEGRAM].primary_command,
+        help_entries=tuple(
+            replace(entry, commands=(first.presentations[AdapterId.TELEGRAM].primary_command,))
+            for entry in second.presentations[AdapterId.TELEGRAM].help_entries
+        ),
     )
     duplicate = replace(
         second,
@@ -195,4 +210,22 @@ def test_registry_rejects_unsupported_adapter_with_surface() -> None:
     )
 
     with pytest.raises(ValueError, match="declares an adapter surface"):
+        validate_capability_registry((invalid,))
+
+
+def test_registry_rejects_help_for_unregistered_command() -> None:
+    capability = capability_by_id("conversation.run.cancel")
+    telegram = capability.presentations[AdapterId.TELEGRAM]
+    invalid = replace(
+        capability,
+        presentations={
+            **capability.presentations,
+            AdapterId.TELEGRAM: replace(
+                telegram,
+                help_entries=(replace(telegram.help_entries[0], commands=("retired",)),),
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="advertises unregistered Telegram commands"):
         validate_capability_registry((invalid,))

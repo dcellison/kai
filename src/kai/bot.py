@@ -38,6 +38,7 @@ from telegram.ext import (
 
 from kai import github_api, memory_command, review, sessions, webhook
 from kai.application_host import KaiCoreServices
+from kai.capability_registry import render_telegram_help
 from kai.config import (
     DATA_DIR,
     OPEN_ENDED_PROVIDERS,
@@ -4444,72 +4445,23 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Handle /help — show all available commands."""
     assert update.message is not None
     await update.message.reply_text(
-        "/stop - Interrupt current response\n"
-        "/new - Start a fresh session\n"
-        "\n"
-        "/models - Choose a model\n"
-        "/model <name> - Switch model directly\n"
-        "/backends - Choose a backend\n"
-        "/backend [backend:provider] - Show or switch backend\n"
-        "\n"
-        "/settings - Show your settings\n"
-        "/settings model <name> - Default model\n"
-        "/settings timeout <n> - Response timeout (seconds)\n"
-        "/settings reset [field] - Clear overrides\n"
-        "\n"
-        "/workspace (or /ws) - Show current workspace\n"
-        "/workspace <name> - Switch by name\n"
-        "/workspace home - Return to default\n"
-        "/workspace new <name> - Create + git init + switch\n"
-        "/workspace delete <name> confirm <name> - Permanently delete a workspace\n"
-        "/project - List memory projects\n"
-        "/project register [name] - Register current workspace as a memory project\n"
-        "/project unregister <name> - Remove a chat-registered project\n"
-        "/workspace allow <path> - Add an allowed workspace\n"
-        "/workspace deny <path> - Remove an allowed workspace\n"
-        "/workspace allowed - List your workspaces\n"
-        "/workspace config - Show workspace settings\n"
-        "/workspace config <field> <value> - Override a setting\n"
-        "/workspace config env KEY=VALUE - Set an env var\n"
-        "/workspace config prompt <text> - Set system prompt\n"
-        "/workspace config reset [field] - Clear overrides\n"
-        "/workspaces - Switch workspace (inline buttons)\n"
-        "\n"
-        "/github - Show GitHub settings\n"
-        "/github notify [number|reset] - View, route, or reset notifications\n"
-        "/github reviews [on|off] - Toggle PR reviews\n"
-        "/github triage [on|off] - Toggle issue triage\n"
-        "/github token [<token>] - Manage access token\n"
-        "/github add <repo> - Watch a repo\n"
-        "/github remove <repo> - Unwatch a repo\n"
-        "/notifications - Show personal notification destinations\n"
-        "/notifications <github|generic> [number|reset] - Route notifications\n"
-        "/review <pr-number> - Review a PR on the inferred repo\n"
-        "/review <owner/repo> <pr-number> - Review an explicit PR\n"
-        "\n"
-        "/memory - Browse remembered facts and episodes\n"
-        "/memory search <q> - Semantic search over memories\n"
-        "/memory stats - Counts and confidence distribution\n"
-        "/memory help - /memory subcommand reference\n"
-        "/preferences - Show your preference document\n"
-        "/preferences set <text> - Replace your preference document\n"
-        "/preferences history - List previous preference revisions\n"
-        "/preferences restore <number> - Restore a displayed revision\n"
-        "\n"
-        "/voice - Toggle voice off / voice-only\n"
-        "/voice only - Voice only (no text)\n"
-        "/voice on - Text + voice\n"
-        "/voice off - Text only\n"
-        "/voice <name> - Set voice\n"
-        "/voices - Choose a voice (inline buttons)\n"
-        "\n"
-        "/stats [@agent] - Show canonical runtime status\n"
-        "/job - List scheduled jobs\n"
-        "/job info <id> - Show job details\n"
-        "/job cancel <id> - Cancel a job\n"
-        "/webhooks - Show webhook server status\n"
-        "/help - This message"
+        render_telegram_help(administrator=await _telegram_principal_is_workshop_admin(update, context))
     )
+
+
+async def _telegram_principal_is_workshop_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Resolve Telegram administrator status from canonical Workshop membership."""
+    store = _get_core_services(context).client_store
+    async with store.connection.execute(
+        "SELECT 1 FROM external_identities ei "
+        "JOIN workshop_memberships wm ON wm.principal_id = ei.principal_id "
+        "WHERE ei.provider = 'telegram' AND ei.external_subject = ? AND wm.role = 'admin' LIMIT 1",
+        (str(_user_id(update)),),
+    ) as cursor:
+        return await cursor.fetchone() is not None
 
 
 @_require_auth

@@ -1316,7 +1316,8 @@ class TestHandleHelp:
     async def test_sends_help_text(self):
         update = _make_update()
         ctx = _make_context()
-        await handle_help(update, ctx)
+        with patch("kai.bot._telegram_principal_is_workshop_admin", new=AsyncMock(return_value=False)):
+            await handle_help(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
         assert "/stop" in reply
         assert "/new" in reply
@@ -1330,7 +1331,8 @@ class TestHandleHelp:
         handlers and the canonical _HELP_TEXT in memory_command.py."""
         update = _make_update()
         ctx = _make_context()
-        await handle_help(update, ctx)
+        with patch("kai.bot._telegram_principal_is_workshop_admin", new=AsyncMock(return_value=False)):
+            await handle_help(update, ctx)
         reply = update.message.reply_text.call_args[0][0]
 
         # /github notify accepts <number|reset>, not [on|off]. The
@@ -1361,6 +1363,21 @@ class TestHandleHelp:
         assert "/voice - Toggle voice off / voice-only" in reply
         assert "/voice off" in reply
         assert "/voice - Toggle voice on/off" not in reply
+
+    @pytest.mark.asyncio
+    async def test_only_administrators_receive_webhook_help(self):
+        update = _make_update()
+        ctx = _make_context()
+        with patch("kai.bot._telegram_principal_is_workshop_admin", new=AsyncMock(return_value=False)):
+            await handle_help(update, ctx)
+        member_help = update.message.reply_text.await_args.args[0]
+
+        with patch("kai.bot._telegram_principal_is_workshop_admin", new=AsyncMock(return_value=True)):
+            await handle_help(update, ctx)
+        administrator_help = update.message.reply_text.await_args.args[0]
+
+        assert "/webhooks" not in member_help
+        assert "/webhooks - Show webhook server status" in administrator_help
 
 
 class TestHandleUnknownCommand:
