@@ -5600,21 +5600,6 @@ function WorkshopView({
             </ContextSection>
           )}
 
-          <ContextSection title="Connection">
-            <ConnectionIndicator connection={connection} />
-            <p>History and new messages are synchronized directly with Kai.</p>
-          </ContextSection>
-
-          <ContextSection title="Authority">
-            <p>
-              {humanDirect
-                ? `Only you and ${channelName} can read and send messages here.`
-                : channel.canSubmitCommands
-                ? "You can read and send messages in this channel. Mention an agent to direct a request to it."
-                : "You can read this outbound channel, but you cannot send messages here."}
-            </p>
-          </ContextSection>
-
           {(channel.kind === "group" || humanDirect) && (
             <ContextSection
               action={
@@ -5775,6 +5760,16 @@ function WorkshopView({
               {standingError && <p className="settings-error" role="alert">{standingError}</p>}
             </ContextSection>
           )}
+
+          <ContextSection title="Authority">
+            <p>
+              {humanDirect
+                ? `Only you and ${channelName} can read and send messages here.`
+                : channel.canSubmitCommands
+                ? "You can read and send messages in this channel. Mention an agent to direct a request to it."
+                : "You can read this outbound channel, but you cannot send messages here."}
+            </p>
+          </ContextSection>
 
           {!humanDirect && <ContextSection
             className="trace-section"

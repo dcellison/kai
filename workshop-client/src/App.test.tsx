@@ -1167,7 +1167,8 @@ describe("Workshop React client", () => {
     const contextSections = Array.from(
       channelContext.querySelectorAll<HTMLDetailsElement>("details.context-section"),
     );
-    expect(contextSections).toHaveLength(5);
+    expect(contextSections).toHaveLength(4);
+    expect(within(channelContext).queryByText("Connection")).toBeNull();
     expect(contextSections.every((section) => !section.open)).toBe(true);
     expect(
       contextSections.every(
@@ -3309,6 +3310,10 @@ describe("Workshop React client", () => {
     expect(titleRow).not.toBeNull();
     expect(titleRow).toContainElement(settingsButton);
     expect(titleRow?.querySelector("h2")).toHaveTextContent("# Lifecycle qualification");
+    const contextTitles = [
+      ...(archiveButton.closest("aside")?.querySelectorAll(".context-section-title") ?? []),
+    ].map((title) => title.textContent);
+    expect(contextTitles.slice(0, 3)).toEqual(["People", "Agents", "Authority"]);
     expect(headerButtons.indexOf(settingsButton)).toBeLessThan(headerButtons.indexOf(archiveButton));
     expect(headerButtons.at(-1)).toBe(archiveButton);
     await user.click(archiveButton);
