@@ -2367,12 +2367,10 @@ function ManageAgentsIcon(): React.JSX.Element {
   );
 }
 
-function ManageMembersIcon(): React.JSX.Element {
+function PlusIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
-      <circle cx="9" cy="8" r="3" stroke="currentColor" strokeWidth="1.8" />
-      <circle cx="17" cy="10" r="2.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M3.5 20v-2a5.5 5.5 0 0 1 11 0v2M14 15.3A4.5 4.5 0 0 1 20.5 19v1" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+      <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
     </svg>
   );
 }
@@ -2416,10 +2414,12 @@ function WorkspacesIcon(): React.JSX.Element {
 }
 
 function ContextSection({
+  action,
   children,
   className = "",
   title,
 }: {
+  action?: ReactNode;
   children: ReactNode;
   className?: string;
   title: string;
@@ -2428,6 +2428,14 @@ function ContextSection({
     <details className={`context-section${className ? ` ${className}` : ""}`}>
       <summary className="context-section-toggle">
         <h3 className="context-section-title">{title}</h3>
+        {action && (
+          <span
+            className="context-section-header-action"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {action}
+          </span>
+        )}
       </summary>
       <div className="context-section-body">{children}</div>
     </details>
@@ -5447,11 +5455,11 @@ function WorkshopView({
           </ContextSection>
 
           {(channel.kind === "group" || humanDirect) && (
-            <ContextSection className="agent-attention-section" title="People">
-              {channel.kind === "group" &&
+            <ContextSection
+              action={
+                channel.kind === "group" &&
                 (channel.role === "owner" || workshop.role === "admin") &&
-                !channelIsArchived(channel) && (
-                <div className="context-section-body-actions">
+                !channelIsArchived(channel) ? (
                   <button
                     className="panel-icon-button"
                     type="button"
@@ -5460,10 +5468,13 @@ function WorkshopView({
                     disabled={memberManagementLoading}
                     onClick={() => void openMemberManagement()}
                   >
-                    <ManageMembersIcon />
+                    <PlusIcon />
                   </button>
-                </div>
-              )}
+                ) : undefined
+              }
+              className="agent-attention-section"
+              title="People"
+            >
               <ul>
                 <li>
                   <HumanAvatar
@@ -5505,9 +5516,9 @@ function WorkshopView({
           )}
 
           {channel.kind === "group" && (
-            <ContextSection className="agent-attention-section" title="Agent participation">
-              {channel.role === "owner" && !channelIsArchived(channel) && (
-                <div className="context-section-body-actions">
+            <ContextSection
+              action={
+                channel.role === "owner" && !channelIsArchived(channel) ? (
                   <button
                     className="panel-icon-button"
                     type="button"
@@ -5518,8 +5529,11 @@ function WorkshopView({
                   >
                     <ManageAgentsIcon />
                   </button>
-                </div>
-              )}
+                ) : undefined
+              }
+              className="agent-attention-section"
+              title="Agents"
+            >
               {standingNotice && (
                 <p className="standing-notice" role="status">{standingNotice}</p>
               )}

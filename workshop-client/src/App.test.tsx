@@ -3101,7 +3101,7 @@ describe("Workshop React client", () => {
       await screen.findByText(`History for ${secondChannelId}`),
     ).toBeVisible();
     await openContextSection("Runtime and workspace");
-    await openContextSection("Agent participation");
+    await openContextSection("Agents");
     expect(await screen.findByText("Qualification")).toBeVisible();
     expect(screen.queryByLabelText("Workspace")).toBeNull();
     expect(loadRuntimeLaneStatus).toHaveBeenCalledWith(
@@ -3470,10 +3470,13 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
-    await openContextSection("People");
+    const peopleSection = (await screen.findByRole("heading", { name: "People" }))
+      .closest("details");
+    expect(peopleSection).not.toHaveAttribute("open");
     await user.click(
       await screen.findByRole("button", { name: "Manage channel members" }),
     );
+    expect(peopleSection).not.toHaveAttribute("open");
     const dialog = await screen.findByRole("dialog", { name: "People" });
     const daniel = within(dialog).getByRole("checkbox", { name: /Daniel/ });
     const scott = within(dialog).getByRole("checkbox", { name: /Scott/ });
@@ -3773,7 +3776,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
-    await openContextSection("Agent participation");
+    await openContextSection("Agents");
     expect(await screen.findByText("Awake in this channel")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Dismiss Kai" }));
 
@@ -3833,7 +3836,7 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
-    await openContextSection("Agent participation");
+    await openContextSection("Agents");
 
     expect(await screen.findByText(/Joined in .* · standing/)).toBeVisible();
     expect(await screen.findByTitle("Agent contribution from standing participation")).toBeVisible();
@@ -3867,10 +3870,13 @@ describe("Workshop React client", () => {
     });
 
     render(<App />);
-    await openContextSection("Agent participation");
+    const agentsSection = (await screen.findByRole("heading", { name: "Agents" }))
+      .closest("details");
+    expect(agentsSection).not.toHaveAttribute("open");
     await user.click(
       await screen.findByRole("button", { name: "Manage channel agents" }),
     );
+    expect(agentsSection).not.toHaveAttribute("open");
     const dialog = await screen.findByRole("dialog", { name: "Agents" });
     expect(within(dialog).getByText(/sponsored by Daniel/i)).toBeVisible();
     const kai = within(dialog).getByRole("checkbox", { name: /Kai/ });
