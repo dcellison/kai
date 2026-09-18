@@ -189,7 +189,9 @@ class WorkshopClientCommandExecutor:
         previews = self._run_previews
         if previews is None:
             return None
-        channel_id = (await self._execution.run_state(run_id)).channel_id
+        run = await self._execution.run_state(run_id)
+        channel_id = run.channel_id
+        agent_id = run.agent_id
         last_published: str | None = None
 
         async def observe(event) -> None:
@@ -200,7 +202,7 @@ class WorkshopClientCommandExecutor:
             if publishable is None or publishable == last_published:
                 return
             last_published = publishable
-            previews.publish(run_id, channel_id, publishable)
+            previews.publish(run_id, channel_id, agent_id, publishable)
 
         return observe
 
