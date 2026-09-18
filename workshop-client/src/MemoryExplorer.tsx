@@ -1,6 +1,7 @@
 import {
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -43,6 +44,15 @@ interface ExplorerFilters {
   projectId: string;
   scope: "" | "global" | "project" | "task";
   tag: string;
+}
+
+interface MemoryDetailPanelLayout {
+  width: number;
+  minimumWidth: number;
+  maximumWidth: number;
+  onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
+  onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onPointerMove: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }
 
 const EMPTY_FILTERS: ExplorerFilters = {
@@ -531,12 +541,14 @@ function MemoryDetailPane({
 }
 
 function MemoryExplorerContent({
+  detailPanelLayout,
   initialMemoryId,
   onAuthenticationFailure,
   onClose,
   onSelectMemory,
   token,
 }: {
+  detailPanelLayout?: MemoryDetailPanelLayout;
   initialMemoryId: string | null;
   onAuthenticationFailure: (message: string) => void;
   onClose: () => void;
@@ -882,8 +894,14 @@ function MemoryExplorerContent({
             >
               <span aria-hidden="true" />
             </button>
-            <button className="quiet-button memory-mobile-back" type="button" onClick={onClose}>
-              Back to conversation
+            <button
+              className="panel-icon-button"
+              type="button"
+              aria-label="Back to conversation"
+              title="Back to conversation"
+              onClick={onClose}
+            >
+              <span aria-hidden="true">←</span>
             </button>
           </div>
         </header>
@@ -1151,9 +1169,24 @@ function MemoryExplorerContent({
       </div>
 
       <aside
-        className="memory-detail-pane"
+        className="context-pane memory-detail-pane"
         aria-label={selectionMode ? "Memory selection" : "Memory detail"}
       >
+        {detailPanelLayout && (
+          <div
+            className="context-resize-handle"
+            role="separator"
+            aria-label="Resize memory detail"
+            aria-orientation="vertical"
+            aria-valuemin={detailPanelLayout.minimumWidth}
+            aria-valuemax={detailPanelLayout.maximumWidth}
+            aria-valuenow={detailPanelLayout.width}
+            tabIndex={0}
+            onKeyDown={detailPanelLayout.onKeyDown}
+            onPointerDown={detailPanelLayout.onPointerDown}
+            onPointerMove={detailPanelLayout.onPointerMove}
+          />
+        )}
         {selectionMode ? (
           <div className="memory-selection-summary">
             <span aria-hidden="true">◇</span>

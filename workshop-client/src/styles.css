@@ -5662,7 +5662,12 @@ button:disabled {
 
 .memory-workspace {
   display: grid;
-  grid-template-columns: minmax(22rem, 0.9fr) minmax(25rem, 1.1fr);
+  grid-template-columns:
+    minmax(22rem, 1fr)
+    min(
+      var(--context-pane-width, 19rem),
+      max(10rem, calc(100% - 22rem))
+    );
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -5674,7 +5679,6 @@ button:disabled {
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
-  border-right: 1px solid var(--color-border);
 }
 
 .memory-header {
@@ -5704,10 +5708,6 @@ button:disabled {
 
 .memory-header-actions > .memory-add-button {
   margin-right: 0;
-}
-
-.memory-mobile-back {
-  display: none;
 }
 
 .memory-browser-scroll,
@@ -6104,10 +6104,10 @@ button:disabled {
 }
 
 .memory-detail-pane {
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: var(--color-surface);
 }
 
 .memory-selection-summary {
@@ -6553,41 +6553,16 @@ button:disabled {
   }
 
   .memory-workspace {
-    grid-template-columns: minmax(20rem, 0.85fr) minmax(22rem, 1.15fr);
+    grid-template-columns:
+      minmax(20rem, 1fr)
+      min(
+        var(--context-pane-width, 19rem),
+        max(10rem, calc(100% - 20rem))
+      );
   }
 
   .workspaces-body {
     grid-template-columns: minmax(16rem, 0.75fr) minmax(20rem, 1.25fr);
-  }
-}
-
-@media (max-width: 920px) {
-  .memory-workspace {
-    display: block;
-    overflow-y: auto;
-  }
-
-  .memory-browser-pane {
-    display: block;
-    overflow: visible;
-    border-right: 0;
-  }
-
-  .memory-header {
-    position: sticky;
-    z-index: 2;
-    top: 0;
-  }
-
-  .memory-browser-scroll,
-  .memory-detail-scroll {
-    overflow: visible;
-  }
-
-  .memory-detail-pane {
-    min-height: 28rem;
-    overflow: visible;
-    border-top: 1px solid var(--color-border-strong);
   }
 }
 
@@ -6617,6 +6592,12 @@ button:disabled {
   .workshop-app.mentions-open,
   .workshop-app.following-open {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .memory-workspace {
+    grid-template-columns:
+      minmax(0, 1fr)
+      min(var(--context-pane-width, 19rem), 44vw);
   }
 
   .workspaces-body {
@@ -6652,7 +6633,6 @@ button:disabled {
     grid-column: 1;
   }
 
-  .memory-mobile-back,
   .mobile-settings-button {
     display: inline-flex;
   }
