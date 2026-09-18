@@ -3780,6 +3780,12 @@ button:disabled {
 }
 
 .agent-workspace-header > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 0.2rem;
+}
+
+.agent-workspace-title {
   display: flex;
   align-items: baseline;
   min-width: 0;
@@ -3792,7 +3798,7 @@ button:disabled {
   font: 560 1.12rem var(--serif);
 }
 
-.agent-workspace-header > div > p:last-child {
+.agent-workspace-title > p {
   margin: 0;
   color: var(--color-text-muted);
   font-size: 0.68rem;

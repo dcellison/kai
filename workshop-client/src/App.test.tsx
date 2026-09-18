@@ -2950,6 +2950,7 @@ describe("Workshop React client", () => {
     await openContextSection("Channel authority");
     expect(screen.getByText("GitHub")).toBeVisible();
     expect(screen.getByText("Durable notification feed")).toBeVisible();
+    expect(screen.getByText("Kai Workshop / Activity")).toBeVisible();
     expect(
       screen.getByText("Active delivery: GitHub → GitHub notifications"),
     ).toBeVisible();
@@ -4101,6 +4102,7 @@ describe("Workshop React client", () => {
     await user.click(manageKai);
 
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
+    expect(screen.getByText("Kai Workshop / Agents")).toBeVisible();
     expect(within(manageKai).getByLabelText("Open")).toHaveClass("live-pip");
     expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
     expect(screen.queryByText("Owner runtime")).toBeNull();

@@ -366,6 +366,7 @@ export function AgentWorkspace({
   principalEvents,
   runActive,
   token,
+  workshopName,
 }: {
   activeChannelId: string;
   initialCreating: boolean;
@@ -388,6 +389,7 @@ export function AgentWorkspace({
   principalEvents: WorkshopPrincipalEvents;
   runActive: boolean;
   token: string;
+  workshopName: string;
 }): React.JSX.Element {
   const confirm = useConfirmation();
   const [definitions, setDefinitions] = useState<WorkshopAgentDefinition[]>([]);
@@ -870,11 +872,13 @@ export function AgentWorkspace({
     <main className="agent-workspace" aria-label="Agents workspace">
       <header className="agent-workspace-header">
         <div>
-          <p className="overline">Software participants</p>
-          <h1>Agents</h1>
-          <p>
-            {counts.ready} ready · {counts.drafts} drafts · {counts.needsAttention} need attention · {principalName}
-          </p>
+          <p className="breadcrumbs">{workshopName} / Agents</p>
+          <div className="agent-workspace-title">
+            <h1>Agents</h1>
+            <p>
+              {counts.ready} ready · {counts.drafts} drafts · {counts.needsAttention} need attention · {principalName}
+            </p>
+          </div>
         </div>
         <div className="agent-header-actions">
           <span className={`agent-live-state ${principalEvents.connection.tone}`} role="status">
