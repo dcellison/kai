@@ -2400,18 +2400,15 @@ function WorkspacesIcon(): React.JSX.Element {
 function ContextSection({
   children,
   className = "",
-  number,
   title,
 }: {
   children: ReactNode;
   className?: string;
-  number: string;
   title: string;
 }): React.JSX.Element {
   return (
     <details className={`context-section${className ? ` ${className}` : ""}`}>
       <summary className="context-section-toggle">
-        <span className="section-number">{number}</span>
         <h3 className="context-section-title">{title}</h3>
       </summary>
       <div className="context-section-body">{children}</div>
@@ -5365,22 +5362,22 @@ function WorkshopView({
           </header>
 
           {channelIsArchived(channel) && (
-            <ContextSection className="archived-channel-state" number="00" title="Archived">
+            <ContextSection className="archived-channel-state" title="Archived">
               <p>This channel is preserved and read-only. Restore it to resume activity.</p>
             </ContextSection>
           )}
           {directMessageArchived && (
-            <ContextSection className="archived-channel-state" number="00" title="Archived for you">
+            <ContextSection className="archived-channel-state" title="Archived for you">
               <p>This conversation is preserved and hidden from your normal list. Restore it to send messages.</p>
             </ContextSection>
           )}
 
-          <ContextSection number="01" title="Connection">
+          <ContextSection title="Connection">
             <ConnectionIndicator connection={connection} />
             <p>History and new messages are synchronized directly with Kai.</p>
           </ContextSection>
 
-          <ContextSection number="02" title="Channel authority">
+          <ContextSection title="Channel authority">
             <p>
               {humanDirect
                 ? `Only you and ${channelName} can read and send messages here.`
@@ -5391,7 +5388,7 @@ function WorkshopView({
           </ContextSection>
 
           {(channel.kind === "group" || humanDirect) && (
-            <ContextSection className="agent-attention-section" number="03" title="People">
+            <ContextSection className="agent-attention-section" title="People">
               {channel.kind === "group" &&
                 (channel.role === "owner" || workshop.role === "admin") &&
                 !channelIsArchived(channel) && (
@@ -5449,7 +5446,7 @@ function WorkshopView({
           )}
 
           {channel.kind === "group" && (
-            <ContextSection className="agent-attention-section" number="04" title="Agent participation">
+            <ContextSection className="agent-attention-section" title="Agent participation">
               {channel.role === "owner" && !channelIsArchived(channel) && (
                 <div className="context-section-body-actions">
                   <button
@@ -5591,7 +5588,6 @@ function WorkshopView({
 
           {!humanDirect && <ContextSection
             className="trace-section"
-            number={channel.kind === "group" ? "05" : "03"}
             title="Runtime and workspace"
           >
             {runtimeLaneStatuses.length > 0 ? (
@@ -5672,7 +5668,6 @@ function WorkshopView({
 
           {!humanDirect && <ContextSection
             className="trace-section"
-            number={channel.kind === "group" ? "06" : "04"}
             title="Run inspector"
           >
             {runtimeLaneStatuses.some((status) => status.operatorDiagnostics) && (
