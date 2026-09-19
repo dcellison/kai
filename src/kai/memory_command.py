@@ -437,6 +437,9 @@ _MSG_NO_FACTS = "No memories yet. Things you tell Kai will be extracted and stor
 _MSG_QUERY_FAILED = "Memory query failed. Try again in a moment."
 _MSG_SESSION_EXPIRED = "Session expired, resyncing."
 _MSG_NO_SEARCH_RESULTS = "No matching memories found."
+_MSG_STALE_DELETE = (
+    "This memory changed in another client and was not deleted. Review the current version before trying again."
+)
 
 # Help text - the static body shown for `/memory help` and for any
 # unrecognized `/memory <subcommand>` invocation. Both code paths
@@ -1855,6 +1858,16 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 expected_revisions={memory_id: cache.revision},
             )
             outcome = batch.results[0].outcome
+            if outcome == "stale":
+                await _send_fact_view(
+                    update,
+                    context,
+                    chat_id,
+                    memory_id,
+                    notice=_MSG_STALE_DELETE,
+                )
+                await query.answer("Memory not deleted.", show_alert=True)
+                return
             # Return to whatever screen the user was on before the
             # fact view. Episode list, facts list, or dashboard
             # fallback. The branches mirror the return_to encodings
@@ -1883,7 +1896,6 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             answer = {
                 "succeeded": "Forgotten.",
                 "not_found": "Not found.",
-                "stale": "This memory changed; reopen it before deleting.",
                 "failed": "Delete failed.",
             }[outcome]
             await query.answer(answer)
@@ -2133,6 +2145,8 @@ async def _send_fact_view(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     memory_id: str,
+    *,
+    notice: str | None = None,
 ) -> None:
     """Open the fact detail view by id.
 
@@ -2185,6 +2199,8 @@ async def _send_fact_view(
         canonical_present=source is not None and source.state == "canonical",
     )
     text, kb = _build_fact_view(fact, return_to, scope_view, provenance)
+    if notice is not None:
+        text = _truncate_to_message_limit(f"{notice}\n\n{text}")
     # Cache holds only this fact's id: navigation state (the source
     # view resolves against it, and return_to rides here). The
     # destructive flows carry the fact id in their own callback
