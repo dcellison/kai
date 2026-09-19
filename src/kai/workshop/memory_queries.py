@@ -7,8 +7,8 @@ import base64
 import hashlib
 import json
 import logging
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -143,6 +143,16 @@ class MemoryRecordDetail:
     confirmation_quote: str | None
     prompt_version: str | None
     episode: dict[str, object] | None
+    source_reference: MemorySourceReference | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySourceReference:
+    state: Literal["canonical", "legacy", "explicit", "invalid"]
+    source_user_ts: str | None
+    source_assistant_ts: str | None
+    source_date: str | None
+    source_date_end: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +222,14 @@ class MemoryStatsSnapshot:
     by_type: dict[str, int]
     by_scope: dict[str, int]
     allowed_projects: tuple[MemoryProjectOption, ...]
+    by_tag: dict[str, int] = field(default_factory=dict)
+    confidence_min: float | None = None
+    confidence_median: float | None = None
+    confidence_max: float | None = None
+    confidence_below_0_7: int = 0
+    confidence_below_0_6: int = 0
+    confirmation_quote_count: int = 0
+    by_prompt_version: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +429,29 @@ class WorkshopMemoryQueryService:
             search_namespace=namespaces[0] if len(namespaces) == 1 else None,
         )
 
+    async def authority_for_transport_binding(
+        self,
+        *,
+        transport: str,
+        external_subject: str,
+        external_channel_id: str,
+    ) -> MemoryQueryAuthority:
+        """Resolve an adapter identity through a canonical channel binding."""
+        async with self._store.connection.execute(
+            "SELECT ei.principal_id FROM external_identities ei "
+            "JOIN channel_bindings cb ON cb.transport = ei.provider "
+            "AND cb.external_channel_id = ? "
+            "JOIN channels c ON c.id = cb.channel_id AND c.archived_at IS NULL "
+            "JOIN channel_memberships cm ON cm.channel_id = cb.channel_id "
+            "AND cm.principal_id = ei.principal_id "
+            "WHERE ei.provider = ? AND ei.external_subject = ?",
+            (external_channel_id, transport, external_subject),
+        ) as cursor:
+            rows = tuple(await cursor.fetchall())
+        if len(rows) != 1:
+            raise WorkshopMemoryAccessDenied("Memory access denied")
+        return self.authority_for_principal(PrincipalId(str(rows[0][0])))
+
     @staticmethod
     def validate_filters(filters: MemoryQueryFilters) -> None:
         for value in (
@@ -600,6 +641,10 @@ class WorkshopMemoryQueryService:
         by_source: dict[str, int] = {}
         by_type: dict[str, int] = {}
         by_scope: dict[str, int] = {}
+        by_tag: dict[str, int] = {}
+        by_prompt_version: dict[str, int] = {}
+        confidences: list[float] = []
+        confirmation_quote_count = 0
         facts = 0
         episodes = 0
         for row in rows:
@@ -621,6 +666,17 @@ class WorkshopMemoryQueryService:
                 episodes += 1
             else:
                 facts += 1
+            if source == "extracted":
+                for tag in _tags(row):
+                    by_tag[tag] = by_tag.get(tag, 0) + 1
+                prompt_version = str(row.metadata.get("prompt_version") or "")
+                by_prompt_version[prompt_version] = by_prompt_version.get(prompt_version, 0) + 1
+                confidence = row.metadata.get("confidence")
+                if isinstance(confidence, int | float):
+                    confidences.append(float(confidence))
+                if row.metadata.get("confirmation_quote"):
+                    confirmation_quote_count += 1
+        sorted_confidences = sorted(confidences)
         return MemoryStatsSnapshot(
             total=len(rows),
             facts=facts,
@@ -629,6 +685,14 @@ class WorkshopMemoryQueryService:
             by_type=dict(sorted(by_type.items())),
             by_scope=dict(sorted(by_scope.items())),
             allowed_projects=await self.allowed_projects(authority),
+            by_tag=dict(sorted(by_tag.items())),
+            confidence_min=(sorted_confidences[0] if sorted_confidences else None),
+            confidence_median=(sorted_confidences[(len(sorted_confidences) - 1) // 2] if sorted_confidences else None),
+            confidence_max=(sorted_confidences[-1] if sorted_confidences else None),
+            confidence_below_0_7=sum(1 for value in confidences if value < 0.7),
+            confidence_below_0_6=sum(1 for value in confidences if value < 0.6),
+            confirmation_quote_count=confirmation_quote_count,
+            by_prompt_version=dict(sorted(by_prompt_version.items())),
         )
 
     @staticmethod
@@ -645,6 +709,18 @@ class WorkshopMemoryQueryService:
         if len(set(checked)) != len(checked):
             raise WorkshopMemoryValidationError("Memory identifiers must be unique")
         return checked
+
+    @classmethod
+    def _validate_expected_revisions(
+        cls,
+        memory_ids: tuple[str, ...],
+        expected_revisions: Mapping[str, str] | None,
+    ) -> dict[str, str]:
+        if expected_revisions is None:
+            return {}
+        if not isinstance(expected_revisions, Mapping) or set(expected_revisions) != set(memory_ids):
+            raise WorkshopMemoryValidationError("Expected memory revisions must match mutation targets")
+        return {memory_id: cls._validate_revision(revision) for memory_id, revision in expected_revisions.items()}
 
     async def _scope_metadata(
         self,
@@ -1101,8 +1177,10 @@ class WorkshopMemoryQueryService:
         *,
         scope: str,
         project_id: str | None = None,
+        expected_revisions: Mapping[str, str] | None = None,
     ) -> MemoryMutationBatch:
         checked = self._validate_memory_ids(memory_ids)
+        revisions = self._validate_expected_revisions(checked, expected_revisions)
         scope_metadata = await self._scope_metadata(
             authority,
             scope=scope,
@@ -1122,53 +1200,56 @@ class WorkshopMemoryQueryService:
                     result = MemoryMutationResult(memory_id, "not_found", None, None)
                 else:
                     prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
-                    merged = dict(record.metadata)
-                    merged.update(scope_metadata)
-                    mutation_raised = False
-                    try:
-                        updated = await asyncio.to_thread(
-                            memory.update_metadata,
-                            user_id=str(authority.principal_id),
-                            memory_id=memory_id,
-                            data=record.text,
-                            metadata=merged,
-                        )
-                    except Exception:
-                        log.exception("Workshop memory scope mutation failed for %s", memory_id)
-                        updated = False
-                        mutation_raised = True
-                    if updated:
-                        new_scope = self._scope_snapshot(
-                            memory.MemoryResult(
-                                id=record.id,
-                                text=record.text,
-                                score=record.score,
-                                memory_type=record.memory_type,
-                                metadata=merged,
-                                created_at=record.created_at,
-                                updated_at=record.updated_at,
-                            ),
-                            allowed_project_id=allowed_project_id,
-                        )
-                        result = MemoryMutationResult(memory_id, "succeeded", prior, new_scope)
+                    if revisions and _memory_revision(record) != revisions[memory_id]:
+                        result = MemoryMutationResult(memory_id, "stale", prior, prior)
                     else:
-                        current = (
-                            record
-                            if mutation_raised
-                            else await asyncio.to_thread(
-                                memory.get_by_id,
+                        merged = dict(record.metadata)
+                        merged.update(scope_metadata)
+                        mutation_raised = False
+                        try:
+                            updated = await asyncio.to_thread(
+                                memory.update_metadata,
                                 user_id=str(authority.principal_id),
                                 memory_id=memory_id,
+                                data=record.text,
+                                metadata=merged,
                             )
-                        )
-                        result = MemoryMutationResult(
-                            memory_id,
-                            "failed" if mutation_raised else "stale" if current is None else "failed",
-                            prior,
-                            self._scope_snapshot(current, allowed_project_id=allowed_project_id)
-                            if current is not None
-                            else None,
-                        )
+                        except Exception:
+                            log.exception("Workshop memory scope mutation failed for %s", memory_id)
+                            updated = False
+                            mutation_raised = True
+                        if updated:
+                            new_scope = self._scope_snapshot(
+                                memory.MemoryResult(
+                                    id=record.id,
+                                    text=record.text,
+                                    score=record.score,
+                                    memory_type=record.memory_type,
+                                    metadata=merged,
+                                    created_at=record.created_at,
+                                    updated_at=record.updated_at,
+                                ),
+                                allowed_project_id=allowed_project_id,
+                            )
+                            result = MemoryMutationResult(memory_id, "succeeded", prior, new_scope)
+                        else:
+                            current = (
+                                record
+                                if mutation_raised
+                                else await asyncio.to_thread(
+                                    memory.get_by_id,
+                                    user_id=str(authority.principal_id),
+                                    memory_id=memory_id,
+                                )
+                            )
+                            result = MemoryMutationResult(
+                                memory_id,
+                                "failed" if mutation_raised else "stale" if current is None else "failed",
+                                prior,
+                                self._scope_snapshot(current, allowed_project_id=allowed_project_id)
+                                if current is not None
+                                else None,
+                            )
                 results.append(result)
                 self._audit_mutation(authority, operation="move_scope", result=result)
         return MemoryMutationBatch("move_scope", tuple(results))
@@ -1177,8 +1258,11 @@ class WorkshopMemoryQueryService:
         self,
         authority: MemoryQueryAuthority,
         memory_ids: Sequence[str],
+        *,
+        expected_revisions: Mapping[str, str] | None = None,
     ) -> MemoryMutationBatch:
         checked = self._validate_memory_ids(memory_ids)
+        revisions = self._validate_expected_revisions(checked, expected_revisions)
         allowed_project_id = await self._allowed_project_id(authority)
         results: list[MemoryMutationResult] = []
         lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
@@ -1193,37 +1277,40 @@ class WorkshopMemoryQueryService:
                     result = MemoryMutationResult(memory_id, "not_found", None, None)
                 else:
                     prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
-                    mutation_raised = False
-                    try:
-                        deleted = await asyncio.to_thread(
-                            memory.delete_by_id,
-                            user_id=str(authority.principal_id),
-                            memory_id=memory_id,
-                        )
-                    except Exception:
-                        log.exception("Workshop memory deletion failed for %s", memory_id)
-                        deleted = False
-                        mutation_raised = True
-                    if deleted:
-                        result = MemoryMutationResult(memory_id, "succeeded", prior, None)
+                    if revisions and _memory_revision(record) != revisions[memory_id]:
+                        result = MemoryMutationResult(memory_id, "stale", prior, prior)
                     else:
-                        current = (
-                            record
-                            if mutation_raised
-                            else await asyncio.to_thread(
-                                memory.get_by_id,
+                        mutation_raised = False
+                        try:
+                            deleted = await asyncio.to_thread(
+                                memory.delete_by_id,
                                 user_id=str(authority.principal_id),
                                 memory_id=memory_id,
                             )
-                        )
-                        result = MemoryMutationResult(
-                            memory_id,
-                            "failed" if mutation_raised else "stale" if current is None else "failed",
-                            prior,
-                            self._scope_snapshot(current, allowed_project_id=allowed_project_id)
-                            if current is not None
-                            else None,
-                        )
+                        except Exception:
+                            log.exception("Workshop memory deletion failed for %s", memory_id)
+                            deleted = False
+                            mutation_raised = True
+                        if deleted:
+                            result = MemoryMutationResult(memory_id, "succeeded", prior, None)
+                        else:
+                            current = (
+                                record
+                                if mutation_raised
+                                else await asyncio.to_thread(
+                                    memory.get_by_id,
+                                    user_id=str(authority.principal_id),
+                                    memory_id=memory_id,
+                                )
+                            )
+                            result = MemoryMutationResult(
+                                memory_id,
+                                "failed" if mutation_raised else "stale" if current is None else "failed",
+                                prior,
+                                self._scope_snapshot(current, allowed_project_id=allowed_project_id)
+                                if current is not None
+                                else None,
+                            )
                 results.append(result)
                 self._audit_mutation(authority, operation="delete", result=result)
         return MemoryMutationBatch("delete", tuple(results))
@@ -1247,6 +1334,27 @@ class WorkshopMemoryQueryService:
         allowed_project_id = await self._allowed_project_id(authority)
         resolved = memory.resolve_memory_scope(result.metadata)
         speaker, confidence = memory.read_time_memory_speaker(result.metadata)
+        provenance = memory.read_transcript_provenance(result.metadata)
+        if provenance.malformed:
+            source_reference = MemorySourceReference("invalid", None, None, None, None)
+        elif provenance.canonical_present:
+            source_reference = MemorySourceReference(
+                "canonical",
+                provenance.user_ts,
+                provenance.assistant_ts,
+                provenance.date,
+                provenance.date_end,
+            )
+        elif result.metadata.get("source") == "explicit":
+            source_reference = MemorySourceReference("explicit", None, None, None, None)
+        else:
+            source_reference = MemorySourceReference(
+                "legacy",
+                provenance.user_ts,
+                provenance.assistant_ts,
+                provenance.date,
+                provenance.date_end,
+            )
         episode = None
         if _record_kind(result) == "episode":
             episode = {}
@@ -1283,6 +1391,7 @@ class WorkshopMemoryQueryService:
                 maximum=256,
             ),
             episode=episode,
+            source_reference=source_reference,
         )
 
     async def search(
