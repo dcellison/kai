@@ -2537,23 +2537,49 @@ function ContextSection({
   action,
   children,
   className = "",
+  revealKey = 0,
+  revealReady = true,
+  revealTargetId = null,
   title,
 }: {
   action?: ReactNode;
   children: ReactNode;
   className?: string;
+  revealKey?: number;
+  revealReady?: boolean;
+  revealTargetId?: string | null;
   title: string;
 }): React.JSX.Element {
   const [open, setOpen] = useState(() => restoreContextSectionState()[title] ?? false);
+  const sectionRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
     setOpen(restoreContextSectionState()[title] ?? false);
   }, [title]);
 
+  useEffect(() => {
+    if (revealKey === 0) return;
+    if (!open) {
+      setOpen(true);
+      storeContextSectionState(title, true);
+      return;
+    }
+    if (!revealReady) return;
+    const target = revealTargetId
+      ? sectionRef.current?.querySelector<HTMLElement>(`#${revealTargetId}`)
+      : sectionRef.current;
+    target?.focus({ preventScroll: true });
+    const frame = window.requestAnimationFrame(() => {
+      target?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open, revealKey, revealReady, revealTargetId, title]);
+
   return (
     <details
       className={`context-section${className ? ` ${className}` : ""}`}
       open={open}
+      ref={sectionRef}
       onToggle={(event) => {
         const nextOpen = event.currentTarget.open;
         setOpen(nextOpen);
@@ -3263,7 +3289,7 @@ function WorkshopView({
     section?: "runtime" | null,
   ) => void;
   onSelectMemory: (memoryId: string | null) => void;
-  onSelectChannel: (channelId: string) => void;
+  onSelectChannel: (channelId: string) => Promise<void>;
   onSetReaction: (
     messageId: string,
     reaction: WorkshopReaction,
@@ -3358,6 +3384,10 @@ function WorkshopView({
   const [actionPaletteError, setActionPaletteError] = useState<string | null>(null);
   const [actionPaletteEntries, setActionPaletteEntries] =
     useState<WorkshopActionPaletteEntry[]>([]);
+  const [runtimeStatusReveal, setRuntimeStatusReveal] = useState({
+    agentId: null as string | null,
+    key: 0,
+  });
   const [channelCreation, setChannelCreation] = useState<{
     initialAgentIds: string[];
     originChannelId: string | null;
@@ -4345,16 +4375,15 @@ function WorkshopView({
     }
     if (operationId === "runtime.status.read") {
       if (!action.targetAgentId) throw new Error("Select an agent to inspect its runtime.");
-      const status = await onLoadRuntimeLaneStatus(action.targetAgentId);
-      return [
-        `Agent: ${status.agentName} (@${status.agentHandle})`,
-        `Backend: ${status.backend} · ${status.provider}`,
-        `Model: ${status.model.value}`,
-        `Workspace: ${status.workspaceLabel ?? "No shared workspace"}`,
-        `Provider session: ${status.providerSessionState.replaceAll("_", " ")}`,
-        `Continuity: ${status.continuityState.replaceAll("_", " ")}`,
-        `Process: ${status.processState}`,
-      ].join("\n");
+      setActionPaletteOpen(false);
+      if (auxiliaryWorkspaceOpen) {
+        await onSelectChannel(channelId);
+      }
+      setRuntimeStatusReveal((current) => ({
+        agentId: action.targetAgentId,
+        key: current.key + 1,
+      }));
+      return null;
     }
     if (operationId === "conversation.session.reset") {
       if (!action.targetAgentId) throw new Error("Select an agent to start a fresh session.");
@@ -6003,13 +6032,25 @@ function WorkshopView({
 
           {!humanDirect && <ContextSection
             className="trace-section"
+            revealKey={runtimeStatusReveal.key}
+            revealReady={runtimeStatusReveal.agentId === null || runtimeLaneStatuses.some(
+              (status) => status.agentId === runtimeStatusReveal.agentId,
+            )}
+            revealTargetId={runtimeStatusReveal.agentId
+              ? `runtime-status-${runtimeStatusReveal.agentId}`
+              : null}
             title="Runtime"
           >
             {runtimeLaneStatuses.length > 0 ? (
               <div className="runtime-lane-statuses">
                 {runtimeLaneStatuses.map((status) => {
                   const displayedRun = status.activeRun ?? status.lastRun;
-                  return <div className="runtime-settings" key={status.agentId}>
+                  return <div
+                    className="runtime-settings"
+                    id={`runtime-status-${status.agentId}`}
+                    key={status.agentId}
+                    tabIndex={-1}
+                  >
                     <div className="runtime-lane-heading">
                       <p className="settings-source">
                         {channel.kind === "group" ? status.agentName : "Agent runtime"}
@@ -6451,7 +6492,7 @@ function ActiveWorkshopClient({
   onOpenSettings: (section?: "github" | null) => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onRestoreDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
-  onSelectChannel: (channelId: string) => void;
+  onSelectChannel: (channelId: string) => Promise<void>;
   onSelectAgent: (
     definitionId: string | null,
     section?: "runtime" | null,
@@ -7535,7 +7576,7 @@ function WorkshopApp(): React.JSX.Element {
         onRestoreDirectMessage={(channelId, clientOperationId) =>
           changeWorkshopDirectMessageArchive(channelId, clientOperationId, "restore")
         }
-        onSelectChannel={(channelId) => void selectChannel(channelId)}
+        onSelectChannel={selectChannel}
         onSelectAgent={selectAgent}
         onSelectMemory={selectMemory}
         onSettingsDirtyChange={setSettingsDirty}

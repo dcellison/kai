@@ -2061,6 +2061,10 @@ describe("Workshop React client", () => {
 
   it("opens registry-backed help and actions from the keyboard and profile menu", async () => {
     const user = userEvent.setup();
+    vi.mocked(loadRuntimeLaneStatus).mockImplementation(async (_session, requestedAgentId) => ({
+      ...runtimeLaneStatus,
+      agentId: requestedAgentId ?? "agt_00000000000000000000000000000001",
+    }));
     sessionStorage.setItem(
       "kai.workshop.read-session.v1",
       JSON.stringify({ channelId, token: "existing-session" }),
@@ -2113,8 +2117,25 @@ describe("Workshop React client", () => {
     expect(within(palette).getByRole("option", { name: /Show runtime status/ }))
       .toHaveTextContent("Kai");
     await user.click(within(palette).getByRole("option", { name: /Show runtime status/ }));
-    expect(await within(palette).findByText(/Agent: Kai \(@kai\)/)).toBeVisible();
-    await user.click(within(palette).getByRole("option", { name: /Open memory/ }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Help and actions" })).not.toBeInTheDocument();
+    });
+    const runtimeHeading = await screen.findByText("Runtime", {
+      selector: ".context-section-title",
+    });
+    const runtimeSection = runtimeHeading.closest("details");
+    expect(runtimeSection).toBeInstanceOf(HTMLDetailsElement);
+    await waitFor(() => expect(runtimeSection).toHaveAttribute("open"));
+    await waitFor(() => {
+      expect(document.activeElement).toHaveAttribute(
+        "id",
+        "runtime-status-agt_00000000000000000000000000000001",
+      );
+    });
+
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    const reopenedPalette = await screen.findByRole("dialog", { name: "Help and actions" });
+    await user.click(within(reopenedPalette).getByRole("option", { name: /Open memory/ }));
     expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: "Daniel profile" }));
