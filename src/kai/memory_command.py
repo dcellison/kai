@@ -1,11 +1,12 @@
 """
 Telegram-facing surface for the `/memory` command (spec 310).
 
-Wraps the Mem0-backed memory store in a per-user browse, search, and
-forget UI. Every read and delete is scoped to the calling user's
-`chat_id` - there is no cross-user inspection. Every write path is
-guarded by an explicit confirmation step rendered as inline buttons,
-because deletions are irreversible.
+Presents the canonical memory query and mutation service as a Telegram
+browse, search, and management UI. Principal resolution, source
+admission, scope authorization, relevance policy, statistics, and
+mutations remain below the adapter boundary. Every destructive action
+is guarded by an explicit confirmation and the record revision that was
+displayed to the user.
 
 Architectural shape:
 - Pure builders (`_build_*`) take fixture data and return
@@ -13,47 +14,21 @@ Architectural shape:
   lets the unit tests assert on rendering without standing up an
   Update/Bot fixture or touching Mem0.
 - Top-level handlers (`handle_memory_command`,
-  `handle_memory_callback`) own the I/O: they fetch from `memory.py`,
-  call the builders, and dispatch send/edit calls to Telegram.
+  `handle_memory_callback`) own transport I/O only: they query
+  `WorkshopMemoryQueryService`, call the builders, and dispatch
+  send/edit calls to Telegram.
 - A module-level dict `_screen_cache` holds the per-chat navigation
   state. The cache is lazy-expired on every access - no background
   reaper task. Losing the cache on process restart is acceptable
   (spec 310 §7.4); the user just retypes `/memory`.
 
-Source filtering has three filter-site categories:
-
-  1. Multi-source admit list (`memory.USER_VISIBLE_SOURCES`, the
-     frozenset of `extracted`, `episode`, `migration`, `explicit`).
-     The data-
-     layer gate is canonical: `memory.get_by_id` and
-     `memory.get_by_tag` admit only those sources, and
-     `memory.delete_by_id` inherits the gate via its delegation.
-     The one UI-side reference is `_send_search`'s post-filter,
-     which exists because `memory.search` is a Mem0 vector lookup
-     that spans every source, including legacy `""`-source rows
-     that must not surface in the operator-facing UI. Both sites
-     read `USER_VISIBLE_SOURCES` from `memory.py` so a future
-     change to the admit list lives in one place.
-  2. Single-source enumeration: `memory.get_all_episodes`, scoped
-     to the literal `"episode"` source for the dashboard's episode-
-     list browser.
-  3. Multi-source enumeration scoped to the fact bucket:
-     `memory.get_all_facts`, scoped to `{"extracted", "migration",
-     "explicit"}` for the dashboard's facts-list browser. Narrower
-     than `USER_VISIBLE_SOURCES` (excludes episode), broader than
-     `get_all_episodes` (admits several sources). Episodes are
-     intentionally excluded because they have their own browser.
-
-Categories 2 and 3 do not participate in `USER_VISIBLE_SOURCES`:
-their purpose is enumeration, not multi-source admission. The
-duplication of source literals is deliberate so that a future
-change to the shared admit list cannot silently broaden either
-enumeration.
+Telegram's screen cache is presentation state only. It can select a
+button target for navigation, but canonical authority and optimistic
+revision checks are re-established by the service for every mutation.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -64,22 +39,32 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from kai import memory
-from kai.config import ONESHOT_REASONER_BACKENDS, Config, MemoryProjectConfig
+from kai.config import ONESHOT_REASONER_BACKENDS, Config
 from kai.history import (
     TranscriptContext,
     TranscriptLookup,
     TranscriptTurn,
-    fetch_transcript_context,
 )
 from kai.memory import (
     MemoryResult,
     MemoryStats,
     ResolvedMemoryScope,
     TranscriptProvenance,
-    read_transcript_provenance,
 )
-from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
 from kai.telegram_context import get_core_services
+from kai.workshop.memory_queries import (
+    MAX_PAGE_SIZE,
+    MemoryProjectOption,
+    MemoryQueryAuthority,
+    MemoryQueryFilters,
+    MemoryRecordDetail,
+    MemoryRecordSummary,
+    MemoryScopeSnapshot,
+    MemorySourceContext,
+    MemoryStatsSnapshot,
+    WorkshopMemoryNotFound,
+    WorkshopMemoryQueryService,
+)
 
 if TYPE_CHECKING:
     # Only used for type hints; importing at runtime would create a
@@ -164,6 +149,7 @@ class _ScreenCache:
     query: str | None = None
     return_to: tuple[str, list[str]] | None = None
     scope_targets: list[tuple[str, str | None]] = field(default_factory=list)
+    revision: str | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -171,6 +157,175 @@ class _ScreenCache:
 # overwritten on every fresh `/memory` invocation (spec §7.4). Keeps
 # memory bounded by chat count, not by historical screen count.
 _screen_cache: dict[int, _ScreenCache] = {}
+
+
+async def _canonical_memory_access(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[WorkshopMemoryQueryService, MemoryQueryAuthority]:
+    """Resolve a Telegram identity to the canonical memory authority."""
+    service = get_core_services(context).memory_queries
+    authority = await service.authority_for_transport_binding(
+        transport="telegram",
+        external_subject=str(_user_id(update)),
+        external_channel_id=str(_chat_id(update)),
+    )
+    return service, authority
+
+
+def _summary_result(record: MemoryRecordSummary, *, score: float = 0.0) -> MemoryResult:
+    """Adapt canonical result metadata to the legacy Telegram renderer shape."""
+    metadata: dict[str, object] = {
+        "source": record.source,
+        "type": record.memory_type,
+        "tags": list(record.tags),
+        "speaker": record.speaker,
+        "confidence": record.confidence,
+        "scope": record.scope.scope,
+        "project_id": record.scope.project_id,
+        "scope_confidence": record.scope.scope_confidence,
+        "scope_source": record.scope.scope_source,
+    }
+    if record.scope.legacy_defaulted:
+        metadata.pop("scope", None)
+        metadata.pop("project_id", None)
+    elif record.scope.invalid_defaulted:
+        metadata["scope"] = "invalid"
+    return MemoryResult(
+        id=record.memory_id,
+        text=record.preview,
+        score=score,
+        memory_type=record.memory_type,
+        metadata=metadata,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _detail_result(detail: MemoryRecordDetail) -> MemoryResult:
+    result = _summary_result(detail.record)
+    metadata = dict(result.metadata)
+    if detail.confirmation_quote is not None:
+        metadata["confirmation_quote"] = detail.confirmation_quote
+    if detail.prompt_version is not None:
+        metadata["prompt_version"] = detail.prompt_version
+    if detail.episode is not None:
+        metadata.update(detail.episode)
+    source = detail.source_reference
+    if source is not None and source.state == "canonical":
+        metadata.update(
+            {
+                "source_user_ts": source.source_user_ts,
+                "source_assistant_ts": source.source_assistant_ts,
+                "source_date": source.source_date,
+                "source_date_end": source.source_date_end,
+            }
+        )
+    return MemoryResult(
+        id=result.id,
+        text=detail.content,
+        score=result.score,
+        memory_type=result.memory_type,
+        metadata=metadata,
+        created_at=result.created_at,
+        updated_at=result.updated_at,
+    )
+
+
+def _scope_view_from_snapshot(
+    scope: MemoryScopeSnapshot,
+    projects: tuple[MemoryProjectOption, ...],
+) -> _ScopeView:
+    projects_by_id = {project.project_id: project.display_name for project in projects}
+    if scope.legacy_defaulted:
+        scope_label = "unresolved (quarantined)"
+    elif scope.invalid_defaulted:
+        scope_label = f"{scope.scope} (invalid, quarantined)"
+    elif scope.scope == memory.SCOPE_PROJECT:
+        project_id = scope.project_id
+        if project_id is None:
+            scope_label = "project (no project id)"
+        elif project_id in projects_by_id:
+            display_name = projects_by_id[project_id]
+            scope_label = (
+                f"project '{project_id}'" if display_name == project_id else f"project '{project_id}' ({display_name})"
+            )
+        else:
+            scope_label = f"project '{project_id}' (not available)"
+    else:
+        scope_label = scope.scope
+    retrievable_label = "yes" if scope.retrievable else f"no ({scope.exclusion_reason or 'not admitted'})"
+    return _ScopeView(
+        resolved=ResolvedMemoryScope(
+            scope=scope.scope,
+            project_id=scope.project_id,
+            workspace_root=None,
+            scope_confidence=scope.scope_confidence,
+            scope_source=scope.scope_source,
+            legacy_defaulted=scope.legacy_defaulted,
+            invalid_defaulted=scope.invalid_defaulted,
+        ),
+        scope_label=scope_label,
+        source_label=f"{scope.scope_source} (confidence {scope.scope_confidence:.2f})",
+        retrievable_label=retrievable_label,
+    )
+
+
+def _scope_targets_from_snapshot(
+    scope: MemoryScopeSnapshot,
+    projects: tuple[MemoryProjectOption, ...],
+) -> list[tuple[str, str | None]]:
+    targets: list[tuple[str, str | None]] = []
+    explicit_global = scope.scope == memory.SCOPE_GLOBAL and not scope.legacy_defaulted and not scope.invalid_defaulted
+    if not explicit_global:
+        targets.append(("global", None))
+    for project in projects:
+        if project.project_id == scope.project_id and not scope.invalid_defaulted:
+            continue
+        targets.append(("project", project.project_id))
+    return targets
+
+
+async def _all_records(
+    service: WorkshopMemoryQueryService,
+    authority: MemoryQueryAuthority,
+    *,
+    filters: MemoryQueryFilters,
+) -> list[MemoryRecordSummary]:
+    records: list[MemoryRecordSummary] = []
+    cursor: str | None = None
+    while True:
+        page = await service.list_records(
+            authority,
+            filters=filters,
+            limit=MAX_PAGE_SIZE,
+            cursor=cursor,
+        )
+        records.extend(page.records)
+        cursor = page.next_cursor
+        if cursor is None:
+            return records
+
+
+def _telegram_stats(stats: MemoryStatsSnapshot) -> MemoryStats:
+    """Adapt canonical statistics to the existing Telegram renderer."""
+    return MemoryStats(
+        total_count=stats.total,
+        by_type=stats.by_type,
+        extracted_count=stats.by_source.get("extracted", 0),
+        episode_count=stats.by_source.get("episode", 0),
+        migration_count=stats.by_source.get("migration", 0),
+        explicit_count=stats.by_source.get("explicit", 0),
+        by_tag=stats.by_tag,
+        confidence_min=stats.confidence_min,
+        confidence_median=stats.confidence_median,
+        confidence_max=stats.confidence_max,
+        confidence_below_0_7=stats.confidence_below_0_7,
+        confidence_below_0_6=stats.confidence_below_0_6,
+        confirmation_quote_count=stats.confirmation_quote_count,
+        by_prompt_version=stats.by_prompt_version,
+        by_scope=stats.by_scope,
+    )
 
 
 def _get_cache(chat_id: int) -> _ScreenCache | None:
@@ -380,26 +535,18 @@ def _browse_score(fact: MemoryResult) -> float:
 
 # ── Scope helpers ───────────────────────────────────────────────────
 #
-# Row-level scope inspection and correction. Reads go through
-# `memory.resolve_memory_scope` so legacy and corrupted rows render
-# their read-time interpretation (the same one retrieval acts on)
-# rather than echoing raw metadata. The retrievability verdict reuses
-# `memory._scoped_memory_admission_reason` - the exact admission rule
-# scoped retrieval applies - so the detail view can never disagree
-# with what scoped retrieval would do. Writes go through
-# `memory.build_scope_metadata` (validated shape, operator
-# provenance) merged over the row's existing metadata, because
-# `memory.update_metadata` replaces the metadata dict wholesale and
-# a partial dict would silently destroy every unlisted field.
+# Scope authority and retrievability arrive as canonical snapshots.
+# This module only turns those decisions into compact Telegram labels
+# and buttons.
 
 
 @dataclass(frozen=True)
 class _ScopeView:
     """Pre-rendered scope strings for the detail and scope screens.
 
-    Built once per render by `_build_scope_view` and passed into the
-    pure builders, so the builders stay free of registry and
-    detection I/O.
+    Built once per render from `MemoryScopeSnapshot` and passed into
+    the pure builders, so the builders stay free of authority and
+    project-registry I/O.
 
     Attributes:
         resolved: The row's read-time scope interpretation; kept so
@@ -422,140 +569,6 @@ class _ScopeView:
     scope_label: str
     source_label: str
     retrievable_label: str
-
-
-def _build_scope_view(
-    fact: MemoryResult,
-    registry: dict[str, MemoryProjectConfig],
-    active: ActiveMemoryProject | None,
-) -> _ScopeView:
-    """Resolve a row's scope into operator-facing display strings.
-
-    `registry` is the merged project registry (operator-pinned YAML
-    over chat-registered rows) and `active` is the project detected
-    for the caller's current workspace, or None. Both come from
-    `_scope_inputs`; tests can pass fixtures directly.
-
-    The retrievability verdict is always computed under scoped
-    admission because scoped retrieval is the only live recall path.
-
-    The allowed-project derivation mirrors scoped retrieval exactly:
-    project authority exists only when a project is detected AND has
-    memory enabled. Keeping the two predicates identical is what the
-    admission-parity guarantee rests on.
-    """
-    resolved = memory.resolve_memory_scope(fact.metadata)
-
-    # Scope label. Project rows render their id plus the registered
-    # display name when it differs; a project id that is no longer
-    # in the registry is flagged rather than hidden, because the row
-    # is still movable and the operator needs to see why it stopped
-    # being retrievable anywhere.
-    if resolved.legacy_defaulted:
-        scope_label = "unresolved (quarantined)"
-    elif resolved.invalid_defaulted:
-        scope_label = f"{resolved.scope} (invalid, quarantined)"
-    elif resolved.scope == memory.SCOPE_PROJECT:
-        pid = resolved.project_id
-        if pid is None:
-            scope_label = "project (no project id)"
-        elif pid in registry:
-            display = registry[pid].display_name
-            scope_label = f"project '{pid}'" if display == pid else f"project '{pid}' ({display})"
-        else:
-            scope_label = f"project '{pid}' (not registered)"
-    else:
-        scope_label = resolved.scope
-
-    source_label = f"{resolved.scope_source} (confidence {resolved.scope_confidence:.2f})"
-
-    # Retrievability verdict under scoped admission. Same
-    # allowed-project derivation and same admission rule as the live
-    # scoped retrieval path. The two enriched arms add the context an
-    # operator cannot reconstruct from the bare reason key (which two
-    # projects mismatched; whether "not allowed" means no project here
-    # or a disabled one).
-    allowed = active.project_id if active is not None and active.memory_enabled else None
-    reason = memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed)
-    if reason is None:
-        retrievable_label = "yes"
-    elif reason == memory._ADMISSION_PROJECT_ID_MISMATCH:
-        retrievable_label = f"no ({reason}: row '{resolved.project_id}', here '{allowed}')"
-    elif reason == memory._ADMISSION_PROJECT_SCOPE_NOT_ALLOWED:
-        detail = "project memory disabled here" if active is not None else "no active project here"
-        retrievable_label = f"no ({reason}: {detail})"
-    else:
-        retrievable_label = f"no ({reason})"
-
-    return _ScopeView(
-        resolved=resolved,
-        scope_label=scope_label,
-        source_label=source_label,
-        retrievable_label=retrievable_label,
-    )
-
-
-def _scope_change_targets(
-    resolved: ResolvedMemoryScope,
-    registry: dict[str, MemoryProjectConfig],
-) -> list[tuple[str, str | None]]:
-    """Derive the scope transitions offered for a row.
-
-    Returns (kind, project_id) tuples in render order: the global
-    target first when offered, then project targets sorted by id for
-    deterministic keyboards.
-
-    Rules:
-    - "Make global" is offered unless the row is already explicitly
-      global with valid provenance. Legacy-default and invalid rows
-      DO get the global target even though they already resolve to
-      global: applying it stamps explicit operator provenance, which
-      converts an auditable-debt row into a deliberate assignment.
-    - Every registered project is a move target except the row's own
-      project - unless the row is invalid-flagged, where re-assigning
-      the same project is meaningful because it repairs the broken
-      provenance while keeping the assignment.
-    """
-    targets: list[tuple[str, str | None]] = []
-    already_explicit_global = (
-        resolved.scope == memory.SCOPE_GLOBAL and not resolved.legacy_defaulted and not resolved.invalid_defaulted
-    )
-    if not already_explicit_global:
-        targets.append(("global", None))
-    for pid in sorted(registry):
-        if pid == resolved.project_id and not resolved.invalid_defaulted:
-            continue
-        targets.append(("project", pid))
-    return targets
-
-
-async def _scope_inputs(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-) -> tuple[dict[str, MemoryProjectConfig], ActiveMemoryProject | None]:
-    """Fetch the merged registry and the caller's active project.
-
-    The workspace comes from the subprocess pool's effective resolver
-    (the same per-user workspace scoped retrieval sees on the next
-    turn). Calling the resolver here rather than the sync getter
-    means the saved workspace gets restored eagerly when needed, so
-    /memory's scope detection lines up with the user's settings
-    instead of the home default the lazy pool would otherwise show.
-    A missing pool collapses to no-workspace semantics: no path
-    means no project authority, the same global-only posture scoped
-    retrieval takes for a None workspace.
-    """
-    config: Config = context.bot_data["config"]
-    canonical_principal_id = memory.canonical_memory_user_id(str(chat_id))
-    registry = merged_registry(
-        config.memory_projects,
-        principal_id=(canonical_principal_id if canonical_principal_id.startswith("prn_") else None),
-    )
-    pool: SubprocessPool | None = get_core_services(context).subprocess_pool
-    if pool is None:
-        return registry, None
-    workspace = await pool.get_effective_workspace(chat_id)
-    return registry, detect_active_memory_project(workspace, registry)
 
 
 # ── Transcript provenance helpers ───────────────────────────────────
@@ -1433,7 +1446,7 @@ def _build_search_results(
 
 
 # Display labels and render order for the fixed (non-project) scope
-# buckets emitted by `memory.get_stats`. Projects render between
+# buckets emitted by the canonical statistics service. Projects render between
 # global_legacy and task, sorted by count descending with id as the
 # tiebreaker, matching the prompt-version table's determinism rule.
 _SCOPE_BUCKET_ORDER: list[tuple[str, str]] = [
@@ -1804,8 +1817,8 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
         if verb == "ffc":
             # Forget single fact: confirm step for the fact id in the
             # payload. `_send_forget_fact_confirm` re-fetches through
-            # `get_by_id`, which re-verifies chat ownership for the
-            # tapping chat before anything renders.
+            # the canonical service, which re-verifies principal and
+            # source authority before anything renders.
             if not args:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
@@ -1820,17 +1833,28 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
             # the shared per-chat cache, and another authorized
             # user's navigation could swap the target between confirm
             # render and tap (the group-chat collision this guards).
-            # `delete_by_id` re-verifies ownership for this chat, so
-            # a forged or foreign id deletes nothing. The cache
-            # contributes only the return_to navigation hint.
+            # The canonical delete service re-verifies authority and
+            # the displayed revision, so a forged, foreign, or stale
+            # id deletes nothing. The cache contributes the expected
+            # revision and return_to navigation hint.
             if not args:
                 await _send_dashboard(update, context, chat_id, edit=True)
                 await query.answer(_MSG_SESSION_EXPIRED)
                 return
             memory_id = args[0]
             cache = _get_cache(chat_id)
+            if cache is None or cache.memory_ids != [memory_id] or cache.revision is None:
+                await _send_dashboard(update, context, chat_id, edit=True)
+                await query.answer(_MSG_SESSION_EXPIRED)
+                return
             return_to = cache.return_to if cache is not None else None
-            ok = memory.delete_by_id(user_id=str(chat_id), memory_id=memory_id)
+            service, authority = await _canonical_memory_access(update, context)
+            batch = await service.delete(
+                authority,
+                [memory_id],
+                expected_revisions={memory_id: cache.revision},
+            )
+            outcome = batch.results[0].outcome
             # Return to whatever screen the user was on before the
             # fact view. Episode list, facts list, or dashboard
             # fallback. The branches mirror the return_to encodings
@@ -1856,7 +1880,13 @@ async def handle_memory_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await _send_facts_list(update, context, chat_id, page, edit=True)
             else:
                 await _send_dashboard(update, context, chat_id, edit=True)
-            await query.answer("Forgotten." if ok else "Not found.")
+            answer = {
+                "succeeded": "Forgotten.",
+                "not_found": "Not found.",
+                "stale": "This memory changed; reopen it before deleting.",
+                "failed": "Delete failed.",
+            }[outcome]
+            await query.answer(answer)
             return
         if verb == "src":
             # Source view for the fact in cache. The fact id was
@@ -1964,9 +1994,10 @@ async def _send_dashboard(
 ) -> None:
     """Render and send/edit the dashboard."""
     try:
-        stats = memory.get_stats(user_id=str(chat_id))
+        service, authority = await _canonical_memory_access(update, context)
+        stats = _telegram_stats(await service.stats(authority))
     except Exception as exc:
-        log.exception("get_stats failed: %s", exc)
+        log.exception("canonical memory stats failed: %s", exc)
         await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     text, kb = _build_dashboard(stats)
@@ -1982,9 +2013,9 @@ async def _send_dashboard(
     config: Config = context.bot_data["config"]
     pool: SubprocessPool | None = get_core_services(context).subprocess_pool
     if pool is not None:
-        effective_backend = pool.get_backend_provider(chat_id)[0]
+        effective_backend = pool.get_backend_provider(_user_id(update))[0]
     else:
-        user_config = config.get_user_config(chat_id)
+        user_config = config.get_user_config(_user_id(update))
         effective_backend = user_config.backend if user_config and user_config.backend else config.default_backend
     if effective_backend not in ONESHOT_REASONER_BACKENDS:
         text += (
@@ -2009,15 +2040,21 @@ async def _send_episode_list(
 ) -> None:
     """Render and send/edit the episode list at `page` (issue #410).
 
-    Fetches via `memory.get_all_episodes`, builds via
+    Fetches canonical episode summaries, builds via
     `_build_episode_list_view`, and sets the cache screen to
     `"episodes"` so a fact opened from this list can route back to
     the same page via `_send_fact_view`'s return_to logic.
     """
     try:
-        episodes = memory.get_all_episodes(user_id=str(chat_id))
+        service, authority = await _canonical_memory_access(update, context)
+        records = await _all_records(
+            service,
+            authority,
+            filters=MemoryQueryFilters(kind="episode"),
+        )
+        episodes = [_summary_result(record) for record in records]
     except Exception as exc:
-        log.exception("get_all_episodes failed: %s", exc)
+        log.exception("canonical episode browse failed: %s", exc)
         await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     text, kb, memory_ids, clamped_page, _total = _build_episode_list_view(episodes, page)
@@ -2038,8 +2075,8 @@ async def _send_facts_list(
 ) -> None:
     """Render and send/edit the facts list at `page`.
 
-    Fetches via `memory.get_all_facts` (the fact-bucket enumeration
-    that folds extracted and migration), re-sorts when sort is
+    Fetches canonical fact summaries (folding extracted, migration,
+    and explicit sources), re-sorts when sort is
     "quality" (the default), builds via `_build_facts_list_view`,
     and sets the cache screen to `"facts"` so a fact opened from
     this list can route back to the same page via `_send_fact_view`'s
@@ -2061,9 +2098,15 @@ async def _send_facts_list(
     builder without inheriting the browse-time default.
     """
     try:
-        facts = memory.get_all_facts(user_id=str(chat_id))
+        service, authority = await _canonical_memory_access(update, context)
+        records = await _all_records(
+            service,
+            authority,
+            filters=MemoryQueryFilters(kind="fact"),
+        )
+        facts = [_summary_result(record) for record in records]
     except Exception as exc:
-        log.exception("get_all_facts failed: %s", exc)
+        log.exception("canonical fact browse failed: %s", exc)
         await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     if sort == "quality":
@@ -2093,10 +2136,8 @@ async def _send_fact_view(
 ) -> None:
     """Open the fact detail view by id.
 
-    Uses memory.get_by_id for an O(1) lookup with ownership + source
-    scoping baked in. Returns None covers all four "no such fact"
-    cases (missing, wrong user, non-extracted, fetch error); the UI
-    treats them identically.
+    Uses the canonical detail service, which re-establishes principal,
+    source, and scope authority before returning the record.
     """
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
@@ -2120,16 +2161,29 @@ async def _send_fact_view(
         # back into a search is not a v1 requirement.
         return_to = None
 
-    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
-    if fact is None:
-        # Race: fact deleted between cache write and tap, or any of the
-        # other not-found conditions get_by_id collapses (wrong user,
-        # non-extracted source, Mem0 fetch error).
+    try:
+        service, authority = await _canonical_memory_access(update, context)
+        detail = await service.detail(authority, memory_id)
+    except WorkshopMemoryNotFound:
+        # Race: fact deleted between cache write and tap, or another
+        # canonical not-found condition (wrong principal or hidden
+        # source).
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
-    registry, active = await _scope_inputs(context, chat_id)
-    scope_view = _build_scope_view(fact, registry, active)
-    provenance = read_transcript_provenance(fact.metadata)
+    fact = _detail_result(detail)
+    projects = await service.allowed_projects(authority)
+    scope_view = _scope_view_from_snapshot(detail.record.scope, projects)
+    source = detail.source_reference
+    provenance = TranscriptProvenance(
+        present=source is not None and source.state == "canonical",
+        chat_id=None,
+        date=source.source_date if source is not None else None,
+        user_ts=source.source_user_ts if source is not None else None,
+        user_text_sha256=None,
+        assistant_ts=source.source_assistant_ts if source is not None else None,
+        date_end=source.source_date_end if source is not None else None,
+        canonical_present=source is not None and source.state == "canonical",
+    )
     text, kb = _build_fact_view(fact, return_to, scope_view, provenance)
     # Cache holds only this fact's id: navigation state (the source
     # view resolves against it, and return_to rides here). The
@@ -2141,6 +2195,7 @@ async def _send_fact_view(
             screen="fact",
             memory_ids=[memory_id],
             return_to=return_to,
+            revision=detail.record.revision,
         ),
     )
     await _send_or_edit(update, text, kb, edit=True)
@@ -2154,13 +2209,17 @@ async def _send_forget_fact_confirm(
 ) -> None:
     """Render the forget-fact confirmation screen.
 
-    Uses memory.get_by_id for the same reason as _send_fact_view:
-    O(1) lookup with ownership/source scoping enforced once.
+    Uses the canonical detail service for the same reason as
+    _send_fact_view: ownership and source admission are enforced below
+    the adapter boundary.
     """
-    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
-    if fact is None:
+    try:
+        service, authority = await _canonical_memory_access(update, context)
+        detail = await service.detail(authority, memory_id)
+    except WorkshopMemoryNotFound:
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
+    fact = _detail_result(detail)
     text, kb = _build_forget_fact_confirm(fact)
     # The confirm and cancel buttons carry the fact id themselves;
     # the cache is refreshed only for the return_to navigation hint
@@ -2173,6 +2232,7 @@ async def _send_forget_fact_confirm(
             screen="forget_fact_confirm",
             memory_ids=[memory_id],
             return_to=return_to,
+            revision=detail.record.revision,
         ),
     )
     await _send_or_edit(update, text, kb, edit=True)
@@ -2192,7 +2252,38 @@ _SOURCE_FAILURE_MESSAGES: dict[str, str] = {
     "principal_mismatch": "This memory's source pointer does not match its canonical owner.",
     "provenance_invalid": "This memory has incomplete source metadata; refusing to dereference it.",
     "legacy": "This memory predates source tracking.",
+    "invalid_provenance": "This memory has incomplete source metadata; refusing to dereference it.",
+    "explicit_creation": "This memory was created explicitly and has no source conversation.",
+    "legacy_source": "This memory predates canonical source tracking.",
+    "source_not_authorized": "The source conversation is not available to this principal.",
+    "canonical_source_missing": "The canonical source messages are no longer available.",
 }
+
+
+def _build_canonical_source_view(
+    fact: MemoryResult,
+    source_context: MemorySourceContext,
+) -> tuple[str, InlineKeyboardMarkup]:
+    if source_context.status != "available" or source_context.source is None:
+        message = _SOURCE_FAILURE_MESSAGES.get(source_context.reason or "", "Source unavailable.")
+        body = f"Source\n\n{message}"
+    else:
+        lines = ["Source", "", f'For memory "{_truncate(fact.text, 60)}":', ""]
+        for source_message in (source_context.source, source_context.result):
+            if source_message is None:
+                continue
+            lines.extend(
+                [
+                    f"[{_format_source_ts(source_message.created_at)}] {source_message.author_display_name}:",
+                    _truncate_source_turn(source_message.body),
+                    "",
+                ]
+            )
+        body = "\n".join(lines).rstrip()
+    body = _truncate_to_message_limit(body)
+    return body, InlineKeyboardMarkup(
+        [[InlineKeyboardButton("back", callback_data=_encode_callback("fview", fact.id))]]
+    )
 
 
 def _build_source_view(
@@ -2259,25 +2350,15 @@ async def _send_source_view(
     between the fact view and the tap surfaces as the standard
     "no longer exists" body rather than a stale rendering.
     """
-    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
-    if fact is None:
+    try:
+        service, authority = await _canonical_memory_access(update, context)
+        detail = await service.detail(authority, memory_id)
+        source_context = await service.source_context(authority, memory_id)
+    except WorkshopMemoryNotFound:
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
-    provenance = read_transcript_provenance(fact.metadata)
-    # `expected_chat_id` enforces the ownership gate: Mem0's
-    # `get_by_id` partition verifies the row belongs to this chat,
-    # but the `source_chat_id` field on that row is just metadata
-    # the row carries; a malformed/forged value pointing at another
-    # chat would otherwise let this UI dereference an unrelated
-    # chat's JSONL. The helper returns chat_mismatch before any
-    # filesystem read on disagreement.
-    lookup = fetch_transcript_context(
-        provenance,
-        memory_id=memory_id,
-        expected_chat_id=chat_id,
-        expected_principal_id=memory.canonical_memory_user_id(str(chat_id)),
-    )
-    text, kb = _build_source_view(fact, lookup)
+    fact = _detail_result(detail)
+    text, kb = _build_canonical_source_view(fact, source_context)
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
     _set_cache(
@@ -2286,6 +2367,7 @@ async def _send_source_view(
             screen="source",
             memory_ids=[memory_id],
             return_to=return_to,
+            revision=detail.record.revision,
         ),
     )
     await _send_or_edit(update, text, kb, edit=True)
@@ -2304,13 +2386,16 @@ async def _send_scope_screen(
     screen always reflects the registry and the row as they are now,
     not as they were when the fact view was first opened.
     """
-    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
-    if fact is None:
+    try:
+        service, authority = await _canonical_memory_access(update, context)
+        detail = await service.detail(authority, memory_id)
+    except WorkshopMemoryNotFound:
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
-    registry, active = await _scope_inputs(context, chat_id)
-    scope_view = _build_scope_view(fact, registry, active)
-    targets = _scope_change_targets(scope_view.resolved, registry)
+    fact = _detail_result(detail)
+    projects = await service.allowed_projects(authority)
+    scope_view = _scope_view_from_snapshot(detail.record.scope, projects)
+    targets = _scope_targets_from_snapshot(detail.record.scope, projects)
     text, kb = _build_scope_screen(fact, scope_view, targets)
     # Preserve return_to so the eventual back-nav from the fact view
     # still lands on the originating list screen after a round trip
@@ -2324,6 +2409,7 @@ async def _send_scope_screen(
             memory_ids=[memory_id],
             return_to=return_to,
             scope_targets=targets,
+            revision=detail.record.revision,
         ),
     )
     await _send_or_edit(update, text, kb, edit=True)
@@ -2350,10 +2436,13 @@ async def _send_scope_confirm(
     and expires unless the chat is genuinely on this fact's scope
     flow, in which case re-rendering its confirm screen is correct.
     """
-    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
-    if fact is None:
+    try:
+        service, authority = await _canonical_memory_access(update, context)
+        detail = await service.detail(authority, memory_id)
+    except WorkshopMemoryNotFound:
         await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
         return
+    fact = _detail_result(detail)
     text, kb = _build_scope_confirm(fact, target, target_idx)
     cache = _get_cache(chat_id)
     return_to = cache.return_to if cache is not None else None
@@ -2365,6 +2454,7 @@ async def _send_scope_confirm(
             memory_ids=[memory_id],
             return_to=return_to,
             scope_targets=scope_targets,
+            revision=detail.record.revision,
         ),
     )
     await _send_or_edit(update, text, kb, edit=True)
@@ -2383,63 +2473,33 @@ async def _apply_scope_change(
     answers after this helper's sends complete, preserving the
     answer-after-send pattern).
 
-    Write shape: the row's existing metadata is copied and the five
-    scope keys are overlaid from `build_scope_metadata`, because
-    `memory.update_metadata` REPLACES the metadata dict wholesale -
-    passing only the scope keys would destroy tags, confidence,
-    episode fields, and every other stored field. Operator moves
-    carry `scope_source="operator"`, full confidence, and no
-    `workspace_root`: that field records write-time workspace
-    provenance, which a retarget from chat does not have.
+    The canonical service owns metadata preservation, project
+    authorization, optimistic revision validation, and mutation audit.
     """
-    fact = memory.get_by_id(user_id=str(chat_id), memory_id=memory_id)
-    if fact is None:
-        await _send_or_edit(update, "This memory no longer exists.", None, edit=True)
-        return "Not found."
-    old = memory.resolve_memory_scope(fact.metadata)
+    cache = _get_cache(chat_id)
+    if cache is None or cache.memory_ids != [memory_id] or cache.revision is None:
+        await _send_dashboard(update, context, chat_id, edit=True)
+        return _MSG_SESSION_EXPIRED
+    service, authority = await _canonical_memory_access(update, context)
     kind, pid = target
-    scope_md = memory.build_scope_metadata(
+    batch = await service.move_scope(
+        authority,
+        [memory_id],
         scope=memory.SCOPE_GLOBAL if kind == "global" else memory.SCOPE_PROJECT,
         project_id=pid,
-        scope_confidence=1.0,
-        scope_source=memory.SCOPE_SOURCE_OPERATOR,
+        expected_revisions={memory_id: cache.revision},
     )
-    merged = dict(fact.metadata or {})
-    merged.update(scope_md)
-    ok = memory.update_metadata(
-        user_id=str(chat_id),
-        memory_id=memory_id,
-        data=fact.text,
-        metadata=merged,
-    )
-    if ok:
-        # Structured audit line, one per applied change. The before
-        # values come from the resolver (not raw metadata) so legacy
-        # rows log the same global-interpretation retrieval acted on;
-        # scope_source after an operator move is always "operator",
-        # so only the before value is recorded.
-        log.info(
-            "%s %s",
-            memory.SCOPE_CHANGE_EVENT,
-            json.dumps(
-                {
-                    "memory_id": memory_id,
-                    "chat_id": chat_id,
-                    "from_scope": old.scope,
-                    "from_project_id": old.project_id,
-                    "from_scope_source": old.scope_source,
-                    "to_scope": scope_md["scope"],
-                    "to_project_id": scope_md["project_id"],
-                },
-                separators=(",", ":"),
-            ),
-        )
     # Re-render the fact view either way: on success it shows the new
     # scope block; on failure it re-fetches and shows whatever state
     # the row is actually in (including "no longer exists" if the row
     # vanished mid-flow).
     await _send_fact_view(update, context, chat_id, memory_id)
-    return "Scope updated." if ok else "Update failed."
+    return {
+        "succeeded": "Scope updated.",
+        "not_found": "Not found.",
+        "stale": "This memory changed; reopen it before changing scope.",
+        "failed": "Update failed.",
+    }[batch.results[0].outcome]
 
 
 async def _send_search(
@@ -2452,28 +2512,13 @@ async def _send_search(
     config: Config = context.bot_data["config"]
     floor = config.memory_search_floor
     try:
-        results = memory.search(query, user_id=str(chat_id), limit=_SEARCH_LIMIT)
+        service, authority = await _canonical_memory_access(update, context)
+        snapshot = await service.search(authority, query, limit=_SEARCH_LIMIT)
+        filtered = [_summary_result(hit.record, score=hit.raw_score) for hit in snapshot.hits]
     except Exception as exc:
-        log.exception("search failed: %s", exc)
+        log.exception("canonical memory search failed: %s", exc)
         await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=False)
         return
-    # Apply the floor in the UI path the same way `format_context`
-    # does (spec §7.5: one knob, two paths).
-    #
-    # Also enforce the user-visible source admit list here. Every
-    # other read path in this module (`get_by_tag`, `get_by_id`)
-    # filters at the data layer, but `memory.search` is a Mem0 vector
-    # lookup that spans every source, including legacy ""-source rows
-    # that must not surface in the operator-facing UI. Without this
-    # post-filter, a search hit could surface a non-user-visible row;
-    # tapping it would call `get_by_id`, fail the admit check, and
-    # render "This memory no longer exists." for a row the user just
-    # saw - confusing and wrong. Filtering here keeps the UI honest:
-    # what the user sees in results is what they can act on.
-    # `USER_VISIBLE_SOURCES` is read from `memory.py` so a future
-    # change to the
-    # admit list lives in one place.
-    filtered = [r for r in results if r.score >= floor and r.metadata.get("source") in memory.USER_VISIBLE_SOURCES]
     text, kb, memory_ids = _build_search_results(query, filtered, floor)
     _set_cache(
         chat_id,
@@ -2494,9 +2539,10 @@ async def _send_stats(
 ) -> None:
     """Render the stats screen."""
     try:
-        stats = memory.get_stats(user_id=str(chat_id))
+        service, authority = await _canonical_memory_access(update, context)
+        stats = _telegram_stats(await service.stats(authority))
     except Exception as exc:
-        log.exception("get_stats failed: %s", exc)
+        log.exception("canonical memory stats failed: %s", exc)
         await _send_or_edit(update, _MSG_QUERY_FAILED, None, edit=edit)
         return
     text, kb = _build_stats(stats)

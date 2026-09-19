@@ -12,7 +12,7 @@ import pytest
 
 from kai import memory
 from kai.config import Config, MemoryProjectConfig
-from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
+from kai.workshop.bootstrap import BootstrapHuman, BootstrapNotificationChannel, bootstrap_default_workshop
 from kai.workshop.conversation_commands import WorkshopConversationCommandService
 from kai.workshop.domain import (
     AgentId,
@@ -124,6 +124,68 @@ def test_authority_is_canonical_and_fails_closed(tmp_path: Path) -> None:
         service.authority_for_principal(PrincipalId("prn_" + "9" * 32))
     with pytest.raises(WorkshopMemoryAccessDenied):
         service.authority_for_principal("101")
+
+
+async def test_transport_authority_resolves_identity_and_current_channel_membership(tmp_path: Path) -> None:
+    store = await WorkshopEventStore.open(tmp_path / "kai.db")
+    try:
+        await bootstrap_default_workshop(
+            store,
+            (BootstrapHuman("Alice", "admin", "telegram", "101", "101", profile_id(101)),),
+            notification_channels=(BootstrapNotificationChannel("telegram", "-1001", ("101",)),),
+        )
+        async with store.connection.execute(
+            "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = '101'",
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        principal_id = PrincipalId(str(row[0]))
+        namespace = WorkshopExecutionStateNamespace(
+            principal_id=principal_id,
+            channel_id=ChannelId("chn_" + "2" * 32),
+            agent_id=AgentId("agt_" + "3" * 32),
+            runtime_profile_id=profile_id(101),
+            legacy_runtime_key=101,
+        )
+        service = WorkshopMemoryQueryService(
+            Config(
+                telegram_bot_token="unused",
+                allowed_user_ids=set(),
+                default_backend="codex",
+                default_model="gpt-5.6-sol",
+            ),
+            store,
+            _RuntimePool(tmp_path),  # type: ignore[arg-type]
+            WorkshopExecutionStateRegistry((namespace,)),
+        )
+
+        direct = await service.authority_for_transport_binding(
+            transport="telegram",
+            external_subject="101",
+            external_channel_id="101",
+        )
+        group = await service.authority_for_transport_binding(
+            transport="telegram",
+            external_subject="101",
+            external_channel_id="-1001",
+        )
+
+        assert direct.principal_id == principal_id
+        assert group.principal_id == principal_id
+        with pytest.raises(WorkshopMemoryAccessDenied):
+            await service.authority_for_transport_binding(
+                transport="telegram",
+                external_subject="101",
+                external_channel_id="unbound",
+            )
+        with pytest.raises(WorkshopMemoryAccessDenied):
+            await service.authority_for_transport_binding(
+                transport="telegram",
+                external_subject="unknown",
+                external_channel_id="101",
+            )
+    finally:
+        await store.close()
 
 
 async def test_management_projects_follow_canonical_workspace_authority(
@@ -435,6 +497,77 @@ async def test_delete_management_restricts_sources_and_reports_stale_targets(
 
     assert [result.outcome for result in batch.results] == ["succeeded", "not_found", "stale"]
     assert all(memory_id not in rows for memory_id in ("ok", "stale"))
+
+
+async def test_mutations_reject_displayed_revisions_that_are_no_longer_current(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, _ = _service(tmp_path)
+    original = _result("fact", "Original content")
+    current = _result("fact", "Changed content", created_at="2026-08-24T12:00:00Z")
+    rows = {"fact": original}
+    writes: list[str] = []
+
+    monkeypatch.setattr(memory, "get_by_id", lambda **kwargs: rows.get(kwargs["memory_id"]))
+    monkeypatch.setattr(
+        memory,
+        "update_metadata",
+        lambda **kwargs: writes.append(kwargs["memory_id"]) or True,
+    )
+    monkeypatch.setattr(
+        memory,
+        "delete_by_id",
+        lambda **kwargs: writes.append(kwargs["memory_id"]) or True,
+    )
+
+    displayed_revision = (await service.detail(authority, "fact")).record.revision
+    rows["fact"] = current
+
+    moved = await service.move_scope(
+        authority,
+        ["fact"],
+        scope="global",
+        expected_revisions={"fact": displayed_revision},
+    )
+    deleted = await service.delete(
+        authority,
+        ["fact"],
+        expected_revisions={"fact": displayed_revision},
+    )
+
+    assert moved.results[0].outcome == "stale"
+    assert deleted.results[0].outcome == "stale"
+    assert writes == []
+
+
+async def test_stats_exposes_one_canonical_detailed_distribution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, _ = _service(tmp_path)
+    confirmed = _result("confirmed", "Confirmed", tags=["decision"])
+    confirmed.metadata.update(
+        {
+            "confidence": 0.65,
+            "prompt_version": "v4",
+            "confirmation_quote": "yes",
+        }
+    )
+    episode = _result("episode", "Episode", source="episode")
+    hidden = _result("hidden", "Hidden", source="internal")
+    monkeypatch.setattr(memory, "get_all", lambda **_kwargs: [confirmed, episode, hidden])
+
+    stats = await service.stats(authority)
+
+    assert stats.total == 2
+    assert stats.by_source == {"episode": 1, "extracted": 1}
+    assert stats.by_tag == {"decision": 1}
+    assert stats.confidence_min == stats.confidence_median == stats.confidence_max == 0.65
+    assert stats.confidence_below_0_7 == 1
+    assert stats.confidence_below_0_6 == 0
+    assert stats.confirmation_quote_count == 1
+    assert stats.by_prompt_version == {"v4": 1}
 
 
 async def test_explicit_fact_creation_is_scoped_idempotent_and_content_free_in_audit(
