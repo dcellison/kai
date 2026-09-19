@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from typing import NamedTuple
 
 import pytest
 
+from kai.adapter_operation_bindings import bind_adapter_operation, workshop_route_name
 from kai.bot import _TELEGRAM_COMMAND_HANDLERS
+from kai.capability_boundaries import CANONICAL_SERVICE_BOUNDARIES
 from kai.capability_registry import (
     CAPABILITY_REGISTRY,
     AdapterDisposition,
@@ -27,6 +30,30 @@ from kai.capability_registry import (
     validate_capability_registry,
 )
 from kai.telegram_adapter import _TELEGRAM_COMMANDS
+
+
+class _SharedAdapterCase(NamedTuple):
+    operation_id: str
+    telegram_entrypoint: str
+    workshop_entrypoint: str
+
+
+@pytest.fixture(
+    params=(
+        _SharedAdapterCase("conversation.run.cancel", "stop", "run_cancel"),
+        _SharedAdapterCase("conversation.session.reset", "new", "runtime_fresh_session"),
+        _SharedAdapterCase("runtime.settings.manage", "settings", "runtime_settings_update"),
+        _SharedAdapterCase("workspace.catalogue.manage", "workspace", "active_workspace_update"),
+        _SharedAdapterCase("integration.github.manage", "github", "github_settings_update"),
+        _SharedAdapterCase("notification.delivery.manage", "notifications", "notification_preference_update"),
+        _SharedAdapterCase("preferences.manage", "preferences", "preferences_update"),
+        _SharedAdapterCase("voice.manage", "voice", "client_preference_update"),
+    ),
+    ids=lambda case: case.operation_id,
+)
+def shared_adapter_case(request: pytest.FixtureRequest) -> _SharedAdapterCase:
+    """Representative operations that both adapters must route canonically."""
+    return request.param
 
 
 def test_registry_accounts_for_every_registered_telegram_command() -> None:
@@ -83,6 +110,50 @@ def test_registry_definitions_have_complete_adapter_and_authority_metadata() -> 
         assert capability.authority_scope in AuthorityScope
         if capability.mutates_state:
             assert capability.idempotency.value != "none"
+
+
+def test_every_capability_names_a_registered_canonical_service_boundary() -> None:
+    assert {capability.canonical_service for capability in CAPABILITY_REGISTRY} <= set(CANONICAL_SERVICE_BOUNDARIES)
+
+
+def test_adapter_entrypoint_binding_rejects_unknown_or_unsupported_operations() -> None:
+    binding = bind_adapter_operation(AdapterId.WORKSHOP, "preferences.manage", "preferences_update")
+
+    assert binding.canonical_service == "preference_documents"
+    assert workshop_route_name("preferences.manage", "preferences_update") == (
+        "capability__preferences_manage__preferences_update"
+    )
+    with pytest.raises(KeyError, match="Unknown capability operation"):
+        bind_adapter_operation(AdapterId.WORKSHOP, "missing.operation", "missing")
+    with pytest.raises(ValueError, match="not implemented by telegram"):
+        bind_adapter_operation(AdapterId.TELEGRAM, "threads.manage", "threads")
+    with pytest.raises(ValueError, match="stable lowercase identifiers"):
+        bind_adapter_operation(AdapterId.WORKSHOP, "preferences.manage", "Preferences Update")
+
+
+def test_shared_adapter_operations_have_one_authority_and_effect_contract(
+    shared_adapter_case: _SharedAdapterCase,
+) -> None:
+    capability = capability_by_id(shared_adapter_case.operation_id)
+    telegram = bind_adapter_operation(
+        AdapterId.TELEGRAM,
+        shared_adapter_case.operation_id,
+        shared_adapter_case.telegram_entrypoint,
+    )
+    workshop = bind_adapter_operation(
+        AdapterId.WORKSHOP,
+        shared_adapter_case.operation_id,
+        shared_adapter_case.workshop_entrypoint,
+    )
+
+    # An adapter may render a different control or response, but credential
+    # resolution, failures, replay, state transitions, and emitted events all
+    # remain owned by this single canonical operation/service contract.
+    assert telegram.operation_id == workshop.operation_id == capability.operation_id
+    assert telegram.canonical_service == workshop.canonical_service == capability.canonical_service
+    assert capability.authority_scope in AuthorityScope
+    assert capability.mutates_state is True
+    assert capability.idempotency.value != "none"
 
 
 def test_reconciled_shared_operations_name_the_service_the_adapters_invoke() -> None:

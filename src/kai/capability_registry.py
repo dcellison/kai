@@ -1007,6 +1007,32 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         requirements=_AUTHENTICATED,
     ),
     _capability(
+        "context.principal_policy.manage",
+        "Principal policy",
+        "Inspect or change the principal-owned policy supplied to agents.",
+        "principal_policies",
+        AuthorityScope.PRINCIPAL,
+        telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
+        workshop=_workshop(WorkshopSurface.RUN_INSPECTOR),
+        mutates_state=True,
+        idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
+        revision_check=True,
+        requirements=_AUTHENTICATED,
+    ),
+    _capability(
+        "runtime.routing_policy.manage",
+        "Task routing policy",
+        "Inspect or change policy-bounded task routing for an agent runtime.",
+        "routing_policy",
+        AuthorityScope.PRINCIPAL_AGENT,
+        telegram=_telegram(disposition=AdapterDisposition.UNSUPPORTED_BY_DESIGN),
+        workshop=_workshop(WorkshopSurface.AGENT_SETTINGS),
+        mutates_state=True,
+        idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
+        revision_check=True,
+        requirements=(*_AUTHENTICATED, ContextRequirement.AGENT),
+    ),
+    _capability(
         "context.inspect",
         "Context inspector",
         "Inspect the redacted context sources used for an agent run.",
@@ -1046,6 +1072,14 @@ def validate_capability_registry(
         not item.operation_id or not item.label or not item.description or not item.canonical_service for item in items
     ):
         raise ValueError("Capability definitions require stable IDs and public metadata")
+
+    # Imported lazily to keep boundary metadata free to import registry helpers
+    # without creating a module-initialization cycle.
+    from kai.capability_boundaries import CANONICAL_SERVICE_BOUNDARIES
+
+    unknown_services = sorted({item.canonical_service for item in items} - set(CANONICAL_SERVICE_BOUNDARIES))
+    if unknown_services:
+        raise ValueError(f"Capability definitions name unknown canonical services: {unknown_services}")
 
     command_owners: dict[str, str] = {}
     for item in items:

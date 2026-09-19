@@ -6,6 +6,8 @@ import ast
 import importlib.util
 from pathlib import Path
 
+from kai.capability_boundaries import CANONICAL_SERVICE_BOUNDARIES
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src" / "kai"
 
@@ -23,6 +25,19 @@ _TELEGRAM_SDK_ADAPTERS = frozenset(
 _TELEGRAM_IMPLEMENTATION_MODULES = _TELEGRAM_SDK_ADAPTERS | {
     "kai.telegram_utils",
 }
+_WORKSHOP_PRESENTATION_MODULES = frozenset(
+    {
+        "kai.http_adapter",
+        "kai.webhook",
+        "kai.workshop.client_access",
+        "kai.workshop.client_api",
+        "kai.workshop.client_sessions",
+        "kai.workshop.client_shell",
+        "kai.workshop.telegram_delivery",
+        "kai.workshop.telegram_delivery_runtime",
+    }
+)
+_ADAPTER_FRAMEWORK_MODULES = _TELEGRAM_IMPLEMENTATION_MODULES | _WORKSHOP_PRESENTATION_MODULES
 
 
 def _module_name(path: Path) -> str:
@@ -107,3 +122,41 @@ def test_workshop_package_does_not_export_adapter_preview_types() -> None:
 
     assert "streaming_preview" not in source
     assert "TelegramStreamingPreview" not in source
+
+
+def test_registered_canonical_service_modules_exist_and_are_transport_neutral() -> None:
+    violations: list[str] = []
+    registered_modules = {module for boundary in CANONICAL_SERVICE_BOUNDARIES.values() for module in boundary.modules}
+    for module in sorted(registered_modules):
+        path = SOURCE_ROOT.parent.joinpath(*module.split(".")).with_suffix(".py")
+        if not path.is_file():
+            violations.append(f"{module} is missing")
+            continue
+        for imported in _imports(path):
+            if imported == "aiohttp" or imported.startswith("aiohttp."):
+                violations.append(f"{module} imports Workshop HTTP type {imported}")
+            if imported == "telegram" or imported.startswith("telegram."):
+                violations.append(f"{module} imports Telegram framework type {imported}")
+            if _is_module_or_child(imported, _ADAPTER_FRAMEWORK_MODULES):
+                violations.append(f"{module} imports adapter implementation {imported}")
+    assert violations == []
+
+
+def test_workshop_mutation_routes_must_name_a_registered_operation() -> None:
+    path = SOURCE_ROOT / "workshop" / "client_api.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    direct_mutation_methods = {"add_post", "add_put", "add_patch", "add_delete"}
+    violations: list[str] = []
+    registered_calls = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr in direct_mutation_methods:
+            violations.append(f"line {node.lineno} uses router.{node.func.attr} without an operation binding")
+        if isinstance(node.func, ast.Name) and node.func.id == "_register_workshop_capability_route":
+            registered_calls += 1
+            keyword_names = {keyword.arg for keyword in node.keywords}
+            if {"operation_id", "entrypoint"} - keyword_names:
+                violations.append(f"line {node.lineno} has an incomplete operation binding")
+    assert registered_calls >= 40
+    assert violations == []

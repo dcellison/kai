@@ -37,8 +37,9 @@ from telegram.ext import (
 )
 
 from kai import github_api, memory_command, review, sessions, webhook
+from kai.adapter_operation_bindings import bind_adapter_operation
 from kai.application_host import KaiCoreServices
-from kai.capability_registry import render_telegram_help
+from kai.capability_registry import AdapterId, render_telegram_help, telegram_command_inventory
 from kai.config import (
     DATA_DIR,
     OPEN_ENDED_PROVIDERS,
@@ -5291,6 +5292,8 @@ def create_bot(
     # added to the narrow exemption set.
     totp_exempt_commands = {"start", "help"}
     for command, callback in _TELEGRAM_COMMAND_HANDLERS:
+        operation_id = telegram_command_inventory()[command]
+        bind_adapter_operation(AdapterId.TELEGRAM, operation_id, command)
         registered_callback = (
             callback if command in totp_exempt_commands else _require_sensitive_authentication(callback)
         )
