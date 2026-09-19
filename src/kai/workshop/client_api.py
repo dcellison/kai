@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
 
+from kai.adapter_operation_bindings import workshop_route_name
 from kai.backend import FOREIGN_WORKSPACE_REMINDER, USER_MESSAGE_MARKER
 from kai.capability_registry import AdapterId, CapabilityContext, capability_availability
 from kai.context_authority import CONTEXT_AUTHORITY_CONTRACT
@@ -382,6 +383,27 @@ from kai.workshop.wake_policy import (
 )
 
 log = logging.getLogger(__name__)
+
+_WorkshopRouteHandler = Callable[[web.Request], Awaitable[web.StreamResponse]]
+
+
+def _register_workshop_capability_route(
+    app: web.Application,
+    method: str,
+    path: str,
+    handler: _WorkshopRouteHandler,
+    *,
+    operation_id: str,
+    entrypoint: str,
+) -> None:
+    """Register one Workshop route with a checked canonical operation name."""
+    app.router.add_route(
+        method,
+        path,
+        handler,
+        name=workshop_route_name(operation_id, entrypoint),
+    )
+
 
 _TIMELINE_PATH = "/v1/channels/{channel_id}/timeline"
 _CHANNEL_MESSAGE_PATH = "/v1/channels/{channel_id}/messages/{message_id}"
@@ -9941,7 +9963,14 @@ def register_workshop_read_routes(
 
         app.router.add_get(_SCHEDULED_JOBS_PATH, handle_scheduled_jobs)
         app.router.add_get(_SCHEDULED_JOB_PATH, handle_scheduled_job)
-        app.router.add_post(_SCHEDULED_JOB_CANCEL_PATH, handle_scheduled_job_cancel)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _SCHEDULED_JOB_CANCEL_PATH,
+            handle_scheduled_job_cancel,
+            operation_id="scheduled_jobs.manage",
+            entrypoint="scheduled_job_cancel",
+        )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_CLIENT_CAPABILITIES_PATH, handle_client_capabilities)
@@ -9949,30 +9978,131 @@ def register_workshop_read_routes(
     app.router.add_get(_CHANNEL_UNREAD_PATH, handle_channel_unread_snapshot)
     app.router.add_get(_CHANNEL_UNREAD_EVENTS_PATH, handle_channel_unread_event_stream)
     app.router.add_get(_CHANNEL_UNREAD_DETAIL_PATH, handle_channel_unread_detail)
-    app.router.add_post(_CHANNEL_READ_POSITION_PATH, handle_channel_read_position)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _CHANNEL_READ_POSITION_PATH,
+        handle_channel_read_position,
+        operation_id="activity.inbox.manage",
+        entrypoint="channel_read_position",
+    )
     app.router.add_get(_THREAD_UNREAD_PATH, handle_thread_unread)
     app.router.add_get(_FOLLOWED_THREADS_PATH, handle_followed_threads)
-    app.router.add_post(_THREAD_FOLLOW_PATH, handle_thread_follow)
-    app.router.add_post(_THREAD_UNFOLLOW_PATH, handle_thread_unfollow)
-    app.router.add_post(_THREAD_READ_POSITION_PATH, handle_thread_read_position)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _THREAD_FOLLOW_PATH,
+        handle_thread_follow,
+        operation_id="threads.manage",
+        entrypoint="thread_follow",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _THREAD_UNFOLLOW_PATH,
+        handle_thread_unfollow,
+        operation_id="threads.manage",
+        entrypoint="thread_unfollow",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _THREAD_READ_POSITION_PATH,
+        handle_thread_read_position,
+        operation_id="threads.manage",
+        entrypoint="thread_read_position",
+    )
     app.router.add_get(_HUMAN_NOTIFICATIONS_PATH, handle_human_notifications)
     app.router.add_get(_HUMAN_NOTIFICATION_COUNTS_PATH, handle_human_notification_counts)
     app.router.add_get(_HUMAN_NOTIFICATION_EVENTS_PATH, handle_human_notification_event_stream)
-    app.router.add_post(_HUMAN_NOTIFICATION_BULK_READ_PATH, handle_human_notification_bulk_read)
-    app.router.add_post(_HUMAN_NOTIFICATION_READ_PATH, handle_human_notification_read)
-    app.router.add_post(_HUMAN_NOTIFICATION_UNREAD_PATH, handle_human_notification_unread)
-    app.router.add_post(_CHANNEL_CREATION_PATH, handle_channel_creation)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _HUMAN_NOTIFICATION_BULK_READ_PATH,
+        handle_human_notification_bulk_read,
+        operation_id="activity.inbox.manage",
+        entrypoint="notification_bulk_read",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _HUMAN_NOTIFICATION_READ_PATH,
+        handle_human_notification_read,
+        operation_id="activity.inbox.manage",
+        entrypoint="notification_read",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _HUMAN_NOTIFICATION_UNREAD_PATH,
+        handle_human_notification_unread,
+        operation_id="activity.inbox.manage",
+        entrypoint="notification_unread",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _CHANNEL_CREATION_PATH,
+        handle_channel_creation,
+        operation_id="channels.manage",
+        entrypoint="channel_create",
+    )
     app.router.add_get(_WORKSHOP_HUMANS_PATH, handle_workshop_humans)
-    app.router.add_post(_HUMAN_CONVERSATION_PATH, handle_human_conversation_start)
-    app.router.add_post(_CHANNEL_ARCHIVAL_PATH, handle_channel_archival)
-    app.router.add_post(_CHANNEL_RESTORATION_PATH, handle_channel_restoration)
-    app.router.add_post(_DIRECT_MESSAGE_ARCHIVAL_PATH, handle_direct_message_archival)
-    app.router.add_post(_DIRECT_MESSAGE_RESTORATION_PATH, handle_direct_message_restoration)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _HUMAN_CONVERSATION_PATH,
+        handle_human_conversation_start,
+        operation_id="direct_messages.manage",
+        entrypoint="human_conversation_start",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _CHANNEL_ARCHIVAL_PATH,
+        handle_channel_archival,
+        operation_id="channels.manage",
+        entrypoint="channel_archive",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _CHANNEL_RESTORATION_PATH,
+        handle_channel_restoration,
+        operation_id="channels.manage",
+        entrypoint="channel_restore",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _DIRECT_MESSAGE_ARCHIVAL_PATH,
+        handle_direct_message_archival,
+        operation_id="direct_messages.manage",
+        entrypoint="direct_message_archive",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _DIRECT_MESSAGE_RESTORATION_PATH,
+        handle_direct_message_restoration,
+        operation_id="direct_messages.manage",
+        entrypoint="direct_message_restore",
+    )
     app.router.add_get(_CHANNEL_MEMBERS_PATH, handle_channel_members)
-    app.router.add_post(_CHANNEL_MEMBER_ADDITION_PATH, handle_channel_member_addition)
-    app.router.add_post(_CHANNEL_MEMBER_REMOVAL_PATH, handle_channel_member_removal)
-    app.router.add_post(_AGENT_ATTACHMENT_PATH, handle_channel_agent_attachment)
-    app.router.add_post(_AGENT_DETACHMENT_PATH, handle_channel_agent_detachment)
+    for path, handler, entrypoint in (
+        (_CHANNEL_MEMBER_ADDITION_PATH, handle_channel_member_addition, "channel_member_add"),
+        (_CHANNEL_MEMBER_REMOVAL_PATH, handle_channel_member_removal, "channel_member_remove"),
+        (_AGENT_ATTACHMENT_PATH, handle_channel_agent_attachment, "channel_agent_attach"),
+        (_AGENT_DETACHMENT_PATH, handle_channel_agent_detachment, "channel_agent_detach"),
+    ):
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            path,
+            handler,
+            operation_id="channels.participants.manage",
+            entrypoint=entrypoint,
+        )
     if standing_participation is not None:
 
         async def handle_channel_standing_participation(request: web.Request) -> web.Response:
@@ -9992,20 +10122,58 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
-        app.router.add_put(_CHANNEL_STANDING_PARTICIPATION_PATH, handle_channel_standing_participation)
-        app.router.add_post(_CHANNEL_STANDING_OBSERVATION_RESUME_PATH, handle_standing_observation_resume)
+        _register_workshop_capability_route(
+            app,
+            "PUT",
+            _CHANNEL_STANDING_PARTICIPATION_PATH,
+            handle_channel_standing_participation,
+            operation_id="channels.standing_participation.manage",
+            entrypoint="standing_policy_update",
+        )
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _CHANNEL_STANDING_OBSERVATION_RESUME_PATH,
+            handle_standing_observation_resume,
+            operation_id="channels.standing_participation.manage",
+            entrypoint="standing_observation_resume",
+        )
     if agent_creation_options is not None:
         app.router.add_get(_AGENT_CREATION_OPTIONS_PATH, handle_agent_creation_options)
     if agent_provisioning is not None:
         app.router.add_get(_AGENT_PROVISIONING_PATH, handle_agent_provisioning_list)
-        app.router.add_post(_AGENT_PROVISIONING_PATH, handle_agent_provisioning)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _AGENT_PROVISIONING_PATH,
+            handle_agent_provisioning,
+            operation_id="agents.manage",
+            entrypoint="agent_provision",
+        )
     app.router.add_get(_AGENT_DEFINITIONS_PATH, handle_agent_definition_list)
-    app.router.add_post(_AGENT_DEFINITIONS_PATH, handle_agent_definition_create)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _AGENT_DEFINITIONS_PATH,
+        handle_agent_definition_create,
+        operation_id="agents.manage",
+        entrypoint="agent_create",
+    )
     app.router.add_get(_AGENT_EVENTS_PATH, handle_agent_event_stream)
     app.router.add_get(_AGENT_DEFINITION_PATH, handle_agent_definition_detail)
-    app.router.add_post(_AGENT_REVISIONS_PATH, handle_agent_revision_create)
-    app.router.add_post(_AGENT_ACTIVATION_PATH, handle_agent_activation)
-    app.router.add_post(_AGENT_ARCHIVAL_PATH, handle_agent_archival)
+    for path, handler, entrypoint in (
+        (_AGENT_REVISIONS_PATH, handle_agent_revision_create, "agent_revision_create"),
+        (_AGENT_ACTIVATION_PATH, handle_agent_activation, "agent_activate"),
+        (_AGENT_ARCHIVAL_PATH, handle_agent_archival, "agent_archive"),
+    ):
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            path,
+            handler,
+            operation_id="agents.manage",
+            entrypoint=entrypoint,
+        )
     if collaboration_policy is not None:
 
         async def handle_agent_collaboration_policy(request: web.Request) -> web.Response:
@@ -10025,8 +10193,22 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_AGENT_COLLABORATION_POLICY_PATH, handle_agent_collaboration_policy)
-        app.router.add_put(_AGENT_COLLABORATION_POLICY_PATH, handle_agent_collaboration_policy)
-        app.router.add_post(_AGENT_COLLABORATION_REVOKE_PATH, handle_agent_collaboration_revoke)
+        _register_workshop_capability_route(
+            app,
+            "PUT",
+            _AGENT_COLLABORATION_POLICY_PATH,
+            handle_agent_collaboration_policy,
+            operation_id="agents.manage",
+            entrypoint="agent_collaboration_policy",
+        )
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _AGENT_COLLABORATION_REVOKE_PATH,
+            handle_agent_collaboration_revoke,
+            operation_id="agents.manage",
+            entrypoint="agent_collaboration_revoke",
+        )
     if agent_enablement is not None:
 
         async def handle_agent_enablement_list(request: web.Request) -> web.Response:
@@ -10063,13 +10245,34 @@ def register_workshop_read_routes(
 
         app.router.add_get(_AGENT_ENABLEMENTS_PATH, handle_agent_enablement_list)
         app.router.add_get(_AGENT_ENABLEMENT_PATH, handle_agent_enablement_detail)
-        app.router.add_post(_AGENT_ENABLE_PATH, handle_agent_enable)
-        app.router.add_post(_AGENT_CONVERSATION_START_PATH, handle_agent_conversation_start)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _AGENT_ENABLE_PATH,
+            handle_agent_enable,
+            operation_id="agents.manage",
+            entrypoint="agent_enable",
+        )
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _AGENT_CONVERSATION_START_PATH,
+            handle_agent_conversation_start,
+            operation_id="agents.manage",
+            entrypoint="agent_conversation_start",
+        )
     app.router.add_get(_TIMELINE_PATH, handle_channel_timeline)
     app.router.add_get(_CHANNEL_MESSAGE_PATH, handle_channel_message)
     app.router.add_get(_THREAD_TIMELINE_PATH, handle_thread_timeline)
     app.router.add_get(_TIMELINE_EVENTS_PATH, handle_channel_event_stream)
-    app.router.add_put(_MESSAGE_REACTIONS_PATH, handle_message_reaction)
+    _register_workshop_capability_route(
+        app,
+        "PUT",
+        _MESSAGE_REACTIONS_PATH,
+        handle_message_reaction,
+        operation_id="reactions.manage",
+        entrypoint="message_reaction",
+    )
     app.router.add_get(_MESSAGE_REACTORS_PATH, handle_message_reactors)
 
     async def handle_human_profile(request: web.Request) -> web.Response:
@@ -10091,7 +10294,14 @@ def register_workshop_read_routes(
             )
 
     app.router.add_get(_HUMAN_PROFILE_PATH, handle_human_profile)
-    app.router.add_patch(_HUMAN_PROFILE_PATH, handle_human_profile_update)
+    _register_workshop_capability_route(
+        app,
+        "PATCH",
+        _HUMAN_PROFILE_PATH,
+        handle_human_profile_update,
+        operation_id="profile.manage",
+        entrypoint="profile_update",
+    )
     if human_avatars is not None:
 
         async def handle_human_avatar(request: web.Request) -> web.Response:
@@ -10127,8 +10337,22 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_HUMAN_AVATAR_PATH, handle_human_avatar)
-        app.router.add_post(_HUMAN_AVATAR_PATH, handle_human_avatar_upload)
-        app.router.add_delete(_HUMAN_AVATAR_PATH, handle_human_avatar_clear)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _HUMAN_AVATAR_PATH,
+            handle_human_avatar_upload,
+            operation_id="profile.manage",
+            entrypoint="avatar_upload",
+        )
+        _register_workshop_capability_route(
+            app,
+            "DELETE",
+            _HUMAN_AVATAR_PATH,
+            handle_human_avatar_clear,
+            operation_id="profile.manage",
+            entrypoint="avatar_clear",
+        )
         app.router.add_get(_PRINCIPAL_AVATAR_PATH, handle_principal_avatar)
     if preference_documents is not None:
 
@@ -10165,9 +10389,23 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_PREFERENCES_PATH, handle_preference_document)
-        app.router.add_put(_PREFERENCES_PATH, handle_preference_update)
+        _register_workshop_capability_route(
+            app,
+            "PUT",
+            _PREFERENCES_PATH,
+            handle_preference_update,
+            operation_id="preferences.manage",
+            entrypoint="preferences_update",
+        )
         app.router.add_get(_PREFERENCE_REVISIONS_PATH, handle_preference_history)
-        app.router.add_post(_PREFERENCE_RESTORE_PATH, handle_preference_restore)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _PREFERENCE_RESTORE_PATH,
+            handle_preference_restore,
+            operation_id="preferences.manage",
+            entrypoint="preferences_restore",
+        )
     if principal_policies is not None:
 
         async def handle_principal_policy_document(request: web.Request) -> web.Response:
@@ -10187,7 +10425,14 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_PRINCIPAL_POLICY_PATH, handle_principal_policy_document)
-        app.router.add_put(_PRINCIPAL_POLICY_PATH, handle_principal_policy_update)
+        _register_workshop_capability_route(
+            app,
+            "PUT",
+            _PRINCIPAL_POLICY_PATH,
+            handle_principal_policy_update,
+            operation_id="context.principal_policy.manage",
+            entrypoint="principal_policy_update",
+        )
     if github_settings is not None:
 
         async def handle_github_settings(request: web.Request) -> web.Response:
@@ -10207,7 +10452,14 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_GITHUB_SETTINGS_PATH, handle_github_settings)
-        app.router.add_patch(_GITHUB_SETTINGS_PATH, handle_github_settings_update)
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
+            _GITHUB_SETTINGS_PATH,
+            handle_github_settings_update,
+            operation_id="integration.github.manage",
+            entrypoint="github_settings_update",
+        )
     if notification_preferences is not None:
 
         async def handle_notification_preferences(request: web.Request) -> web.Response:
@@ -10230,9 +10482,13 @@ def register_workshop_read_routes(
             _NOTIFICATION_PREFERENCES_PATH,
             handle_notification_preferences,
         )
-        app.router.add_patch(
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
             _NOTIFICATION_PREFERENCES_PATH,
             handle_notification_preference_update,
+            operation_id="notification.delivery.manage",
+            entrypoint="notification_preference_update",
         )
     if channel_notification_policy is not None:
 
@@ -10253,9 +10509,13 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_CHANNEL_NOTIFICATION_POLICY_PATH, handle_channel_notification_policy)
-        app.router.add_patch(
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
             _CHANNEL_NOTIFICATION_POLICY_PATH,
             handle_channel_notification_policy_update,
+            operation_id="notification.delivery.manage",
+            entrypoint="channel_notification_policy_update",
         )
     if client_preferences is not None:
 
@@ -10276,7 +10536,14 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_CLIENT_PREFERENCES_PATH, handle_client_preferences)
-        app.router.add_patch(_CLIENT_PREFERENCES_PATH, handle_client_preference_update)
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
+            _CLIENT_PREFERENCES_PATH,
+            handle_client_preference_update,
+            operation_id="voice.manage",
+            entrypoint="client_preference_update",
+        )
     if appearance_preferences is not None:
 
         async def handle_appearance_preferences(request: web.Request) -> web.Response:
@@ -10296,9 +10563,13 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_APPEARANCE_PREFERENCES_PATH, handle_appearance_preferences)
-        app.router.add_patch(
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
             _APPEARANCE_PREFERENCES_PATH,
             handle_appearance_preference_update,
+            operation_id="appearance.manage",
+            entrypoint="appearance_preference_update",
         )
     if artifact_service is not None:
 
@@ -10319,7 +10590,14 @@ def register_workshop_read_routes(
             )
 
         app.router.add_get(_ARTIFACT_CONTENT_PATH, handle_artifact_content)
-        app.router.add_post(_ARTIFACT_DOWNLOAD_PATH, handle_artifact_download)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _ARTIFACT_DOWNLOAD_PATH,
+            handle_artifact_download,
+            operation_id="artifacts.read",
+            entrypoint="artifact_download",
+        )
     if runtime_lane_status is not None:
 
         async def handle_runtime_lane_status(request: web.Request) -> web.Response:
@@ -10339,9 +10617,13 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_RUNTIME_LANE_STATUS_PATH, handle_runtime_lane_status)
-        app.router.add_post(
+        _register_workshop_capability_route(
+            app,
+            "POST",
             _RUNTIME_LANE_FRESH_SESSION_PATH,
             handle_runtime_lane_fresh_session,
+            operation_id="conversation.session.reset",
+            entrypoint="runtime_fresh_session",
         )
     if settings_workspaces is not None:
 
@@ -10483,39 +10765,110 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_RUNTIME_SETTINGS_PATH, handle_runtime_settings)
-        app.router.add_patch(
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
             _RUNTIME_SETTINGS_PATH,
             handle_runtime_settings_update,
+            operation_id="runtime.settings.manage",
+            entrypoint="runtime_settings_update",
         )
         app.router.add_get(_MODEL_CATALOGUE_PATH, handle_model_catalogue)
-        app.router.add_post(_MODEL_CATALOGUE_PATH, handle_model_catalogue_refresh)
-        app.router.add_put(_MODEL_CATALOGUE_PATH, handle_model_catalogue_operator_upsert)
-        app.router.add_delete(_MODEL_CATALOGUE_PATH, handle_model_catalogue_operator_deactivate)
-        app.router.add_post(
-            _MODEL_CATALOGUE_ADMIN_REFRESH_PATH,
-            handle_model_catalogue_refresh_all,
-        )
-        app.router.add_post(_ACTIVE_WORKSPACE_PATH, handle_active_workspace_update)
-        app.router.add_post(_WORKSPACE_COLLECTION_PATH, handle_workspace_creation)
-        app.router.add_delete(_WORKSPACE_COLLECTION_PATH, handle_workspace_deletion)
+        for method, path, handler, entrypoint in (
+            ("POST", _MODEL_CATALOGUE_PATH, handle_model_catalogue_refresh, "model_catalogue_refresh"),
+            ("PUT", _MODEL_CATALOGUE_PATH, handle_model_catalogue_operator_upsert, "model_operator_upsert"),
+            (
+                "DELETE",
+                _MODEL_CATALOGUE_PATH,
+                handle_model_catalogue_operator_deactivate,
+                "model_operator_deactivate",
+            ),
+            (
+                "POST",
+                _MODEL_CATALOGUE_ADMIN_REFRESH_PATH,
+                handle_model_catalogue_refresh_all,
+                "model_catalogue_refresh_all",
+            ),
+        ):
+            _register_workshop_capability_route(
+                app,
+                method,
+                path,
+                handler,
+                operation_id="runtime.model.manage",
+                entrypoint=entrypoint,
+            )
+        for method, path, handler, entrypoint in (
+            ("POST", _ACTIVE_WORKSPACE_PATH, handle_active_workspace_update, "active_workspace_update"),
+            ("POST", _WORKSPACE_COLLECTION_PATH, handle_workspace_creation, "workspace_create"),
+            ("DELETE", _WORKSPACE_COLLECTION_PATH, handle_workspace_deletion, "workspace_delete"),
+        ):
+            _register_workshop_capability_route(
+                app,
+                method,
+                path,
+                handler,
+                operation_id="workspace.catalogue.manage",
+                entrypoint=entrypoint,
+            )
         app.router.add_get(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
-        app.router.add_post(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
-        app.router.add_delete(_WORKSPACE_GRANTS_PATH, handle_workspace_grants)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _WORKSPACE_GRANTS_PATH,
+            handle_workspace_grants,
+            operation_id="workspace.catalogue.manage",
+            entrypoint="workspace_grant_add",
+        )
+        _register_workshop_capability_route(
+            app,
+            "DELETE",
+            _WORKSPACE_GRANTS_PATH,
+            handle_workspace_grants,
+            operation_id="workspace.catalogue.manage",
+            entrypoint="workspace_grant_remove",
+        )
         app.router.add_get(_MEMORY_PROJECTS_PATH, handle_memory_projects)
-        app.router.add_post(_MEMORY_PROJECTS_PATH, handle_memory_projects)
-        app.router.add_delete(_MEMORY_PROJECT_PATH, handle_memory_project_removal)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _MEMORY_PROJECTS_PATH,
+            handle_memory_projects,
+            operation_id="workspace.memory_project.manage",
+            entrypoint="memory_project_register",
+        )
+        _register_workshop_capability_route(
+            app,
+            "DELETE",
+            _MEMORY_PROJECT_PATH,
+            handle_memory_project_removal,
+            operation_id="workspace.memory_project.manage",
+            entrypoint="memory_project_unregister",
+        )
         app.router.add_get(_WORKSPACE_CONFIG_PATH, handle_workspace_config)
-        app.router.add_patch(
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
             _WORKSPACE_CONFIG_PATH,
             handle_workspace_config_update,
+            operation_id="workspace.catalogue.manage",
+            entrypoint="workspace_config_update",
         )
-        app.router.add_put(
+        _register_workshop_capability_route(
+            app,
+            "PUT",
             _WORKSPACE_ENVIRONMENT_PATH,
             handle_workspace_environment_update,
+            operation_id="workspace.catalogue.manage",
+            entrypoint="workspace_environment_set",
         )
-        app.router.add_delete(
+        _register_workshop_capability_route(
+            app,
+            "DELETE",
             _WORKSPACE_ENVIRONMENT_PATH,
             handle_workspace_environment_update,
+            operation_id="workspace.catalogue.manage",
+            entrypoint="workspace_environment_remove",
         )
     if routing_eligibility is not None:
 
@@ -10539,7 +10892,14 @@ def register_workshop_read_routes(
                 )
 
         app.router.add_get(_ROUTING_POLICY_PATH, handle_routing_policy)
-        app.router.add_patch(_ROUTING_POLICY_PATH, handle_routing_policy)
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
+            _ROUTING_POLICY_PATH,
+            handle_routing_policy,
+            operation_id="runtime.routing_policy.manage",
+            entrypoint="routing_policy_update",
+        )
     if memory_queries is not None:
 
         async def handle_memory_stats(request: web.Request) -> web.Response:
@@ -10638,15 +10998,39 @@ def register_workshop_read_routes(
 
         app.router.add_get(_MEMORY_STATS_PATH, handle_memory_stats)
         app.router.add_get(_MEMORY_RECORDS_PATH, handle_memory_records)
-        app.router.add_post(_MEMORY_RECORDS_PATH, handle_memory_create)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _MEMORY_RECORDS_PATH,
+            handle_memory_create,
+            operation_id="memory.manage",
+            entrypoint="memory_create",
+        )
         app.router.add_get(_MEMORY_SEARCH_PATH, handle_memory_search)
         app.router.add_get(_MEMORY_DETAIL_PATH, handle_memory_detail)
-        app.router.add_patch(_MEMORY_DETAIL_PATH, handle_memory_edit)
+        _register_workshop_capability_route(
+            app,
+            "PATCH",
+            _MEMORY_DETAIL_PATH,
+            handle_memory_edit,
+            operation_id="memory.manage",
+            entrypoint="memory_edit",
+        )
         app.router.add_get(_MEMORY_SOURCE_PATH, handle_memory_source)
-        app.router.add_patch(_MEMORY_SCOPE_PATH, handle_memory_scope_mutation)
-        app.router.add_delete(_MEMORY_DETAIL_PATH, handle_memory_delete_mutation)
-        app.router.add_post(_MEMORY_BULK_SCOPE_PATH, handle_memory_bulk_scope_mutation)
-        app.router.add_post(_MEMORY_BULK_DELETE_PATH, handle_memory_bulk_delete_mutation)
+        for method, path, handler, entrypoint in (
+            ("PATCH", _MEMORY_SCOPE_PATH, handle_memory_scope_mutation, "memory_scope_update"),
+            ("DELETE", _MEMORY_DETAIL_PATH, handle_memory_delete_mutation, "memory_delete"),
+            ("POST", _MEMORY_BULK_SCOPE_PATH, handle_memory_bulk_scope_mutation, "memory_bulk_scope"),
+            ("POST", _MEMORY_BULK_DELETE_PATH, handle_memory_bulk_delete_mutation, "memory_bulk_delete"),
+        ):
+            _register_workshop_capability_route(
+                app,
+                method,
+                path,
+                handler,
+                operation_id="memory.manage",
+                entrypoint=entrypoint,
+            )
 
 
 def register_workshop_enrollment_routes(
@@ -10666,7 +11050,14 @@ def register_workshop_enrollment_routes(
             request_lock=request_lock,
         )
 
-    app.router.add_post(_ENROLLMENT_REDEMPTION_PATH, handle_enrollment_redemption)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _ENROLLMENT_REDEMPTION_PATH,
+        handle_enrollment_redemption,
+        operation_id="onboarding.start",
+        entrypoint="enrollment_redeem",
+    )
 
 
 def register_workshop_command_routes(
@@ -10742,9 +11133,30 @@ def register_workshop_command_routes(
             request_lock=request_lock,
         )
 
-    app.router.add_post(_COMMAND_SUBMISSION_PATH, handle_command_submission)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _COMMAND_SUBMISSION_PATH,
+        handle_command_submission,
+        operation_id="conversation.message.send",
+        entrypoint="command_submit",
+    )
     app.router.add_get(_RUN_STATE_PATH, handle_run_state)
     app.router.add_get(_RUN_TRACE_PATH, handle_run_trace)
     app.router.add_get(_RUN_CONTEXT_MANIFESTS_PATH, handle_run_context_manifests)
-    app.router.add_post(_RUN_CANCELLATION_PATH, handle_run_cancellation)
-    app.router.add_post(_AGENT_DISMISSAL_PATH, handle_agent_dismissal)
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _RUN_CANCELLATION_PATH,
+        handle_run_cancellation,
+        operation_id="conversation.run.cancel",
+        entrypoint="run_cancel",
+    )
+    _register_workshop_capability_route(
+        app,
+        "POST",
+        _AGENT_DISMISSAL_PATH,
+        handle_agent_dismissal,
+        operation_id="channels.participants.manage",
+        entrypoint="agent_dismiss",
+    )
