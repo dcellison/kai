@@ -256,6 +256,7 @@ function errorText(caught: unknown, fallback: string): string {
 type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
   executionProfileControl?: ReactNode;
+  initialSection?: "github" | null;
   nativeAgentRuntime?: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
@@ -277,6 +278,7 @@ type SettingsWorkspaceContentProps = {
 function SettingsWorkspaceContent({
   agentRuntime = false,
   executionProfileControl,
+  initialSection = null,
   nativeAgentRuntime = false,
   onAuthenticationFailure,
   onChannelAccessFailure,
@@ -385,7 +387,11 @@ function SettingsWorkspaceContent({
     ? AGENT_RUNTIME_SECTIONS
     : GENERAL_SETTINGS_SECTIONS;
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
-    agentRuntime ? "settings-section-runtime" : GENERAL_SETTINGS_SECTIONS[0].id,
+    agentRuntime
+      ? "settings-section-runtime"
+      : initialSection === "github"
+        ? "settings-section-github"
+        : GENERAL_SETTINGS_SECTIONS[0].id,
   );
   const nativeRuntime = agentRuntime && nativeAgentRuntime;
   const titleId = nativeRuntime
@@ -407,11 +413,17 @@ function SettingsWorkspaceContent({
     const reduceMotion = typeof window.matchMedia === "function"
       && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     setActiveSection(sectionId);
-    section.scrollIntoView({
+    section.scrollIntoView?.({
       behavior: reduceMotion ? "auto" : "smooth",
       block: "start",
     });
   };
+
+  useEffect(() => {
+    if (!agentRuntime && initialSection === "github") {
+      navigateToSection("settings-section-github");
+    }
+  }, [agentRuntime, initialSection]);
 
   const updateActiveSection = (): void => {
     const scroll = settingsScrollRef.current;

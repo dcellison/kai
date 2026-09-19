@@ -17,6 +17,48 @@ export interface WorkshopSession {
   token: string;
 }
 
+export type WorkshopCapabilityScope =
+  | "public"
+  | "principal"
+  | "conversation"
+  | "principal_agent"
+  | "agent_owner"
+  | "channel_member"
+  | "channel_owner"
+  | "administrator";
+
+export interface WorkshopCapabilityAvailability {
+  available: boolean;
+  confirmation: "none" | "context_dependent" | "required";
+  description: string;
+  disposition:
+    | "native_surface"
+    | "action_palette"
+    | "administrator_only"
+    | "presentation_alias"
+    | "compatibility_only";
+  inputShape: string;
+  label: string;
+  mutatesState: boolean;
+  operationId: string;
+  paletteEntry: boolean;
+  scope: WorkshopCapabilityScope;
+  surface: string | null;
+  unavailableReason: string | null;
+}
+
+export interface WorkshopCapabilitySnapshot {
+  capabilities: WorkshopCapabilityAvailability[];
+  context: {
+    administrator: boolean;
+    agent: boolean;
+    agentOwner: boolean;
+    channelOwner: boolean;
+    conversation: boolean;
+    workspace: boolean;
+  };
+}
+
 export interface WorkshopAgentSummary {
   agentId: string;
   available: boolean;

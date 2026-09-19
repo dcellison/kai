@@ -236,6 +236,14 @@ def test_telegram_help_is_registry_backed_and_filters_administrator_operations()
     } <= set(telegram_command_inventory())
 
 
+def test_help_and_actions_is_canonical_and_registry_backed_for_both_adapters() -> None:
+    capability = capability_by_id("capabilities.discover")
+
+    assert capability.implementation_state == ImplementationState.CANONICAL
+    assert capability.presentations[AdapterId.WORKSHOP].palette_entry is True
+    assert capability.presentations[AdapterId.TELEGRAM].help_discoverable is True
+
+
 def test_unsupported_operations_do_not_appear_in_adapter_availability() -> None:
     results = capability_availability(
         AdapterId.TELEGRAM,

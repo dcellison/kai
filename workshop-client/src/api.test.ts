@@ -44,6 +44,7 @@ import {
   loadModelCatalogue,
   loadMessageReactors,
   loadNavigation,
+  loadWorkshopCapabilities,
   loadGitHubSettings,
   loadNotificationPreferences,
   loadChannelNotificationPolicy,
@@ -840,6 +841,49 @@ describe("Workshop client API", () => {
       device_display_name: "Daniel's Mini",
       enrollment_token: "one-time-token",
     });
+  });
+
+  it("loads redacted registry-backed Workshop action metadata", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({
+      version: 1,
+      context: {
+        administrator: false,
+        agent: true,
+        agent_owner: false,
+        channel_owner: false,
+        conversation: true,
+        workspace: true,
+      },
+      capabilities: [{
+        available: true,
+        confirmation: "none",
+        description: "Inspect the current runtime.",
+        disposition: "native_surface",
+        input_shape: "optional_agent",
+        label: "Show runtime status",
+        mutates_state: false,
+        operation_id: "runtime.status.read",
+        palette_entry: true,
+        scope: "principal_agent",
+        surface: "run_inspector",
+        unavailable_reason: null,
+      }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const snapshot = await loadWorkshopCapabilities(session, agentId);
+
+    expect(snapshot.context).toEqual(expect.objectContaining({ agent: true, agentOwner: false }));
+    expect(snapshot.capabilities).toEqual([
+      expect.objectContaining({
+        operationId: "runtime.status.read",
+        paletteEntry: true,
+        scope: "principal_agent",
+      }),
+    ]);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `/v1/client/capabilities?channel_id=${channelId}&agent_id=${agentId}`,
+    );
   });
 
   it("loads only the newest window with a single tail request", async () => {
