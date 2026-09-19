@@ -672,7 +672,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
             input_shape=CapabilityInputShape.PULL_REQUEST_REFERENCE,
             implemented=False,
         ),
-        implementation_state=ImplementationState.TELEGRAM_COMPATIBILITY,
+        implementation_state=ImplementationState.CANONICAL,
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,

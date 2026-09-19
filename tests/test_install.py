@@ -93,6 +93,7 @@ from kai.install import (
     _resolve_codex_bin_prompt_default,
     _retire_install_home_claude,
     _retire_install_home_dir,
+    _review_job_status,
     _runtime_policy_apply_plan,
     _runtime_policy_status,
     _runtime_storage_status,
@@ -5428,6 +5429,30 @@ class TestCmdStatus:
     def test_status_reports_unavailable_github_automation_database(self, tmp_path):
         assert _github_automation_status(tmp_path / "missing.db") == (
             "Workshop GitHub automation: NOT VERIFIED (database unavailable)"
+        )
+
+    def test_status_reports_canonical_manual_review_jobs(self, tmp_path):
+        db_path = tmp_path / "kai.db"
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            "CREATE TABLE workshop_review_jobs (review_job_id TEXT PRIMARY KEY, principal_id TEXT, status TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE workshop_review_artifacts ("
+            "artifact_id TEXT PRIMARY KEY, review_job_id TEXT, principal_id TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO workshop_review_jobs VALUES (?, 'prn_owner', ?)",
+            [("one", "succeeded"), ("two", "failed")],
+        )
+        connection.execute("INSERT INTO workshop_review_artifacts VALUES ('artifact', 'one', 'prn_owner')")
+        connection.commit()
+        connection.close()
+
+        assert _review_job_status(db_path) == (
+            "Workshop review jobs: active; pending=0, executing=0, succeeded=1, "
+            "failed=1, cancelled=0, timed out=0, artifacts=1, integrity gaps=0; "
+            "authority=canonical/principal-scoped"
         )
 
     def test_status_reports_canonical_post_run_effect_queue(self, tmp_path):

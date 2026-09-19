@@ -434,12 +434,9 @@ class PRReviewResult:
     """
     Output of the shared `generate_pr_review()` execution helper.
 
-    Carries enough metadata for either output sink: the webhook path
-    uses repo + pr_number to post a GitHub comment and the title/URL
-    for the Telegram summary; the manual Telegram path uses the same
-    fields plus the collection warnings for the chat reply. The
-    `output_path` slot is populated by the Telegram sink after writing
-    the canonical `/tmp/pr-<N>-review.md` file.
+    Carries enough metadata for either output sink: webhook automation
+    can post a GitHub comment, while the canonical manual-review service
+    persists a bounded principal-owned artifact for any authorized adapter.
 
     Attributes:
         repo: Full repository name.
@@ -450,9 +447,6 @@ class PRReviewResult:
             backend.
         collection_warnings: Recoverable fetcher failures, carried so
             the sink can surface them.
-        output_path: Optional absolute path of the local review
-            artifact (used by the Telegram sink; left None on the
-            webhook path).
     """
 
     repo: str
@@ -461,7 +455,6 @@ class PRReviewResult:
     pr_url: str
     review_text: str
     collection_warnings: tuple[CollectionWarning, ...]
-    output_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3301,12 +3294,9 @@ async def generate_pr_review(
     """
     Build the review bundle, render the prompt, and run the review backend.
 
-    The shared execution helper that backs both output sinks (the
-    webhook GitHub-comment path and the Telegram manual-command
-    path). Returns a `PRReviewResult` carrying enough metadata for
-    either sink to react: repository identity, PR title/URL for
-    summaries, the raw review text, and the bundle's collection
-    warnings so the sink can surface what context was incomplete.
+    The shared execution helper that backs webhook automation and canonical
+    manual-review jobs. Returns a `PRReviewResult` carrying repository
+    identity, PR title/URL, raw review text, and collection warnings.
 
     Args:
         repo: Full repository name ("owner/name").
@@ -3379,11 +3369,10 @@ async def review_pr(
     Full review pipeline: build the bundle, run the review, post results.
 
     Top-level entry called from webhook.py as a background task.
-    Delegates the heavy lifting to `generate_pr_review()` so the
-    webhook and Telegram manual sinks share the same context-gathering
-    and prompt-rendering path; this function owns only the
-    GitHub-comment post and the Telegram summary that follow a
-    successful review.
+    Delegates the heavy lifting to `generate_pr_review()` so webhook
+    automation and canonical manual-review jobs share the same context
+    gathering and prompt rendering; this function owns the webhook
+    path's GitHub comment and configured notification summary.
 
     The webhook payload still drives extraction of routing metadata
     (`extract_pr_metadata`); `generate_pr_review()` re-fetches the
