@@ -2946,6 +2946,94 @@ class TestCallbackDispatch:
         assert toast == "Forgotten."
 
     @pytest.mark.asyncio
+    async def test_stale_delete_persists_warning_refreshes_detail_and_allows_retry(
+        self,
+        monkeypatch,
+        update_factory,
+        context_factory,
+    ):
+        monkeypatch.setattr(memory_command.memory, "is_enabled", lambda: True)
+        current = MemoryResult(
+            id="f1",
+            text="Q1583_CANONICAL_MEMORY modified.",
+            score=0.0,
+            memory_type="fact",
+            metadata={
+                "source": "explicit",
+                "tags": [],
+                "scope": "global",
+                "scope_source": "operator",
+                "scope_confidence": 1.0,
+            },
+            created_at="2026-09-19T12:46:57Z",
+            updated_at="2026-09-19T12:50:17Z",
+        )
+        monkeypatch.setattr(
+            memory_command.memory,
+            "get_by_id",
+            lambda *, user_id, memory_id: current,
+        )
+
+        class StaleThenSuccessfulService(_CanonicalMemoryFake):
+            def __init__(self) -> None:
+                self.expected_revisions: list[dict[str, str]] = []
+
+            async def delete(self, _authority, memory_ids, *, expected_revisions=None):
+                self.expected_revisions.append(dict(expected_revisions or {}))
+                outcome = "stale" if len(self.expected_revisions) == 1 else "succeeded"
+                return MemoryMutationBatch(
+                    "delete",
+                    (MemoryMutationResult(memory_ids[0], outcome, None, None),),
+                )
+
+        service = StaleThenSuccessfulService()
+        ctx = context_factory()
+        ctx.application.core_services.memory_queries = service
+        memory_command._set_cache(
+            100,
+            memory_command._ScreenCache(
+                screen="forget_fact_confirm",
+                memory_ids=["f1"],
+                return_to=("facts", ["0"]),
+                revision="mr1_old",
+            ),
+        )
+
+        stale = update_factory(callback_data="mem:ffd:f1")
+        await memory_command.handle_memory_callback(stale, ctx)
+
+        rendered = stale.callback_query.edit_message_text.call_args.kwargs["text"]
+        assert memory_command._MSG_STALE_DELETE in rendered
+        assert current.text in rendered
+        stale.callback_query.answer.assert_awaited_once_with(
+            "Memory not deleted.",
+            show_alert=True,
+        )
+        refreshed = memory_command._get_cache(100)
+        assert refreshed is not None
+        assert refreshed.screen == "fact"
+        assert refreshed.revision == "mr1_f1"
+        assert service.expected_revisions == [{"f1": "mr1_old"}]
+
+        confirm = update_factory(callback_data="mem:ffc:f1")
+        await memory_command.handle_memory_callback(confirm, ctx)
+        retried = update_factory(callback_data="mem:ffd:f1")
+        sent: dict[str, object] = {}
+
+        async def fake_send_facts(update, context, chat_id, page, edit=False):
+            sent.update(chat_id=chat_id, page=page, edit=edit)
+
+        monkeypatch.setattr(memory_command, "_send_facts_list", fake_send_facts)
+        await memory_command.handle_memory_callback(retried, ctx)
+
+        assert service.expected_revisions == [
+            {"f1": "mr1_old"},
+            {"f1": "mr1_f1"},
+        ]
+        assert sent == {"chat_id": 100, "page": 0, "edit": True}
+        retried.callback_query.answer.assert_awaited_once_with("Forgotten.")
+
+    @pytest.mark.asyncio
     async def test_send_failure_yields_single_query_failed_answer(self, monkeypatch, update_factory, context_factory):
         # Regression for the double-answer bug. Round-3 code answered
         # the query BEFORE _send_*; if the send raised, the outer
