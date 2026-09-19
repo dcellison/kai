@@ -104,6 +104,8 @@ import type {
   WorkshopCollaborationActivity,
   WorkshopScheduledJob,
   WorkshopScheduledJobCancellation,
+  WorkshopCapabilityAvailability,
+  WorkshopCapabilitySnapshot,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -217,6 +219,79 @@ function parseReactions(value: unknown): WorkshopMessageReaction[] | null {
     });
   }
   return reactions;
+}
+
+const CAPABILITY_SCOPES = new Set([
+  "public",
+  "principal",
+  "conversation",
+  "principal_agent",
+  "agent_owner",
+  "channel_member",
+  "channel_owner",
+  "administrator",
+]);
+
+const CAPABILITY_DISPOSITIONS = new Set([
+  "native_surface",
+  "action_palette",
+  "administrator_only",
+  "presentation_alias",
+  "compatibility_only",
+]);
+
+const CAPABILITY_CONFIRMATIONS = new Set(["none", "context_dependent", "required"]);
+
+function parseCapability(value: unknown): WorkshopCapabilityAvailability | null {
+  if (!isRecord(value)) return null;
+  const {
+    available,
+    confirmation,
+    description,
+    disposition,
+    input_shape: inputShape,
+    label,
+    mutates_state: mutatesState,
+    operation_id: operationId,
+    palette_entry: paletteEntry,
+    scope,
+    surface,
+    unavailable_reason: unavailableReason,
+  } = value;
+  if (
+    available !== true ||
+    typeof confirmation !== "string" ||
+    !CAPABILITY_CONFIRMATIONS.has(confirmation) ||
+    typeof description !== "string" ||
+    typeof disposition !== "string" ||
+    !CAPABILITY_DISPOSITIONS.has(disposition) ||
+    typeof inputShape !== "string" ||
+    typeof label !== "string" ||
+    typeof mutatesState !== "boolean" ||
+    typeof operationId !== "string" ||
+    !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/.test(operationId) ||
+    typeof paletteEntry !== "boolean" ||
+    typeof scope !== "string" ||
+    !CAPABILITY_SCOPES.has(scope) ||
+    (surface !== null && typeof surface !== "string") ||
+    unavailableReason !== null
+  ) {
+    return null;
+  }
+  return {
+    available,
+    confirmation: confirmation as WorkshopCapabilityAvailability["confirmation"],
+    description,
+    disposition: disposition as WorkshopCapabilityAvailability["disposition"],
+    inputShape,
+    label,
+    mutatesState,
+    operationId,
+    paletteEntry,
+    scope: scope as WorkshopCapabilityAvailability["scope"],
+    surface,
+    unavailableReason,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -786,6 +861,51 @@ export async function loadNavigation(token: string): Promise<WorkshopNavigation>
       principalId: payload.principal.principal_id,
     },
     workshops,
+  };
+}
+
+export async function loadWorkshopCapabilities(
+  session: WorkshopSession,
+  agentId: string | null = null,
+): Promise<WorkshopCapabilitySnapshot> {
+  const parameters = new URLSearchParams({ channel_id: session.channelId });
+  if (agentId !== null) parameters.set("agent_id", agentId);
+  const response = await authorizedFetch(
+    session,
+    `/v1/client/capabilities?${parameters.toString()}`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load available actions."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isRecord(payload.context) ||
+    typeof payload.context.administrator !== "boolean" ||
+    typeof payload.context.agent !== "boolean" ||
+    typeof payload.context.agent_owner !== "boolean" ||
+    typeof payload.context.channel_owner !== "boolean" ||
+    typeof payload.context.conversation !== "boolean" ||
+    typeof payload.context.workspace !== "boolean" ||
+    !Array.isArray(payload.capabilities)
+  ) {
+    throw new Error("Kai returned unsupported action metadata.");
+  }
+  const capabilities = payload.capabilities.map(parseCapability);
+  if (capabilities.some((capability) => capability === null)) {
+    throw new Error("Kai returned unsupported action metadata.");
+  }
+  return {
+    capabilities: capabilities as WorkshopCapabilityAvailability[],
+    context: {
+      administrator: payload.context.administrator,
+      agent: payload.context.agent,
+      agentOwner: payload.context.agent_owner,
+      channelOwner: payload.context.channel_owner,
+      conversation: payload.context.conversation,
+      workspace: payload.context.workspace,
+    },
   };
 }
 

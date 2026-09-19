@@ -27,6 +27,7 @@ import {
   dismissChannelAgent,
   detachChannelAgent,
   loadAppearancePreferences,
+  loadWorkshopCapabilities,
   loadChannelMembers,
   loadChannelMessage,
   loadRuntimeLaneStatus,
@@ -91,6 +92,7 @@ import type {
   WorkshopReplyParticipant,
   WorkshopReaction,
   WorkshopReactionReactors,
+  WorkshopCapabilityAvailability,
 } from "./types";
 import {
   AGENT_DEFINITION_PATTERN,
@@ -119,6 +121,10 @@ import { usePrincipalEvents } from "./usePrincipalEvents";
 import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
+import {
+  ActionPalette,
+  type WorkshopActionPaletteEntry,
+} from "./ActionPalette";
 import {
   HumanAvatar,
   HumanAvatarCacheProvider,
@@ -202,6 +208,7 @@ type WorkshopDestination =
   | {
       kind: "settings";
       runtimeChannelId: string | null;
+      section: "github" | null;
     };
 
 function destinationFromLocation(): WorkshopDestination {
@@ -239,6 +246,7 @@ function destinationFromLocation(): WorkshopDestination {
         runtimeChannelId && CHANNEL_PATTERN.test(runtimeChannelId)
           ? runtimeChannelId
           : null,
+      section: parameters.get("section") === "github" ? "github" : null,
     };
   }
   if (parameters.get("view") === "agents") {
@@ -300,6 +308,9 @@ function writeDestination(
     url.searchParams.set("view", "settings");
     if (destination.runtimeChannelId) {
       url.searchParams.set("runtime", destination.runtimeChannelId);
+    }
+    if (destination.section) {
+      url.searchParams.set("section", destination.section);
     }
   } else if (destination.kind === "agents") {
     url.searchParams.set("view", "agents");
@@ -3073,6 +3084,7 @@ function WorkshopView({
   requestedThreadRootId,
   focusedMessageError,
   settingsDestination,
+  settingsInitialSection,
   settingsRuntimeLabel,
   settingsSession,
   navigation,
@@ -3163,6 +3175,7 @@ function WorkshopView({
   requestedThreadRootId: string | null;
   focusedMessageError: string | null;
   settingsDestination: boolean;
+  settingsInitialSection: "github" | null;
   settingsRuntimeLabel: string;
   settingsSession: WorkshopSession;
   navigation: WorkshopNavigation;
@@ -3242,7 +3255,7 @@ function WorkshopView({
   onOpenAgentDefinition: (definitionId: string) => Promise<void>;
   onOpenAgentSetup: (definitionId: string | null, setupId: string | null) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
-  onOpenSettings: () => void;
+  onOpenSettings: (section?: "github" | null) => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onRestoreDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectAgent: (
@@ -3340,6 +3353,11 @@ function WorkshopView({
     : null;
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [actionPaletteOpen, setActionPaletteOpen] = useState(false);
+  const [actionPaletteLoading, setActionPaletteLoading] = useState(false);
+  const [actionPaletteError, setActionPaletteError] = useState<string | null>(null);
+  const [actionPaletteEntries, setActionPaletteEntries] =
+    useState<WorkshopActionPaletteEntry[]>([]);
   const [channelCreation, setChannelCreation] = useState<{
     initialAgentIds: string[];
     originChannelId: string | null;
@@ -3413,6 +3431,14 @@ function WorkshopView({
   }, [channelId]);
   const humanName = navigation.principal.displayName || "You";
   const humanRole = workshopRoleLabel(workshop.role);
+  const paletteAgents = useMemo(() => channel.agents
+    .filter((agent) => agent.lifecycleState === "active" && agent.runtimeProfileId !== null)
+    .map((agent) => ({
+      agentId: agent.agentId,
+      definitionId:
+        agentCatalogue.find((candidate) => candidate.agentId === agent.agentId)?.definitionId ?? null,
+      name: agent.name,
+    })), [agentCatalogue, channel.agents]);
   const threadRootMessage = useMemo(
     () => messages.find((message) => message.messageId === threadRootMessageId) ??
       (focusedThreadRoot?.messageId === threadRootMessageId ? focusedThreadRoot : null),
@@ -4094,6 +4120,84 @@ function WorkshopView({
   }, [profileMenuOpen]);
 
   useEffect(() => {
+    const openPalette = (event: globalThis.KeyboardEvent): void => {
+      if (
+        event.key.toLocaleLowerCase() === "k" &&
+        (event.metaKey || event.ctrlKey) &&
+        !event.altKey
+      ) {
+        event.preventDefault();
+        setProfileMenuOpen(false);
+        setActionPaletteOpen(true);
+      }
+    };
+    document.addEventListener("keydown", openPalette);
+    return () => document.removeEventListener("keydown", openPalette);
+  }, []);
+
+  useEffect(() => {
+    if (!actionPaletteOpen) return;
+    let cancelled = false;
+    setActionPaletteLoading(true);
+    setActionPaletteError(null);
+    const session = { channelId, token: memoryToken };
+    void Promise.all([
+      loadWorkshopCapabilities(session),
+      Promise.allSettled(
+        paletteAgents.map((agent) => loadWorkshopCapabilities(session, agent.agentId)),
+      ),
+    ]).then(([base, agentResults]) => {
+      if (cancelled) return;
+      const entries = new Map<string, WorkshopActionPaletteEntry>();
+      const include = (
+        capability: WorkshopCapabilityAvailability,
+        target: (typeof paletteAgents)[number] | null,
+      ): void => {
+        if (!capability.paletteEntry || capability.operationId === "capabilities.discover") return;
+        const targeted = capability.scope === "principal_agent" || capability.scope === "agent_owner";
+        if (targeted !== (target !== null)) return;
+        const key = `${capability.operationId}-${target?.agentId ?? "global"}`;
+        entries.set(key, {
+          capability,
+          key,
+          targetAgentId: target?.agentId ?? null,
+          targetLabel: target?.name ?? null,
+        });
+      };
+      base.capabilities.forEach((capability) => include(capability, null));
+      agentResults.forEach((result, index) => {
+        if (result.status !== "fulfilled") return;
+        const target = paletteAgents[index];
+        result.value.capabilities.forEach((capability) => include(capability, target));
+      });
+      setActionPaletteEntries([...entries.values()].sort((left, right) =>
+        left.capability.label.localeCompare(right.capability.label) ||
+        (left.targetLabel ?? "").localeCompare(right.targetLabel ?? "")
+      ));
+    }).catch((caught) => {
+      if (cancelled) return;
+      if (caught instanceof AuthenticationError) {
+        onMemoryAuthenticationFailure(caught.message);
+        return;
+      }
+      setActionPaletteError(
+        caught instanceof Error ? caught.message : "Could not load available actions.",
+      );
+    }).finally(() => {
+      if (!cancelled) setActionPaletteLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    actionPaletteOpen,
+    channelId,
+    memoryToken,
+    onMemoryAuthenticationFailure,
+    paletteAgents,
+  ]);
+
+  useEffect(() => {
     let cancelled = false;
     setRuntimeLaneStatuses([]);
     setSettingsWorkspaceError(null);
@@ -4206,6 +4310,63 @@ function WorkshopView({
     } finally {
       setFreshSessionBusyAgentId(null);
     }
+  };
+
+  const invokePaletteAction = async (
+    action: WorkshopActionPaletteEntry,
+  ): Promise<string | null> => {
+    const { operationId } = action.capability;
+    if (operationId === "workspace.catalogue.manage") {
+      onOpenWorkspaces();
+      return null;
+    }
+    if (operationId === "memory.manage") {
+      onOpenMemory();
+      return null;
+    }
+    if (operationId === "scheduled_jobs.manage") {
+      onOpenScheduledJobs();
+      return null;
+    }
+    if (operationId === "integration.github.manage") {
+      onOpenSettings("github");
+      return null;
+    }
+    if (
+      operationId === "runtime.model.manage" ||
+      operationId === "runtime.backend.manage"
+    ) {
+      const target = paletteAgents.find((agent) => agent.agentId === action.targetAgentId);
+      if (!target?.definitionId) {
+        throw new Error("This agent's runtime settings are not available.");
+      }
+      onSelectAgent(target.definitionId, "runtime");
+      return null;
+    }
+    if (operationId === "runtime.status.read") {
+      if (!action.targetAgentId) throw new Error("Select an agent to inspect its runtime.");
+      const status = await onLoadRuntimeLaneStatus(action.targetAgentId);
+      return [
+        `Agent: ${status.agentName} (@${status.agentHandle})`,
+        `Backend: ${status.backend} · ${status.provider}`,
+        `Model: ${status.model.value}`,
+        `Workspace: ${status.workspaceLabel ?? "No shared workspace"}`,
+        `Provider session: ${status.providerSessionState.replaceAll("_", " ")}`,
+        `Continuity: ${status.continuityState.replaceAll("_", " ")}`,
+        `Process: ${status.processState}`,
+      ].join("\n");
+    }
+    if (operationId === "conversation.session.reset") {
+      if (!action.targetAgentId) throw new Error("Select an agent to start a fresh session.");
+      const status = await onLoadRuntimeLaneStatus(action.targetAgentId);
+      if (status.activeRun !== null) {
+        throw new Error(`${status.agentName} has an active run. Stop it before starting a fresh session.`);
+      }
+      setActionPaletteOpen(false);
+      await beginFreshProviderSession(status);
+      return null;
+    }
+    throw new Error("This action does not yet have a native Workshop interaction.");
   };
 
   // The composer rests at a single line and grows with its content, so the
@@ -5020,6 +5181,17 @@ function WorkshopView({
                 <span aria-hidden="true">⚙</span>
                 <span><strong>Settings</strong><small>Profile and preferences</small></span>
               </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setProfileMenuOpen(false);
+                  setActionPaletteOpen(true);
+                }}
+              >
+                <span aria-hidden="true">?</span>
+                <span><strong>Help and actions</strong><small>Search available operations · ⌘/Ctrl-K</small></span>
+              </button>
               <div className="profile-menu-separator" />
               <button
                 className="forget-session-menu-item"
@@ -5126,6 +5298,7 @@ function WorkshopView({
         />
       ) : settingsOpen ? (
         <SettingsWorkspace
+          initialSection={settingsInitialSection}
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onChannelAccessFailure={onSettingsAccessFailure}
           onClose={() => onSelectChannel(channelId)}
@@ -5188,7 +5361,7 @@ function WorkshopView({
             <button
               className="quiet-button mobile-settings-button"
               type="button"
-              onClick={onOpenSettings}
+              onClick={() => onOpenSettings()}
             >
               Settings
             </button>
@@ -5397,6 +5570,18 @@ function WorkshopView({
                   }
                 }}
                 onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+                  if (
+                    event.key === "/" &&
+                    draft.length === 0 &&
+                    selectedArtifact === null &&
+                    !event.metaKey &&
+                    !event.ctrlKey &&
+                    !event.altKey
+                  ) {
+                    event.preventDefault();
+                    setActionPaletteOpen(true);
+                    return;
+                  }
                   if (mentionTrigger && mentionCandidates.length > 0) {
                     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
                       event.preventDefault();
@@ -6151,6 +6336,15 @@ function WorkshopView({
           }}
         />
       )}
+      {actionPaletteOpen && (
+        <ActionPalette
+          actions={actionPaletteEntries}
+          error={actionPaletteError}
+          loading={actionPaletteLoading}
+          onClose={() => setActionPaletteOpen(false)}
+          onInvoke={invokePaletteAction}
+        />
+      )}
     </main>
   );
 }
@@ -6254,7 +6448,7 @@ function ActiveWorkshopClient({
   onOpenFollowing: () => void;
   onOpenFollowedThread: (thread: WorkshopFollowedThread) => boolean;
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
-  onOpenSettings: () => void;
+  onOpenSettings: (section?: "github" | null) => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onRestoreDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectChannel: (channelId: string) => void;
@@ -6651,6 +6845,7 @@ function ActiveWorkshopClient({
       focusedMessageError={focusedMessageError}
       memoryToken={session.token}
       settingsDestination={destination.kind === "settings"}
+      settingsInitialSection={destination.kind === "settings" ? destination.section : null}
       settingsRuntimeLabel={settingsChannel ? channelDisplayName(settingsChannel) : "assigned runtime"}
       settingsSession={settingsSession}
       navigation={navigation}
@@ -7061,10 +7256,11 @@ function WorkshopApp(): React.JSX.Element {
     writeDestination(nextDestination, "push");
   };
 
-  const openSettings = (): void => {
+  const openSettings = (section: "github" | null = null): void => {
     const nextDestination: WorkshopDestination = {
       kind: "settings",
       runtimeChannelId: null,
+      section,
     };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");

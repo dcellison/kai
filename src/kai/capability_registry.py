@@ -831,7 +831,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
             disposition=AdapterDisposition.ACTION_PALETTE,
             palette=True,
         ),
-        implementation_state=ImplementationState.TELEGRAM_COMPATIBILITY,
+        implementation_state=ImplementationState.CANONICAL,
     ),
     _capability(
         "conversation.message.send",

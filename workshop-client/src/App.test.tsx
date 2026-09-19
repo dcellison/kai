@@ -35,6 +35,7 @@ import {
   loadWorkshopHumans,
   loadFollowedThreads,
   loadNavigation,
+  loadWorkshopCapabilities,
   loadNotificationPreferences,
   loadMemoryDetail,
   loadMemoryProjects,
@@ -123,6 +124,7 @@ vi.mock("./api", async (importOriginal) => {
     loadAgentEnablements: vi.fn(),
     loadAgentProvisioningSetups: vi.fn(),
     loadNavigation: vi.fn(),
+    loadWorkshopCapabilities: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadMemoryDetail: vi.fn(),
     loadMemoryProjects: vi.fn(),
@@ -849,6 +851,17 @@ describe("Workshop React client", () => {
       truncated: false,
     });
     vi.mocked(loadNavigation).mockResolvedValue(navigation);
+    vi.mocked(loadWorkshopCapabilities).mockResolvedValue({
+      capabilities: [],
+      context: {
+        administrator: true,
+        agent: false,
+        agentOwner: false,
+        channelOwner: true,
+        conversation: true,
+        workspace: false,
+      },
+    });
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
       mutation: null,
       revision: "apr_current",
@@ -2044,6 +2057,85 @@ describe("Workshop React client", () => {
     expect(window.location.search).toBe("");
     expect(screen.getByRole("separator", { name: "Resize channel context" }))
       .toHaveAttribute("aria-valuenow", "384");
+  });
+
+  it("opens registry-backed help and actions from the keyboard and profile menu", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadWorkshopCapabilities).mockResolvedValue({
+      capabilities: [
+        {
+          available: true,
+          confirmation: "none",
+          description: "Browse personal memory records.",
+          disposition: "native_surface",
+          inputShape: "memory_operation",
+          label: "Open memory",
+          mutatesState: true,
+          operationId: "memory.manage",
+          paletteEntry: true,
+          scope: "principal",
+          surface: "memory",
+          unavailableReason: null,
+        },
+        {
+          available: true,
+          confirmation: "none",
+          description: "Inspect the current runtime.",
+          disposition: "native_surface",
+          inputShape: "optional_agent",
+          label: "Show runtime status",
+          mutatesState: false,
+          operationId: "runtime.status.read",
+          paletteEntry: true,
+          scope: "principal_agent",
+          surface: "run_inspector",
+          unavailableReason: null,
+        },
+      ],
+      context: {
+        administrator: true,
+        agent: true,
+        agentOwner: true,
+        channelOwner: true,
+        conversation: true,
+        workspace: true,
+      },
+    });
+
+    render(<App />);
+    await screen.findByText("Canonical history is ready.");
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Help and actions" });
+    expect(within(palette).getByRole("option", { name: /Show runtime status/ }))
+      .toHaveTextContent("Kai");
+    await user.click(within(palette).getByRole("option", { name: /Show runtime status/ }));
+    expect(await within(palette).findByText(/Agent: Kai \(@kai\)/)).toBeVisible();
+    await user.click(within(palette).getByRole("option", { name: /Open memory/ }));
+    expect(await screen.findByRole("heading", { name: "Memory", level: 1 })).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Daniel profile" }));
+    await user.click(screen.getByRole("menuitem", { name: /Help and actions/ }));
+    expect(await screen.findByRole("dialog", { name: "Help and actions" })).toBeVisible();
+  });
+
+  it("opens help and actions instead of sending slash text from an empty composer", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    render(<App />);
+
+    const composer = await screen.findByLabelText("Message Kai");
+    await user.type(composer, "/");
+
+    expect(await screen.findByRole("dialog", { name: "Help and actions" })).toBeVisible();
+    expect(composer).toHaveValue("");
+    expect(submitCommand).not.toHaveBeenCalled();
   });
 
   it("keeps session forgetting in the profile menu and confirms it", async () => {
