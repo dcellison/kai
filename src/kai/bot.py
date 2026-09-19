@@ -11,6 +11,7 @@ python-telegram-bot selects the first handler whose filters match.
 
 import asyncio
 import functools
+import io
 import json
 import logging
 import math
@@ -36,7 +37,7 @@ from telegram.ext import (
     filters,
 )
 
-from kai import github_api, memory_command, review, sessions, webhook
+from kai import github_api, memory_command, sessions, webhook
 from kai.adapter_operation_bindings import bind_adapter_operation
 from kai.application_host import KaiCoreServices
 from kai.capability_registry import AdapterId, render_telegram_help, telegram_command_inventory
@@ -46,7 +47,6 @@ from kai.config import (
     PROVIDER_DEFAULTS,
     Config,
     DeploymentMode,
-    ModelRole,
     WorkspaceConfig,
     canonicalize_model_for_backend,
     get_effective_provider,
@@ -104,6 +104,10 @@ from kai.workshop.preferences import (
     WorkshopPreferenceService,
     WorkshopPreferenceStorageError,
     WorkshopPreferenceValidationError,
+)
+from kai.workshop.review_jobs import (
+    WorkshopReviewJobAccessDenied,
+    WorkshopReviewJobValidationError,
 )
 from kai.workshop.runtime_lane_status import (
     RuntimeLaneStatusSnapshot,
@@ -4172,297 +4176,72 @@ async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("\n".join(lines))
 
 
-# Canonical local directory for the /review command's review artifact.
-# The path `/tmp/pr-<N>-review.md` is a deliberate echo of the
-# operator's chat-review-loop convention so manual and product-generated
-# review artifacts land where the operator already expects them. Kept
-# as a module-level constant so tests can redirect to a tmp_path
-# without colliding with locally-owned `/tmp/pr-<N>-review.md` files.
-_REVIEW_TMP_DIR = Path("/tmp")
-
-
-async def _resolve_review_repo(
-    actor_id: int,
-    workspace: str,
-    config: Config,
-) -> tuple[str, str]:
-    """
-    Resolve the short-form `/review <pr-number>` to ``(repo, workspace_remote)``.
-
-    Walks the conservative ladder per the spec:
-
-    1. If the active workspace is a git checkout whose `origin` remote
-       normalizes to exactly one repo in the user's admin-configured
-       GitHub repo list, return that repo.
-    2. Otherwise, if the user's configured GitHub repo list contains
-       exactly one repo, return that repo.
-    3. Otherwise, return the empty string so the caller can prompt
-       for the explicit `owner/repo` form.
-
-    No fallback to ``Config.github_repo`` (deprecated), no
-    first-of-list, and no new workspace-to-repo mapping.
-
-    The second tuple element is the normalized workspace `origin`
-    remote (or "" when the workspace is not a GitHub checkout). The
-    caller compares it to the chosen repo to decide whether the
-    workspace is safe to pass as ``local_repo_path``; passing a
-    workspace that does not match the target repo would surface the
-    wrong spec / conventions / surrounding-code excerpts into the
-    review, regardless of which ladder rung produced the repo.
-
-    Args:
-        actor_id: The authorized Telegram user id; drives user-scoped
-            config and effective-repo lookups so a group chat does
-            not read the wrong user's settings.
-        workspace: The active workspace path (already resolved via
-            the pool); kept as a parameter so the caller can also
-            check workspace-matches in the explicit-repo branch
-            without re-fetching.
-    """
-    user_config = config.get_user_config(actor_id)
-    authorized_repos = sorted({repo.strip().lower() for repo in (user_config.github_repos if user_config else [])})
-
-    workspace_remote_raw = await review._resolve_workspace_remote_repo(workspace)
-    workspace_remote = workspace_remote_raw.lower() if workspace_remote_raw else ""
-
-    if workspace_remote and workspace_remote in authorized_repos:
-        return workspace_remote, workspace_remote
-
-    if len(authorized_repos) == 1:
-        return authorized_repos[0].lower(), workspace_remote
-
-    return "", workspace_remote
-
-
 @_require_auth
 async def handle_review_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle the /review command; run a deep PR review on demand.
-
-    Shapes:
-
-        /review <pr-number>              repository is inferred from
-                                         the active workspace's git
-                                         remote (when it matches one
-                                         of the user's configured
-                                         GitHub repos) or from the
-                                         sole configured repo.
-        /review <owner/repo> <pr-number> explicit repository.
-
-    Runtime registration places this handler behind the common authorization
-    and TOTP middleware. The review runs inside the update handler (not a detached
-    background task). On success the review text lands at
-    ``/tmp/pr-<N>-review.md`` as the canonical artifact, a
-    timestamped copy is staged under the human actor's canonical file area via
-    ``_save_upload()``, and the staged copy is uploaded to Telegram
-    as a document attachment so phone-only use can read the full
-    review. No GitHub comment is posted and no canonical webhook
-    automation work is created.
-    """
+    """Submit one durable canonical PR review and render its result in Telegram."""
     assert update.message is not None
-
-    # `actor_id` drives every human-scoped lookup (config, effective
-    # repos, backend, provider, model override, file ownership); `chat_id`
-    # drives conversation compatibility state and the reply target. In a
-    # notification group the two
-    # differ: chat_id is the group's id and would silently miss the
-    # authorized operator's user config if it were used for the
-    # user-scoped reads, dropping the review onto global defaults.
-    actor_id = _user_id(update)
-    chat_id = _chat_id(update)
-    config: Config = context.bot_data["config"]
-    pool = _get_pool(context)
-    workspace = str(await pool.get_effective_workspace(chat_id))
-
     args = list(context.args or [])
     usage = "Usage: /review [owner/repo] <pr-number>"
-
-    # Two shapes: one arg (PR number, inferred repo) or two args
-    # (explicit repo + PR number). Anything else is a usage error.
-    # `workspace_remote` captures the normalized active-workspace
-    # `origin` so the post-parse step can decide whether the
-    # workspace is safe to pass as local_repo_path.
-    repo: str = ""
-    workspace_remote: str = ""
-    pr_number: int = 0
+    repository: str | None
     if len(args) == 1:
-        try:
-            pr_number = int(args[0])
-        except ValueError:
-            await update.message.reply_text(usage)
-            return
-        repo, workspace_remote = await _resolve_review_repo(actor_id, workspace, config)
-        if not repo:
-            await update.message.reply_text(
-                f"{usage}\n"
-                "Could not infer the repository from your active workspace or your "
-                "admin-configured GitHub repo list."
-            )
-            return
+        repository = None
+        number_text = args[0]
     elif len(args) == 2:
-        candidate = args[0].lower()
-        if not _REPO_PATTERN.match(candidate):
-            await update.message.reply_text("Invalid repo format. Expected: owner/repo (e.g., dcellison/kai)")
-            return
-        repo = candidate
-        try:
-            pr_number = int(args[1])
-        except ValueError:
-            await update.message.reply_text(usage)
-            return
-        workspace_remote_raw = await review._resolve_workspace_remote_repo(workspace)
-        workspace_remote = workspace_remote_raw.lower() if workspace_remote_raw else ""
+        repository = args[0]
+        number_text = args[1]
     else:
         await update.message.reply_text(usage)
         return
+    try:
+        pull_request_number = int(number_text)
+    except ValueError:
+        await update.message.reply_text(usage)
+        return
 
-    # Review collection shells out to `gh` in the outer Kai process. The
-    # target must therefore come from the user's admin-controlled users.yaml
-    # grant, never merely from a self-service notification subscription. This
-    # check covers both the inferred and explicit command forms and defaults
-    # to no authority for missing users and admins with an empty list.
-    user_config = config.get_user_config(actor_id)
-    if user_config is None or not user_config.authorizes_github_repo(repo):
-        log.warning(
-            "Denied manual GitHub review for user %d: repository %s is not admin-authorized",
-            actor_id,
-            repo,
+    service = _get_core_services(context).review_jobs
+    try:
+        authority = await service.authority_for_external_identity(
+            "telegram",
+            str(_user_id(update)),
         )
+        submitted = await service.submit(
+            authority,
+            repository=repository,
+            pull_request_number=pull_request_number,
+            idempotency_key=f"telegram-review:{_user_id(update)}:{update.update_id}",
+        )
+    except WorkshopReviewJobValidationError as exc:
+        await update.message.reply_text(f"{usage}\n{exc}")
+        return
+    except WorkshopReviewJobAccessDenied as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    if submitted.status not in {"succeeded", "failed", "cancelled", "timed_out"}:
+        await update.message.reply_text(f"Review queued for {submitted.repository}#{submitted.pull_request_number}…")
+    terminal = await service.wait_for_terminal(authority, submitted.review_job_id)
+    if terminal.status != "succeeded":
+        detail = f" ({terminal.last_error_code})" if terminal.last_error_code else ""
         await update.message.reply_text(
-            f"Repository `{repo}` is not authorized for GitHub review. "
-            "Ask the Kai administrator to add its exact name to your github_repos entry in users.yaml."
+            f"Review {terminal.status.replace('_', ' ')} for "
+            f"{terminal.repository}#{terminal.pull_request_number}{detail}."
         )
         return
 
-    # Execution identity comes from the protected runtime profile. GitHub
-    # authorization and optional per-role model overrides remain operator
-    # policy on the human bootstrap record during this migration.
-    claude_user = pool.get_os_user(actor_id)
-    agent_backend, provider = pool.get_backend_provider(actor_id)
-    model_override = pool.get_role_model(actor_id, ModelRole.PR_REVIEW)
-    github_token = await sessions.get_github_token(actor_id)
-    if getattr(config, "protected_install", False) is True and not github_token:
-        await update.message.reply_text(
-            "PR review requires a stored per-user GitHub token in protected installs. "
-            "Send `/github token <token>` first."
+    artifact = await service.artifact(authority, terminal.review_job_id)
+    document = io.BytesIO(artifact.body)
+    document.name = artifact.filename
+    await context.bot.send_document(
+        _chat_id(update),
+        document=document,
+        caption=(f"PR #{terminal.pull_request_number} review\nArtifact {artifact.artifact_id}"),
+        filename=artifact.filename,
+    )
+    await update.message.reply_text(f"Review completed for {terminal.repository}#{terminal.pull_request_number}.")
+    if artifact.warnings:
+        warnings_block = "Warnings:\n" + "\n".join(
+            f"  [{warning.source}] {warning.message}" for warning in artifact.warnings
         )
-        return
-
-    # Only pass the workspace as `local_repo_path` when its `origin`
-    # remote actually matches the target repo. Otherwise the bundle
-    # would load spec/conventions from an unrelated checkout and
-    # the surrounding-code search would either misdirect (rare path
-    # collisions) or emit a noisy unavailable warning even though
-    # the workspace and the PR repo are intentionally unrelated.
-    # Passing None makes the bundle skip spec, conventions, and
-    # related-context cleanly.
-    local_repo_path = workspace if workspace_remote == repo else None
-
-    # Start ack: always sent before the backend invocation; a single
-    # review can run up to PR_REVIEW_TIMEOUT_S seconds and silent
-    # Telegram during that wait would be confusing.
-    await update.message.reply_text(f"Reviewing {repo}#{pr_number}…")
-
-    try:
-        result = await review.generate_pr_review(
-            repo,
-            pr_number,
-            local_repo_path=local_repo_path,
-            spec_dir=config.spec_dir,
-            include_prior_comments=True,
-            claude_user=claude_user,
-            agent_backend=agent_backend,
-            provider=provider,
-            timeout_s=config.pr_review_timeout_s,
-            model_override=model_override,
-            github_token=github_token,
-        )
-    except Exception as exc:
-        log.exception("Manual review failed for %s#%d", repo, pr_number)
-        await update.message.reply_text(f"Review failed for {repo}#{pr_number}: {exc}")
-        return
-
-    if not result.review_text.strip():
-        await update.message.reply_text(f"Review returned no output for {repo}#{pr_number}.")
-        return
-
-    # File body: short metadata header in front of the raw review
-    # text so the standalone artifact identifies the PR it covers.
-    body = f"# PR #{pr_number} review\n\nRepository: {repo}\nURL: {result.pr_url}\n\n{result.review_text}\n"
-
-    canonical = _REVIEW_TMP_DIR / f"pr-{pr_number}-review.md"
-    try:
-        canonical.write_text(body)
-    except OSError as exc:
-        # The canonical artifact is the contract: if we cannot write
-        # it the review effectively does not exist for the operator
-        # (no /tmp file to read, nothing to stage or upload). Surface
-        # the failure as a clear chat error so the operator does not
-        # see only the "Reviewing…" ack and silence.
-        log.exception("Failed to write canonical review artifact for %s#%d", repo, pr_number)
-        await update.message.reply_text(f"Review backend succeeded but writing {canonical} failed: {exc}")
-        return
-
-    # Stage a timestamped copy under the canonical human principal's file
-    # namespace using
-    # the existing upload-file naming convention so the staged
-    # artifact composes with the principal-owned file area and never
-    # overwrites a previous review's staged copy. Staging failure
-    # is non-fatal: the canonical /tmp artifact still exists and
-    # the reply will surface the staging gap explicitly.
-    staged: Path | None = None
-    staging_failed = False
-    try:
-        staged = _save_upload(
-            body.encode(),
-            f"pr-{pr_number}-review.md",
-            principal_id=_upload_principal_id(context, actor_id),
-            reader_user=claude_user,
-        )
-    except (OSError, WorkshopStorageNamespaceError):
-        staging_failed = True
-        log.exception("Failed to stage review copy for %s#%d", repo, pr_number)
-
-    # Upload the staged Markdown file to Telegram so phone-only use
-    # can read the full review. The staged file is the upload source
-    # rather than /tmp because the send-file allowlist may reject
-    # /tmp and the staged path lives under the configured per-chat
-    # data area. Failure is non-fatal (the canonical /tmp artifact
-    # is already written) but it is NOT silent: a phone-only
-    # operator cannot read /tmp, so the final reply must say the
-    # attachment failed if it did.
-    upload_failed = False
-    if staged is not None:
-        try:
-            with open(staged, "rb") as f:
-                await context.bot.send_document(
-                    chat_id,
-                    document=f,
-                    caption=f"PR #{pr_number} review\n{canonical}",
-                    filename=f"pr-{pr_number}-review.md",
-                )
-        except Exception:
-            upload_failed = True
-            log.exception("Failed to upload staged review document for %s#%d", repo, pr_number)
-
-    # Reply 1: short status line. Always sent first so the operator
-    # sees the canonical path immediately, before any potentially
-    # long warning block. Per the spec the status comes before
-    # warnings, and per Telegram's 4096-char message limit it has to
-    # stand alone so a flood of warnings does not crowd it out.
-    status_lines = [f"Review written to {canonical}"]
-    if staging_failed:
-        status_lines.append("Staging copy failed; document attachment skipped.")
-    elif upload_failed:
-        status_lines.append("Attachment failed; open the file at the path above.")
-    await update.message.reply_text("\n".join(status_lines))
-
-    # Reply 2+: collection warnings, chunked so the Telegram message
-    # limit (4096 chars) cannot truncate the final reply when a
-    # large bundle emits many file/fetch failures. chunk_text breaks
-    # at paragraph or line boundaries when possible.
-    if result.collection_warnings:
-        warnings_block = "Warnings:\n" + "\n".join(f"  [{w.source}] {w.message}" for w in result.collection_warnings)
         for chunk in chunk_text(warnings_block):
             await update.message.reply_text(chunk)
 

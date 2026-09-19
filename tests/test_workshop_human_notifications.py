@@ -584,7 +584,7 @@ class TestHumanNotificationAuthority:
         registry = await WorkshopExecutionStateRegistry.from_store(upgraded, profile_registry(101, 202))
         policy = await WorkshopChannelNotificationPolicyService.open(path, registry)
         try:
-            assert await upgraded.schema_version() == 85
+            assert await upgraded.schema_version() == schema.WORKSHOP_SCHEMA_VERSION
             authority = policy.authority_for_principal(scott_id)
             migrated = await policy.inspect(authority)
             assert [(item.channel_id, item.level, item.source) for item in migrated.channels] == [

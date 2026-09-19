@@ -65,6 +65,7 @@ from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
     WorkshopProactivePublicationService,
 )
+from kai.workshop.review_jobs import WorkshopReviewJobService
 from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
@@ -149,6 +150,7 @@ class KaiCoreReadiness:
     store: bool
     scheduler: bool
     github_automation: bool
+    review_jobs: bool
     post_run_effects: bool
     agent_delegation: bool
 
@@ -162,6 +164,7 @@ class KaiCoreReadiness:
                 self.store,
                 self.scheduler,
                 self.github_automation,
+                self.review_jobs,
                 self.post_run_effects,
                 self.agent_delegation,
             )
@@ -178,6 +181,7 @@ class KaiCoreReadiness:
                 "store": self.store,
                 "scheduler": self.scheduler,
                 "github_automation": self.github_automation,
+                "review_jobs": self.review_jobs,
                 "post_run_effects": self.post_run_effects,
                 "agent_delegation": self.agent_delegation,
             },
@@ -222,6 +226,7 @@ class KaiCoreServices:
     proactive_publication: WorkshopProactivePublicationService
     integration_notifications: WorkshopIntegrationNotificationService
     github_automation: WorkshopGitHubAutomationService
+    review_jobs: WorkshopReviewJobService
     post_run_effects: WorkshopPostRunEffectService
     agent_delegation: WorkshopAgentDelegationService
     collaboration_context: WorkshopCollaborationContextService
@@ -285,6 +290,7 @@ class KaiApplicationHost:
             store=services is not None,
             scheduler=services is not None and services.scheduler.readiness.ready,
             github_automation=services is not None and services.github_automation.ready,
+            review_jobs=services is not None and services.review_jobs.ready,
             post_run_effects=services is not None and services.post_run_effects.ready,
             agent_delegation=services is not None and services.agent_delegation.ready,
         )
@@ -306,6 +312,7 @@ class KaiApplicationHost:
         scheduler: WorkshopCanonicalScheduler | None = None
         integration_notifications: WorkshopIntegrationNotificationService | None = None
         github_automation: WorkshopGitHubAutomationService | None = None
+        review_jobs: WorkshopReviewJobService | None = None
         post_run_effects: WorkshopPostRunEffectService | None = None
         github_settings: WorkshopGitHubSettingsService | None = None
         notification_preferences: WorkshopNotificationPreferenceService | None = None
@@ -547,6 +554,14 @@ class KaiApplicationHost:
                 spec_dir=self._config.spec_dir,
                 review_timeout_seconds=self._config.pr_review_timeout_s,
             )
+            review_jobs = await WorkshopReviewJobService.open_and_start(
+                Path(self._config.session_db_path),
+                runtime_pool,
+                self._execution_state,
+                runtime_state,
+                spec_dir=self._config.spec_dir,
+                review_timeout_seconds=self._config.pr_review_timeout_s,
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -583,6 +598,7 @@ class KaiApplicationHost:
                 proactive_publication=proactive_publication,
                 integration_notifications=integration_notifications,
                 github_automation=github_automation,
+                review_jobs=review_jobs,
                 post_run_effects=post_run_effects,
                 agent_delegation=agent_delegation,
                 collaboration_context=collaboration_context,
@@ -601,6 +617,8 @@ class KaiApplicationHost:
                 await scheduler.stop()
             if github_automation is not None:
                 await github_automation.stop()
+            if review_jobs is not None:
+                await review_jobs.stop()
             if integration_notifications is not None:
                 await integration_notifications.close()
             if github_settings is not None:
@@ -654,6 +672,7 @@ class KaiApplicationHost:
             self.services.private_text_execution.wait(),
             self.services.scheduler.wait(),
             self.services.github_automation.wait(),
+            self.services.review_jobs.wait(),
             self.services.post_run_effects.wait(),
             self.services.agent_delegation.wait(),
             *(adapter.wait() for adapter in self._adapters.values()),
@@ -679,6 +698,7 @@ class KaiApplicationHost:
         for operation in (
             services.scheduler.stop,
             services.github_automation.stop,
+            services.review_jobs.stop,
             services.integration_notifications.close,
             services.github_settings.close,
             services.notification_preferences.close,

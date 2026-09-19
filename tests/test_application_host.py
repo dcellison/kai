@@ -312,6 +312,20 @@ class _FakeGitHubAutomation:
         self.events.append("github-automation:stop")
 
 
+class _FakeReviewJobs(_FakeGitHubAutomation):
+    @classmethod
+    async def open_and_start(cls, *_args, **_kwargs):
+        events = _FakeExecutionFactory.events
+        events.append("review-jobs:start")
+        return cls(events)
+
+    async def wait(self) -> None:
+        self.events.append("review-jobs:wait")
+
+    async def stop(self) -> None:
+        self.events.append("review-jobs:stop")
+
+
 class _FakeAdapterReadiness:
     def __init__(self, *, ready: bool) -> None:
         self.ready = ready
@@ -385,6 +399,7 @@ def host_dependencies(monkeypatch):
     )
     monkeypatch.setattr(host_module, "WorkshopModelCatalogueService", _FakeModelCatalogue)
     monkeypatch.setattr(host_module, "WorkshopGitHubAutomationService", _FakeGitHubAutomation)
+    monkeypatch.setattr(host_module, "WorkshopReviewJobService", _FakeReviewJobs)
     monkeypatch.setattr(
         host_module,
         "WorkshopRuntimeStateWriter",
@@ -477,6 +492,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
             "store": True,
             "scheduler": True,
             "github_automation": True,
+            "review_jobs": True,
             "post_run_effects": True,
         },
     }
@@ -506,6 +522,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         "appearance-preferences:open",
         "integrations:open",
         "github-automation:start",
+        "review-jobs:start",
     ]
 
     await host.wait()
@@ -513,14 +530,16 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
 
     assert host.readiness.state == KaiApplicationState.STOPPED
     assert host.readiness.ready is False
-    assert host_dependencies[-20:] == [
+    assert host_dependencies[-22:] == [
         "execution:wait",
         "scheduler:wait",
         "github-automation:wait",
+        "review-jobs:wait",
         "post-run-effects:wait",
         "delegation:wait",
         "scheduler:stop",
         "github-automation:stop",
+        "review-jobs:stop",
         "integrations:close",
         "github-settings:close",
         "notification-preferences:close",

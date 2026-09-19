@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 85
+WORKSHOP_SCHEMA_VERSION = 86
 
 
 @dataclass(frozen=True, slots=True)
@@ -3869,6 +3869,90 @@ _DURABLE_CHANNEL_NOTIFICATION_POLICY_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_CANONICAL_REVIEW_JOB_SCHEMA = SchemaMigration(
+    version=86,
+    name="canonical_manual_review_jobs",
+    statements=(
+        """
+        CREATE TABLE workshop_review_jobs (
+            review_job_id TEXT PRIMARY KEY CHECK (
+                length(review_job_id) BETWEEN 1 AND 128
+            ),
+            principal_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            repository TEXT NOT NULL CHECK (
+                length(repository) BETWEEN 3 AND 200
+            ),
+            pull_request_number INTEGER NOT NULL CHECK (
+                pull_request_number > 0
+            ),
+            local_repo_path TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT NOT NULL CHECK (
+                length(idempotency_key) BETWEEN 1 AND 128
+            ),
+            request_fingerprint TEXT NOT NULL CHECK (
+                length(request_fingerprint) = 64
+                AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'pending', 'executing', 'succeeded', 'failed',
+                    'cancelled', 'timed_out'
+                )
+            ),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                attempt_count >= 0
+            ),
+            cancellation_requested_at TEXT,
+            last_error_code TEXT,
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            started_at TEXT,
+            terminal_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            UNIQUE (principal_id, idempotency_key)
+        )
+        """,
+        "CREATE INDEX workshop_review_jobs_status_idx ON workshop_review_jobs (status, created_at, review_job_id)",
+        "CREATE INDEX workshop_review_jobs_principal_idx ON workshop_review_jobs (principal_id, created_at DESC)",
+        """
+        CREATE TABLE workshop_review_artifacts (
+            artifact_id TEXT PRIMARY KEY CHECK (
+                length(artifact_id) BETWEEN 1 AND 128
+            ),
+            review_job_id TEXT NOT NULL UNIQUE
+                REFERENCES workshop_review_jobs(review_job_id) ON DELETE CASCADE,
+            principal_id TEXT NOT NULL,
+            filename TEXT NOT NULL CHECK (
+                length(filename) BETWEEN 1 AND 255
+            ),
+            media_type TEXT NOT NULL CHECK (media_type = 'text/markdown'),
+            body BLOB NOT NULL CHECK (length(body) BETWEEN 1 AND 1048576),
+            byte_size INTEGER NOT NULL CHECK (
+                byte_size BETWEEN 1 AND 1048576
+            ),
+            sha256 TEXT NOT NULL CHECK (
+                length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            warnings_json TEXT NOT NULL CHECK (
+                json_valid(warnings_json) AND json_type(warnings_json) = 'array'
+            ),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """,
+        "CREATE INDEX workshop_review_artifacts_principal_idx "
+        "ON workshop_review_artifacts (principal_id, created_at DESC)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -3955,6 +4039,7 @@ _MIGRATIONS = (
     _CANONICAL_MEMORY_PROJECT_REGISTRY_SCHEMA,
     _CANONICAL_PROVIDER_SESSION_RESET_SCHEMA,
     _DURABLE_CHANNEL_NOTIFICATION_POLICY_SCHEMA,
+    _CANONICAL_REVIEW_JOB_SCHEMA,
 )
 
 

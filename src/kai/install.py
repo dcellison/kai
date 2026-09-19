@@ -9945,6 +9945,7 @@ def _cmd_status() -> None:
     print(_deployed_adapter_policy_status(_DEPLOYED_ENV_FILE))
     print(_core_schedule_status(Path(data_dir) / "kai.db"))
     print(_github_automation_status(Path(data_dir) / "kai.db"))
+    print(_review_job_status(Path(data_dir) / "kai.db"))
     print(_integration_route_status(Path(data_dir) / "kai.db"))
     print(_internal_api_authority_status(Path(data_dir) / "kai.db"))
     print(_post_run_effect_status(Path(data_dir) / "kai.db"))
@@ -10546,6 +10547,52 @@ def _github_automation_status(db_path: Path) -> str:
         f"{prefix} {status}; pending={pending}, executing={executing}, "
         f"succeeded={succeeded}, failed={failed}, uncertain={uncertain}; "
         "subscription routing=canonical"
+    )
+
+
+def _review_job_status(db_path: Path) -> str:
+    """Report durable manual PR-review jobs and principal-owned artifacts."""
+    prefix = "Workshop review jobs:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workshop_review_jobs'"
+            ).fetchone()
+            if table is None:
+                return f"{prefix} pending; canonical authority unavailable"
+            counts = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'executing' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status = 'timed_out' THEN 1 ELSE 0 END) "
+                "FROM workshop_review_jobs"
+            ).fetchone()
+            artifact_counts = connection.execute(
+                "SELECT COUNT(*), SUM(CASE WHEN j.review_job_id IS NULL "
+                "OR j.principal_id != a.principal_id THEN 1 ELSE 0 END) "
+                "FROM workshop_review_artifacts a LEFT JOIN workshop_review_jobs j "
+                "ON j.review_job_id = a.review_job_id"
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return f"{prefix} NOT VERIFIED ({exc})"
+    values = tuple(int(value or 0) for value in (counts or (0, 0, 0, 0, 0, 0)))
+    pending, executing, succeeded, failed, cancelled, timed_out = values
+    artifacts = int(artifact_counts[0] or 0) if artifact_counts else 0
+    gaps = int(artifact_counts[1] or 0) if artifact_counts else 0
+    status = "active" if executing == 0 and gaps == 0 else "ATTENTION"
+    return (
+        f"{prefix} {status}; pending={pending}, executing={executing}, "
+        f"succeeded={succeeded}, failed={failed}, cancelled={cancelled}, "
+        f"timed out={timed_out}, artifacts={artifacts}, integrity gaps={gaps}; "
+        "authority=canonical/principal-scoped"
     )
 
 

@@ -55,7 +55,7 @@ CANONICAL_SERVICE_BOUNDARIES: Mapping[str, CanonicalServiceBoundary] = MappingPr
         "preference_documents": CanonicalServiceBoundary(("kai.workshop.preferences",)),
         "principal_policies": CanonicalServiceBoundary(("kai.workshop.principal_policies",)),
         "private_text_execution": CanonicalServiceBoundary(("kai.workshop.private_text_execution",)),
-        "review_jobs": CanonicalServiceBoundary(("kai.workshop.github_automation",)),
+        "review_jobs": CanonicalServiceBoundary(("kai.workshop.review_jobs",)),
         "runtime_lane_status": CanonicalServiceBoundary(("kai.workshop.runtime_lane_status",)),
         "routing_policy": CanonicalServiceBoundary(("kai.workshop.routing_policy",)),
         "settings_workspaces": CanonicalServiceBoundary(("kai.workshop.settings_workspaces",)),
