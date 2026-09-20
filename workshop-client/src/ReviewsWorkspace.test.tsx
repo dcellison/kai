@@ -1,14 +1,14 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { loadReviewJobs } from "./api";
+import { loadReviewArtifact, loadReviewJobs } from "./api";
 import { ConfirmationProvider } from "./ConfirmationDialog";
 import { ReviewsWorkspace } from "./ReviewsWorkspace";
 
 vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
-  return { ...original, loadReviewJobs: vi.fn() };
+  return { ...original, loadReviewArtifact: vi.fn(), loadReviewJobs: vi.fn() };
 });
 
 const session = {
@@ -17,6 +17,10 @@ const session = {
 };
 
 describe("ReviewsWorkspace", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(loadReviewJobs).mockResolvedValue({
@@ -75,5 +79,49 @@ describe("ReviewsWorkspace", () => {
 
     await user.click(screen.getByRole("button", { name: "Review pull request" }));
     expect(onReviewPullRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the artifact window synchronously before loading its contents", async () => {
+    const user = userEvent.setup();
+    let resolveArtifact!: (artifact: Blob) => void;
+    vi.mocked(loadReviewArtifact).mockReturnValue(new Promise((resolve) => {
+      resolveArtifact = resolve;
+    }));
+    const popup = {
+      close: vi.fn(),
+      location: { href: "about:blank" },
+      opener: window,
+    } as unknown as Window;
+    const open = vi.spyOn(window, "open").mockReturnValue(popup);
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:review-artifact"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    render(
+      <ConfirmationProvider>
+        <ReviewsWorkspace
+          connection={{ label: "Live", tone: "connected" }}
+          onAuthenticationFailure={vi.fn()}
+          onChannelAccessFailure={vi.fn()}
+          onReviewPullRequest={vi.fn()}
+          revision={0}
+          session={session}
+          workshopName="Kai Workshop"
+        />
+      </ConfirmationProvider>,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Open" }));
+    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(loadReviewArtifact).toHaveBeenCalledTimes(1);
+    expect(popup.location.href).toBe("about:blank");
+
+    resolveArtifact(new Blob(["review"]));
+    await waitFor(() => expect(popup.location.href).toBe("blob:review-artifact"));
+    expect(popup.opener).toBeNull();
   });
 });
