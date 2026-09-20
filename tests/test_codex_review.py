@@ -142,18 +142,14 @@ class TestCodexAppServerReviewReasoner:
         ]
         thread_params = messages[2]["params"]
         assert thread_params["approvalPolicy"] == "never"
-        assert thread_params["sandbox"] == "read-only"
+        assert "sandbox" not in thread_params
         assert thread_params["config"]["project_doc_max_bytes"] == 0
         turn_params = messages[3]["params"]
         assert turn_params["approvalPolicy"] == "never"
-        assert turn_params["sandboxPolicy"] == {
-            "type": "readOnly",
-            "access": {
-                "type": "restricted",
-                "includePlatformDefaults": True,
-                "readableRoots": [str(tmp_path)],
-            },
-        }
+        assert "sandboxPolicy" not in turn_params
+        config_values = [argv[index + 1] for index, value in enumerate(argv) if value == "--config"]
+        assert 'default_permissions="kai-oneshot"' in config_values
+        assert any(value.startswith("permissions.kai-oneshot=") for value in config_values)
         assert messages[4]["params"] == {"threadId": "thr_review"}
         proc.stdin.close.assert_called_once()
         proc.kill.assert_not_called()
