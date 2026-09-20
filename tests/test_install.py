@@ -5189,6 +5189,7 @@ class TestCmdStatus:
         _cmd_status()
         output = capsys.readouterr().out
         assert "Installation Status" in output
+        assert "Adapter capability parity: active;" in output
         assert "Workshop bootstrap:" in output
         assert "Workshop collaboration authority:" in output
         assert "Workshop unread authority:" in output

@@ -22,6 +22,7 @@ from kai.capability_registry import (
     ContextRequirement,
     ImplementationState,
     WorkshopSurface,
+    adapter_capability_parity_status,
     capability_availability,
     capability_by_id,
     render_telegram_help,
@@ -186,6 +187,22 @@ def test_single_user_compatibility_paths_have_an_explicit_removal_gate() -> None
         capability = capability_by_id(operation_id)
         assert capability.implementation_state == ImplementationState.MIXED_COMPATIBILITY
         assert capability.compatibility_removal_gate == CompatibilityRemovalGate.SINGLE_USER_DEPLOYMENT_RETIRED
+
+
+def test_telegram_memory_convergence_retired_the_compatibility_gate() -> None:
+    capability = capability_by_id("memory.manage")
+
+    assert capability.implementation_state == ImplementationState.CANONICAL
+    assert capability.compatibility_removal_gate is None
+    assert capability.presentations[AdapterId.TELEGRAM].disposition == AdapterDisposition.NATIVE_SURFACE
+
+
+def test_adapter_parity_status_records_complete_and_intentional_dispositions() -> None:
+    assert adapter_capability_parity_status() == (
+        "Adapter capability parity: active; operations=33, canonical=27, "
+        "compatibility gated=6, incomplete=0, shared=19, intentional adapter-specific=14; "
+        "authority=canonical registry, help/discovery=registry-backed"
+    )
 
 
 def test_reset_all_is_one_runtime_settings_operation_not_a_duplicate_capability() -> None:

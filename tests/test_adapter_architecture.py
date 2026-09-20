@@ -7,6 +7,7 @@ import importlib.util
 from pathlib import Path
 
 from kai.capability_boundaries import CANONICAL_SERVICE_BOUNDARIES
+from kai.capability_registry import CAPABILITY_REGISTRY, AdapterId
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src" / "kai"
@@ -160,3 +161,45 @@ def test_workshop_mutation_routes_must_name_a_registered_operation() -> None:
                 violations.append(f"line {node.lineno} has an incomplete operation binding")
     assert registered_calls >= 40
     assert violations == []
+
+
+def test_every_implemented_workshop_capability_has_a_checked_route_binding() -> None:
+    path = SOURCE_ROOT / "workshop" / "client_api.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    bound_operations: set[str] = set()
+    malformed: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "_register_workshop_capability_route":
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        operation = keywords.get("operation_id")
+        if not isinstance(operation, ast.Constant) or not isinstance(operation.value, str):
+            malformed.append(f"line {node.lineno} has a non-literal primary operation binding")
+            continue
+        bound_operations.add(operation.value)
+        additional = keywords.get("additional_operation_bindings")
+        if additional is None:
+            continue
+        if not isinstance(additional, (ast.Tuple, ast.List)):
+            malformed.append(f"line {node.lineno} has malformed additional operation bindings")
+            continue
+        for item in additional.elts:
+            if (
+                not isinstance(item, (ast.Tuple, ast.List))
+                or len(item.elts) != 2
+                or not isinstance(item.elts[0], ast.Constant)
+                or not isinstance(item.elts[0].value, str)
+            ):
+                malformed.append(f"line {node.lineno} has malformed additional operation binding")
+                continue
+            bound_operations.add(item.elts[0].value)
+
+    implemented = {
+        capability.operation_id
+        for capability in CAPABILITY_REGISTRY
+        if capability.presentations[AdapterId.WORKSHOP].implemented
+    }
+    assert malformed == []
+    assert bound_operations == implemented

@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
 
-from kai.adapter_operation_bindings import workshop_route_name
+from kai.adapter_operation_bindings import bind_adapter_operation, workshop_route_name
 from kai.backend import FOREIGN_WORKSPACE_REMINDER, USER_MESSAGE_MARKER
 from kai.capability_registry import AdapterId, CapabilityContext, capability_availability
 from kai.context_authority import CONTEXT_AUTHORITY_CONTRACT
@@ -405,8 +405,11 @@ def _register_workshop_capability_route(
     *,
     operation_id: str,
     entrypoint: str,
+    additional_operation_bindings: tuple[tuple[str, str], ...] = (),
 ) -> None:
-    """Register one Workshop route with a checked canonical operation name."""
+    """Register a Workshop route with checked canonical operation names."""
+    for additional_operation_id, additional_entrypoint in additional_operation_bindings:
+        bind_adapter_operation(AdapterId.WORKSHOP, additional_operation_id, additional_entrypoint)
     app.router.add_route(
         method,
         path,
@@ -10296,7 +10299,14 @@ def register_workshop_read_routes(
         )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
-    app.router.add_get(_CLIENT_CAPABILITIES_PATH, handle_client_capabilities)
+    _register_workshop_capability_route(
+        app,
+        "GET",
+        _CLIENT_CAPABILITIES_PATH,
+        handle_client_capabilities,
+        operation_id="capabilities.discover",
+        entrypoint="capability_discovery",
+    )
     app.router.add_get(_PRINCIPAL_EVENTS_PATH, handle_principal_event_stream)
     app.router.add_get(_CHANNEL_UNREAD_PATH, handle_channel_unread_snapshot)
     app.router.add_get(_CHANNEL_UNREAD_EVENTS_PATH, handle_channel_unread_event_stream)
@@ -10939,7 +10949,14 @@ def register_workshop_read_routes(
                     service=runtime_lane_status,
                 )
 
-        app.router.add_get(_RUNTIME_LANE_STATUS_PATH, handle_runtime_lane_status)
+        _register_workshop_capability_route(
+            app,
+            "GET",
+            _RUNTIME_LANE_STATUS_PATH,
+            handle_runtime_lane_status,
+            operation_id="runtime.status.read",
+            entrypoint="runtime_status",
+        )
         _register_workshop_capability_route(
             app,
             "POST",
@@ -11095,6 +11112,7 @@ def register_workshop_read_routes(
             handle_runtime_settings_update,
             operation_id="runtime.settings.manage",
             entrypoint="runtime_settings_update",
+            additional_operation_bindings=(("runtime.backend.manage", "runtime_backend_update"),),
         )
         app.router.add_get(_MODEL_CATALOGUE_PATH, handle_model_catalogue)
         for method, path, handler, entrypoint in (
@@ -11466,7 +11484,14 @@ def register_workshop_command_routes(
     )
     app.router.add_get(_RUN_STATE_PATH, handle_run_state)
     app.router.add_get(_RUN_TRACE_PATH, handle_run_trace)
-    app.router.add_get(_RUN_CONTEXT_MANIFESTS_PATH, handle_run_context_manifests)
+    _register_workshop_capability_route(
+        app,
+        "GET",
+        _RUN_CONTEXT_MANIFESTS_PATH,
+        handle_run_context_manifests,
+        operation_id="context.inspect",
+        entrypoint="context_inspection",
+    )
     _register_workshop_capability_route(
         app,
         "POST",

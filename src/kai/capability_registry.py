@@ -82,7 +82,6 @@ class CompatibilityRemovalGate(StrEnum):
     """Named condition that permits a temporary adapter compatibility path."""
 
     SINGLE_USER_DEPLOYMENT_RETIRED = "single_user_deployment_retired"
-    TELEGRAM_MEMORY_CONVERGED = "telegram_memory_converged"
 
 
 class ContextRequirement(StrEnum):
@@ -685,7 +684,6 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         AuthorityScope.PRINCIPAL,
         telegram=_telegram(
             "memory",
-            disposition=AdapterDisposition.COMPATIBILITY_ONLY,
             input_shape=CapabilityInputShape.MEMORY_OPERATION,
             help_group=6,
             help_entries=(
@@ -700,8 +698,6 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
             palette=True,
             input_shape=CapabilityInputShape.MEMORY_OPERATION,
         ),
-        implementation_state=ImplementationState.MIXED_COMPATIBILITY,
-        compatibility_removal_gate=CompatibilityRemovalGate.TELEGRAM_MEMORY_CONVERGED,
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.CONTEXT_DEPENDENT,
@@ -1214,6 +1210,31 @@ def render_telegram_help(*, administrator: bool) -> str:
             f"{entry.usage} - {entry.description}" for entry in presentation.help_entries
         )
     return "\n\n".join("\n".join(grouped[group]) for group in sorted(grouped))
+
+
+def adapter_capability_parity_status() -> str:
+    """Summarize the validated, transport-neutral capability contract."""
+    items = validate_capability_registry()
+    canonical = sum(item.implementation_state == ImplementationState.CANONICAL for item in items)
+    compatibility_gated = sum(item.implementation_state == ImplementationState.MIXED_COMPATIBILITY for item in items)
+    incomplete = sum(
+        item.implementation_state in {ImplementationState.PLANNED, ImplementationState.TELEGRAM_COMPATIBILITY}
+        for item in items
+    )
+    shared = sum(all(item.presentations[adapter].implemented for adapter in AdapterId) for item in items)
+    intentional_adapter_specific = sum(
+        any(
+            item.presentations[adapter].disposition == AdapterDisposition.UNSUPPORTED_BY_DESIGN for adapter in AdapterId
+        )
+        for item in items
+    )
+    state = "active" if incomplete == 0 else "INCOMPLETE"
+    return (
+        f"Adapter capability parity: {state}; operations={len(items)}, canonical={canonical}, "
+        f"compatibility gated={compatibility_gated}, incomplete={incomplete}, "
+        f"shared={shared}, intentional adapter-specific={intentional_adapter_specific}; "
+        "authority=canonical registry, help/discovery=registry-backed"
+    )
 
 
 def capability_availability(
