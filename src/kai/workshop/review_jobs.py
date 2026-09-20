@@ -13,6 +13,7 @@ from pathlib import Path
 
 from kai import review
 from kai.config import ModelRole
+from kai.oneshot import OneShotSubprocessError
 from kai.workshop.domain import PrincipalId, RuntimeProfileId
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
 from kai.workshop.runtime_pool import WorkshopRuntimePool
@@ -26,7 +27,29 @@ _POLL_SECONDS = 0.1
 _DRAIN_SECONDS = 30.0
 _MAX_ARTIFACT_BYTES = 1024 * 1024
 _MAX_WARNINGS_BYTES = 64 * 1024
+_MAX_TRANSPORT_ATTEMPTS = 3
+_TRANSPORT_RETRY_DELAYS_SECONDS = (1.0, 3.0)
 _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "timed_out"})
+
+
+def _is_transient_review_transport_failure(exc: BaseException) -> bool:
+    """Recognize only bounded Codex transport failures without exposing output."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OneShotSubprocessError):
+            detail = b"\n".join((current.stderr, current.stdout)).decode(errors="replace").lower()
+            return any(
+                marker in detail
+                for marker in (
+                    "failed to connect to websocket",
+                    "websocket connection is unavailable",
+                    "websocket connection failed",
+                )
+            )
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class WorkshopReviewJobError(RuntimeError):
@@ -509,8 +532,39 @@ class WorkshopReviewJobService:
                 await self._mark(item.review_job_id, "cancelled", "cancelled")
             raise
         except Exception as exc:
-            await self._mark(item.review_job_id, "failed", type(exc).__name__)
+            if _is_transient_review_transport_failure(exc):
+                attempt_count = await self._attempt_count(item.review_job_id)
+                if attempt_count < _MAX_TRANSPORT_ATTEMPTS:
+                    await self._mark(
+                        item.review_job_id,
+                        "pending",
+                        "review_transport_retry",
+                        terminal=False,
+                    )
+                    delay = _TRANSPORT_RETRY_DELAYS_SECONDS[attempt_count - 1]
+                    log.warning(
+                        "Canonical review job %s will retry after a transient transport failure (attempt %d/%d)",
+                        item.review_job_id,
+                        attempt_count,
+                        _MAX_TRANSPORT_ATTEMPTS,
+                    )
+                    await asyncio.sleep(delay)
+                    self._wake.set()
+                    return
+                await self._mark(item.review_job_id, "failed", "review_transport_unavailable")
+            else:
+                await self._mark(item.review_job_id, "failed", "review_backend_failed")
             raise
+
+    async def _attempt_count(self, review_job_id: str) -> int:
+        async with self._store.connection.execute(
+            "SELECT attempt_count FROM workshop_review_jobs WHERE review_job_id = ?",
+            (review_job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise WorkshopReviewJobAccessDenied("Review job disappeared during execution")
+        return int(row[0])
 
     async def _store_artifact(self, item: _ReviewWork, result: review.PRReviewResult) -> None:
         body = (

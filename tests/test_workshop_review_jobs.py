@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kai.oneshot import OneShotSubprocessError
 from kai.review import CollectionWarning, PRReviewResult
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.execution_state import WorkshopExecutionStateRegistry
@@ -244,6 +245,113 @@ class TestReviewJobAuthority:
                 )
             assert completed.status == "succeeded"
             assert completed.attempt_count == 2
+        finally:
+            await service.stop()
+
+    async def test_transient_codex_transport_failure_retries_then_succeeds(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        registry = await _seed(path)
+        service, _ = await _open(path, registry, tmp_path)
+        transport_error = RuntimeError("Codex review failed")
+        transport_error.__cause__ = OneShotSubprocessError(
+            returncode=1,
+            stderr=b"Reading prompt from stdin",
+            stdout=b'{"type":"error","message":"failed to connect to websocket"}',
+        )
+        try:
+            authority = service.authority_for_principal(registry.namespaces[0].principal_id)
+            generate = AsyncMock(side_effect=(transport_error, transport_error, _result()))
+            with (
+                patch(
+                    "kai.workshop.review_jobs.review._resolve_workspace_remote_repo",
+                    new=AsyncMock(return_value=""),
+                ),
+                patch("kai.workshop.review_jobs.review.generate_pr_review", new=generate),
+                patch("kai.workshop.review_jobs._TRANSPORT_RETRY_DELAYS_SECONDS", (0.0, 0.0)),
+            ):
+                submitted = await service.submit(
+                    authority,
+                    repository="owner/repo",
+                    pull_request_number=42,
+                    idempotency_key="transport-recovers",
+                )
+                completed = await asyncio.wait_for(
+                    service.wait_for_terminal(authority, submitted.review_job_id),
+                    timeout=2,
+                )
+            assert completed.status == "succeeded"
+            assert completed.attempt_count == 3
+            assert generate.await_count == 3
+        finally:
+            await service.stop()
+
+    async def test_exhausted_transport_failure_has_stable_code(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        registry = await _seed(path)
+        service, _ = await _open(path, registry, tmp_path)
+        transport_error = RuntimeError("Codex review failed")
+        transport_error.__cause__ = OneShotSubprocessError(
+            returncode=1,
+            stderr=b"failed to connect to websocket: task was cancelled",
+        )
+        try:
+            authority = service.authority_for_principal(registry.namespaces[0].principal_id)
+            with (
+                patch(
+                    "kai.workshop.review_jobs.review._resolve_workspace_remote_repo",
+                    new=AsyncMock(return_value=""),
+                ),
+                patch(
+                    "kai.workshop.review_jobs.review.generate_pr_review",
+                    new=AsyncMock(side_effect=transport_error),
+                ),
+                patch("kai.workshop.review_jobs._TRANSPORT_RETRY_DELAYS_SECONDS", (0.0, 0.0)),
+            ):
+                submitted = await service.submit(
+                    authority,
+                    repository="owner/repo",
+                    pull_request_number=42,
+                    idempotency_key="transport-exhausted",
+                )
+                failed = await asyncio.wait_for(
+                    service.wait_for_terminal(authority, submitted.review_job_id),
+                    timeout=2,
+                )
+            assert failed.status == "failed"
+            assert failed.attempt_count == 3
+            assert failed.last_error_code == "review_transport_unavailable"
+        finally:
+            await service.stop()
+
+    async def test_backend_failure_has_stable_code(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        registry = await _seed(path)
+        service, _ = await _open(path, registry, tmp_path)
+        try:
+            authority = service.authority_for_principal(registry.namespaces[0].principal_id)
+            with (
+                patch(
+                    "kai.workshop.review_jobs.review._resolve_workspace_remote_repo",
+                    new=AsyncMock(return_value=""),
+                ),
+                patch(
+                    "kai.workshop.review_jobs.review.generate_pr_review",
+                    new=AsyncMock(side_effect=RuntimeError("provider rejected request")),
+                ),
+            ):
+                submitted = await service.submit(
+                    authority,
+                    repository="owner/repo",
+                    pull_request_number=42,
+                    idempotency_key="backend-failed",
+                )
+                failed = await asyncio.wait_for(
+                    service.wait_for_terminal(authority, submitted.review_job_id),
+                    timeout=2,
+                )
+            assert failed.status == "failed"
+            assert failed.attempt_count == 1
+            assert failed.last_error_code == "review_backend_failed"
         finally:
             await service.stop()
 
