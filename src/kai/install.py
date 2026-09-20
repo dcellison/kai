@@ -47,6 +47,7 @@ from pathlib import Path
 import yaml
 
 from kai.backend_registry import BackendRegistryError, load_backend_registry, render_backend_registry
+from kai.capability_registry import adapter_capability_parity_status
 from kai.config import (
     _VALID_ROLES,
     BACKEND_PROVIDERS,
@@ -9943,6 +9944,7 @@ def _cmd_status() -> None:
     print(_check_path(Path("/etc/sudoers.d/kai"), "Sudoers"))
     print(_check_service_status(platform))
     print(_deployed_adapter_policy_status(_DEPLOYED_ENV_FILE))
+    print(adapter_capability_parity_status())
     print(_core_schedule_status(Path(data_dir) / "kai.db"))
     print(_github_automation_status(Path(data_dir) / "kai.db"))
     print(_review_job_status(Path(data_dir) / "kai.db"))
