@@ -574,12 +574,22 @@ class TestCodexOneShotReasonerArgv:
             "skill_mcp_dependency_install",
             "view_image",
         } <= set(disabled)
-        # Config isolation and feature switches are Codex root options.
-        # They must precede the `exec` subcommand; membership-only
-        # assertions would not catch a flag accepted in the wrong scope.
-        root_options = {"--ignore-user-config", "--ignore-rules", "--strict-config", "--config", "--disable"}
+        # Config and feature switches are Codex root options. The remaining
+        # isolation switches belong to `exec`; membership-only assertions
+        # would not catch either class being accepted in the wrong scope.
+        root_options = {"--config", "--disable"}
         assert all(i < exec_index for i, arg in enumerate(cmd) if arg in root_options)
-        exec_options = {"--json", "--skip-git-repo-check", "--ephemeral", "--cd", "--model", "--output-schema"}
+        exec_options = {
+            "--json",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
+            "--cd",
+            "--model",
+            "--output-schema",
+        }
         assert all(i > exec_index for i, arg in enumerate(cmd) if arg in exec_options)
         # Permission profiles and the legacy --sandbox flag do not
         # compose: adding --sandbox would silently override this

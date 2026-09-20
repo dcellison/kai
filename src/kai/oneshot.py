@@ -1084,9 +1084,9 @@ class CodexOneShotReasoner:
     - `--ephemeral` mirrors Claude's `--no-session-persistence`: no
       session files written under ~/.codex per call.
     - Root-level configuration and feature flags are placed before the
-      `exec` subcommand.  Codex only guarantees those options at the
-      multitool parser's root; putting them after `exec` can leave them
-      present in argv without applying them to the invocation.
+      `exec` subcommand. Exec-only isolation flags remain after it; Codex's
+      parser rejects `--ignore-user-config`, `--ignore-rules`, and
+      `--strict-config` at the root.
     - `--ignore-user-config` and `--ignore-rules` keep user config,
       MCP servers, hooks, skills, and user/project execpolicy rules
       from influencing a bounded call. Authentication still comes
@@ -1214,9 +1214,6 @@ class CodexOneShotReasoner:
         # to change the transport selected by the root parser.
         cmd: list[str] = [
             resolved_binary,
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--strict-config",
             "--config",
             'approval_policy="never"',
             "--config",
@@ -1236,6 +1233,9 @@ class CodexOneShotReasoner:
                 "--json",
                 "--skip-git-repo-check",
                 "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--strict-config",
                 "--cd",
                 str(self._cwd),
             ]
