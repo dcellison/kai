@@ -5089,7 +5089,7 @@ def _generate_launchd_plist(install_dir: str, data_dir: str, service_user: str) 
             <integer>10</integer>
 
             <key>ProcessType</key>
-            <string>Background</string>
+            <string>Interactive</string>
 
             <key>ExitTimeOut</key>
             <integer>{_LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>

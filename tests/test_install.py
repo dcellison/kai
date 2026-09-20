@@ -1338,6 +1338,12 @@ class TestGenerateLaunchdPlist:
         assert "<key>ExitTimeOut</key>" in result
         assert "<integer>65</integer>" in result
 
+    def test_classifies_user_facing_service_as_interactive(self):
+        result = _generate_launchd_plist("/opt/kai", "/var/lib/kai", "kai")
+        assert "<key>ProcessType</key>" in result
+        assert "<string>Interactive</string>" in result
+        assert "<string>Background</string>" not in result
+
 
 class TestGenerateSystemdUnit:
     def test_contains_user(self):
