@@ -79,6 +79,7 @@ from kai.workshop.standing_observation import WorkshopStandingObservationService
 from kai.workshop.standing_participation import WorkshopStandingParticipationService
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
+from kai.workshop.webhook_diagnostics import WorkshopWebhookDiagnosticsService
 
 
 class KaiApplicationState(StrEnum):
@@ -235,6 +236,7 @@ class KaiCoreServices:
     collaboration_policy: WorkshopCollaborationPolicyService
     standing_participation: WorkshopStandingParticipationService
     standing_observation: WorkshopStandingObservationService
+    webhook_diagnostics: WorkshopWebhookDiagnosticsService
     delivery_policy: WorkshopDeliveryBindingPolicy
 
 
@@ -562,6 +564,10 @@ class KaiApplicationHost:
                 spec_dir=self._config.spec_dir,
                 review_timeout_seconds=self._config.pr_review_timeout_s,
             )
+            webhook_diagnostics = WorkshopWebhookDiagnosticsService(
+                self._config,
+                client_store,
+            )
 
             self._services = KaiCoreServices(
                 subprocess_pool=subprocess_pool,
@@ -607,6 +613,7 @@ class KaiApplicationHost:
                 collaboration_policy=collaboration_policy,
                 standing_participation=standing_participation,
                 standing_observation=standing_observation,
+                webhook_diagnostics=webhook_diagnostics,
                 delivery_policy=delivery_policy,
             )
             self._state = KaiApplicationState.READY

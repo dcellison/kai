@@ -150,6 +150,7 @@ from kai.workshop.storage_namespaces import (
 )
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.timeline import TimelineAccessDeniedError, TimelineCursorError
+from kai.workshop.webhook_diagnostics import WorkshopWebhookDiagnosticsService
 
 log = logging.getLogger(__name__)
 
@@ -2227,6 +2228,7 @@ async def _register_workshop_client_api(
     standing_participation: WorkshopStandingParticipationService | None = None,
     scheduler: WorkshopCanonicalScheduler | None = None,
     review_jobs: WorkshopReviewJobService | None = None,
+    webhook_diagnostics: WorkshopWebhookDiagnosticsService | None = None,
     runtime_pool: WorkshopRuntimePool | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
@@ -2280,6 +2282,7 @@ async def _register_workshop_client_api(
             standing_participation=standing_participation,
             scheduler=scheduler,
             review_jobs=review_jobs,
+            webhook_diagnostics=webhook_diagnostics,
             invalidate_agent_context=(
                 runtime_pool.invalidate_agent_retained_context if runtime_pool is not None else None
             ),
@@ -2330,6 +2333,10 @@ async def start(
         route_registrars: Explicitly configured adapter-owned HTTP routes.
     """
     global _app, _runner, _workshop_lan_runner
+
+    webhook_diagnostics = getattr(core_services, "webhook_diagnostics", None)
+    if webhook_diagnostics is not None:
+        webhook_diagnostics.bind_listener_probe(is_running)
 
     _app = web.Application(client_max_size=MAX_ARTIFACT_BYTES + 128 * 1024)
     _app[CORE_HOST_KEY] = core_host
@@ -2383,6 +2390,7 @@ async def start(
             standing_participation=getattr(core_services, "standing_participation", None),
             scheduler=getattr(core_services, "scheduler", None),
             review_jobs=getattr(core_services, "review_jobs", None),
+            webhook_diagnostics=getattr(core_services, "webhook_diagnostics", None),
             runtime_pool=getattr(core_services, "runtime_pool", None),
         )
 

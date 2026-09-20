@@ -59,6 +59,38 @@ export interface WorkshopCapabilitySnapshot {
   };
 }
 
+export type WorkshopWebhookDiagnosticState =
+  | "healthy"
+  | "degraded"
+  | "disabled"
+  | "unavailable";
+
+export interface WorkshopWebhookEndpointDiagnostic {
+  description: string;
+  displayName: string;
+  endpointClass: string;
+  state: WorkshopWebhookDiagnosticState;
+}
+
+export interface WorkshopWebhookDiagnostics {
+  deliveries: {
+    executing: number;
+    failed: number;
+    pending: number;
+    retrying: number;
+    state: WorkshopWebhookDiagnosticState;
+    succeeded: number;
+    windowHours: number;
+  };
+  endpoints: WorkshopWebhookEndpointDiagnostic[];
+  guidance: string[];
+  listener: {
+    port: number;
+    state: WorkshopWebhookDiagnosticState;
+  };
+  state: WorkshopWebhookDiagnosticState;
+}
+
 export interface WorkshopAgentSummary {
   agentId: string;
   available: boolean;

@@ -193,6 +193,7 @@ from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageRegistry,
 )
 from kai.workshop.store import WorkshopEventStore
+from kai.workshop.webhook_diagnostics import WorkshopWebhookDiagnosticsService
 from tests.workshop_profiles import profile_id, profile_registry
 
 _NOW = datetime(2026, 8, 11, 14, 0, tzinfo=UTC)
@@ -1255,6 +1256,7 @@ async def _open_client(
     runtime_lane_status=None,
     scheduler=None,
     review_jobs=None,
+    webhook_diagnostics=None,
     invalidate_agent_context=None,
 ) -> TestClient:
     app = web.Application()
@@ -1288,6 +1290,7 @@ async def _open_client(
         runtime_lane_status=runtime_lane_status,
         scheduler=scheduler,
         review_jobs=review_jobs,
+        webhook_diagnostics=webhook_diagnostics,
         invalidate_agent_context=invalidate_agent_context,
     )
     client = TestClient(TestServer(app))
@@ -1362,6 +1365,63 @@ async def _read_sse_event(response) -> dict[str, object]:
             event_id = value
         elif field == "data":
             data_lines.append(value)
+
+
+@pytest.mark.asyncio
+async def test_webhook_diagnostics_api_is_admin_only_and_redacted(tmp_path: Path) -> None:
+    store, alice_id, _alice_channel, bob_id, _bob_channel = await _open_store(tmp_path / "kai.db")
+    service = WorkshopWebhookDiagnosticsService(
+        SimpleNamespace(
+            webhook_port=8123,
+            github_webhook_secret="github-secret",
+            generic_webhook_secret="generic-secret",
+            telegram_enabled=True,
+            telegram_webhook_url="https://private.example/secret-path",
+            workshop_enabled=True,
+        ),
+        store,
+    )
+    service.bind_listener_probe(lambda: True)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id, "bob-token": bob_id}),
+        webhook_diagnostics=service,
+    )
+    try:
+        member = await client.get(
+            "/v1/client/administration/webhook-diagnostics",
+            headers={"Authorization": "Bearer bob-token"},
+        )
+        assert member.status == 403
+        assert await member.json() == {
+            "error": {
+                "code": "access_denied",
+                "message": "Administrator access required",
+            }
+        }
+
+        admin = await client.get(
+            "/v1/client/administration/webhook-diagnostics",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert admin.status == 200
+        payload = await admin.json()
+        assert payload["state"] == "healthy"
+        assert payload["listener"] == {"state": "healthy", "port": 8123}
+        serialized = json.dumps(payload)
+        assert "github-secret" not in serialized
+        assert "generic-secret" not in serialized
+        assert "secret-path" not in serialized
+        assert "/Users/" not in serialized
+
+        invalid = await client.get(
+            "/v1/client/administration/webhook-diagnostics?detail=secret",
+            headers={"Authorization": "Bearer alice-token"},
+        )
+        assert invalid.status == 400
+    finally:
+        await client.close()
+        await store.close()
 
 
 @pytest.mark.asyncio

@@ -144,6 +144,13 @@ from kai.workshop.storage_namespaces import (
     WorkshopPrincipalStorageNamespace,
     WorkshopPrincipalStorageRegistry,
 )
+from kai.workshop.webhook_diagnostics import (
+    WebhookDeliveryHealth,
+    WebhookDiagnosticsAccessDenied,
+    WebhookDiagnosticsSnapshot,
+    WebhookDiagnosticState,
+    WebhookEndpointDiagnostic,
+)
 from kai.workspace_utils import is_workspace_allowed
 from tests.workshop_profiles import profile_id, profile_registry
 
@@ -1058,6 +1065,7 @@ def _make_context(config=None, claude=None, pool=None, args=None, user_data=None
         ),
         client_preferences=client_preferences,
         runtime_lane_status=MagicMock(),
+        webhook_diagnostics=SimpleNamespace(inspect=AsyncMock()),
     )
     ctx.application = application
     ctx.args = args or []
@@ -2226,38 +2234,55 @@ class TestHandleVoiceCallback:
 
 class TestHandleWebhooks:
     @pytest.mark.asyncio
-    async def test_running_with_secret(self):
+    async def test_renders_canonical_admin_snapshot(self):
         update = _make_update()
-        ctx = _make_context(config=_make_config(github_webhook_secret="s3cret"))
-        with patch("kai.bot.webhook.is_running", return_value=True):
-            await handle_webhooks(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "running" in reply
-        assert "GitHub setup" in reply
-
-    @pytest.mark.asyncio
-    async def test_not_running(self):
-        update = _make_update()
-        ctx = _make_context(config=_make_config(github_webhook_secret="s3cret"))
-        with patch("kai.bot.webhook.is_running", return_value=False):
-            await handle_webhooks(update, ctx)
-        reply = update.message.reply_text.call_args[0][0]
-        assert "not running" in reply
-
-    @pytest.mark.asyncio
-    async def test_no_external_secrets(self):
-        update = _make_update()
-        ctx = _make_context(
-            config=_make_config(
-                github_webhook_secret="",
-                generic_webhook_secret="",
-            )
+        ctx = _make_context()
+        snapshot = WebhookDiagnosticsSnapshot(
+            state=WebhookDiagnosticState.HEALTHY,
+            listener_state=WebhookDiagnosticState.HEALTHY,
+            listener_port=8123,
+            endpoints=(
+                WebhookEndpointDiagnostic(
+                    "github_webhook",
+                    "GitHub webhook ingress",
+                    WebhookDiagnosticState.HEALTHY,
+                    "GitHub event ingress is configured.",
+                ),
+            ),
+            deliveries=WebhookDeliveryHealth(
+                WebhookDiagnosticState.HEALTHY,
+                24,
+                0,
+                0,
+                0,
+                3,
+                0,
+            ),
+            guidance=(),
         )
-        with patch("kai.bot.webhook.is_running", return_value=True):
-            await handle_webhooks(update, ctx)
+        ctx.application.core_services.webhook_diagnostics.inspect.return_value = snapshot
+
+        await handle_webhooks(update, ctx)
+
+        principal_id = ctx.application.core_services.principal_storage.for_runtime_config_id(1).principal_id
+        ctx.application.core_services.webhook_diagnostics.inspect.assert_awaited_once_with(principal_id)
         reply = update.message.reply_text.call_args[0][0]
-        assert "No external webhook secrets" in reply
-        assert "/api/schedule" in reply
+        assert "Webhook and integration diagnostics: healthy" in reply
+        assert "Shared listener: healthy (port 8123)" in reply
+        assert "GitHub webhook ingress: healthy" in reply
+        assert "succeeded=3" in reply
+
+    @pytest.mark.asyncio
+    async def test_member_is_denied(self):
+        update = _make_update()
+        ctx = _make_context()
+        ctx.application.core_services.webhook_diagnostics.inspect.side_effect = WebhookDiagnosticsAccessDenied(
+            "Administrator access required"
+        )
+
+        await handle_webhooks(update, ctx)
+
+        update.message.reply_text.assert_awaited_once_with("Administrator access required.")
 
 
 # ── handle_workspace ─────────────────────────────────────────────────

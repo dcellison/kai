@@ -37,7 +37,7 @@ from telegram.ext import (
     filters,
 )
 
-from kai import github_api, memory_command, sessions, webhook
+from kai import github_api, memory_command, sessions
 from kai.adapter_operation_bindings import bind_adapter_operation
 from kai.application_host import KaiCoreServices
 from kai.capability_registry import AdapterId, render_telegram_help, telegram_command_inventory
@@ -131,6 +131,10 @@ from kai.workshop.settings_workspaces import (
 )
 from kai.workshop.storage_namespaces import WorkshopStorageNamespaceError
 from kai.workshop.streaming_preview import ConfirmedTelegramStreamingPreview
+from kai.workshop.webhook_diagnostics import (
+    WebhookDiagnosticsAccessDenied,
+    render_telegram_webhook_diagnostics,
+)
 from kai.workspace_utils import is_workspace_allowed
 
 _UPLOAD_ROOT_MODE = 0o711
@@ -4138,42 +4142,16 @@ async def handle_github(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @_require_auth
 async def handle_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /webhooks — show webhook server status and endpoint info."""
+    """Render the canonical administrator-scoped webhook diagnostic snapshot."""
     assert update.message is not None
-    config: Config = context.bot_data["config"]
-    running = webhook.is_running()
-    status = "running" if running else "not running"
-    has_github_secret = bool(config.github_webhook_secret)
-    has_generic_secret = bool(config.generic_webhook_secret)
-    lines = [
-        f"Webhook server: {status}",
-        f"Port: {config.webhook_port}",
-        "",
-        "Endpoints:",
-        "  GET  /health          (health check)",
-        "  POST /api/schedule    (principal-bound scheduling API)",
-        "  POST /api/services/*  (principal-bound service proxy)",
-    ]
-    if has_github_secret:
-        lines.append("  POST /webhook/github  (GitHub events)")
-    if has_generic_secret:
-        lines.append("  POST /webhook         (generic)")
-    if not has_github_secret and not has_generic_secret:
-        lines += [
-            "",
-            "No external webhook secrets are configured.",
-            "Internal APIs remain active with per-user process credentials.",
-        ]
-    if running and has_github_secret:
-        lines += [
-            "",
-            "GitHub setup:",
-            "1. Set Payload URL to https://your-host/webhook/github",
-            "2. Content type: application/json",
-            "3. Set the secret to match GITHUB_WEBHOOK_SECRET",
-            "4. Choose events: Pushes, Pull requests, Issues, Comments",
-        ]
-    await update.message.reply_text("\n".join(lines))
+    services = _get_core_services(context)
+    try:
+        principal = services.principal_storage.for_runtime_config_id(_user_id(update)).principal_id
+        snapshot = await services.webhook_diagnostics.inspect(principal)
+    except (WebhookDiagnosticsAccessDenied, WorkshopStorageNamespaceError):
+        await update.message.reply_text("Administrator access required.")
+        return
+    await update.message.reply_text(render_telegram_webhook_diagnostics(snapshot))
 
 
 @_require_auth
