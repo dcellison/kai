@@ -8,6 +8,8 @@ import pytest
 
 from kai.review import (
     _CHANGED_FILES_SECTION_FLOOR,
+    _CODEX_APP_SERVER_MAX_INPUT_CHARS,
+    _CODEX_REVIEW_CONTEXT_CHARS,
     _MAX_COMMITS_CHARS,
     _MAX_DIFF_CHARS,
     _MAX_LINKED_ISSUES_CHARS,
@@ -2387,6 +2389,7 @@ class TestGeneratePRReview:
         assert mock_build.call_args.kwargs["local_repo_path"] == "/repo"
         assert mock_build.call_args.kwargs["spec_dir"] == "my/specs"
         assert mock_build.call_args.kwargs["include_prior_comments"] is False
+        assert mock_build.call_args.kwargs["max_context_chars"] == _CODEX_REVIEW_CONTEXT_CHARS
         mock_render.assert_called_once_with(ctx)
         run_kwargs = mock_run.call_args.kwargs
         assert run_kwargs["agent_backend"] == "codex"
@@ -2398,6 +2401,42 @@ class TestGeneratePRReview:
         assert result.repo == "owner/repo"
         assert result.pr_number == 42
         assert isinstance(result, PRReviewResult)
+
+    @pytest.mark.asyncio
+    async def test_non_codex_backend_keeps_general_context_budget(self):
+        ctx = _ctx(patch="x")
+        with (
+            patch("kai.review.build_pr_review_context", return_value=ctx) as mock_build,
+            patch("kai.review.build_review_prompt_from_context", return_value="rendered"),
+            patch("kai.review.run_review", return_value="output"),
+        ):
+            await generate_pr_review(
+                "owner/repo",
+                42,
+                agent_backend="claude",
+            )
+
+        assert mock_build.call_args.kwargs["max_context_chars"] == _MAX_REVIEW_CONTEXT_CHARS
+
+    @pytest.mark.asyncio
+    async def test_codex_prompt_over_app_server_limit_fails_before_transport(self):
+        ctx = _ctx(patch="x")
+        with (
+            patch("kai.review.build_pr_review_context", return_value=ctx),
+            patch(
+                "kai.review.build_review_prompt_from_context",
+                return_value="x" * (_CODEX_APP_SERVER_MAX_INPUT_CHARS + 1),
+            ),
+            patch("kai.review.run_review", return_value="output") as mock_run,
+            pytest.raises(RuntimeError, match="exceeds the app-server input limit"),
+        ):
+            await generate_pr_review(
+                "owner/repo",
+                42,
+                agent_backend="codex",
+            )
+
+        mock_run.assert_not_called()
 
 
 # ── Review-round fixes ─────────────────────────────────────────────
@@ -2840,6 +2879,48 @@ class TestBundleCapLifts:
         assert _MAX_PATCH_CHARS == 200_000
         assert _CHANGED_FILES_SECTION_FLOOR == 450_000
         assert _OVERHEAD_RESERVE == 50_000
+
+
+class TestCodexReviewTransportBudget:
+    """Codex app-server has a hard combined-input ceiling below the
+    general review bundle budget.  A large real-world review shape must
+    be reduced before transport rather than rejected by app-server.
+    """
+
+    def test_large_bundle_renders_below_app_server_limit(self):
+        changed_files = tuple(
+            ChangedFile(
+                path=f"src/large_{index}.py",
+                status="modified",
+                content=chr(65 + index) * 200_000,
+                note=None,
+            )
+            for index in range(8)
+        )
+        ctx = _ctx(
+            patch="P" * 130_000,
+            changed_files=changed_files,
+            related_context=(
+                RelatedExcerpt(
+                    path="src/caller.py",
+                    line=1,
+                    symbol="caller",
+                    kind="function",
+                    reason="changed symbol",
+                    excerpt="R" * 30_000,
+                ),
+            ),
+        )
+
+        out = budget_review_context(
+            ctx,
+            max_total_chars=_CODEX_REVIEW_CONTEXT_CHARS,
+        )
+        prompt = build_review_prompt_from_context(out)
+
+        assert _estimate_total_chars(out) <= _CODEX_REVIEW_CONTEXT_CHARS
+        assert len(prompt) <= _CODEX_APP_SERVER_MAX_INPUT_CHARS
+        assert any(note.section == "CHANGED_FILES_AT_HEAD" for note in out.budget_notes)
 
 
 class TestChangedFileURLEncoding:
