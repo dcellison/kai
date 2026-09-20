@@ -319,6 +319,8 @@ async def test_stats_and_detail_expose_only_bounded_stable_fields(
 
     detail = await service.detail(authority, episode.id)
     assert detail.content == "Deploy succeeded."
+    assert detail.extraction_provenance == "legacy"
+    assert detail.extraction_receipt is None
     assert detail.episode == {
         "goal": "Deploy Kai",
         "outcome": "Succeeded",

@@ -25,6 +25,7 @@ from kai.workshop.domain import (
     RunExecutionOwnerId,
 )
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
+from kai.workshop.memory_extraction_receipts import MemoryExtractionReceiptService, MemoryExtractionReceiptSpec
 from kai.workshop.outbound import (
     OutboundMessage,
     record_outbound_message_with_streaming_finalization,
@@ -853,6 +854,71 @@ class TestAtomicTerminalTransactions:
 
         profile_state.has_memory_for_run.assert_awaited_once_with(str(run.run_id))
         profile_state.ingest_memory.assert_not_awaited()
+
+    async def test_recovered_post_run_effect_reconciles_a_started_receipt(self, tmp_path: Path):
+        database = tmp_path / "kai.db"
+        store, authority, claim = await _started_run(database)
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+            claim,
+            body="Stored before receipt completion",
+            occurred_at=_NOW + timedelta(seconds=4),
+            runtime_session=RuntimeSessionSettlement(
+                channel_id=run.channel_id,
+                agent_id=run.agent_id,
+                runtime_profile_id=profile_id(101),
+                selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                workspace="/private/tmp/kai-workshop-test-workspace",
+                provider_session_id="provider-session-before-receipt-completion",
+                run_id=run.run_id,
+            ),
+        )
+        result_message_id = result.execution.run.result_message_id
+        assert result_message_id is not None
+        await MemoryExtractionReceiptService(store.connection, _claim_owner="a" * 32).claim(
+            MemoryExtractionReceiptSpec(
+                principal_id=str(run.requested_by_principal_id),
+                runtime_profile_id=profile_id(101),
+                run_id=str(run.run_id),
+                source_message_id=str(run.inbound_message_id),
+                result_message_id=str(result_message_id),
+                extraction_role="fact_extraction",
+                backend="codex",
+                provider="openai",
+                model="gpt-5.6-sol",
+                prompt_version="13",
+                schema_version="1",
+                policy_version="1",
+            )
+        )
+        await store.connection.execute(
+            "UPDATE workshop_post_run_effects SET status = 'executing' WHERE run_id = ?",
+            (run.run_id,),
+        )
+        await store.connection.commit()
+        await store.close()
+
+        profile_state = SimpleNamespace(
+            memory_context_turns=8,
+            has_memory_for_run=AsyncMock(return_value=True),
+            ingest_memory=AsyncMock(),
+        )
+        service = await WorkshopPostRunEffectService.open_and_start(
+            database,
+            SimpleNamespace(for_profile=lambda _profile_id: profile_state),  # type: ignore[arg-type]
+        )
+        try:
+            for _ in range(100):
+                if (await service.readiness()).succeeded == 1:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("receipt reconciliation did not settle")
+        finally:
+            await service.stop()
+
+        profile_state.has_memory_for_run.assert_awaited_once_with(str(run.run_id))
+        profile_state.ingest_memory.assert_awaited_once()
 
     async def test_stale_fence_rolls_back_every_visible_outcome_row(self, tmp_path: Path):
         store, authority, stale_claim = await _started_run(tmp_path / "kai.db")

@@ -106,6 +106,7 @@ from kai.workshop.diagnostics import (
     workshop_human_provisioning_status,
     workshop_legacy_jsonl_archive_status,
     workshop_memory_authority_status,
+    workshop_memory_extraction_receipt_status,
     workshop_memory_project_registry_status,
     workshop_operational_state_status,
     workshop_runtime_session_status,
@@ -10027,6 +10028,7 @@ def _cmd_status() -> None:
             memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
         )
     )
+    print(workshop_memory_extraction_receipt_status(Path(data_dir) / "kai.db"))
     print(
         _memory_scope_review_status(
             Path(data_dir) / "memory-scope-review.json",

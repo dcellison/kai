@@ -1748,6 +1748,7 @@ def _serialize_memory_record(record: MemoryRecordSummary) -> dict[str, object]:
 
 
 def _serialize_memory_detail(detail: MemoryRecordDetail) -> dict[str, object]:
+    receipt = detail.extraction_receipt
     return {
         **_serialize_memory_record(detail.record),
         "content": detail.content,
@@ -1755,6 +1756,37 @@ def _serialize_memory_detail(detail: MemoryRecordDetail) -> dict[str, object]:
         "confirmation_quote": detail.confirmation_quote,
         "prompt_version": detail.prompt_version,
         "episode": detail.episode,
+        "extraction_provenance": detail.extraction_provenance,
+        "extraction_receipt": (
+            {
+                "receipt_id": receipt.receipt_id,
+                "run_id": receipt.run_id,
+                "source_message_id": receipt.source_message_id,
+                "result_message_id": receipt.result_message_id,
+                "runtime_profile_id": receipt.runtime_profile_id,
+                "extraction_role": receipt.extraction_role,
+                "backend": receipt.backend,
+                "provider": receipt.provider,
+                "model": receipt.model,
+                "prompt_version": receipt.prompt_version,
+                "schema_version": receipt.schema_version,
+                "policy_version": receipt.policy_version,
+                "status": receipt.status,
+                "decision_outcome": receipt.decision_outcome,
+                "failure_code": receipt.failure_code,
+                "candidate_ids": list(receipt.candidate_ids),
+                "classifier_result": receipt.classifier_result,
+                "proposed_intents": list(receipt.proposed_intents),
+                "validation_outcome": receipt.validation_outcome,
+                "storage_outcome": receipt.storage_outcome,
+                "memory_scopes": list(receipt.memory_scopes),
+                "duration_ms": receipt.duration_ms,
+                "created_at": receipt.created_at,
+                "completed_at": receipt.completed_at,
+            }
+            if receipt is not None
+            else None
+        ),
     }
 
 

@@ -244,6 +244,7 @@ class TestWorkshopSchema:
             "workshop_github_automation_work",
             "workshop_review_jobs",
             "workshop_review_artifacts",
+            "memory_extraction_receipts",
             "workshop_integration_routes",
             "workshop_integration_route_owners",
             "principal_notification_delivery_preferences",
@@ -600,6 +601,7 @@ class TestWorkshopSchema:
                     84,
                     85,
                     86,
+                    87,
                 ]
         finally:
             await upgraded.close()
