@@ -122,6 +122,12 @@ _MAX_PRIOR_COMMENTS_CHARS = 50_000
 # would consume headroom the dynamic allocator routes to
 # changed-files.
 _MAX_REVIEW_CONTEXT_CHARS = 3_500_000
+# Codex app-server rejects a turn when the combined text input exceeds
+# 1,048,576 Unicode characters.  Budget Codex review bundles below that
+# transport ceiling, retaining explicit headroom for prompt instructions,
+# boundary markers, budget notes, and estimator drift.
+_CODEX_APP_SERVER_MAX_INPUT_CHARS = 1_048_576
+_CODEX_REVIEW_CONTEXT_CHARS = 950_000
 _MAX_PATCH_CHARS = 200_000
 # Minimum cap the dynamic changed-files allocator can produce. Matches
 # the legacy static cap so the safety net never regresses below
@@ -2197,7 +2203,11 @@ def _estimate_total_chars(ctx: PRReviewContext) -> int:
     return total
 
 
-def _compute_dynamic_changed_files_cap(ctx: PRReviewContext) -> int:
+def _compute_dynamic_changed_files_cap(
+    ctx: PRReviewContext,
+    *,
+    max_total_chars: int = _MAX_REVIEW_CONTEXT_CHARS,
+) -> int:
     """Compute the section cap for changed_files given the rest of the bundle.
 
     Constructs a measurement context with `changed_files=()` and reuses
@@ -2207,7 +2217,8 @@ def _compute_dynamic_changed_files_cap(ctx: PRReviewContext) -> int:
     never starve changed-files below the legacy static-cap behavior.
     Holds `_OVERHEAD_RESERVE` back for rendered overhead the estimator
     does not capture (per-section boundary tokens, BEGIN/END markers,
-    status lines).
+    status lines). `max_total_chars` defaults to the general review
+    ceiling but may be lowered for a backend transport boundary.
     """
     measurement_ctx = PRReviewContext(
         repo=ctx.repo,
@@ -2225,11 +2236,15 @@ def _compute_dynamic_changed_files_cap(ctx: PRReviewContext) -> int:
         collection_warnings=ctx.collection_warnings,
     )
     non_changed = _estimate_total_chars(measurement_ctx)
-    headroom = _MAX_REVIEW_CONTEXT_CHARS - non_changed - _OVERHEAD_RESERVE
+    headroom = max_total_chars - non_changed - _OVERHEAD_RESERVE
     return max(_CHANGED_FILES_SECTION_FLOOR, headroom)
 
 
-def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
+def budget_review_context(
+    ctx: PRReviewContext,
+    *,
+    max_total_chars: int = _MAX_REVIEW_CONTEXT_CHARS,
+) -> PRReviewContext:
     """
     Apply per-section caps and the drop ladder to a freshly-collected bundle.
 
@@ -2244,6 +2259,8 @@ def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
     Args:
         ctx: The context returned by `build_pr_review_context()`
             before any budget action.
+        max_total_chars: Backend-aware ceiling for the estimated
+            context bundle.
 
     Returns:
         A new PRReviewContext with each capped section replaced,
@@ -2304,7 +2321,10 @@ def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
         budget_notes=tuple(notes),
         collection_warnings=ctx.collection_warnings,
     )
-    dynamic_cap = _compute_dynamic_changed_files_cap(partial_ctx)
+    dynamic_cap = _compute_dynamic_changed_files_cap(
+        partial_ctx,
+        max_total_chars=max_total_chars,
+    )
     changed_files, n = _cap_changed_files(ctx.changed_files, cap=dynamic_cap)
     notes.extend(n)
 
@@ -2337,12 +2357,16 @@ def budget_review_context(ctx: PRReviewContext) -> PRReviewContext:
     # and the resulting bundle still overshoots, or when
     # `_estimate_total_chars` materially under-counts rendered
     # overhead.
-    if _estimate_total_chars(capped) <= _MAX_REVIEW_CONTEXT_CHARS:
+    if _estimate_total_chars(capped) <= max_total_chars:
         return capped
-    return _apply_cross_section_ladder(capped)
+    return _apply_cross_section_ladder(capped, max_total_chars=max_total_chars)
 
 
-def _apply_cross_section_ladder(ctx: PRReviewContext) -> PRReviewContext:
+def _apply_cross_section_ladder(
+    ctx: PRReviewContext,
+    *,
+    max_total_chars: int = _MAX_REVIEW_CONTEXT_CHARS,
+) -> PRReviewContext:
     """
     Reduce sections in documented priority order until under the global cap.
 
@@ -2387,7 +2411,7 @@ def _apply_cross_section_ladder(ctx: PRReviewContext) -> PRReviewContext:
         )
 
     def _over() -> bool:
-        return _estimate_total_chars(_current()) > _MAX_REVIEW_CONTEXT_CHARS
+        return _estimate_total_chars(_current()) > max_total_chars
 
     # Rung 1: drop related-context excerpts in priority order
     # (lowest signal first). The per-section cap already used the
@@ -2571,7 +2595,7 @@ def _apply_cross_section_ladder(ctx: PRReviewContext) -> PRReviewContext:
                 message=(
                     f"Bundle remains above global ceiling after the full drop ladder; "
                     f"estimated {_estimate_total_chars(_current())} chars vs cap "
-                    f"{_MAX_REVIEW_CONTEXT_CHARS}."
+                    f"{max_total_chars}."
                 ),
             )
         )
@@ -2601,6 +2625,7 @@ async def build_pr_review_context(
     spec_dir: str = "specs",
     include_prior_comments: bool = True,
     github_token: str | None = None,
+    max_context_chars: int = _MAX_REVIEW_CONTEXT_CHARS,
 ) -> PRReviewContext:
     """
     Collect the full review-context bundle for a PR.
@@ -2627,6 +2652,8 @@ async def build_pr_review_context(
         spec_dir: Spec directory relative to the repo root.
         include_prior_comments: Whether to fetch and include prior
             review thread context.
+        max_context_chars: Backend-aware ceiling passed to the
+            deterministic context budgeter.
 
     Returns:
         A fully populated, budgeted `PRReviewContext`.
@@ -2709,7 +2736,7 @@ async def build_pr_review_context(
         prior_comments=prior_comments,
         collection_warnings=tuple(warnings),
     )
-    return budget_review_context(raw)
+    return budget_review_context(raw, max_total_chars=max_context_chars)
 
 
 async def _fetch_pr_commits(repo: str, pr_number: int, github_token: str | None = None) -> tuple[Commit, ...]:
@@ -3316,6 +3343,7 @@ async def generate_pr_review(
             responsible for translating this into a user-visible
             error (webhook failure summary, Telegram error reply).
     """
+    context_limit = _CODEX_REVIEW_CONTEXT_CHARS if agent_backend == "codex" else _MAX_REVIEW_CONTEXT_CHARS
     context = await build_pr_review_context(
         repo,
         pr_number,
@@ -3323,8 +3351,14 @@ async def generate_pr_review(
         spec_dir=spec_dir,
         include_prior_comments=include_prior_comments,
         github_token=github_token,
+        max_context_chars=context_limit,
     )
     prompt = build_review_prompt_from_context(context)
+    if agent_backend == "codex" and len(prompt) > _CODEX_APP_SERVER_MAX_INPUT_CHARS:
+        raise RuntimeError(
+            "Codex review prompt exceeds the app-server input limit after "
+            f"budgeting ({len(prompt)} > {_CODEX_APP_SERVER_MAX_INPUT_CHARS} characters)"
+        )
     review_text = await run_review(
         prompt,
         claude_user=claude_user,
