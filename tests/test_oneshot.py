@@ -551,8 +551,12 @@ class TestCodexOneShotReasonerArgv:
         assert 'web_search="disabled"' in config_values
         assert "mcp_servers={}" in config_values
 
+        enabled = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--enable"]
+        assert enabled == ["responses_websockets_v2"]
+
         disabled = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--disable"]
         assert {
+            "responses_websockets",
             "shell_tool",
             "unified_exec",
             "apps",

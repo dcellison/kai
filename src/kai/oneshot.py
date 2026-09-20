@@ -112,12 +112,21 @@ _CODEX_ONESHOT_PERMISSION_PROFILE = (
 )
 
 
+# `--ignore-user-config` is a security boundary, but it also removes the
+# operator's transport feature selection. Pin the supported v2 WebSocket
+# transport so bounded one-shot calls do not fall back to the legacy responses
+# transport. The matching legacy feature remains explicitly disabled below;
+# `--strict-config` makes a future Codex rename fail closed.
+_CODEX_ONESHOT_ENABLED_FEATURES = ("responses_websockets_v2",)
+
+
 # Defense in depth around the permission profile.  `shell_tool=false` is the
 # load-bearing tool suppression; the remaining entries remove other built-in
 # or account-backed tool surfaces that a Codex release may otherwise advertise
 # to the model.  `--strict-config` on the invocation makes a renamed/removed
 # control fail the one-shot call closed instead of silently weakening it.
 _CODEX_ONESHOT_DISABLED_FEATURES = (
+    "responses_websockets",
     "shell_tool",
     "unified_exec",
     "apps",
@@ -1088,6 +1097,9 @@ class CodexOneShotReasoner:
       `--ignore-user-config`.
     - `--strict-config` makes an unsupported security control fail
       the call instead of being ignored after a Codex CLI change.
+    - `responses_websockets_v2` is enabled and the legacy
+      `responses_websockets` transport is disabled explicitly. Ignoring user
+      configuration must not silently select the retired transport.
     - `approval_policy="never"` prevents an untrusted prompt from
       turning a tool attempt into an operator approval request.
     - The `kai-oneshot` permission profile grants read access only to
@@ -1220,6 +1232,8 @@ class CodexOneShotReasoner:
             "--cd",
             str(self._cwd),
         ]
+        for feature in _CODEX_ONESHOT_ENABLED_FEATURES:
+            cmd.extend(["--enable", feature])
         for feature in _CODEX_ONESHOT_DISABLED_FEATURES:
             cmd.extend(["--disable", feature])
         if model is not None:
