@@ -552,11 +552,12 @@ class TestCodexOneShotReasonerArgv:
         assert "mcp_servers={}" in config_values
 
         enabled = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--enable"]
-        assert enabled == ["responses_websockets_v2"]
+        assert enabled == []
 
         disabled = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--disable"]
         assert {
             "responses_websockets",
+            "responses_websockets_v2",
             "shell_tool",
             "unified_exec",
             "apps",
