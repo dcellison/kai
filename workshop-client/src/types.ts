@@ -916,6 +916,42 @@ export interface WorkshopGitHubSettings {
   tokenStored: boolean;
 }
 
+export type WorkshopReviewJobStatus =
+  | "pending"
+  | "executing"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+
+export interface WorkshopReviewJob {
+  artifact: {
+    artifactId: string;
+    filename: string;
+    warningCount: number;
+    warnings: { message: string; source: string }[];
+  } | null;
+  attemptCount: number;
+  createdAt: string;
+  lastErrorCode: string | null;
+  pullRequestNumber: number;
+  repository: string;
+  replayed: boolean;
+  reviewJobId: string;
+  status: WorkshopReviewJobStatus;
+  updatedAt: string;
+}
+
+export interface WorkshopReviewJobs {
+  jobs: WorkshopReviewJob[];
+  submission: {
+    activeWorkspace: string;
+    activeWorkspaceRepository: string | null;
+    inferredRepository: string | null;
+    repositories: string[];
+  };
+}
+
 export type WorkshopGitHubSettingsChange =
   | { field: "repository"; name: string; subscribed: boolean }
   | { field: "repository_reset" }

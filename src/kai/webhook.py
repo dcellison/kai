@@ -131,6 +131,7 @@ from kai.workshop.proactive_publication import (
     ProactivePublicationAuthority,
     ProactivePublicationResult,
 )
+from kai.workshop.review_jobs import WorkshopReviewJobService
 from kai.workshop.routing_eligibility import WorkshopRoutingEligibilityService
 from kai.workshop.routing_policy import WorkshopRoutingPolicyService
 from kai.workshop.run_previews import WorkshopRunPreviewRegistry
@@ -2225,6 +2226,7 @@ async def _register_workshop_client_api(
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
     standing_participation: WorkshopStandingParticipationService | None = None,
     scheduler: WorkshopCanonicalScheduler | None = None,
+    review_jobs: WorkshopReviewJobService | None = None,
     runtime_pool: WorkshopRuntimePool | None = None,
 ) -> Callable[[web.Application], None]:
     """Register the client API against the core-owned canonical store.
@@ -2277,6 +2279,7 @@ async def _register_workshop_client_api(
             collaboration_policy=collaboration_policy,
             standing_participation=standing_participation,
             scheduler=scheduler,
+            review_jobs=review_jobs,
             invalidate_agent_context=(
                 runtime_pool.invalidate_agent_retained_context if runtime_pool is not None else None
             ),
@@ -2379,6 +2382,7 @@ async def start(
             collaboration_policy=getattr(core_services, "collaboration_policy", None),
             standing_participation=getattr(core_services, "standing_participation", None),
             scheduler=getattr(core_services, "scheduler", None),
+            review_jobs=getattr(core_services, "review_jobs", None),
             runtime_pool=getattr(core_services, "runtime_pool", None),
         )
 

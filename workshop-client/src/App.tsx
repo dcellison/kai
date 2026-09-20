@@ -111,6 +111,7 @@ import { MemoryExplorer } from "./MemoryExplorer";
 import { WorkspacesWorkspace } from "./WorkspacesWorkspace";
 import { ScheduledJobsWorkspace } from "./ScheduledJobsWorkspace";
 import { SettingsWorkspace } from "./SettingsWorkspace";
+import { ReviewDialog } from "./ReviewDialog";
 import { AgentWorkspace } from "./AgentWorkspace";
 import { MentionsInbox } from "./MentionsInbox";
 import { FollowingThreads } from "./FollowingThreads";
@@ -3380,6 +3381,8 @@ function WorkshopView({
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [actionPaletteOpen, setActionPaletteOpen] = useState(false);
+  const [reviewDialogOpen, setReviewDialogOpen] = useState(false);
+  const [reviewRevision, setReviewRevision] = useState(0);
   const [actionPaletteLoading, setActionPaletteLoading] = useState(false);
   const [actionPaletteError, setActionPaletteError] = useState<string | null>(null);
   const [actionPaletteEntries, setActionPaletteEntries] =
@@ -4362,6 +4365,11 @@ function WorkshopView({
       onOpenSettings("github");
       return null;
     }
+    if (operationId === "integration.github.review") {
+      setActionPaletteOpen(false);
+      setReviewDialogOpen(true);
+      return null;
+    }
     if (
       operationId === "runtime.model.manage" ||
       operationId === "runtime.backend.manage"
@@ -5334,6 +5342,8 @@ function WorkshopView({
           onDirtyChange={onSettingsDirtyChange}
           onHumanAvatarChanged={setHumanAvatarOverride}
           onNavigationChanged={onAgentNavigationChanged}
+          onReviewPullRequest={() => setReviewDialogOpen(true)}
+          reviewRevision={reviewRevision}
           isAdministrator={workshop.role === "admin"}
           principalName={humanName}
           roleLabel={humanRole}
@@ -6384,6 +6394,15 @@ function WorkshopView({
           loading={actionPaletteLoading}
           onClose={() => setActionPaletteOpen(false)}
           onInvoke={invokePaletteAction}
+        />
+      )}
+      {reviewDialogOpen && (
+        <ReviewDialog
+          onAuthenticationFailure={onMemoryAuthenticationFailure}
+          onChannelAccessFailure={onSettingsAccessFailure}
+          onClose={() => setReviewDialogOpen(false)}
+          onSubmitted={() => setReviewRevision((current) => current + 1)}
+          session={settingsSession}
         />
       )}
     </main>
