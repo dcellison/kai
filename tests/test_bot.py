@@ -3211,10 +3211,7 @@ class TestSwitchWorkspaceConfig:
         mock_sessions = AsyncMock()
         # build_workspace_config returns the merged config (here, just YAML)
         mock_sessions.build_workspace_config = AsyncMock(return_value=ws_config)
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook"),
-        ):
+        with patch("kai.bot.sessions", mock_sessions):
             result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
 
         # Config was returned and passed to change_workspace
@@ -3233,10 +3230,7 @@ class TestSwitchWorkspaceConfig:
         mock_sessions = AsyncMock()
         # No YAML config, no DB overrides -> returns None
         mock_sessions.build_workspace_config = AsyncMock(return_value=None)
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook"),
-        ):
+        with patch("kai.bot.sessions", mock_sessions):
             result = await _do_switch_workspace(ctx, 12345, ws_path.resolve())
 
         assert result is None
@@ -3260,10 +3254,7 @@ class TestSwitchWorkspaceConfig:
 
         mock_sessions = AsyncMock()
         mock_sessions.build_workspace_config = AsyncMock(return_value=ws_config)
-        with (
-            patch("kai.bot.sessions", mock_sessions),
-            patch("kai.bot.webhook"),
-        ):
+        with patch("kai.bot.sessions", mock_sessions):
             await _switch_workspace(update, ctx, ws_path.resolve())
 
         reply_text = update.message.reply_text.call_args[0][0]
