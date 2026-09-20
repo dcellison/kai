@@ -644,10 +644,9 @@ class TestRunReviewClaudeDispatch:
 class TestRunReviewCodexDispatch:
     """
     `run_review` with `agent_backend="codex"` dispatches to
-    `CodexOneShotReasoner` (NOT an inline `codex exec` spawn). The
-    reasoner owns the `codex exec --json` argv, CODEX_BIN resolution,
-    per-user os_user routing, the allow-listed subprocess env, and
-    the NDJSON event walk; this class pins the dispatch contract:
+    `CodexAppServerReviewReasoner` (NOT `codex exec`). The reasoner
+    owns the bounded app-server lifecycle, per-user os_user routing,
+    read-only turn, and temporary-thread deletion; this class pins the dispatch contract:
     ctor kwargs (including join_items=True), registry model
     resolution, override and timeout pass-through, raw-text return,
     and the collapse of typed reasoner errors to RuntimeError.
@@ -669,7 +668,7 @@ class TestRunReviewCodexDispatch:
         fake = self._fake_reasoner(text="review body from codex")
 
         with (
-            patch("kai.review.CodexOneShotReasoner", return_value=fake) as ctor,
+            patch("kai.review.CodexAppServerReviewReasoner", return_value=fake) as ctor,
             patch("kai.review.asyncio.create_subprocess_exec") as mock_exec,
         ):
             result = await run_review("review prompt", agent_backend="codex", claude_user="someone")
@@ -696,7 +695,7 @@ class TestRunReviewCodexDispatch:
         """
         fake = self._fake_reasoner()
 
-        with patch("kai.review.CodexOneShotReasoner", return_value=fake) as ctor:
+        with patch("kai.review.CodexAppServerReviewReasoner", return_value=fake) as ctor:
             await run_review("prompt", agent_backend="codex")
 
         assert ctor.call_args.kwargs["join_items"] is True
@@ -711,7 +710,7 @@ class TestRunReviewCodexDispatch:
         """
         fake = self._fake_reasoner()
 
-        with patch("kai.review.CodexOneShotReasoner", return_value=fake):
+        with patch("kai.review.CodexAppServerReviewReasoner", return_value=fake):
             await run_review("prompt", agent_backend="codex", model_override="gpt-5.4")
 
         assert fake.run.call_args.kwargs["model"] == "gpt-5.4"
@@ -722,7 +721,7 @@ class TestRunReviewCodexDispatch:
         per-call timeout on the codex branch too."""
         fake = self._fake_reasoner()
 
-        with patch("kai.review.CodexOneShotReasoner", return_value=fake):
+        with patch("kai.review.CodexAppServerReviewReasoner", return_value=fake):
             await run_review("prompt", agent_backend="codex", timeout_s=888)
 
         assert fake.run.call_args.kwargs["timeout"] == 888
@@ -735,7 +734,7 @@ class TestRunReviewCodexDispatch:
         fake.run = AsyncMock(side_effect=OneShotTimeout())
 
         with (
-            patch("kai.review.CodexOneShotReasoner", return_value=fake),
+            patch("kai.review.CodexAppServerReviewReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"Review subprocess timed out"),
         ):
             await run_review("prompt", agent_backend="codex")
@@ -748,7 +747,7 @@ class TestRunReviewCodexDispatch:
         fake.run = AsyncMock(side_effect=OneShotSubprocessError(returncode=1, stderr=b"auth failed"))
 
         with (
-            patch("kai.review.CodexOneShotReasoner", return_value=fake),
+            patch("kai.review.CodexAppServerReviewReasoner", return_value=fake),
             pytest.raises(RuntimeError, match=r"Codex review failed"),
         ):
             await run_review("prompt", agent_backend="codex")

@@ -42,10 +42,10 @@ from pathlib import Path
 
 import aiohttp
 
+from kai.codex_review import CodexAppServerReviewReasoner
 from kai.config import ModelRole, get_model_for
 from kai.oneshot import (
     ClaudeOneShotReasoner,
-    CodexOneShotReasoner,
     GooseOneShotReasoner,
     OneShotError,
     OneShotTimeout,
@@ -2986,10 +2986,10 @@ async def run_review(
     `claude --print` text output, no tools, no session persistence,
     neutral cwd).
 
-    Codex path: `CodexOneShotReasoner` (`codex exec --json`); the
-    reasoner walks the NDJSON event stream and, with
-    `join_items=True`, joins every completed agent_message so a
-    multi-message review survives intact.
+    Codex path: `CodexAppServerReviewReasoner`; the bounded job uses
+    the same app-server JSON-RPC transport as Kai's conversational
+    Codex backend, but in a short-lived read-only thread that is
+    deleted after the turn.
 
     OpenCode path: `OpenCodeOneShotReasoner`, which spawns a fresh
     `opencode acp` JSON-RPC subprocess per call, accumulates
@@ -3050,24 +3050,18 @@ async def run_review(
         return result.text
 
     if agent_backend == "codex":
-        # Dispatch to the codex one-shot reasoner, which owns the
-        # `codex exec --json` argv (--skip-git-repo-check plus the
-        # --ephemeral / --ignore-rules sandboxing flags), CODEX_BIN
-        # resolution, per-user os_user routing via the shared
-        # sudo -H wrap, the allow-listed subprocess env, and the
-        # NDJSON event walk. join_items=True joins every completed
-        # agent_message so a preamble plus body both survive in the
-        # posted markdown; triage keeps the last-wins default for
-        # its one-JSON-object contract. Typed reasoner errors
-        # collapse to RuntimeError so the webhook handler's existing
-        # catch surface is unchanged.
+        # Dispatch reviews through the app-server JSON-RPC transport
+        # already proven by Kai's conversational Codex backend. This
+        # reasoner owns a short-lived read-only thread under the
+        # neutral one-shot cwd, per-user OAuth routing, tool
+        # suppression, thread deletion, and process teardown.
         review_model = get_model_for(
             ModelRole.PR_REVIEW,
             agent_backend,
             provider,
             override=model_override,
         )
-        reasoner = CodexOneShotReasoner(os_user=claude_user, join_items=True)
+        reasoner = CodexAppServerReviewReasoner(os_user=claude_user, join_items=True)
         try:
             result = await reasoner.run(
                 prompt=prompt,
