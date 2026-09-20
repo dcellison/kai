@@ -45,6 +45,7 @@ import {
   loadMessageReactors,
   loadPreferenceDocument,
   loadPreferenceHistory,
+  loadReviewJobs,
   loadRun,
   loadRunTrace,
   loadSettingsWorkspace,
@@ -134,6 +135,7 @@ vi.mock("./api", async (importOriginal) => {
     loadMessageReactors: vi.fn(),
     loadPreferenceDocument: vi.fn(),
     loadPreferenceHistory: vi.fn(),
+    loadReviewJobs: vi.fn(),
     loadTimeline: vi.fn(),
     loadThreadTimeline: vi.fn(),
     loadThreadUnread: vi.fn(),
@@ -860,6 +862,15 @@ describe("Workshop React client", () => {
         channelOwner: true,
         conversation: true,
         workspace: false,
+      },
+    });
+    vi.mocked(loadReviewJobs).mockResolvedValue({
+      jobs: [],
+      submission: {
+        activeWorkspace: "/srv/kai",
+        activeWorkspaceRepository: "dcellison/kai",
+        inferredRepository: "dcellison/kai",
+        repositories: ["dcellison/kai"],
       },
     });
     vi.mocked(loadAppearancePreferences).mockResolvedValue({
@@ -1690,7 +1701,7 @@ describe("Workshop React client", () => {
       "Activity",
       "Agents",
     ]);
-    for (const name of ["Mentions", "Following"]) {
+    for (const name of ["Mentions", "Following", "Reviews"]) {
       expect(
         within(navigationPanel).getByRole("button", { name }).querySelector(".workspace-nav-icon"),
       ).toBeInTheDocument();
@@ -1700,6 +1711,24 @@ describe("Workshop React client", () => {
     expect(
       within(navigationPanel).getByRole("button", { name: "Following" }).querySelector("svg"),
     ).toHaveAttribute("fill", "none");
+  });
+
+  it("opens durable pull-request reviews from Activity navigation", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+
+    render(<App />);
+
+    await user.click(await screen.findByRole("button", { name: "Reviews" }));
+    expect(await screen.findByRole("heading", { name: "Reviews", level: 2 })).toBeVisible();
+    expect(screen.getByText("Kai Workshop / Activity")).toBeVisible();
+    expect(screen.getByText("No on-demand reviews yet.")).toBeVisible();
+    expect(window.location.search).toBe("?view=reviews");
+    expect(loadReviewJobs).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes Following from principal thread events", async () => {
@@ -2099,6 +2128,20 @@ describe("Workshop React client", () => {
           surface: "run_inspector",
           unavailableReason: null,
         },
+        {
+          available: true,
+          confirmation: "context_dependent",
+          description: "Start a durable review of an authorized GitHub pull request.",
+          disposition: "action_palette",
+          inputShape: "pull_request_reference",
+          label: "Review pull request",
+          mutatesState: true,
+          operationId: "integration.github.review",
+          paletteEntry: true,
+          scope: "principal",
+          surface: "action_palette",
+          unavailableReason: null,
+        },
       ],
       context: {
         administrator: true,
@@ -2140,7 +2183,9 @@ describe("Workshop React client", () => {
 
     await user.click(screen.getByRole("button", { name: "Daniel profile" }));
     await user.click(screen.getByRole("menuitem", { name: /Help and actions/ }));
-    expect(await screen.findByRole("dialog", { name: "Help and actions" })).toBeVisible();
+    const profilePalette = await screen.findByRole("dialog", { name: "Help and actions" });
+    await user.click(within(profilePalette).getByRole("option", { name: /Review pull request/ }));
+    expect(await screen.findByRole("dialog", { name: "Review pull request" })).toBeVisible();
   });
 
   it("opens help and actions instead of sending slash text from an empty composer", async () => {

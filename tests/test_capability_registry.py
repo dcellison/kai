@@ -244,6 +244,18 @@ def test_help_and_actions_is_canonical_and_registry_backed_for_both_adapters() -
     assert capability.presentations[AdapterId.TELEGRAM].help_discoverable is True
 
 
+def test_review_action_is_discoverable_without_an_agent_workspace_context() -> None:
+    results = capability_availability(
+        AdapterId.WORKSHOP,
+        CapabilityContext(authenticated=True),
+    )
+    review = next(result for result in results if result.operation_id == "integration.github.review")
+
+    assert review.available is True
+    assert review.palette_entry is True
+    assert review.authority_scope == AuthorityScope.PRINCIPAL
+
+
 def test_unsupported_operations_do_not_appear_in_adapter_availability() -> None:
     results = capability_availability(
         AdapterId.TELEGRAM,

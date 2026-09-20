@@ -847,6 +847,12 @@ button:disabled {
   height: 0.9rem;
 }
 
+.reviews-nav-icon svg {
+  display: block;
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
 .channel-link.active {
   background: color-mix(in srgb, var(--color-accent) 10%, transparent);
   color: var(--color-text-strong);
@@ -2853,8 +2859,7 @@ button:disabled {
 }
 
 .review-dialog > header,
-.github-reviews-actions,
-.github-review-list > li {
+.review-list > li {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -3504,7 +3509,8 @@ button:disabled {
 .workshop-app.scheduled-jobs-open,
 .workshop-app.memory-open,
 .workshop-app.mentions-open,
-.workshop-app.following-open {
+.workshop-app.following-open,
+.workshop-app.reviews-open {
   grid-template-columns: var(--channel-sidebar-width, 16.5rem) minmax(0, 1fr);
 }
 
@@ -5546,54 +5552,97 @@ button:disabled {
   width: 100%;
 }
 
-.github-reviews-card > summary {
-  cursor: pointer;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 0.82rem;
+.reviews-workspace {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--color-canvas);
 }
 
-.github-reviews-actions {
-  margin-top: 0.65rem;
+.reviews-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  padding: 0.8rem 1.25rem;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: 0.72rem;
 }
 
-.github-review-list {
+.reviews-summary strong {
+  color: var(--color-accent);
+  font-size: 1rem;
+}
+
+.reviews-error {
+  margin: 0;
+  padding: 0.7rem 1.25rem;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-danger);
+}
+
+.reviews-empty {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.6rem;
+  min-height: 10rem;
+  color: var(--color-text-muted);
+}
+
+.reviews-empty svg {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.review-list {
   display: grid;
   gap: 0;
-  margin: 0.65rem 0 0;
+  align-content: start;
+  margin: 0;
   padding: 0;
+  overflow-y: auto;
   list-style: none;
 }
 
-.github-review-list > li {
-  padding: 0.55rem 0;
-  border-top: 1px solid var(--color-border);
+.review-list > li {
+  padding: 0.8rem 1.25rem;
+  border-bottom: 1px solid var(--color-border);
 }
 
-.github-review-list > li > div:first-child,
-.github-review-list small {
+.review-copy,
+.review-copy small {
   display: block;
   min-width: 0;
 }
 
-.github-review-list strong,
-.github-review-list small {
+.review-copy strong,
+.review-copy small {
   overflow-wrap: anywhere;
 }
 
-.github-review-list strong {
+.review-copy > strong {
   color: var(--color-text-strong);
-  font-size: 0.72rem;
+  font-size: 0.82rem;
 }
 
-.github-review-list small {
+.review-copy small {
   margin-top: 0.15rem;
   color: var(--color-text-muted);
-  font-size: 0.64rem;
+  font-size: 0.7rem;
 }
 
-.github-review-list .review-warning {
+.review-list .review-warning {
   color: var(--color-warning);
+}
+
+.review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.4rem;
 }
 
 .review-warnings {
@@ -7155,7 +7204,8 @@ button:disabled {
   .workshop-app.scheduled-jobs-open,
   .workshop-app.memory-open,
   .workshop-app.mentions-open,
-  .workshop-app.following-open {
+  .workshop-app.following-open,
+  .workshop-app.reviews-open {
     grid-template-columns: var(--channel-sidebar-width, 15rem) minmax(0, 1fr);
   }
 
@@ -7203,7 +7253,8 @@ button:disabled {
   .workshop-app.scheduled-jobs-open,
   .workshop-app.memory-open,
   .workshop-app.mentions-open,
-  .workshop-app.following-open {
+  .workshop-app.following-open,
+  .workshop-app.reviews-open {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -7233,6 +7284,7 @@ button:disabled {
   .workspaces-workspace,
   .mentions-workspace,
   .following-workspace,
+  .reviews-workspace,
   .memory-workspace,
   .settings-workspace {
     grid-column: 1;

@@ -115,6 +115,7 @@ import { ReviewDialog } from "./ReviewDialog";
 import { AgentWorkspace } from "./AgentWorkspace";
 import { MentionsInbox } from "./MentionsInbox";
 import { FollowingThreads } from "./FollowingThreads";
+import { ReviewsWorkspace } from "./ReviewsWorkspace";
 import { useHumanNotifications } from "./useHumanNotifications";
 import { useFollowedThreads } from "./useFollowedThreads";
 import { useChannelUnread } from "./useChannelUnread";
@@ -206,6 +207,7 @@ type WorkshopDestination =
   | { kind: "scheduled-jobs" }
   | { kind: "mentions" }
   | { kind: "following" }
+  | { kind: "reviews" }
   | {
       kind: "settings";
       runtimeChannelId: string | null;
@@ -225,6 +227,9 @@ function destinationFromLocation(): WorkshopDestination {
   }
   if (parameters.get("view") === "following") {
     return { kind: "following" };
+  }
+  if (parameters.get("view") === "reviews") {
+    return { kind: "reviews" };
   }
   if (parameters.get("view") === "settings") {
     const runtimeChannelId = parameters.get("runtime");
@@ -331,6 +336,8 @@ function writeDestination(
     url.searchParams.set("view", "mentions");
   } else if (destination.kind === "following") {
     url.searchParams.set("view", "following");
+  } else if (destination.kind === "reviews") {
+    url.searchParams.set("view", "reviews");
   } else if (destination.kind === "conversation") {
     if (destination.messageId) {
       url.searchParams.set("message", destination.messageId);
@@ -2534,6 +2541,17 @@ function ScheduledJobsIcon(): React.JSX.Element {
   );
 }
 
+function PullRequestIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <circle cx="6" cy="5" r="2" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="6" cy="19" r="2" stroke="currentColor" strokeWidth="1.8" />
+      <circle cx="18" cy="5" r="2" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M6 7v10M18 7v3a5 5 0 0 1-5 5H9" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
 function ContextSection({
   action,
   children,
@@ -3100,6 +3118,7 @@ function WorkshopView({
   memoryToken,
   mentionsDestination,
   followingDestination,
+  reviewsDestination,
   following,
   inbox,
   unread,
@@ -3153,6 +3172,7 @@ function WorkshopView({
   onOpenMemory,
   onOpenMentions,
   onOpenFollowing,
+  onOpenReviews,
   onOpenFollowedThread,
   onOpenHumanNotification,
   onCreateAgent,
@@ -3191,6 +3211,7 @@ function WorkshopView({
   memoryToken: string;
   mentionsDestination: boolean;
   followingDestination: boolean;
+  reviewsDestination: boolean;
   following: ReturnType<typeof useFollowedThreads>;
   inbox: ReturnType<typeof useHumanNotifications>;
   unread: ReturnType<typeof useChannelUnread>;
@@ -3276,6 +3297,7 @@ function WorkshopView({
   onOpenMemory: () => void;
   onOpenMentions: () => void;
   onOpenFollowing: () => void;
+  onOpenReviews: () => void;
   onOpenFollowedThread: (thread: WorkshopFollowedThread) => boolean;
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onCreateAgent: () => void;
@@ -3319,9 +3341,11 @@ function WorkshopView({
   const memoryOpen = memoryDestination !== null;
   const mentionsOpen = mentionsDestination;
   const followingOpen = followingDestination;
+  const reviewsOpen = reviewsDestination;
   const settingsOpen = settingsDestination;
   const auxiliaryWorkspaceOpen =
-    agentsOpen || workspacesOpen || memoryOpen || mentionsOpen || followingOpen || settingsOpen;
+    agentsOpen || workspacesOpen || memoryOpen || mentionsOpen || followingOpen ||
+    reviewsOpen || settingsOpen;
   const channelName = channelDisplayName(channel);
   const symbol = channelSymbol(channel);
   const humanDirect = channelIsHumanDirect(channel);
@@ -4861,7 +4885,7 @@ function WorkshopView({
 
   return (
     <main
-      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${workspacesOpen ? "workspaces-open" : ""} ${scheduledJobsOpen ? "scheduled-jobs-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${followingOpen ? "following-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
+      className={`workshop-app ${agentsOpen ? "agents-open" : ""} ${workspacesOpen ? "workspaces-open" : ""} ${scheduledJobsOpen ? "scheduled-jobs-open" : ""} ${memoryOpen ? "memory-open" : ""} ${mentionsOpen ? "mentions-open" : ""} ${followingOpen ? "following-open" : ""} ${reviewsOpen ? "reviews-open" : ""} ${settingsOpen ? "settings-open" : ""} ${sidebarLayout.collapsed ? "sidebar-collapsed" : ""} ${resizingSidebar || resizingContext ? "pane-resizing" : ""}`}
       style={{
         "--channel-sidebar-width": `${
           sidebarLayout.collapsed
@@ -5109,6 +5133,23 @@ function WorkshopView({
               </span>
             )}
           </button>
+          <button
+            className={`channel-link reviews-link ${reviewsOpen ? "active" : ""}`}
+            type="button"
+            aria-label="Reviews"
+            title="Reviews"
+            onClick={onOpenReviews}
+          >
+            <span className="workspace-nav-icon reviews-nav-icon" aria-hidden="true">
+              <PullRequestIcon />
+            </span>
+            <span>Reviews</span>
+            {reviewsOpen && (
+              <span className="channel-link-status">
+                <span className="live-pip" aria-label="Open" />
+              </span>
+            )}
+          </button>
 
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
@@ -5342,8 +5383,6 @@ function WorkshopView({
           onDirtyChange={onSettingsDirtyChange}
           onHumanAvatarChanged={setHumanAvatarOverride}
           onNavigationChanged={onAgentNavigationChanged}
-          onReviewPullRequest={() => setReviewDialogOpen(true)}
-          reviewRevision={reviewRevision}
           isAdministrator={workshop.role === "admin"}
           principalName={humanName}
           roleLabel={humanRole}
@@ -5379,6 +5418,16 @@ function WorkshopView({
           connection={connection}
           following={following}
           onOpen={onOpenFollowedThread}
+          workshopName={workshop.name}
+        />
+      ) : reviewsOpen ? (
+        <ReviewsWorkspace
+          connection={connection}
+          onAuthenticationFailure={onMemoryAuthenticationFailure}
+          onChannelAccessFailure={onSettingsAccessFailure}
+          onReviewPullRequest={() => setReviewDialogOpen(true)}
+          revision={reviewRevision}
+          session={settingsSession}
           workshopName={workshop.name}
         />
       ) : (
@@ -6401,7 +6450,10 @@ function WorkshopView({
           onAuthenticationFailure={onMemoryAuthenticationFailure}
           onChannelAccessFailure={onSettingsAccessFailure}
           onClose={() => setReviewDialogOpen(false)}
-          onSubmitted={() => setReviewRevision((current) => current + 1)}
+          onSubmitted={() => {
+            setReviewRevision((current) => current + 1);
+            onOpenReviews();
+          }}
           session={settingsSession}
         />
       )}
@@ -6472,6 +6524,7 @@ function ActiveWorkshopClient({
   onOpenMemory,
   onOpenMentions,
   onOpenFollowing,
+  onOpenReviews,
   onOpenFollowedThread,
   onOpenHumanNotification,
   onOpenSettings,
@@ -6506,6 +6559,7 @@ function ActiveWorkshopClient({
   onOpenMemory: () => void;
   onOpenMentions: () => void;
   onOpenFollowing: () => void;
+  onOpenReviews: () => void;
   onOpenFollowedThread: (thread: WorkshopFollowedThread) => boolean;
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
   onOpenSettings: (section?: "github" | null) => void;
@@ -6889,6 +6943,7 @@ function ActiveWorkshopClient({
       memoryDestination={destination.kind === "memory" ? destination : null}
       mentionsDestination={destination.kind === "mentions"}
       followingDestination={destination.kind === "following"}
+      reviewsDestination={destination.kind === "reviews"}
       following={following}
       inbox={inbox}
       unread={unread}
@@ -6950,6 +7005,7 @@ function ActiveWorkshopClient({
       onOpenMemory={onOpenMemory}
       onOpenMentions={onOpenMentions}
       onOpenFollowing={onOpenFollowing}
+      onOpenReviews={onOpenReviews}
       onOpenFollowedThread={onOpenFollowedThread}
       onOpenHumanNotification={onOpenHumanNotification}
       onOpenSettings={onOpenSettings}
@@ -7246,6 +7302,19 @@ function WorkshopApp(): React.JSX.Element {
       return;
     }
     const nextDestination: WorkshopDestination = { kind: "following" };
+    setDestination(nextDestination);
+    writeDestination(nextDestination, "push");
+  };
+
+  const openReviews = async (): Promise<void> => {
+    if (
+      destination.kind === "settings" &&
+      settingsDirty &&
+      !await confirm("Discard unsaved preference changes?")
+    ) {
+      return;
+    }
+    const nextDestination: WorkshopDestination = { kind: "reviews" };
     setDestination(nextDestination);
     writeDestination(nextDestination, "push");
   };
@@ -7586,6 +7655,7 @@ function WorkshopApp(): React.JSX.Element {
         onOpenMemory={() => void openMemory()}
         onOpenMentions={() => void openMentions()}
         onOpenFollowing={() => void openFollowing()}
+        onOpenReviews={() => void openReviews()}
         onOpenFollowedThread={openFollowedThread}
         onOpenHumanNotification={openHumanNotification}
         onOpenSettings={openSettings}

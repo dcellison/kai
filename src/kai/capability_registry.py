@@ -675,7 +675,7 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         mutates_state=True,
         confirmation=ConfirmationPolicy.CONTEXT_DEPENDENT,
         idempotency=IdempotencyPolicy.REQUIRED,
-        requirements=(*_AUTHENTICATED, ContextRequirement.WORKSPACE),
+        requirements=_AUTHENTICATED,
     ),
     _capability(
         "memory.manage",

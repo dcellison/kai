@@ -19,8 +19,6 @@ import {
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadGitHubSettings,
-  loadReviewJobs,
-  loadReviewArtifact,
   loadNotificationPreferences,
   loadChannelNotificationPolicy,
   loadClientPreferences,
@@ -39,8 +37,6 @@ import {
   upsertOperatorModel,
   updateRuntimeSettings,
   updateGitHubSettings,
-  mutateReviewJob,
-  downloadReviewArtifact,
   updateNotificationPreference,
   updateChannelNotificationPolicy,
   updateClientPreference,
@@ -55,8 +51,6 @@ import type {
   WorkshopPreferenceHistory,
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
-  WorkshopReviewJob,
-  WorkshopReviewJobs,
   WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
@@ -259,17 +253,6 @@ function errorText(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
 
-function reviewStatusLabel(status: WorkshopReviewJob["status"]): string {
-  return {
-    pending: "Queued",
-    executing: "Running",
-    succeeded: "Completed",
-    failed: "Failed",
-    cancelled: "Cancelled",
-    timed_out: "Timed out",
-  }[status];
-}
-
 type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
   executionProfileControl?: ReactNode;
@@ -280,8 +263,6 @@ type SettingsWorkspaceContentProps = {
   onClose: () => void;
   onDirtyChange: (dirty: boolean) => void;
   onNavigationChanged?: () => Promise<void>;
-  onReviewPullRequest?: () => void;
-  reviewRevision?: number;
   onHumanAvatarChanged?: (
     principalId: string,
     avatar: WorkshopHumanAvatarDescriptor,
@@ -305,8 +286,6 @@ function SettingsWorkspaceContent({
   onDirtyChange,
   onNavigationChanged,
   onHumanAvatarChanged,
-  onReviewPullRequest,
-  reviewRevision = 0,
   isAdministrator,
   runtimeLabel,
   runActive,
@@ -368,11 +347,6 @@ function SettingsWorkspaceContent({
   const [githubNotice, setGitHubNotice] = useState<string | null>(null);
   const [githubRepository, setGitHubRepository] = useState("");
   const [githubToken, setGitHubToken] = useState("");
-  const [reviews, setReviews] = useState<WorkshopReviewJobs | null>(null);
-  const [reviewsLoading, setReviewsLoading] = useState(true);
-  const [reviewsBusy, setReviewsBusy] = useState<string | null>(null);
-  const [reviewsError, setReviewsError] = useState<string | null>(null);
-
   const [notifications, setNotifications] =
     useState<WorkshopNotificationPreferences | null>(null);
   const [notificationLoading, setNotificationLoading] = useState(true);
@@ -718,20 +692,6 @@ function SettingsWorkspaceContent({
     }
   }, [handleAccessFailure, session]);
 
-  const refreshReviews = useCallback(async (showLoading = true): Promise<void> => {
-    if (showLoading) setReviewsLoading(true);
-    setReviewsError(null);
-    try {
-      setReviews(await loadReviewJobs(session));
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setReviewsError(errorText(caught, "Could not load pull-request reviews."));
-      }
-    } finally {
-      if (showLoading) setReviewsLoading(false);
-    }
-  }, [handleAccessFailure, session]);
-
   const refreshNotifications = useCallback(async (): Promise<void> => {
     setNotificationLoading(true);
     setNotificationError(null);
@@ -803,7 +763,6 @@ function SettingsWorkspaceContent({
       void refreshPreferences();
       void refreshProfile();
       void refreshGitHub();
-      void refreshReviews();
       void refreshNotifications();
       void refreshChannelNotifications();
       void refreshClients();
@@ -814,25 +773,12 @@ function SettingsWorkspaceContent({
     refreshAppearance,
     refreshClients,
     refreshGitHub,
-    refreshReviews,
     refreshChannelNotifications,
     refreshNotifications,
     refreshPreferences,
     refreshProfile,
     refreshRuntime,
   ]);
-
-  useEffect(() => {
-    if (!agentRuntime && reviewRevision > 0) void refreshReviews(false);
-  }, [agentRuntime, refreshReviews, reviewRevision]);
-
-  useEffect(() => {
-    if (agentRuntime || !reviews?.jobs.some((job) => job.status === "pending" || job.status === "executing")) {
-      return;
-    }
-    const timer = window.setTimeout(() => void refreshReviews(false), 2_000);
-    return () => window.clearTimeout(timer);
-  }, [agentRuntime, refreshReviews, reviews]);
 
   useEffect(() => {
     onDirtyChange(preferenceDirty || profileDirty);
@@ -1203,44 +1149,6 @@ function SettingsWorkspaceContent({
       return false;
     } finally {
       setGitHubBusy(false);
-    }
-  };
-
-  const changeReviewJob = async (job: WorkshopReviewJob, action: "cancel" | "retry"): Promise<void> => {
-    if (action === "cancel" && !await confirm(`Cancel the review of ${job.repository}#${job.pullRequestNumber}?`)) {
-      return;
-    }
-    setReviewsBusy(job.reviewJobId);
-    setReviewsError(null);
-    try {
-      const clientOperationId = globalThis.crypto?.randomUUID
-        ? `workshop-review:${globalThis.crypto.randomUUID()}`
-        : `workshop-review:${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      await mutateReviewJob(session, job.reviewJobId, action, clientOperationId);
-      await refreshReviews(false);
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setReviewsError(errorText(caught, `Could not ${action} the pull-request review.`));
-      }
-    } finally {
-      setReviewsBusy(null);
-    }
-  };
-
-  const openReviewArtifact = async (job: WorkshopReviewJob): Promise<void> => {
-    setReviewsBusy(job.reviewJobId);
-    setReviewsError(null);
-    try {
-      const url = URL.createObjectURL(await loadReviewArtifact(session, job.reviewJobId));
-      const opened = window.open(url, "_blank", "noopener,noreferrer");
-      if (!opened) throw new Error("The browser blocked the review artifact window.");
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    } catch (caught) {
-      if (!handleAccessFailure(caught)) {
-        setReviewsError(errorText(caught, "Could not open the review artifact."));
-      }
-    } finally {
-      setReviewsBusy(null);
     }
   };
 
@@ -2296,67 +2204,6 @@ function SettingsWorkspaceContent({
                 </div>
               </article>
 
-              <details className="settings-card github-reviews-card">
-                <summary>Recent reviews</summary>
-                <div className="github-reviews-actions">
-                  <p>Durable reviews continue if this page closes or Kai restarts.</p>
-                  {onReviewPullRequest && (
-                    <button className="quiet-button" type="button" onClick={onReviewPullRequest}>
-                      Review pull request
-                    </button>
-                  )}
-                </div>
-                {reviewsLoading ? <p role="status">Loading recent reviews…</p> : reviews ? (
-                  reviews.jobs.length > 0 ? (
-                    <ol className="github-review-list">
-                      {reviews.jobs.slice(0, 8).map((job) => (
-                        <li key={job.reviewJobId}>
-                          <div>
-                            <strong>{job.repository}#{job.pullRequestNumber}</strong>
-                            <small>{reviewStatusLabel(job.status)} · {formatDate(job.updatedAt)}</small>
-                            {job.lastErrorCode && <small>Error: {job.lastErrorCode.replaceAll("_", " ")}</small>}
-                            {job.artifact && job.artifact.warningCount > 0 && (
-                              <details className="review-warnings">
-                                <summary className="review-warning">
-                                  {job.artifact.warningCount} collection warning{job.artifact.warningCount === 1 ? "" : "s"}
-                                </summary>
-                                <ul>
-                                  {job.artifact.warnings.map((warning, index) => (
-                                    <li key={`${warning.source}-${index}`}>
-                                      <strong>{warning.source.replaceAll("_", " ")}</strong>: {warning.message}
-                                    </li>
-                                  ))}
-                                </ul>
-                              </details>
-                            )}
-                          </div>
-                          <div className="settings-actions">
-                            {job.artifact && (
-                              <>
-                                <button className="quiet-button" type="button" disabled={reviewsBusy === job.reviewJobId}
-                                  onClick={() => void openReviewArtifact(job)}>Open</button>
-                                <button className="quiet-button" type="button" disabled={reviewsBusy === job.reviewJobId}
-                                  onClick={() => void downloadReviewArtifact(session, job).catch((caught) =>
-                                    setReviewsError(errorText(caught, "Could not download the review artifact."))
-                                  )}>Download</button>
-                              </>
-                            )}
-                            {(job.status === "pending" || job.status === "executing") && (
-                              <button className="quiet-button" type="button" disabled={reviewsBusy === job.reviewJobId}
-                                onClick={() => void changeReviewJob(job, "cancel")}>Cancel</button>
-                            )}
-                            {(job.status === "failed" || job.status === "cancelled" || job.status === "timed_out") && (
-                              <button className="quiet-button" type="button" disabled={reviewsBusy === job.reviewJobId}
-                                onClick={() => void changeReviewJob(job, "retry")}>Retry</button>
-                            )}
-                          </div>
-                        </li>
-                      ))}
-                    </ol>
-                  ) : <p>No on-demand reviews yet.</p>
-                ) : <p>Recent reviews are unavailable.</p>}
-                {reviewsError && <p className="settings-error" role="alert">{reviewsError}</p>}
-              </details>
               </div>
 
               <div className="settings-card-column">
