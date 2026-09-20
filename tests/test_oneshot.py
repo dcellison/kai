@@ -534,7 +534,8 @@ class TestCodexOneShotReasonerArgv:
 
         cmd = mock_exec.call_args[0]
         assert cmd[0] == "codex"
-        assert cmd[1] == "exec"
+        exec_index = cmd.index("exec")
+        assert exec_index > 1
         assert "--json" in cmd
         assert "--skip-git-repo-check" in cmd
         assert "--ephemeral" in cmd
@@ -573,6 +574,13 @@ class TestCodexOneShotReasonerArgv:
             "skill_mcp_dependency_install",
             "view_image",
         } <= set(disabled)
+        # Config isolation and feature switches are Codex root options.
+        # They must precede the `exec` subcommand; membership-only
+        # assertions would not catch a flag accepted in the wrong scope.
+        root_options = {"--ignore-user-config", "--ignore-rules", "--strict-config", "--config", "--disable"}
+        assert all(i < exec_index for i, arg in enumerate(cmd) if arg in root_options)
+        exec_options = {"--json", "--skip-git-repo-check", "--ephemeral", "--cd", "--model", "--output-schema"}
+        assert all(i > exec_index for i, arg in enumerate(cmd) if arg in exec_options)
         # Permission profiles and the legacy --sandbox flag do not
         # compose: adding --sandbox would silently override this
         # narrower profile.

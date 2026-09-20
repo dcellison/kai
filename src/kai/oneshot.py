@@ -1083,6 +1083,10 @@ class CodexOneShotReasoner:
       codex one-shot lineage is to pass this on every exec invocation.
     - `--ephemeral` mirrors Claude's `--no-session-persistence`: no
       session files written under ~/.codex per call.
+    - Root-level configuration and feature flags are placed before the
+      `exec` subcommand.  Codex only guarantees those options at the
+      multitool parser's root; putting them after `exec` can leave them
+      present in argv without applying them to the invocation.
     - `--ignore-user-config` and `--ignore-rules` keep user config,
       MCP servers, hooks, skills, and user/project execpolicy rules
       from influencing a bounded call. Authentication still comes
@@ -1204,12 +1208,12 @@ class CodexOneShotReasoner:
             resolved_binary = resolve_oneshot_binary("codex")
         except BinaryResolutionError as e:
             raise OneShotRoutingError(str(e)) from e
+        # Codex's config and feature switches belong to the CLI root,
+        # before the subcommand token.  Keep this partition explicit:
+        # post-subcommand flags can remain visible in argv while failing
+        # to change the transport selected by the root parser.
         cmd: list[str] = [
             resolved_binary,
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",
@@ -1223,11 +1227,19 @@ class CodexOneShotReasoner:
             'web_search="disabled"',
             "--config",
             "mcp_servers={}",
-            "--cd",
-            str(self._cwd),
         ]
         for feature in _CODEX_ONESHOT_DISABLED_FEATURES:
             cmd.extend(["--disable", feature])
+        cmd.extend(
+            [
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--cd",
+                str(self._cwd),
+            ]
+        )
         if model is not None:
             cmd.extend(["--model", model])
 
