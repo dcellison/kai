@@ -87,6 +87,13 @@ from kai.workshop.memory_authority import (
     WorkshopMemoryAuthorityMigration,
     reconcile_workshop_memory_authority,
 )
+from kai.workshop.memory_extraction_receipts import (
+    MemoryExtractionReceiptClaim,
+    MemoryExtractionReceiptCompletion,
+    MemoryExtractionReceiptService,
+    MemoryExtractionReceiptSnapshot,
+    MemoryExtractionReceiptSpec,
+)
 from kai.workshop.memory_project_registry import (
     WorkshopMemoryProjectRegistryMigration,
     reconcile_memory_project_registry,
@@ -397,6 +404,32 @@ async def bootstrap_workshop_foundation(
             humans,
             notification_channels=notification_channels,
             workshop_id=workshop_id,
+        )
+
+
+async def claim_memory_extraction_receipt(
+    spec: MemoryExtractionReceiptSpec,
+) -> MemoryExtractionReceiptClaim:
+    """Claim one canonical run/role receipt under the shared DB lock."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        return await MemoryExtractionReceiptService(_get_db()).claim(spec)
+
+
+async def complete_memory_extraction_receipt(
+    receipt_id: str,
+    principal_id: str,
+    completion: MemoryExtractionReceiptCompletion,
+) -> MemoryExtractionReceiptSnapshot:
+    """Complete one claimed extraction receipt under the shared DB lock."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        return await MemoryExtractionReceiptService(_get_db()).complete(
+            receipt_id,
+            principal_id,
+            completion,
         )
 
 

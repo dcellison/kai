@@ -41,7 +41,9 @@ from kai.oneshot import (
     CodexOneShotReasoner,
     GooseOneShotReasoner,
     OneShotError,
+    OneShotOutputError,
     OneShotReasoner,
+    OneShotRoutingError,
     OneShotSubprocessError,
     OneShotTimeout,
     OpenCodeOneShotReasoner,
@@ -49,6 +51,12 @@ from kai.oneshot import (
 )
 from kai.oneshot import _ensure_extractor_cwd as _ensure_extractor_cwd
 from kai.prompt_utils import encode_untrusted_json_record, make_untrusted_json_envelope
+from kai.workshop.memory_extraction_receipts import (
+    MemoryExtractionReceiptClaim,
+    MemoryExtractionReceiptCompletion,
+    MemoryExtractionReceiptSpec,
+    MemoryExtractionStorageDecision,
+)
 
 log = logging.getLogger(__name__)
 
@@ -167,6 +175,10 @@ _EXTRACTION_PROMPT_VERSION: str = "13"
 # v2 (2026-06-12): added the optional scope_hint field (global vs
 # project write-scope judgment for the scoped-memory routing path).
 _EPISODE_PROMPT_VERSION: str = "2"
+_FACT_SCHEMA_VERSION: str = "1"
+_EPISODE_SCHEMA_VERSION: str = "1"
+_FACT_POLICY_VERSION: str = "1"
+_EPISODE_POLICY_VERSION: str = "1"
 
 # Consecutive stage-1 subprocess failures across all users in this
 # process, and the streak length at which one ERROR-level alarm fires
@@ -357,6 +369,9 @@ _STRUCTURAL_MARKER_RE = re.compile(
 class ExtractionResult:
     facts: list[dict]
     has_episode: bool
+    model: str | None = None
+    outcome: str = "succeeded"
+    raw_fact_count: int = 0
 
 
 _FACT_SCHEMA: dict = {
@@ -2131,6 +2146,34 @@ def _build_memory_reasoner(
 # ── Subprocess wiring ───────────────────────────────────────────────
 
 
+_AUTH_FAILURE_MARKERS = (
+    "authentication",
+    "unauthorized",
+    "not logged in",
+    "login required",
+    "token expired",
+    "expired token",
+    "invalid api key",
+    "invalid_api_key",
+    "status 401",
+    "http 401",
+)
+
+
+def _failure_code_from_text(detail: str) -> str:
+    """Classify bounded provider output without persisting it."""
+    detail = detail[:8192].casefold()
+    if any(marker in detail for marker in _AUTH_FAILURE_MARKERS):
+        return "authentication_failure"
+    return "provider_failure"
+
+
+def _subprocess_failure_code(error: OneShotSubprocessError) -> str:
+    """Classify provider failures without persisting captured output."""
+    detail = b"\n".join((error.stderr[:4096], error.stdout[:4096])).decode("utf-8", errors="replace")
+    return _failure_code_from_text(detail)
+
+
 async def _run_extractor(
     payload_text: str,
     config: Config,
@@ -2144,6 +2187,7 @@ async def _run_extractor(
     system_prompt: str = _EXTRACTION_SYSTEM_PROMPT,
     user_window_text: str = "",
     assistant_window_text: str = "",
+    resolved_model: str | None = None,
 ) -> ExtractionResult:
     """
     Spawn `claude --print` with the extractor prompt and parse the JSON.
@@ -2221,17 +2265,18 @@ async def _run_extractor(
     # is None for sandbox / eval user_ids and the resolver falls
     # through to the global default + registry cascade.
     user_cfg = _resolve_user_config(user_id, config)
+    model = resolved_model or resolve_user_model(
+        ModelRole.MEMORY_EXTRACTION,
+        user_cfg,
+        config,
+        backend=effective_backend,
+        provider=effective_provider,
+    )
     try:
         result = await reasoner.run(
             prompt=payload_text,
             system_prompt=system_prompt,
-            model=resolve_user_model(
-                ModelRole.MEMORY_EXTRACTION,
-                user_cfg,
-                config,
-                backend=effective_backend,
-                provider=effective_provider,
-            ),
+            model=model,
             timeout=config.memory_extraction_timeout_s,
             purpose="fact_extraction",
             json_schema=_FACT_SCHEMA,
@@ -2241,7 +2286,7 @@ async def _run_extractor(
             "Memory extraction timed out after %ds",
             config.memory_extraction_timeout_s,
         )
-        return ExtractionResult(facts=[], has_episode=False)
+        return ExtractionResult(facts=[], has_episode=False, model=model, outcome="timeout")
     except OneShotSubprocessError as e:
         log.warning(
             "Memory extraction subprocess exited %d (stderr_bytes=%d, stdout_bytes=%d)",
@@ -2262,7 +2307,18 @@ async def _run_extractor(
                 "availability for the affected runtime profile.",
                 _consecutive_subprocess_failures,
             )
-        return ExtractionResult(facts=[], has_episode=False)
+        return ExtractionResult(
+            facts=[],
+            has_episode=False,
+            model=model,
+            outcome=_subprocess_failure_code(e),
+        )
+    except OneShotRoutingError:
+        log.warning("Memory extraction routing policy rejected the configured reasoner")
+        return ExtractionResult(facts=[], has_episode=False, model=model, outcome="policy_rejection")
+    except OneShotOutputError:
+        log.warning("Memory extraction reasoner output could not be parsed")
+        return ExtractionResult(facts=[], has_episode=False, model=model, outcome="parsing_failure")
     except OneShotError as exc:
         # OneShotOutputError or any future OneShotError subclass the
         # reasoner adds. Collapse to empty extraction rather than
@@ -2272,7 +2328,7 @@ async def _run_extractor(
         # should produce the same zero-state result as the older
         # subprocess-error path.
         log.warning("Memory extraction reasoner error (type=%s)", type(exc).__name__)
-        return ExtractionResult(facts=[], has_episode=False)
+        return ExtractionResult(facts=[], has_episode=False, model=model, outcome="provider_failure")
 
     # The subprocess ran to completion, so any failure streak is over;
     # the next streak should alarm again at its own threshold crossing.
@@ -2282,10 +2338,10 @@ async def _run_extractor(
         parsed = json.loads(result.text)
     except json.JSONDecodeError:
         log.warning("Memory extraction produced invalid JSON (chars=%d)", len(result.text))
-        return ExtractionResult(facts=[], has_episode=False)
+        return ExtractionResult(facts=[], has_episode=False, model=model, outcome="parsing_failure")
     if not isinstance(parsed, dict):
         log.warning("Memory extraction returned non-object JSON (type=%s)", type(parsed).__name__)
-        return ExtractionResult(facts=[], has_episode=False)
+        return ExtractionResult(facts=[], has_episode=False, model=model, outcome="parsing_failure")
     # Defense-in-depth: the CLI can exit 0 with is_error=true while the
     # envelope still parses. Treat that as extraction failure, not
     # silent success with partial data.
@@ -2293,7 +2349,12 @@ async def _run_extractor(
         log.warning(
             "Memory extraction CLI envelope reports is_error=true",
         )
-        return ExtractionResult(facts=[], has_episode=False)
+        return ExtractionResult(
+            facts=[],
+            has_episode=False,
+            model=model,
+            outcome=_failure_code_from_text(json.dumps(parsed, default=str)),
+        )
     # The §13.2 step-5 smoke test revealed that `claude --print
     # --output-format json --json-schema ...` nests schema-validated
     # payloads under a top-level `structured_output` key, not at the
@@ -2312,17 +2373,22 @@ async def _run_extractor(
     else:
         payload_root = parsed
     facts_raw = payload_root.get("facts") or []
+    raw_fact_count = len(facts_raw) if isinstance(facts_raw, list) else 0
     has_episode = bool(payload_root.get("has_episode"))
+    validated = _validate_facts(
+        facts_raw if isinstance(facts_raw, list) else [],
+        candidate_ids,
+        candidate_metadata=candidate_metadata,
+        user_id=user_id,
+        user_window_text=user_window_text,
+        assistant_window_text=assistant_window_text,
+    )
     return ExtractionResult(
-        facts=_validate_facts(
-            facts_raw,
-            candidate_ids,
-            candidate_metadata=candidate_metadata,
-            user_id=user_id,
-            user_window_text=user_window_text,
-            assistant_window_text=assistant_window_text,
-        ),
+        facts=validated,
         has_episode=has_episode,
+        model=model,
+        outcome="validation_rejection" if raw_fact_count and not validated else "succeeded",
+        raw_fact_count=raw_fact_count,
     )
 
 
@@ -2404,6 +2470,8 @@ async def _run_episode_extractor(
     effective_backend: str,
     effective_provider: str,
     os_user: str | None = None,
+    resolved_model: str | None = None,
+    failure_category_out: list[str] | None = None,
 ) -> tuple[dict | None, str | None]:
     """
     Spawn `claude --print` with the episode-generator prompt and parse.
@@ -2434,39 +2502,60 @@ async def _run_episode_extractor(
     # `extract_and_store` (per-user OS routing); stage 2 inherits the
     # same target so the policy boundary is enforced consistently.
     reasoner = _build_memory_reasoner(effective_backend, os_user=os_user, provider=effective_provider)
+    model = resolved_model or resolve_user_model(
+        ModelRole.MEMORY_EPISODE,
+        _resolve_user_config(user_id, config),
+        config,
+        backend=effective_backend,
+        provider=effective_provider,
+    )
     try:
         result = await reasoner.run(
             prompt=payload_text,
             system_prompt=_EPISODE_SYSTEM_PROMPT,
-            model=resolve_user_model(
-                ModelRole.MEMORY_EPISODE,
-                _resolve_user_config(user_id, config),
-                config,
-                backend=effective_backend,
-                provider=effective_provider,
-            ),
+            model=model,
             timeout=config.memory_episode_timeout_s,
             purpose="episode_generation",
             json_schema=_EPISODE_SCHEMA,
         )
     except OneShotTimeout:
+        if failure_category_out is not None:
+            failure_category_out.append("timeout")
         return None, "timeout"
     except OneShotSubprocessError as e:
+        if failure_category_out is not None:
+            failure_category_out.append(_subprocess_failure_code(e))
         return None, f"exit_{e.returncode}"
+    except OneShotRoutingError:
+        if failure_category_out is not None:
+            failure_category_out.append("policy_rejection")
+        return None, "reasoner_routing_error"
+    except OneShotOutputError:
+        if failure_category_out is not None:
+            failure_category_out.append("parsing_failure")
+        return None, "reasoner_output_error"
     except OneShotError:
         # Future-proof: any other reasoner-level failure collapses to
         # a parse-shaped reason rather than propagating. The outer
         # _generate_episode's broad except handles the truly
         # unexpected case; this branch keeps known reasoner failures
         # in the stage-2 vocabulary.
+        if failure_category_out is not None:
+            failure_category_out.append("provider_failure")
         return None, "reasoner_error"
     try:
         parsed = json.loads(result.text)
     except json.JSONDecodeError:
+        if failure_category_out is not None:
+            failure_category_out.append("parsing_failure")
         return None, "invalid_json"
     if not isinstance(parsed, dict):
+        if failure_category_out is not None:
+            failure_category_out.append("parsing_failure")
         return None, "non_object_envelope"
     if parsed.get("is_error") is True:
+        if failure_category_out is not None:
+            failure_category_out.append(_failure_code_from_text(json.dumps(parsed, default=str)))
         return None, "is_error"
     # Same nested/root resolution as stage 1: `claude --print
     # --output-format json --json-schema ...` puts the schema-validated
@@ -2479,6 +2568,8 @@ async def _run_episode_extractor(
         episode_root = parsed
     episode = episode_root.get("episode")
     if not isinstance(episode, dict):
+        if failure_category_out is not None:
+            failure_category_out.append("parsing_failure")
         return None, "missing_episode_field"
     return episode, None
 
@@ -2529,6 +2620,11 @@ async def _generate_episode(
     outcome: str = "store_failed"
     memory_id: str | None = None
     reason: str | None = None
+    receipt_claim: MemoryExtractionReceiptClaim | None = None
+    receipt_decisions: list[MemoryExtractionStorageDecision] = []
+    raw_count = accepted_count = 0
+    validation_outcome = "not_attempted"
+    failure_categories: list[str] = []
     try:
         async with sem:
             # Restart the clock AFTER acquiring the per-user semaphore
@@ -2540,6 +2636,28 @@ async def _generate_episode(
             # restart matters when episode-worthy turns arrive in
             # quick succession and the second waits on the first.
             start = time.monotonic()
+            episode_model = resolve_user_model(
+                ModelRole.MEMORY_EPISODE,
+                _resolve_user_config(user_id, config),
+                config,
+                backend=effective_backend,
+                provider=effective_provider,
+            )
+            receipt_spec = _canonical_receipt_spec(
+                canonical_provenance=canonical_provenance,
+                principal_id=user_id,
+                runtime_profile_id=runtime_profile_id,
+                extraction_role="episode_generation",
+                backend=effective_backend,
+                provider=effective_provider,
+                model=episode_model,
+                prompt_version=_EPISODE_PROMPT_VERSION,
+                schema_version=_EPISODE_SCHEMA_VERSION,
+                policy_version=_EPISODE_POLICY_VERSION,
+            )
+            receipt_claim = await _claim_canonical_receipt(receipt_spec)
+            if receipt_claim is not None and not receipt_claim.claimed:
+                return
             payload = _build_episode_payload(user_text, assistant_text)
             episode, run_reason = await _run_episode_extractor(
                 payload,
@@ -2548,6 +2666,8 @@ async def _generate_episode(
                 effective_backend=effective_backend,
                 effective_provider=effective_provider,
                 os_user=os_user,
+                resolved_model=episode_model,
+                failure_category_out=failure_categories,
             )
             if episode is None:
                 # Map the run-helper's failure tags onto the documented
@@ -2584,6 +2704,7 @@ async def _generate_episode(
                     outcome = "parse_error"
                 reason = run_reason
             else:
+                raw_count = 1
                 # Final-gate validation: reject workflow-event-shape
                 # episodes before they reach add_structured. The
                 # backstop catches the canonical `Evaluate spec`,
@@ -2601,8 +2722,11 @@ async def _generate_episode(
                 if validated is None:
                     outcome = "validate_rejected"
                     reason = reject_reason
+                    validation_outcome = "rejected"
                 else:
                     episode = validated
+                    accepted_count = 1
+                    validation_outcome = "accepted"
                     # Build the metadata dict matching the Sophia
                     # schema + the `actors` Kai extension. `lessons`
                     # is optional and absent from the dict when the
@@ -2637,6 +2761,8 @@ async def _generate_episode(
                     }
                     if canonical_provenance is not None:
                         extra.update(canonical_provenance)
+                    if receipt_claim is not None:
+                        extra[memory.EXTRACTION_RECEIPT_ID_KEY] = receipt_claim.receipt.receipt_id
                     if "lessons" in episode:
                         extra["lessons"] = episode["lessons"]
                     # Write-scope routing, same consumption shape as
@@ -2693,6 +2819,18 @@ async def _generate_episode(
                         outcome = "stored"
                         memory_id = mem_id
                         reason = None
+                        receipt_decisions.append(
+                            MemoryExtractionStorageDecision(
+                                index=0,
+                                intent="store_episode",
+                                outcome="stored",
+                                new_memory_id=mem_id,
+                                scope=str(scope_meta["scope"]),
+                                project_id=(
+                                    str(scope_meta["project_id"]) if scope_meta.get("project_id") is not None else None
+                                ),
+                            )
+                        )
                         # Episode-side scope log, emitted only for a
                         # row that actually landed (mirrors the fact
                         # side's stored-rows-only tally). Episodes are
@@ -2711,16 +2849,89 @@ async def _generate_episode(
                     else:
                         outcome = "store_failed"
                         reason = "add_structured returned None"
+                        failure_categories.append("storage_failure")
+                        receipt_decisions.append(
+                            MemoryExtractionStorageDecision(
+                                index=0,
+                                intent="store_episode",
+                                outcome="storage_failed",
+                                scope=str(scope_meta["scope"]),
+                                project_id=(
+                                    str(scope_meta["project_id"]) if scope_meta.get("project_id") is not None else None
+                                ),
+                            )
+                        )
     except asyncio.CancelledError:
         # Cooperative-shutdown signal. Re-raise so the runner knows the
         # task was cancelled (not silently completed) - same posture as
         # extract_and_store. Skip the log line because cancellation is
         # not a stage-2 outcome; it is a shutdown event.
+        if receipt_claim is not None and receipt_claim.claimed:
+            try:
+                await _complete_canonical_receipt(
+                    receipt_claim,
+                    MemoryExtractionReceiptCompletion(
+                        status="failed",
+                        decision_outcome="cancelled",
+                        failure_code="cancelled",
+                        candidate_ids=(),
+                        classifier_result=True,
+                        proposed_intents=(),
+                        raw_count=raw_count,
+                        accepted_count=accepted_count,
+                        validation_outcome="not_completed",
+                        storage_decisions=tuple(receipt_decisions),
+                        stored_count=0,
+                        replaced_count=0,
+                        skipped_count=0,
+                        memory_scopes=_receipt_memory_scopes(receipt_decisions),
+                        duration_ms=int((time.monotonic() - start) * 1000),
+                    ),
+                )
+            except Exception:
+                log.warning("Episode extraction cancellation receipt failed", exc_info=True)
         raise
     except Exception as e:
         outcome = "store_failed"
         reason = f"unexpected: {type(e).__name__}: {e}"
+        failure_categories.append("unexpected_failure")
     duration_ms = int((time.monotonic() - start) * 1000)
+    if receipt_claim is not None and receipt_claim.claimed:
+        if outcome == "stored":
+            receipt_status = "completed"
+            receipt_outcome = "stored"
+            failure_code = None
+        elif outcome == "validate_rejected":
+            receipt_status = "completed"
+            receipt_outcome = "validation_rejected"
+            failure_code = None
+        else:
+            receipt_status = "failed"
+            failure_code = failure_categories[0] if failure_categories else "provider_failure"
+            receipt_outcome = failure_code
+        try:
+            await _complete_canonical_receipt(
+                receipt_claim,
+                MemoryExtractionReceiptCompletion(
+                    status=receipt_status,
+                    decision_outcome=receipt_outcome,
+                    failure_code=failure_code,
+                    candidate_ids=(),
+                    classifier_result=True,
+                    proposed_intents=(("store_episode", None),) if raw_count else (),
+                    raw_count=raw_count,
+                    accepted_count=accepted_count,
+                    validation_outcome=validation_outcome,
+                    storage_decisions=tuple(receipt_decisions),
+                    stored_count=1 if outcome == "stored" else 0,
+                    replaced_count=0,
+                    skipped_count=0,
+                    memory_scopes=_receipt_memory_scopes(receipt_decisions),
+                    duration_ms=duration_ms,
+                ),
+            )
+        except Exception:
+            log.warning("Episode extraction receipt completion failed", exc_info=True)
     _emit_episode_log(
         user_id=user_id,
         outcome=outcome,
@@ -2875,6 +3086,8 @@ def _store_facts(
     assistant_log: LogEntry | None = None,
     canonical_provenance: dict[str, object] | None = None,
     runtime_profile_id: str | None = None,
+    receipt_id: str | None = None,
+    receipt_decisions: list[MemoryExtractionStorageDecision] | None = None,
 ) -> tuple[int, int, int]:
     """
     Persist validated facts via memory.add_structured, branching on intent.
@@ -2935,6 +3148,35 @@ def _store_facts(
     scope_defaulted = 0
     stored_by_scope: dict[str, int] = {memory.SCOPE_GLOBAL: 0, memory.SCOPE_PROJECT: 0}
 
+    def _record_decision(
+        *,
+        index: int,
+        intent: object,
+        outcome: str,
+        new_memory_id: str | None = None,
+        replaced_memory_id: object = None,
+        scope_meta: dict[str, object] | None = None,
+    ) -> None:
+        if receipt_decisions is None:
+            return
+        receipt_decisions.append(
+            MemoryExtractionStorageDecision(
+                index=index,
+                intent=str(intent) if isinstance(intent, str) and intent else "invalid",
+                outcome=outcome,
+                new_memory_id=new_memory_id,
+                replaced_memory_id=(
+                    str(replaced_memory_id) if isinstance(replaced_memory_id, str) and replaced_memory_id else None
+                ),
+                scope=str(scope_meta["scope"]) if scope_meta is not None else None,
+                project_id=(
+                    str(scope_meta["project_id"])
+                    if scope_meta is not None and scope_meta.get("project_id") is not None
+                    else None
+                ),
+            )
+        )
+
     def _tally_scope(scope_meta: dict[str, object]) -> None:
         nonlocal scope_hinted, scope_defaulted
         if scope_meta["scope_source"] == memory.SCOPE_SOURCE_CLASSIFIER:
@@ -2944,9 +3186,10 @@ def _store_facts(
         scope = str(scope_meta["scope"])
         stored_by_scope[scope] = stored_by_scope.get(scope, 0) + 1
 
-    for fact in facts:
+    for index, fact in enumerate(facts):
         content = fact.get("content")
         if not isinstance(content, str) or not content.strip():
+            _record_decision(index=index, intent=fact.get("intent"), outcome="validation_rejected")
             continue
 
         intent = fact.get("intent")
@@ -2979,6 +3222,8 @@ def _store_facts(
         }
         if canonical_provenance is not None:
             extra.update(canonical_provenance)
+        if receipt_id is not None:
+            extra[memory.EXTRACTION_RECEIPT_ID_KEY] = receipt_id
         # confirmation_quote is only present on confirmed_action facts
         # by the time _validate_facts has run.
         if "confirmation_quote" in fact:
@@ -3020,6 +3265,13 @@ def _store_facts(
                 outcome="skipped",
             )
             skipped += 1
+            _record_decision(
+                index=index,
+                intent=intent,
+                outcome="duplicate_skipped",
+                replaced_memory_id=existing_id,
+                scope_meta=scope_meta,
+            )
             continue
 
         if intent == "update_of":
@@ -3070,6 +3322,13 @@ def _store_facts(
                     outcome="add_failed_after_delete",
                     level=logging.WARNING,
                 )
+                _record_decision(
+                    index=index,
+                    intent=intent,
+                    outcome="storage_failed_after_delete",
+                    replaced_memory_id=existing_id,
+                    scope_meta=scope_meta,
+                )
                 continue
             outcome = "stored" if delete_ok else "delete_failed_added_anyway"
             _emit_intent_log(
@@ -3083,6 +3342,14 @@ def _store_facts(
             stored += 1
             replaced += 1
             _tally_scope(scope_meta)
+            _record_decision(
+                index=index,
+                intent=intent,
+                outcome="replaced" if delete_ok else "replacement_delete_failed",
+                new_memory_id=memory_id,
+                replaced_memory_id=existing_id,
+                scope_meta=scope_meta,
+            )
             continue
 
         # intent == "new" (rule-1 already rejected anything else, but
@@ -3090,6 +3357,7 @@ def _store_facts(
         # symmetric and means a future intent value with no handler
         # falls through to a no-op rather than silently joining `new`).
         if intent != "new":
+            _record_decision(index=index, intent=intent, outcome="validation_rejected", scope_meta=scope_meta)
             continue
 
         neighbor = _paraphrase_neighbor(
@@ -3120,6 +3388,13 @@ def _store_facts(
                 cosine=round(neighbor.score, 3),
                 content_preview=content[:100],
             )
+            _record_decision(
+                index=index,
+                intent=intent,
+                outcome="duplicate_skipped",
+                replaced_memory_id=neighbor.id,
+                scope_meta=scope_meta,
+            )
             continue
 
         # add_structured returns the Mem0 memory id on success and None
@@ -3145,6 +3420,13 @@ def _store_facts(
             )
             stored += 1
             _tally_scope(scope_meta)
+            _record_decision(
+                index=index,
+                intent=intent,
+                outcome="stored",
+                new_memory_id=memory_id,
+                scope_meta=scope_meta,
+            )
         else:
             # `dropped_backend`: storage disabled OR backend swallowed
             # the call (Mem0 add() has an internal try/except that turns
@@ -3159,6 +3441,12 @@ def _store_facts(
                 new_id=None,
                 replaced_id=None,
                 outcome="dropped_backend",
+            )
+            _record_decision(
+                index=index,
+                intent=intent,
+                outcome="storage_failed",
+                scope_meta=scope_meta,
             )
     # One fact-side scope-routing line per extraction run (this
     # function is called at most once per run, and only when the
@@ -3176,6 +3464,161 @@ def _store_facts(
         stored_project=stored_by_scope.get(memory.SCOPE_PROJECT, 0),
     )
     return stored, replaced, skipped
+
+
+# ── Canonical extraction receipts (issue #1705) ────────────────────
+
+
+def _canonical_receipt_spec(
+    *,
+    canonical_provenance: dict[str, object] | None,
+    principal_id: str,
+    runtime_profile_id: str | None,
+    extraction_role: str,
+    backend: str,
+    provider: str,
+    model: str,
+    prompt_version: str,
+    schema_version: str,
+    policy_version: str,
+) -> MemoryExtractionReceiptSpec | None:
+    """Build a content-free receipt spec only for canonical production runs."""
+    if canonical_provenance is None:
+        return None
+    run_id = canonical_provenance.get(memory.WORKSHOP_RUN_ID_KEY)
+    source_message_id = canonical_provenance.get(memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY)
+    result_message_id = canonical_provenance.get(memory.WORKSHOP_RESULT_MESSAGE_ID_KEY)
+    if not all(isinstance(value, str) and value for value in (run_id, source_message_id, result_message_id)):
+        raise RuntimeError("Canonical memory extraction provenance is incomplete")
+    if not principal_id.startswith("prn_") or not runtime_profile_id:
+        raise RuntimeError("Canonical memory extraction owner is incomplete")
+    return MemoryExtractionReceiptSpec(
+        principal_id=principal_id,
+        runtime_profile_id=runtime_profile_id,
+        run_id=str(run_id),
+        source_message_id=str(source_message_id),
+        result_message_id=str(result_message_id),
+        extraction_role=extraction_role,
+        backend=backend,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+        policy_version=policy_version,
+    )
+
+
+async def _claim_canonical_receipt(
+    spec: MemoryExtractionReceiptSpec | None,
+) -> MemoryExtractionReceiptClaim | None:
+    if spec is None:
+        return None
+    from kai import sessions
+
+    return await sessions.claim_memory_extraction_receipt(spec)
+
+
+async def _complete_canonical_receipt(
+    claim: MemoryExtractionReceiptClaim | None,
+    completion: MemoryExtractionReceiptCompletion,
+) -> None:
+    if claim is None or not claim.claimed:
+        return
+    from kai import sessions
+
+    await sessions.complete_memory_extraction_receipt(
+        claim.receipt.receipt_id,
+        claim.receipt.principal_id,
+        completion,
+    )
+
+
+def _receipt_memory_scopes(
+    decisions: list[MemoryExtractionStorageDecision],
+) -> tuple[tuple[str, str | None], ...]:
+    scopes = {(decision.scope, decision.project_id) for decision in decisions if decision.scope is not None}
+    return tuple(
+        sorted(((scope, project_id) for scope, project_id in scopes), key=lambda item: (item[0], item[1] or ""))
+    )
+
+
+def _fact_receipt_completion(
+    *,
+    result: ExtractionResult,
+    candidate_ids: set[str],
+    decisions: list[MemoryExtractionStorageDecision],
+    stored: int,
+    replaced: int,
+    skipped: int,
+    duration_ms: int,
+) -> MemoryExtractionReceiptCompletion:
+    raw_count = max(result.raw_fact_count, len(result.facts))
+    failure_outcomes = {
+        "timeout",
+        "authentication_failure",
+        "provider_failure",
+        "parsing_failure",
+        "policy_rejection",
+    }
+    storage_failed = any("failed" in decision.outcome for decision in decisions)
+    if result.outcome in failure_outcomes:
+        status = "failed"
+        decision_outcome = result.outcome
+        failure_code = result.outcome
+        validation_outcome = "not_attempted"
+    elif storage_failed:
+        status = "failed"
+        decision_outcome = "partial_storage_failure" if stored else "storage_failure"
+        failure_code = "storage_failure"
+        validation_outcome = "accepted" if raw_count == len(result.facts) else "partial"
+    elif raw_count and not result.facts:
+        status = "completed"
+        decision_outcome = "validation_rejected"
+        failure_code = None
+        validation_outcome = "rejected"
+    elif not result.facts:
+        status = "completed"
+        decision_outcome = "episode_only" if result.has_episode else "zero_memory"
+        failure_code = None
+        validation_outcome = "empty"
+    else:
+        status = "completed"
+        outcomes = {decision.outcome for decision in decisions}
+        if outcomes == {"replaced"}:
+            decision_outcome = "replaced"
+        elif outcomes == {"duplicate_skipped"}:
+            decision_outcome = "duplicate_skipped"
+        elif outcomes == {"stored"}:
+            decision_outcome = "stored"
+        else:
+            decision_outcome = "mixed"
+        failure_code = None
+        validation_outcome = "accepted" if raw_count == len(result.facts) else "partial"
+    return MemoryExtractionReceiptCompletion(
+        status=status,
+        decision_outcome=decision_outcome,
+        failure_code=failure_code,
+        candidate_ids=tuple(sorted(candidate_ids)),
+        classifier_result=result.has_episode if result.outcome not in failure_outcomes else None,
+        proposed_intents=tuple(
+            (
+                str(fact.get("intent") or "invalid"),
+                str(fact["existing_id"])
+                if isinstance(fact.get("existing_id"), str) and fact.get("existing_id")
+                else None,
+            )
+            for fact in result.facts
+        ),
+        raw_count=raw_count,
+        accepted_count=len(result.facts),
+        validation_outcome=validation_outcome,
+        storage_decisions=tuple(decisions),
+        stored_count=stored,
+        replaced_count=replaced,
+        skipped_count=skipped,
+        memory_scopes=_receipt_memory_scopes(decisions),
+        duration_ms=duration_ms,
+    )
 
 
 # ── Public API ──────────────────────────────────────────────────────
@@ -3284,6 +3727,13 @@ async def extract_and_store(
     # mirrors `_resolve_effective_backend`.
     effective_backend = effective_backend_override or _resolve_effective_backend(user_id, config)
     effective_provider = effective_provider_override or _resolve_effective_provider(user_id, config)
+    fact_model = resolve_user_model(
+        ModelRole.MEMORY_EXTRACTION,
+        _resolve_user_config(user_id, config),
+        config,
+        backend=effective_backend,
+        provider=effective_provider,
+    )
 
     # Active-project detection, ONCE per run, threaded into both
     # stages like os_user and the backend triple above so a single
@@ -3305,6 +3755,49 @@ async def extract_and_store(
             ),
         )
 
+    receipt_spec = _canonical_receipt_spec(
+        canonical_provenance=canonical_provenance,
+        principal_id=user_id,
+        runtime_profile_id=runtime_profile_id,
+        extraction_role="fact_extraction",
+        backend=effective_backend,
+        provider=effective_provider,
+        model=fact_model,
+        prompt_version=_EXTRACTION_PROMPT_VERSION,
+        schema_version=_FACT_SCHEMA_VERSION,
+        policy_version=_FACT_POLICY_VERSION,
+    )
+    try:
+        receipt_claim = await _claim_canonical_receipt(receipt_spec)
+    except Exception:
+        log.warning("extract_and_store: canonical receipt claim failed", exc_info=True)
+        return 0
+    if receipt_claim is not None and not receipt_claim.claimed:
+        prior = receipt_claim.receipt
+        if prior.status == "completed" and prior.classifier_result is True:
+            episode = _generate_episode(
+                user_text=user_text,
+                assistant_text=assistant_text,
+                user_id=user_id,
+                session_id=session_id,
+                config=config,
+                effective_backend=effective_backend,
+                effective_provider=effective_provider,
+                os_user=os_user,
+                active_project=active_project,
+                user_log=user_log,
+                assistant_log=assistant_log,
+                canonical_provenance=canonical_provenance,
+                runtime_profile_id=runtime_profile_id,
+            )
+            if await_episode:
+                await episode
+            else:
+                ep_task = asyncio.create_task(episode, name=f"episode-{user_id}")
+                _pending_episode_tasks.add(ep_task)
+                ep_task.add_done_callback(_pending_episode_tasks.discard)
+        return prior.stored_count
+
     sem = _get_semaphore(user_id)
     # Pre-initialize the storage counters so the post-try summary log
     # cannot reference an unbound name regardless of which branch (or
@@ -3314,6 +3807,8 @@ async def extract_and_store(
     # no-facts branches removed that early-return guarantee, so the
     # init moves out where the lifecycle is obvious.
     stored = replaced = skipped = 0
+    candidate_id_set: set[str] = set()
+    receipt_decisions: list[MemoryExtractionStorageDecision] = []
     start = time.monotonic()
     try:
         async with sem:
@@ -3389,7 +3884,7 @@ async def extract_and_store(
                 admitted = [c for c in candidates if _scope_admitted(c.metadata, write_project_id)]
                 excluded_by_scope = len(candidates) - len(admitted)
                 candidates = admitted
-            candidate_id_set: set[str] = {c.id for c in candidates}
+            candidate_id_set = {c.id for c in candidates}
             # Per-id metadata lookup for `_validate_facts` Rule 4b
             # (issue #414): the rule needs the existing row's stored
             # tags to detect a confirmation row being consolidated
@@ -3441,6 +3936,7 @@ async def extract_and_store(
                 os_user=os_user,
                 user_window_text=user_window_text,
                 assistant_window_text=assistant_window_text,
+                resolved_model=fact_model,
             )
             # Restructured for stage-2 (issue #385): facts and has_episode
             # are independent. An exchange can be episode-worthy without
@@ -3469,10 +3965,25 @@ async def extract_and_store(
                         assistant_log=assistant_log,
                         canonical_provenance=canonical_provenance,
                         runtime_profile_id=runtime_profile_id,
+                        receipt_id=(receipt_claim.receipt.receipt_id if receipt_claim is not None else None),
+                        receipt_decisions=receipt_decisions,
                     ),
                 )
             else:
                 stored = replaced = skipped = 0
+            fact_duration_ms = int((time.monotonic() - start) * 1000)
+            await _complete_canonical_receipt(
+                receipt_claim,
+                _fact_receipt_completion(
+                    result=result,
+                    candidate_ids=candidate_id_set,
+                    decisions=receipt_decisions,
+                    stored=stored,
+                    replaced=replaced,
+                    skipped=skipped,
+                    duration_ms=fact_duration_ms,
+                ),
+            )
             # Stage-2 spawn (issue #385). Scheduled AFTER _store_facts
             # returns so stage-1 facts are durably stored before stage
             # 2 is even on the event loop. Independent of result.facts:
@@ -3525,12 +4036,36 @@ async def extract_and_store(
         # facts this turn, system continues running. Same outcome as
         # extraction disabled.
         log.warning("extract_and_store: claude binary not found on PATH")
+        await _complete_canonical_receipt(
+            receipt_claim,
+            _fact_receipt_completion(
+                result=ExtractionResult([], False, fact_model, "provider_failure"),
+                candidate_ids=candidate_id_set,
+                decisions=receipt_decisions,
+                stored=stored,
+                replaced=replaced,
+                skipped=skipped,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            ),
+        )
         return 0
     except PermissionError:
         # Cwd unwritable, or binary not executable. Logged once per
         # occurrence; the next call may succeed if the operator fixes
         # permissions.
         log.warning("extract_and_store: permission error", exc_info=True)
+        await _complete_canonical_receipt(
+            receipt_claim,
+            _fact_receipt_completion(
+                result=ExtractionResult([], False, fact_model, "policy_rejection"),
+                candidate_ids=candidate_id_set,
+                decisions=receipt_decisions,
+                stored=stored,
+                replaced=replaced,
+                skipped=skipped,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            ),
+        )
         return 0
     except asyncio.CancelledError:
         # Cancellation is a cooperative-shutdown signal from the event
@@ -3543,9 +4078,41 @@ async def extract_and_store(
         # discards the task reference, so propagation terminates there
         # without crashing the loop).
         log.debug("extract_and_store: cancelled, propagating for structured shutdown")
+        await _complete_canonical_receipt(
+            receipt_claim,
+            MemoryExtractionReceiptCompletion(
+                status="failed",
+                decision_outcome="cancelled",
+                failure_code="cancelled",
+                candidate_ids=tuple(sorted(candidate_id_set)),
+                classifier_result=None,
+                proposed_intents=(),
+                raw_count=0,
+                accepted_count=0,
+                validation_outcome="not_completed",
+                storage_decisions=tuple(receipt_decisions),
+                stored_count=stored,
+                replaced_count=replaced,
+                skipped_count=skipped,
+                memory_scopes=_receipt_memory_scopes(receipt_decisions),
+                duration_ms=int((time.monotonic() - start) * 1000),
+            ),
+        )
         raise
     except Exception:
         log.warning("extract_and_store: unexpected failure", exc_info=True)
+        await _complete_canonical_receipt(
+            receipt_claim,
+            _fact_receipt_completion(
+                result=ExtractionResult([], False, fact_model, "provider_failure"),
+                candidate_ids=candidate_id_set,
+                decisions=receipt_decisions,
+                stored=stored,
+                replaced=replaced,
+                skipped=skipped,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            ),
+        )
         return 0
     duration_ms = int((time.monotonic() - start) * 1000)
     log.info(

@@ -44,6 +44,7 @@ WORKSHOP_RUNTIME_PROFILE_ID_KEY = "workshop_runtime_profile_id"
 WORKSHOP_SOURCE_MESSAGE_ID_KEY = "workshop_source_message_id"
 WORKSHOP_RESULT_MESSAGE_ID_KEY = "workshop_result_message_id"
 WORKSHOP_RUN_ID_KEY = "workshop_run_id"
+EXTRACTION_RECEIPT_ID_KEY = "memory_extraction_receipt_id"
 _WORKSHOP_MEMORY_PROVENANCE_VERSION = 1
 
 # ── Data classes ────────────────────────────────────────────────────

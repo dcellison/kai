@@ -21,6 +21,11 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
 )
+from kai.workshop.memory_extraction_receipts import (
+    MemoryExtractionReceiptAccessDenied,
+    MemoryExtractionReceiptService,
+    MemoryExtractionReceiptSnapshot,
+)
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from kai.workspace_utils import is_workspace_allowed
@@ -144,6 +149,8 @@ class MemoryRecordDetail:
     prompt_version: str | None
     episode: dict[str, object] | None
     source_reference: MemorySourceReference | None = None
+    extraction_provenance: str = "not_applicable"
+    extraction_receipt: MemoryExtractionReceiptSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1370,6 +1377,36 @@ class WorkshopMemoryQueryService:
                         for item in value[:MAX_MEMORY_TAGS]
                         if isinstance(item, str) and item
                     ]
+        source = str(result.metadata.get("source") or "")
+        receipt_id = result.metadata.get(memory.EXTRACTION_RECEIPT_ID_KEY)
+        extraction_provenance = "not_applicable"
+        extraction_receipt = None
+        if source in {"extracted", "episode"}:
+            if receipt_id is None:
+                extraction_provenance = "legacy"
+            elif not isinstance(receipt_id, str) or not receipt_id or len(receipt_id) > 128:
+                extraction_provenance = "invalid"
+            else:
+                try:
+                    extraction_receipt = await MemoryExtractionReceiptService(self._store.connection).receipt(
+                        MemoryExtractionReceiptService.authority_for_principal(authority.principal_id),
+                        receipt_id,
+                    )
+                except MemoryExtractionReceiptAccessDenied:
+                    extraction_provenance = "invalid"
+                else:
+                    run_id = result.metadata.get(memory.WORKSHOP_RUN_ID_KEY)
+                    source_message_id = result.metadata.get(memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY)
+                    result_message_id = result.metadata.get(memory.WORKSHOP_RESULT_MESSAGE_ID_KEY)
+                    if (
+                        run_id != extraction_receipt.run_id
+                        or source_message_id != extraction_receipt.source_message_id
+                        or result_message_id != extraction_receipt.result_message_id
+                    ):
+                        extraction_receipt = None
+                        extraction_provenance = "invalid"
+                    else:
+                        extraction_provenance = "canonical"
         return MemoryRecordDetail(
             record=self._summary(
                 result,
@@ -1392,6 +1429,8 @@ class WorkshopMemoryQueryService:
             ),
             episode=episode,
             source_reference=source_reference,
+            extraction_provenance=extraction_provenance,
+            extraction_receipt=extraction_receipt,
         )
 
     async def search(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 86
+WORKSHOP_SCHEMA_VERSION = 87
 
 
 @dataclass(frozen=True, slots=True)
@@ -3953,6 +3953,118 @@ _CANONICAL_REVIEW_JOB_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_MEMORY_EXTRACTION_RECEIPT_SCHEMA = SchemaMigration(
+    version=87,
+    name="canonical_memory_extraction_receipts",
+    statements=(
+        """
+        CREATE TABLE memory_extraction_receipts (
+            receipt_id TEXT PRIMARY KEY CHECK (
+                length(receipt_id) BETWEEN 1 AND 128
+            ),
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT CHECK (
+                length(principal_id) BETWEEN 1 AND 128
+            ),
+            runtime_profile_id TEXT NOT NULL CHECK (
+                length(runtime_profile_id) BETWEEN 1 AND 128
+            ),
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT CHECK (
+                length(run_id) BETWEEN 1 AND 128
+            ),
+            source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT CHECK (
+                length(source_message_id) BETWEEN 1 AND 128
+            ),
+            result_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE RESTRICT CHECK (
+                length(result_message_id) BETWEEN 1 AND 128
+            ),
+            extraction_role TEXT NOT NULL CHECK (
+                extraction_role IN ('fact_extraction', 'episode_generation')
+            ),
+            backend TEXT NOT NULL CHECK (length(backend) BETWEEN 1 AND 64),
+            provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 64),
+            model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 256),
+            prompt_version TEXT NOT NULL CHECK (
+                length(prompt_version) BETWEEN 1 AND 64
+            ),
+            schema_version TEXT NOT NULL CHECK (
+                length(schema_version) BETWEEN 1 AND 64
+            ),
+            policy_version TEXT NOT NULL CHECK (
+                length(policy_version) BETWEEN 1 AND 64
+            ),
+            status TEXT NOT NULL CHECK (
+                status IN ('running', 'completed', 'failed')
+            ),
+            decision_outcome TEXT CHECK (
+                decision_outcome IS NULL OR length(decision_outcome) BETWEEN 1 AND 64
+            ),
+            failure_code TEXT CHECK (
+                failure_code IS NULL OR length(failure_code) BETWEEN 1 AND 64
+            ),
+            candidate_ids_json TEXT NOT NULL DEFAULT '[]' CHECK (
+                json_valid(candidate_ids_json)
+                AND json_type(candidate_ids_json) = 'array'
+                AND json_array_length(candidate_ids_json) <= 32
+            ),
+            classifier_result INTEGER CHECK (
+                classifier_result IS NULL OR classifier_result IN (0, 1)
+            ),
+            proposed_intents_json TEXT NOT NULL DEFAULT '[]' CHECK (
+                json_valid(proposed_intents_json)
+                AND json_type(proposed_intents_json) = 'array'
+            ),
+            validation_outcome_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(validation_outcome_json)
+                AND json_type(validation_outcome_json) = 'object'
+            ),
+            storage_outcome_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(storage_outcome_json)
+                AND json_type(storage_outcome_json) = 'object'
+            ),
+            memory_scope_json TEXT NOT NULL DEFAULT '[]' CHECK (
+                json_valid(memory_scope_json)
+                AND json_type(memory_scope_json) = 'array'
+            ),
+            duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+            request_fingerprint TEXT NOT NULL CHECK (
+                length(request_fingerprint) = 64
+                AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            completion_fingerprint TEXT CHECK (
+                completion_fingerprint IS NULL OR (
+                    length(completion_fingerprint) = 64
+                    AND completion_fingerprint NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            claim_owner TEXT NOT NULL CHECK (length(claim_owner) = 32),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            updated_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ),
+            completed_at TEXT,
+            UNIQUE (run_id, extraction_role),
+            CHECK (
+                (status = 'running' AND decision_outcome IS NULL
+                    AND failure_code IS NULL AND completion_fingerprint IS NULL
+                    AND completed_at IS NULL)
+                OR (status IN ('completed', 'failed')
+                    AND decision_outcome IS NOT NULL
+                    AND completion_fingerprint IS NOT NULL
+                    AND completed_at IS NOT NULL)
+            )
+        )
+        """,
+        "CREATE INDEX memory_extraction_receipts_principal_idx "
+        "ON memory_extraction_receipts (principal_id, created_at DESC)",
+        "CREATE INDEX memory_extraction_receipts_status_idx ON memory_extraction_receipts (status, created_at)",
+        "CREATE INDEX memory_extraction_receipts_runtime_idx "
+        "ON memory_extraction_receipts (runtime_profile_id, created_at DESC)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4040,6 +4152,7 @@ _MIGRATIONS = (
     _CANONICAL_PROVIDER_SESSION_RESET_SCHEMA,
     _DURABLE_CHANNEL_NOTIFICATION_POLICY_SCHEMA,
     _CANONICAL_REVIEW_JOB_SCHEMA,
+    _MEMORY_EXTRACTION_RECEIPT_SCHEMA,
 )
 
 

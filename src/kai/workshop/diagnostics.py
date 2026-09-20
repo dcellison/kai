@@ -2031,6 +2031,65 @@ def workshop_memory_authority_status(db_path: Path, *, memory_enabled: bool | No
     )
 
 
+def workshop_memory_extraction_receipt_status(db_path: Path) -> str:
+    """Report durable extraction provenance without reading memory content."""
+    prefix = "Workshop memory extraction receipts:"
+    if not db_path.is_file():
+        return f"{prefix} NOT VERIFIED (database unavailable)"
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if "memory_extraction_receipts" not in tables:
+                return f"{prefix} NOT INITIALIZED"
+            row = connection.execute(
+                "SELECT COUNT(*), "
+                "SUM(extraction_role = 'fact_extraction'), "
+                "SUM(extraction_role = 'episode_generation'), "
+                "SUM(status = 'completed'), SUM(status = 'failed'), "
+                "SUM(status = 'running'), SUM(decision_outcome = 'zero_memory') "
+                "FROM memory_extraction_receipts"
+            ).fetchone()
+            total, fact, episode, completed, failed, running, zero_memory = (
+                tuple(int(value or 0) for value in row) if row is not None else (0, 0, 0, 0, 0, 0, 0)
+            )
+            integrity_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_extraction_receipts receipt "
+                "LEFT JOIN runs run ON run.id = receipt.run_id "
+                "LEFT JOIN messages source ON source.id = receipt.source_message_id "
+                "LEFT JOIN messages result ON result.id = receipt.result_message_id "
+                "LEFT JOIN principals principal ON principal.id = receipt.principal_id "
+                "WHERE run.id IS NULL OR source.id IS NULL OR result.id IS NULL "
+                "OR principal.id IS NULL OR run.requested_by_principal_id != receipt.principal_id "
+                "OR run.runtime_profile_id != receipt.runtime_profile_id "
+                "OR run.inbound_message_id != receipt.source_message_id "
+                "OR run.result_message_id != receipt.result_message_id",
+            )
+            replay_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM ("
+                "SELECT run_id, extraction_role, COUNT(*) AS total "
+                "FROM memory_extraction_receipts GROUP BY run_id, extraction_role "
+                "HAVING total != 1)",
+            )
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if running == 0 and integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; receipts={total} (fact={fact}, episode={episode}, "
+        f"completed={completed}, failed={failed}, running={running}), zero-memory={zero_memory}; "
+        f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; "
+        "authority=canonical/privacy-bounded, legacy provenance=read-time classified"
+    )
+
+
 def workshop_operational_state_status(db_path: Path) -> str:
     """Describe canonical job ownership and GitHub subscription authority."""
     prefix = "Workshop operational state:"

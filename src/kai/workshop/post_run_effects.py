@@ -230,7 +230,16 @@ class WorkshopPostRunEffectService:
             ):
                 raise RuntimeError("Post-run effect no longer matches one successful canonical run")
             profile_state = self._runtime_state.for_profile(effect.runtime_profile_id)
-            if await profile_state.has_memory_for_run(str(effect.run_id)):
+            async with self._store.connection.execute(
+                "SELECT 1 FROM memory_extraction_receipts WHERE run_id = ? AND extraction_role = 'fact_extraction'",
+                (effect.run_id,),
+            ) as cursor:
+                receipt_started = await cursor.fetchone() is not None
+            if await profile_state.has_memory_for_run(str(effect.run_id)) and not receipt_started:
+                # Compatibility for effects settled before canonical extraction
+                # receipts existed. Once a receipt has been claimed, replay must
+                # pass through its authority so an interrupted completion is
+                # reconciled rather than silently stranded in `running`.
                 await self._settle(effect.run_id)
                 return
             async with self._store.connection.execute(
