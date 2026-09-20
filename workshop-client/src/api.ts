@@ -108,6 +108,7 @@ import type {
   WorkshopScheduledJobCancellation,
   WorkshopCapabilityAvailability,
   WorkshopCapabilitySnapshot,
+  WorkshopWebhookDiagnostics,
 } from "./types";
 import { HUMAN_NOTIFICATION_PATTERN, MESSAGE_PATTERN } from "./types";
 import { isWorkshopThemeId } from "./theme";
@@ -908,6 +909,101 @@ export async function loadWorkshopCapabilities(
       conversation: payload.context.conversation,
       workspace: payload.context.workspace,
     },
+  };
+}
+
+const WEBHOOK_DIAGNOSTIC_STATES = new Set([
+  "healthy",
+  "degraded",
+  "disabled",
+  "unavailable",
+]);
+
+function isWebhookDiagnosticState(value: unknown): value is WorkshopWebhookDiagnostics["state"] {
+  return typeof value === "string" && WEBHOOK_DIAGNOSTIC_STATES.has(value);
+}
+
+export async function loadWebhookDiagnostics(
+  session: WorkshopSession,
+): Promise<WorkshopWebhookDiagnostics> {
+  const response = await authorizedFetch(
+    session,
+    "/v1/client/administration/webhook-diagnostics",
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) {
+    throw new Error(safeErrorMessage(payload, "Could not load webhook diagnostics."));
+  }
+  if (
+    !isRecord(payload) ||
+    payload.version !== 1 ||
+    !isWebhookDiagnosticState(payload.state) ||
+    !isRecord(payload.listener) ||
+    !isWebhookDiagnosticState(payload.listener.state) ||
+    typeof payload.listener.port !== "number" ||
+    !Number.isInteger(payload.listener.port) ||
+    payload.listener.port < 1 ||
+    !Array.isArray(payload.endpoints) ||
+    !isRecord(payload.deliveries) ||
+    !isWebhookDiagnosticState(payload.deliveries.state) ||
+    !Array.isArray(payload.guidance) ||
+    !payload.guidance.every((item) => typeof item === "string")
+  ) {
+    throw new Error("Kai returned unsupported webhook diagnostics.");
+  }
+  const rawDeliveries = payload.deliveries;
+  const endpoints = payload.endpoints.map((endpoint) => {
+    if (
+      !isRecord(endpoint) ||
+      typeof endpoint.endpoint_class !== "string" ||
+      typeof endpoint.display_name !== "string" ||
+      !isWebhookDiagnosticState(endpoint.state) ||
+      typeof endpoint.description !== "string"
+    ) {
+      return null;
+    }
+    return {
+      description: endpoint.description,
+      displayName: endpoint.display_name,
+      endpointClass: endpoint.endpoint_class,
+      state: endpoint.state,
+    };
+  });
+  const deliveryFields = [
+    "window_hours",
+    "pending",
+    "executing",
+    "retrying",
+    "succeeded",
+    "failed",
+  ] as const;
+  if (
+    endpoints.some((endpoint) => endpoint === null) ||
+    !deliveryFields.every((field) => (
+      typeof rawDeliveries[field] === "number" &&
+      Number.isInteger(rawDeliveries[field]) &&
+      (rawDeliveries[field] as number) >= 0
+    ))
+  ) {
+    throw new Error("Kai returned unsupported webhook diagnostics.");
+  }
+  return {
+    deliveries: {
+      executing: rawDeliveries.executing as number,
+      failed: rawDeliveries.failed as number,
+      pending: rawDeliveries.pending as number,
+      retrying: rawDeliveries.retrying as number,
+      state: rawDeliveries.state as WorkshopWebhookDiagnostics["state"],
+      succeeded: rawDeliveries.succeeded as number,
+      windowHours: rawDeliveries.window_hours as number,
+    },
+    endpoints: endpoints as WorkshopWebhookDiagnostics["endpoints"],
+    guidance: payload.guidance as string[],
+    listener: {
+      port: payload.listener.port,
+      state: payload.listener.state,
+    },
+    state: payload.state,
   };
 }
 

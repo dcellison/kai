@@ -211,7 +211,7 @@ type WorkshopDestination =
   | {
       kind: "settings";
       runtimeChannelId: string | null;
-      section: "github" | null;
+      section: "administration" | "github" | null;
     };
 
 function destinationFromLocation(): WorkshopDestination {
@@ -252,7 +252,12 @@ function destinationFromLocation(): WorkshopDestination {
         runtimeChannelId && CHANNEL_PATTERN.test(runtimeChannelId)
           ? runtimeChannelId
           : null,
-      section: parameters.get("section") === "github" ? "github" : null,
+      section:
+        parameters.get("section") === "administration"
+          ? "administration"
+          : parameters.get("section") === "github"
+            ? "github"
+            : null,
     };
   }
   if (parameters.get("view") === "agents") {
@@ -3223,7 +3228,7 @@ function WorkshopView({
   requestedThreadRootId: string | null;
   focusedMessageError: string | null;
   settingsDestination: boolean;
-  settingsInitialSection: "github" | null;
+  settingsInitialSection: "administration" | "github" | null;
   settingsRuntimeLabel: string;
   settingsSession: WorkshopSession;
   navigation: WorkshopNavigation;
@@ -3304,7 +3309,7 @@ function WorkshopView({
   onOpenAgentDefinition: (definitionId: string) => Promise<void>;
   onOpenAgentSetup: (definitionId: string | null, setupId: string | null) => Promise<void>;
   onOpenAgentChannel: (channelId: string) => Promise<void>;
-  onOpenSettings: (section?: "github" | null) => void;
+  onOpenSettings: (section?: "administration" | "github" | null) => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onRestoreDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectAgent: (
@@ -4392,6 +4397,10 @@ function WorkshopView({
     if (operationId === "integration.github.review") {
       setActionPaletteOpen(false);
       setReviewDialogOpen(true);
+      return null;
+    }
+    if (operationId === "administration.webhook_status.read") {
+      onOpenSettings("administration");
       return null;
     }
     if (
@@ -6562,7 +6571,7 @@ function ActiveWorkshopClient({
   onOpenReviews: () => void;
   onOpenFollowedThread: (thread: WorkshopFollowedThread) => boolean;
   onOpenHumanNotification: (notification: WorkshopHumanNotification) => boolean;
-  onOpenSettings: (section?: "github" | null) => void;
+  onOpenSettings: (section?: "administration" | "github" | null) => void;
   onRestoreChannel: (channelId: string, clientOperationId: string) => Promise<void>;
   onRestoreDirectMessage: (channelId: string, clientOperationId: string) => Promise<void>;
   onSelectChannel: (channelId: string) => Promise<void>;
@@ -7385,7 +7394,9 @@ function WorkshopApp(): React.JSX.Element {
     writeDestination(nextDestination, "push");
   };
 
-  const openSettings = (section: "github" | null = null): void => {
+  const openSettings = (
+    section: "administration" | "github" | null = null,
+  ): void => {
     const nextDestination: WorkshopDestination = {
       kind: "settings",
       runtimeChannelId: null,

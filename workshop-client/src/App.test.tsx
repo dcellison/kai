@@ -36,6 +36,7 @@ import {
   loadFollowedThreads,
   loadNavigation,
   loadWorkshopCapabilities,
+  loadWebhookDiagnostics,
   loadNotificationPreferences,
   loadMemoryDetail,
   loadMemoryProjects,
@@ -126,6 +127,7 @@ vi.mock("./api", async (importOriginal) => {
     loadAgentProvisioningSetups: vi.fn(),
     loadNavigation: vi.fn(),
     loadWorkshopCapabilities: vi.fn(),
+    loadWebhookDiagnostics: vi.fn(),
     loadNotificationPreferences: vi.fn(),
     loadMemoryDetail: vi.fn(),
     loadMemoryProjects: vi.fn(),
@@ -998,6 +1000,21 @@ describe("Workshop React client", () => {
       runtimeProfileId,
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(settingsWorkspace);
+    vi.mocked(loadWebhookDiagnostics).mockResolvedValue({
+      state: "healthy",
+      listener: { state: "healthy", port: 8123 },
+      endpoints: [],
+      deliveries: {
+        state: "healthy",
+        windowHours: 24,
+        pending: 0,
+        executing: 0,
+        retrying: 0,
+        succeeded: 0,
+        failed: 0,
+      },
+      guidance: [],
+    });
     vi.mocked(loadWorkspaceGrants).mockResolvedValue({
       grants: [
         {
@@ -2186,6 +2203,50 @@ describe("Workshop React client", () => {
     const profilePalette = await screen.findByRole("dialog", { name: "Help and actions" });
     await user.click(within(profilePalette).getByRole("option", { name: /Review pull request/ }));
     expect(await screen.findByRole("dialog", { name: "Review pull request" })).toBeVisible();
+  });
+
+  it("opens administrator webhook diagnostics from the action palette", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "existing-session" }),
+    );
+    vi.mocked(loadWorkshopCapabilities).mockResolvedValue({
+      capabilities: [
+        {
+          available: true,
+          confirmation: "none",
+          description: "Inspect redacted host webhook and integration readiness.",
+          disposition: "administrator_only",
+          inputShape: "none",
+          label: "Webhook diagnostics",
+          mutatesState: false,
+          operationId: "administration.webhook_status.read",
+          paletteEntry: true,
+          scope: "administrator",
+          surface: "administration",
+          unavailableReason: null,
+        },
+      ],
+      context: {
+        administrator: true,
+        agent: true,
+        agentOwner: true,
+        channelOwner: true,
+        conversation: true,
+        workspace: true,
+      },
+    });
+
+    render(<App />);
+    await screen.findByText("Canonical history is ready.");
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Help and actions" });
+    await user.click(within(palette).getByRole("option", { name: /Webhook diagnostics/ }));
+
+    expect(await screen.findByRole("heading", { name: "Settings", level: 1 })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Administration", level: 2 })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Webhook diagnostics" })).toBeVisible();
   });
 
   it("opens help and actions instead of sending slash text from an empty composer", async () => {

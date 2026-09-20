@@ -16,6 +16,7 @@ import {
   loadPreferenceDocument,
   loadPreferenceHistory,
   loadSettingsWorkspace,
+  loadWebhookDiagnostics,
   loadWorkspaceConfig,
   loadWorkspaceGrants,
   loadMemoryProjects,
@@ -54,6 +55,7 @@ import type {
   WorkshopHumanProfile,
   WorkshopHumanAvatar,
   WorkshopSettingsWorkspace,
+  WorkshopWebhookDiagnostics,
   WorkshopWorkspaceConfig,
 } from "./types";
 
@@ -72,6 +74,7 @@ vi.mock("./api", async (importOriginal) => {
     loadAppearancePreferences: vi.fn(),
     loadPreferenceHistory: vi.fn(),
     loadSettingsWorkspace: vi.fn(),
+    loadWebhookDiagnostics: vi.fn(),
     loadWorkspaceConfig: vi.fn(),
     loadWorkspaceGrants: vi.fn(),
     loadMemoryProjects: vi.fn(),
@@ -128,6 +131,29 @@ const humanAvatar: WorkshopHumanAvatar = {
   stateVersion: 0,
   url: null,
   width: null,
+};
+
+const webhookDiagnostics: WorkshopWebhookDiagnostics = {
+  state: "healthy",
+  listener: { state: "healthy", port: 8123 },
+  endpoints: [
+    {
+      endpointClass: "github_webhook",
+      displayName: "GitHub webhook ingress",
+      state: "healthy",
+      description: "GitHub event ingress is configured.",
+    },
+  ],
+  deliveries: {
+    state: "healthy",
+    windowHours: 24,
+    pending: 0,
+    executing: 0,
+    retrying: 0,
+    succeeded: 3,
+    failed: 0,
+  },
+  guidance: ["Publish ingress through an operator-managed HTTPS endpoint."],
 };
 
 const activeHumanAvatar: WorkshopHumanAvatar = {
@@ -481,6 +507,7 @@ describe("Settings workspace", () => {
       ],
     });
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
+    vi.mocked(loadWebhookDiagnostics).mockResolvedValue(webhookDiagnostics);
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
     vi.mocked(loadHumanProfile).mockResolvedValue(humanProfile);
@@ -580,6 +607,28 @@ describe("Settings workspace", () => {
       "location",
     );
     expect(editor).toHaveValue(`${preference.content}Unsaved navigation draft`);
+  });
+
+  it("shows redacted webhook diagnostics only to administrators", async () => {
+    const user = userEvent.setup();
+    renderSettings();
+
+    expect(await screen.findByRole("heading", { name: "Webhook diagnostics" })).toBeVisible();
+    expect(screen.getAllByText("healthy", { selector: ".webhook-diagnostic-state" }))
+      .toHaveLength(2);
+    await user.click(screen.getByText("Endpoint classes"));
+    expect(screen.getByText("GitHub webhook ingress")).toBeVisible();
+    expect(screen.getByText(/3 succeeded/)).toBeVisible();
+    expect(loadWebhookDiagnostics).toHaveBeenCalledWith(session);
+  });
+
+  it("does not request or expose host diagnostics to members", async () => {
+    renderSettings(vi.fn(), false, vi.fn(), false);
+
+    expect(await screen.findByLabelText("Preference Markdown")).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Administration" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Webhook diagnostics" })).toBeNull();
+    expect(loadWebhookDiagnostics).not.toHaveBeenCalled();
   });
 
   it("updates the principal display name while showing the immutable handle", async () => {

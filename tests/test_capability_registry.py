@@ -215,12 +215,16 @@ def test_contextual_availability_is_redacted_and_excludes_admin_operations() -> 
     assert "secret" not in serialized.lower()
 
 
-def test_unimplemented_workshop_operations_are_not_advertised() -> None:
+def test_webhook_diagnostics_are_advertised_only_to_workshop_administrators() -> None:
     results = capability_availability(
         AdapterId.WORKSHOP,
         CapabilityContext(authenticated=True, administrator=True),
     )
-    assert "administration.webhook_status.read" not in {result.operation_id for result in results}
+    diagnostics = next(result for result in results if result.operation_id == "administration.webhook_status.read")
+
+    assert diagnostics.available is True
+    assert diagnostics.palette_entry is True
+    assert diagnostics.authority_scope == AuthorityScope.ADMINISTRATOR
 
 
 def test_telegram_help_is_registry_backed_and_filters_administrator_operations() -> None:

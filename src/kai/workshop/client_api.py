@@ -387,6 +387,10 @@ from kai.workshop.wake_policy import (
     dismiss_channel_agent,
     resolve_agent_engagements,
 )
+from kai.workshop.webhook_diagnostics import (
+    WebhookDiagnosticsAccessDenied,
+    WorkshopWebhookDiagnosticsService,
+)
 
 log = logging.getLogger(__name__)
 
@@ -497,6 +501,7 @@ _REVIEW_JOB_PATH = "/v1/client/reviews/{review_job_id}"
 _REVIEW_JOB_CANCEL_PATH = "/v1/client/reviews/{review_job_id}/cancel"
 _REVIEW_JOB_RETRY_PATH = "/v1/client/reviews/{review_job_id}/retry"
 _REVIEW_JOB_ARTIFACT_PATH = "/v1/client/reviews/{review_job_id}/artifact"
+_WEBHOOK_DIAGNOSTICS_PATH = "/v1/client/administration/webhook-diagnostics"
 _SCHEDULED_JOB_CANCEL_FIELDS = frozenset({"client_operation_id"})
 _MAX_SCHEDULED_JOB_CANCEL_BODY_BYTES = 1_024
 _REVIEW_JOB_SUBMISSION_FIELDS = frozenset({"repository", "pull_request_number", "client_operation_id"})
@@ -4100,6 +4105,39 @@ async def _principal_is_workshop_admin(
         (principal_id,),
     ) as cursor:
         return await cursor.fetchone() is not None
+
+
+async def _handle_webhook_diagnostics(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopWebhookDiagnosticsService,
+) -> web.Response:
+    """Return one redacted host diagnostic snapshot to administrators only."""
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        response = _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+    if request.query or request.can_read_body:
+        return _error_response(
+            status=400,
+            code="invalid_request",
+            message="Invalid webhook diagnostics request",
+        )
+    try:
+        snapshot = await service.inspect(principal_id)
+    except WebhookDiagnosticsAccessDenied:
+        return _error_response(
+            status=403,
+            code="access_denied",
+            message="Administrator access required",
+        )
+    return _json_response(snapshot.as_dict(), status=200)
 
 
 async def _handle_model_catalogue_operator_entry(
@@ -9696,6 +9734,7 @@ def register_workshop_read_routes(
     standing_participation: WorkshopStandingParticipationService | None = None,
     scheduler: WorkshopCanonicalScheduler | None = None,
     review_jobs: WorkshopReviewJobService | None = None,
+    webhook_diagnostics: WorkshopWebhookDiagnosticsService | None = None,
     invalidate_agent_context: Callable[[AgentId], Awaitable[tuple[int, int]]] | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
@@ -10236,6 +10275,25 @@ def register_workshop_read_routes(
             entrypoint="review_retry",
         )
         app.router.add_get(_REVIEW_JOB_ARTIFACT_PATH, handle_review_job_artifact)
+
+    if webhook_diagnostics is not None:
+
+        async def handle_webhook_diagnostics(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_webhook_diagnostics(
+                    request,
+                    authenticator=authenticator,
+                    service=webhook_diagnostics,
+                )
+
+        _register_workshop_capability_route(
+            app,
+            "GET",
+            _WEBHOOK_DIAGNOSTICS_PATH,
+            handle_webhook_diagnostics,
+            operation_id="administration.webhook_status.read",
+            entrypoint="webhook_diagnostics",
+        )
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_CLIENT_CAPABILITIES_PATH, handle_client_capabilities)

@@ -63,6 +63,6 @@ CANONICAL_SERVICE_BOUNDARIES: Mapping[str, CanonicalServiceBoundary] = MappingPr
             ("kai.workshop.standing_observation", "kai.workshop.standing_participation")
         ),
         "thread_service": CanonicalServiceBoundary(("kai.workshop.thread_unread", "kai.workshop.timeline")),
-        "webhook_diagnostics": CanonicalServiceBoundary(("kai.workshop.diagnostics",)),
+        "webhook_diagnostics": CanonicalServiceBoundary(("kai.workshop.webhook_diagnostics",)),
     }
 )

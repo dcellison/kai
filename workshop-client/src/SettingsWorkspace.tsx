@@ -24,6 +24,7 @@ import {
   loadClientPreferences,
   loadModelCatalogue,
   loadSettingsWorkspace,
+  loadWebhookDiagnostics,
   loadWorkspaceConfig,
   PreferenceRevisionConflictError,
   refreshAllModelCatalogues,
@@ -68,6 +69,7 @@ import type {
   WorkshopSettingsWorkspace,
   WorkshopWorkspaceConfig,
   WorkshopWorkspaceSettingChange,
+  WorkshopWebhookDiagnostics,
 } from "./types";
 import { applyWorkshopTheme } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
@@ -146,6 +148,11 @@ const GENERAL_SETTINGS_SECTIONS = [
   { id: "settings-section-clients", label: "Client preferences" },
 ] as const;
 
+const ADMINISTRATION_SETTINGS_SECTION = {
+  id: "settings-section-administration",
+  label: "Administration",
+} as const;
+
 const AGENT_RUNTIME_SECTIONS = [
   { id: "settings-section-runtime", label: "Runtime settings" },
   { id: "settings-section-workspace", label: "Workspace settings" },
@@ -153,6 +160,7 @@ const AGENT_RUNTIME_SECTIONS = [
 
 type SettingsSectionId =
   | (typeof GENERAL_SETTINGS_SECTIONS)[number]["id"]
+  | (typeof ADMINISTRATION_SETTINGS_SECTION)["id"]
   | (typeof AGENT_RUNTIME_SECTIONS)[number]["id"];
 
 const DND_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
@@ -256,7 +264,7 @@ function errorText(caught: unknown, fallback: string): string {
 type SettingsWorkspaceContentProps = {
   agentRuntime?: boolean;
   executionProfileControl?: ReactNode;
-  initialSection?: "github" | null;
+  initialSection?: "administration" | "github" | null;
   nativeAgentRuntime?: boolean;
   onAuthenticationFailure: (message: string) => void;
   onChannelAccessFailure: (message: string) => void;
@@ -381,16 +389,27 @@ function SettingsWorkspaceContent({
   const [appearanceError, setAppearanceError] = useState<string | null>(null);
   const [appearanceNotice, setAppearanceNotice] = useState<string | null>(null);
 
+  const [webhookDiagnostics, setWebhookDiagnostics] =
+    useState<WorkshopWebhookDiagnostics | null>(null);
+  const [webhookDiagnosticsLoading, setWebhookDiagnosticsLoading] =
+    useState(isAdministrator);
+  const [webhookDiagnosticsError, setWebhookDiagnosticsError] =
+    useState<string | null>(null);
+
   const settingsScrollRef = useRef<HTMLDivElement>(null);
   const visibleSections = agentRuntime
     ? AGENT_RUNTIME_SECTIONS
-    : GENERAL_SETTINGS_SECTIONS;
+    : isAdministrator
+      ? [...GENERAL_SETTINGS_SECTIONS, ADMINISTRATION_SETTINGS_SECTION]
+      : GENERAL_SETTINGS_SECTIONS;
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
     agentRuntime
       ? "settings-section-runtime"
-      : initialSection === "github"
-        ? "settings-section-github"
-        : GENERAL_SETTINGS_SECTIONS[0].id,
+      : initialSection === "administration" && isAdministrator
+        ? "settings-section-administration"
+        : initialSection === "github"
+          ? "settings-section-github"
+          : GENERAL_SETTINGS_SECTIONS[0].id,
   );
   const nativeRuntime = agentRuntime && nativeAgentRuntime;
   const titleId = nativeRuntime
@@ -419,10 +438,10 @@ function SettingsWorkspaceContent({
   };
 
   useEffect(() => {
-    if (!agentRuntime && initialSection === "github") {
-      navigateToSection("settings-section-github");
+    if (!agentRuntime && initialSection !== null) {
+      navigateToSection(`settings-section-${initialSection}` as SettingsSectionId);
     }
-  }, [agentRuntime, initialSection]);
+  }, [agentRuntime, initialSection, isAdministrator]);
 
   const updateActiveSection = (): void => {
     const scroll = settingsScrollRef.current;
@@ -756,6 +775,27 @@ function SettingsWorkspaceContent({
     }
   }, [handleAccessFailure, session]);
 
+  const refreshWebhookDiagnostics = useCallback(async (): Promise<void> => {
+    if (!isAdministrator) {
+      setWebhookDiagnostics(null);
+      setWebhookDiagnosticsLoading(false);
+      return;
+    }
+    setWebhookDiagnosticsLoading(true);
+    setWebhookDiagnosticsError(null);
+    try {
+      setWebhookDiagnostics(await loadWebhookDiagnostics(session));
+    } catch (caught) {
+      if (!handleAccessFailure(caught)) {
+        setWebhookDiagnosticsError(
+          errorText(caught, "Could not load webhook diagnostics."),
+        );
+      }
+    } finally {
+      setWebhookDiagnosticsLoading(false);
+    }
+  }, [handleAccessFailure, isAdministrator, session]);
+
   useEffect(() => {
     if (agentRuntime) {
       void refreshRuntime();
@@ -767,6 +807,9 @@ function SettingsWorkspaceContent({
       void refreshChannelNotifications();
       void refreshClients();
       void refreshAppearance();
+      if (isAdministrator) {
+        void refreshWebhookDiagnostics();
+      }
     }
   }, [
     agentRuntime,
@@ -778,6 +821,8 @@ function SettingsWorkspaceContent({
     refreshPreferences,
     refreshProfile,
     refreshRuntime,
+    refreshWebhookDiagnostics,
+    isAdministrator,
   ]);
 
   useEffect(() => {
@@ -2713,6 +2758,106 @@ function SettingsWorkspaceContent({
           {clientError && clients && <p className="settings-error" role="alert">{clientError}</p>}
           </div>
           </section>
+
+          {isAdministrator && (
+            <section className="settings-section" id="settings-section-administration">
+              <div>
+                <p className="section-number">05</p>
+                <h2>Administration</h2>
+                <p>
+                  Read-only host service and integration health. Secrets, credentials,
+                  filesystem paths, and network addresses are never displayed.
+                </p>
+              </div>
+              <div className="settings-section-content administration-settings-content">
+                {webhookDiagnosticsLoading ? (
+                  <p role="status">Loading service and integration diagnostics…</p>
+                ) : webhookDiagnostics ? (
+                  <article className="settings-card webhook-diagnostics-card">
+                    <div className="webhook-diagnostics-heading">
+                      <div>
+                        <p className="settings-card-label">Service and integrations</p>
+                        <h3>Webhook diagnostics</h3>
+                      </div>
+                      <span
+                        className="webhook-diagnostic-state"
+                        data-state={webhookDiagnostics.state}
+                      >
+                        {webhookDiagnostics.state}
+                      </span>
+                    </div>
+                    <dl>
+                      <div>
+                        <dt>Shared listener</dt>
+                        <dd>{webhookDiagnostics.listener.state}</dd>
+                      </div>
+                      <div>
+                        <dt>Port</dt>
+                        <dd>{webhookDiagnostics.listener.port}</dd>
+                      </div>
+                      <div>
+                        <dt>Recent delivery health</dt>
+                        <dd>
+                          {webhookDiagnostics.deliveries.state} · {webhookDiagnostics.deliveries.windowHours}h
+                        </dd>
+                      </div>
+                    </dl>
+                    <p className="settings-help">
+                      {webhookDiagnostics.deliveries.pending} pending · {webhookDiagnostics.deliveries.executing} executing · {webhookDiagnostics.deliveries.retrying} retrying · {webhookDiagnostics.deliveries.succeeded} succeeded · {webhookDiagnostics.deliveries.failed} failed
+                    </p>
+                    <details className="webhook-diagnostics-detail">
+                      <summary>Endpoint classes</summary>
+                      <ul>
+                        {webhookDiagnostics.endpoints.map((endpoint) => (
+                          <li key={endpoint.endpointClass}>
+                            <div>
+                              <strong>{endpoint.displayName}</strong>
+                              <span
+                                className="webhook-diagnostic-state"
+                                data-state={endpoint.state}
+                              >
+                                {endpoint.state}
+                              </span>
+                            </div>
+                            <p>{endpoint.description}</p>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                    {webhookDiagnostics.guidance.length > 0 && (
+                      <details className="webhook-diagnostics-detail">
+                        <summary>Setup guidance</summary>
+                        <ul>
+                          {webhookDiagnostics.guidance.map((item) => (
+                            <li key={item}>{item}</li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                    <p className="settings-help">
+                      Diagnostics are read-only. Installation and webhook registration remain operator actions.
+                    </p>
+                  </article>
+                ) : (
+                  <div className="settings-failure">
+                    <p role="alert">
+                      {webhookDiagnosticsError ?? "Webhook diagnostics are unavailable."}
+                    </p>
+                    <button
+                      className="quiet-button"
+                      type="button"
+                      onClick={() => void refreshWebhookDiagnostics()}
+                    >
+                      Retry
+                    </button>
+                  </div>
+                )}
+                {webhookDiagnosticsError && webhookDiagnostics && (
+                  <p className="settings-error" role="alert">{webhookDiagnosticsError}</p>
+                )}
+              </div>
+            </section>
+          )}
           </>
         )}
       </div>

@@ -808,9 +808,9 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
         workshop=_workshop(
             WorkshopSurface.ADMINISTRATION,
             disposition=AdapterDisposition.ADMINISTRATOR_ONLY,
-            implemented=False,
+            palette=True,
         ),
-        implementation_state=ImplementationState.TELEGRAM_COMPATIBILITY,
+        implementation_state=ImplementationState.CANONICAL,
         requirements=(*_AUTHENTICATED, ContextRequirement.ADMINISTRATOR),
     ),
     _capability(

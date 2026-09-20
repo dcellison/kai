@@ -435,6 +435,11 @@ def _host() -> KaiApplicationHost:
             spec_dir="specs",
             pr_review_timeout_s=900,
             telegram_enabled=False,
+            telegram_webhook_url=None,
+            github_webhook_secret=None,
+            generic_webhook_secret=None,
+            webhook_port=8080,
+            workshop_enabled=True,
             model_catalogue_refresh_interval_s=0,
             model_catalogue_refresh_timeout_s=30,
         ),  # type: ignore[arg-type]
@@ -497,6 +502,7 @@ async def test_core_starts_and_stops_without_a_telegram_application(host_depende
         },
     }
     assert services.subprocess_pool is not None
+    assert services.webhook_diagnostics is not None
     assert _FakeModelCatalogue.adapters is not None
     assert set(_FakeModelCatalogue.adapters) == {"claude", "codex", "goose", "opencode", "pi"}
     assert isinstance(_FakeModelCatalogue.adapters["claude"], ClaudeModelDiscoveryAdapter)

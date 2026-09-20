@@ -45,6 +45,7 @@ import {
   loadMessageReactors,
   loadNavigation,
   loadWorkshopCapabilities,
+  loadWebhookDiagnostics,
   loadGitHubSettings,
   loadNotificationPreferences,
   loadChannelNotificationPolicy,
@@ -819,6 +820,51 @@ function preferencePayload(
 
 describe("Workshop client API", () => {
   beforeEach(() => vi.unstubAllGlobals());
+
+  it("loads a redacted canonical webhook diagnostic snapshot", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      version: 1,
+      state: "healthy",
+      listener: { state: "healthy", port: 8123 },
+      endpoints: [{
+        endpoint_class: "github_webhook",
+        display_name: "GitHub webhook ingress",
+        state: "healthy",
+        description: "GitHub event ingress is configured.",
+      }],
+      deliveries: {
+        state: "healthy",
+        window_hours: 24,
+        pending: 0,
+        executing: 0,
+        retrying: 0,
+        succeeded: 3,
+        failed: 0,
+      },
+      guidance: ["Use an operator-managed HTTPS endpoint."],
+    }), { status: 200 })));
+
+    await expect(loadWebhookDiagnostics(session)).resolves.toEqual({
+      state: "healthy",
+      listener: { state: "healthy", port: 8123 },
+      endpoints: [{
+        endpointClass: "github_webhook",
+        displayName: "GitHub webhook ingress",
+        state: "healthy",
+        description: "GitHub event ingress is configured.",
+      }],
+      deliveries: {
+        state: "healthy",
+        windowHours: 24,
+        pending: 0,
+        executing: 0,
+        retrying: 0,
+        succeeded: 3,
+        failed: 0,
+      },
+      guidance: ["Use an operator-managed HTTPS endpoint."],
+    });
+  });
 
   it("redeems an enrollment grant without putting credentials in the URL", async () => {
     const fetchMock = vi.fn().mockResolvedValue(

@@ -5508,6 +5508,111 @@ button:disabled {
   gap: 0.75rem;
 }
 
+.webhook-diagnostics-heading,
+.webhook-diagnostics-detail li > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.webhook-diagnostics-heading h3 {
+  margin: 0;
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+  font-size: 1rem;
+  font-weight: 560;
+}
+
+.webhook-diagnostic-state {
+  flex: none;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  padding: 0.2rem 0.45rem;
+  color: var(--color-text-muted);
+  font: 0.62rem var(--mono);
+  text-transform: capitalize;
+}
+
+.webhook-diagnostic-state[data-state="healthy"] {
+  border-color: color-mix(in srgb, var(--color-success) 48%, transparent);
+  color: var(--color-success);
+}
+
+.webhook-diagnostic-state[data-state="degraded"] {
+  border-color: color-mix(in srgb, var(--color-warning) 48%, transparent);
+  color: var(--color-warning);
+}
+
+.webhook-diagnostic-state[data-state="unavailable"] {
+  border-color: color-mix(in srgb, var(--color-danger) 48%, transparent);
+  color: var(--color-danger);
+}
+
+.webhook-diagnostics-card dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: 0.55rem;
+  margin: 0.9rem 0 0;
+}
+
+.webhook-diagnostics-card dl > div {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.65rem;
+  background: var(--color-canvas-inset);
+}
+
+.webhook-diagnostics-card dt,
+.webhook-diagnostics-card dd {
+  margin: 0;
+}
+
+.webhook-diagnostics-card dt {
+  color: var(--color-text-muted);
+  font-size: 0.62rem;
+}
+
+.webhook-diagnostics-card dd {
+  margin-top: 0.25rem;
+  color: var(--color-text-strong);
+  font: 0.68rem var(--mono);
+  text-transform: capitalize;
+}
+
+.webhook-diagnostics-detail {
+  margin-top: 0.75rem;
+  border-top: 1px solid var(--color-border);
+  padding-top: 0.65rem;
+}
+
+.webhook-diagnostics-detail summary {
+  color: var(--color-text-strong);
+  font-size: 0.7rem;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.webhook-diagnostics-detail ul {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0.65rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.webhook-diagnostics-detail li {
+  min-width: 0;
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.webhook-diagnostics-detail li strong {
+  color: var(--color-text-strong);
+}
+
 .settings-card > label.settings-checkbox-row {
   display: flex;
   align-items: center;
