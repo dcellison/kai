@@ -136,14 +136,20 @@ export function ReviewsWorkspace({
   };
 
   const openArtifact = async (job: WorkshopReviewJob): Promise<void> => {
+    const opened = window.open("about:blank", "_blank");
+    if (!opened) {
+      setError("The browser blocked the review artifact window.");
+      return;
+    }
+    opened.opener = null;
     setBusyId(job.reviewJobId);
     setError(null);
     try {
       const url = URL.createObjectURL(await loadReviewArtifact(session, job.reviewJobId));
-      const opened = window.open(url, "_blank", "noopener,noreferrer");
-      if (!opened) throw new Error("The browser blocked the review artifact window.");
+      opened.location.href = url;
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (caught) {
+      opened.close();
       handleFailure(caught, "Could not open the review artifact.");
     } finally {
       setBusyId(null);
@@ -158,8 +164,14 @@ export function ReviewsWorkspace({
     <section className="reviews-workspace" aria-label="Reviews">
       <ActivityWorkspaceHeader
         actions={(
-          <button className="quiet-button" type="button" onClick={onReviewPullRequest}>
-            Review pull request
+          <button
+            aria-label="Review pull request"
+            className="panel-icon-button reviews-launch-button"
+            title="Review pull request"
+            type="button"
+            onClick={onReviewPullRequest}
+          >
+            <PullRequestIcon />
           </button>
         )}
         connection={connection}

@@ -5576,6 +5576,11 @@ button:disabled {
   font-size: 1rem;
 }
 
+.reviews-launch-button svg {
+  width: 1rem;
+  height: 1rem;
+}
+
 .reviews-error {
   margin: 0;
   padding: 0.7rem 1.25rem;
