@@ -24,6 +24,7 @@ from kai.config import DATA_DIR, resolve_claude_user
 from kai.oneshot import (
     _CODEX_ENV_ALLOWLIST,
     _CODEX_ONESHOT_DISABLED_FEATURES,
+    _CODEX_ONESHOT_PERMISSION_PROFILE,
     _CODEX_PRESERVED_AUTH_VARS,
     _EXTRACTOR_CWD,
     OneShotOutputError,
@@ -138,10 +139,13 @@ class _CodexReviewProtocol:
             },
         )
         await self.notify("initialized")
+        # The process-level `default_permissions` selects Kai's shared
+        # bounded one-shot profile. Do not also send either legacy `sandbox`
+        # or turn-level `sandboxPolicy`: profiles do not compose with those
+        # fields, and Codex 0.147 rejects the former restricted-read shape.
         thread_params: dict[str, Any] = {
             "cwd": str(cwd),
             "approvalPolicy": "never",
-            "sandbox": "read-only",
             "serviceName": "kai_review_job",
             "config": {
                 "project_doc_max_bytes": 0,
@@ -166,14 +170,6 @@ class _CodexReviewProtocol:
             "input": [{"type": "text", "text": prompt}],
             "cwd": str(cwd),
             "approvalPolicy": "never",
-            "sandboxPolicy": {
-                "type": "readOnly",
-                "access": {
-                    "type": "restricted",
-                    "includePlatformDefaults": True,
-                    "readableRoots": [str(cwd)],
-                },
-            },
         }
         if model:
             params["model"] = model
@@ -257,6 +253,12 @@ class CodexAppServerReviewReasoner:
             resolved_binary,
             "--config",
             'approval_policy="never"',
+            # Reuse the exec reasoner's canonical permission profile rather
+            # than maintaining a second app-server protocol representation.
+            "--config",
+            'default_permissions="kai-oneshot"',
+            "--config",
+            _CODEX_ONESHOT_PERMISSION_PROFILE,
             "--config",
             'web_search="disabled"',
             "--config",
