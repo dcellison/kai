@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kai.codex_review import CodexAppServerReviewReasoner
-from kai.oneshot import OneShotSubprocessError
+from kai.oneshot import OneShotOutputError, OneShotSubprocessError
 
 
 def _message(value: dict) -> bytes:
@@ -18,8 +18,28 @@ def _message(value: dict) -> bytes:
 def _review_exchange(*, failed: bool = False) -> list[bytes]:
     messages = [
         _message({"id": 1, "result": {"userAgent": "codex"}}),
-        _message({"id": 2, "result": {"thread": {"id": "thr_review"}}}),
-        _message({"id": 3, "result": {"turn": {"id": "turn_review", "status": "inProgress"}}}),
+        _message(
+            {
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "model": "gpt-5.5",
+                            "defaultReasoningEffort": "medium",
+                            "supportedReasoningEfforts": [
+                                {"reasoningEffort": "low"},
+                                {"reasoningEffort": "medium"},
+                                {"reasoningEffort": "high"},
+                                {"reasoningEffort": "xhigh"},
+                            ],
+                        }
+                    ],
+                    "nextCursor": None,
+                },
+            }
+        ),
+        _message({"id": 3, "result": {"thread": {"id": "thr_review"}}}),
+        _message({"id": 4, "result": {"turn": {"id": "turn_review", "status": "inProgress"}}}),
     ]
     if failed:
         messages.append(
@@ -73,7 +93,7 @@ def _review_exchange(*, failed: bool = False) -> list[bytes]:
                 ),
             ]
         )
-    messages.append(_message({"id": 4, "result": {}}))
+    messages.append(_message({"id": 5, "result": {}}))
     return messages
 
 
@@ -136,21 +156,29 @@ class TestCodexAppServerReviewReasoner:
         assert [message["method"] for message in messages] == [
             "initialize",
             "initialized",
+            "model/list",
             "thread/start",
             "turn/start",
             "thread/delete",
         ]
-        thread_params = messages[2]["params"]
+        assert messages[2]["params"] == {
+            "cursor": None,
+            "limit": 100,
+            "includeHidden": True,
+        }
+        thread_params = messages[3]["params"]
         assert thread_params["approvalPolicy"] == "never"
         assert "sandbox" not in thread_params
         assert thread_params["config"]["project_doc_max_bytes"] == 0
-        turn_params = messages[3]["params"]
+        turn_params = messages[4]["params"]
         assert turn_params["approvalPolicy"] == "never"
+        assert turn_params["model"] == "gpt-5.5"
+        assert turn_params["effort"] == "medium"
         assert "sandboxPolicy" not in turn_params
         config_values = [argv[index + 1] for index, value in enumerate(argv) if value == "--config"]
         assert 'default_permissions="kai-oneshot"' in config_values
         assert any(value.startswith("permissions.kai-oneshot=") for value in config_values)
-        assert messages[4]["params"] == {"threadId": "thr_review"}
+        assert messages[5]["params"] == {"threadId": "thr_review"}
         proc.stdin.close.assert_called_once()
         proc.kill.assert_not_called()
 
@@ -204,9 +232,63 @@ class TestCodexAppServerReviewReasoner:
 
         assert _written_messages(proc)[-1] == {
             "method": "thread/delete",
-            "id": 4,
+            "id": 5,
             "params": {"threadId": "thr_review"},
         }
+
+    @pytest.mark.asyncio
+    async def test_rejects_model_metadata_with_incompatible_default_effort(
+        self,
+        tmp_path: Path,
+    ):
+        proc = _make_app_server_proc(
+            [
+                _message({"id": 1, "result": {"userAgent": "codex"}}),
+                _message(
+                    {
+                        "id": 2,
+                        "result": {
+                            "data": [
+                                {
+                                    "model": "gpt-5.5",
+                                    "defaultReasoningEffort": "max",
+                                    "supportedReasoningEfforts": [
+                                        {"reasoningEffort": "medium"},
+                                    ],
+                                }
+                            ],
+                            "nextCursor": None,
+                        },
+                    }
+                ),
+            ]
+        )
+        reasoner = CodexAppServerReviewReasoner(cwd=tmp_path)
+
+        with (
+            patch("kai.codex_review.resolve_oneshot_binary", return_value="codex"),
+            patch("kai.codex_review.resolve_claude_user", return_value=None),
+            patch(
+                "kai.codex_review.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=proc),
+            ),
+            pytest.raises(
+                OneShotOutputError,
+                match="default reasoning effort is not supported",
+            ),
+        ):
+            await reasoner.run(
+                prompt="Review this pull request",
+                model="gpt-5.5",
+                timeout=30,
+                purpose="pr_review",
+            )
+
+        assert [message["method"] for message in _written_messages(proc)] == [
+            "initialize",
+            "initialized",
+            "model/list",
+        ]
 
     @pytest.mark.asyncio
     async def test_process_is_killed_when_stdin_close_does_not_stop_it(self):

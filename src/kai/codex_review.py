@@ -44,6 +44,8 @@ log = logging.getLogger(__name__)
 _STDERR_LIMIT = 64 * 1024
 _PROCESS_EXIT_TIMEOUT_SECONDS = 2.0
 _THREAD_DELETE_TIMEOUT_SECONDS = 2.0
+_MODEL_LIST_PAGE_LIMIT = 100
+_MODEL_LIST_MAX_PAGES = 20
 
 # The conversational app-server transport succeeds without forcing an upstream
 # Responses transport. Keep that proven behavior. The remaining feature
@@ -118,7 +120,7 @@ class _CodexReviewProtocol:
                 raise OneShotOutputError(f"Codex {method} returned a malformed result")
             return result
 
-    async def initialize(self, *, cwd: Path, model: str | None) -> None:
+    async def initialize(self, *, cwd: Path, model: str | None) -> str | None:
         await self.request(
             "initialize",
             {
@@ -139,6 +141,7 @@ class _CodexReviewProtocol:
             },
         )
         await self.notify("initialized")
+        reasoning_effort = await self._model_default_reasoning_effort(model)
         # The process-level `default_permissions` selects Kai's shared
         # bounded one-shot profile. Do not also send either legacy `sandbox`
         # or turn-level `sandboxPolicy`: profiles do not compose with those
@@ -159,8 +162,63 @@ class _CodexReviewProtocol:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise OneShotOutputError("Codex thread/start returned no thread.id")
         self.thread_id = thread["id"]
+        return reasoning_effort
 
-    async def run_turn(self, *, prompt: str, cwd: Path, model: str | None, join_items: bool) -> str:
+    async def _model_default_reasoning_effort(self, model: str | None) -> str | None:
+        """Resolve a model-compatible effort from app-server metadata.
+
+        The target user's Codex configuration may select an effort that the
+        review model does not support.  An explicit review model therefore
+        needs an explicit compatible effort on `turn/start`.  App-server's
+        model catalogue is the authority for both the supported values and
+        the suggested default.
+        """
+        if model is None:
+            return None
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _page in range(_MODEL_LIST_MAX_PAGES):
+            result = await self.request(
+                "model/list",
+                {
+                    "cursor": cursor,
+                    "limit": _MODEL_LIST_PAGE_LIMIT,
+                    "includeHidden": True,
+                },
+            )
+            entries = result.get("data")
+            if not isinstance(entries, list):
+                raise OneShotOutputError("Codex model/list returned no data array")
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("model") != model:
+                    continue
+                default_effort = entry.get("defaultReasoningEffort")
+                supported = entry.get("supportedReasoningEfforts")
+                if not isinstance(default_effort, str) or not default_effort:
+                    raise OneShotOutputError("Codex review model has no default reasoning effort")
+                if not isinstance(supported, list) or not any(
+                    isinstance(value, dict) and value.get("reasoningEffort") == default_effort for value in supported
+                ):
+                    raise OneShotOutputError("Codex review model default reasoning effort is not supported")
+                return default_effort
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                break
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+                raise OneShotOutputError("Codex model/list returned an invalid cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise OneShotOutputError("Codex model/list did not advertise the review model")
+
+    async def run_turn(
+        self,
+        *,
+        prompt: str,
+        cwd: Path,
+        model: str | None,
+        reasoning_effort: str | None,
+        join_items: bool,
+    ) -> str:
         if self.thread_id is None:
             raise OneShotOutputError("Codex review thread was not initialized")
         request_id = self._next_id
@@ -173,6 +231,8 @@ class _CodexReviewProtocol:
         }
         if model:
             params["model"] = model
+        if reasoning_effort:
+            params["effort"] = reasoning_effort
         await self._write({"method": "turn/start", "id": request_id, "params": params})
 
         visible: list[str] = []
@@ -302,12 +362,13 @@ class CodexAppServerReviewReasoner:
             rendered_prompt = _render_codex_stdin(system_prompt, prompt)
 
             async def exchange() -> str:
-                await protocol.initialize(cwd=self._cwd, model=model)
+                reasoning_effort = await protocol.initialize(cwd=self._cwd, model=model)
                 try:
                     return await protocol.run_turn(
                         prompt=rendered_prompt,
                         cwd=self._cwd,
                         model=model,
+                        reasoning_effort=reasoning_effort,
                         join_items=self._join_items,
                     )
                 finally:
