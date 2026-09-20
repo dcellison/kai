@@ -121,6 +121,10 @@ class TestReviewJobAuthority:
             assert artifact.filename == "owner-repo-pr-42-review.md"
             assert b"No blocking findings" in artifact.body
             assert artifact.warnings == (CollectionWarning("related_context", "Unavailable"),)
+            recent = await service.list_recent(authority)
+            assert recent[0].review_job_id == terminal.review_job_id
+            assert recent[0].artifact_filename == artifact.filename
+            assert recent[0].warning_count == 1
             assert generate.call_args.kwargs["local_repo_path"] == str(tmp_path / "repo")
             assert generate.call_args.kwargs["github_token"] == "ghp_test"
             assert runtime_pool.get_role_model.call_count == 1

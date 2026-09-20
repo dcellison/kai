@@ -292,6 +292,12 @@ from kai.workshop.principal_policies import (
     WorkshopPrincipalPolicyStorageError,
     WorkshopPrincipalPolicyValidationError,
 )
+from kai.workshop.review_jobs import (
+    ReviewJobSnapshot,
+    WorkshopReviewJobAccessDenied,
+    WorkshopReviewJobService,
+    WorkshopReviewJobValidationError,
+)
 from kai.workshop.routing_eligibility import (
     RoutingEligibilityAccessDenied,
     RoutingEligibilityAuthority,
@@ -486,8 +492,15 @@ _PRINCIPAL_EVENTS_PATH = "/v1/client/events"
 _SCHEDULED_JOBS_PATH = "/v1/client/scheduled-jobs"
 _SCHEDULED_JOB_PATH = "/v1/client/scheduled-jobs/{job_id}"
 _SCHEDULED_JOB_CANCEL_PATH = "/v1/client/scheduled-jobs/{job_id}/cancel"
+_REVIEW_JOBS_PATH = "/v1/client/reviews"
+_REVIEW_JOB_PATH = "/v1/client/reviews/{review_job_id}"
+_REVIEW_JOB_CANCEL_PATH = "/v1/client/reviews/{review_job_id}/cancel"
+_REVIEW_JOB_RETRY_PATH = "/v1/client/reviews/{review_job_id}/retry"
+_REVIEW_JOB_ARTIFACT_PATH = "/v1/client/reviews/{review_job_id}/artifact"
 _SCHEDULED_JOB_CANCEL_FIELDS = frozenset({"client_operation_id"})
 _MAX_SCHEDULED_JOB_CANCEL_BODY_BYTES = 1_024
+_REVIEW_JOB_SUBMISSION_FIELDS = frozenset({"repository", "pull_request_number", "client_operation_id"})
+_MAX_REVIEW_JOB_BODY_BYTES = 2_048
 _CLIENT_OPERATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _CHANNEL_UNREAD_PATH = "/v1/client/unread"
 _CHANNEL_UNREAD_EVENTS_PATH = "/v1/client/unread/events"
@@ -7372,6 +7385,193 @@ def _serialize_principal_client_event_batch(batch: _PrincipalClientEventBatch) -
     return (f"id: {batch.through_position}\nevent: workshop.principal.changed\ndata: {payload}\n\n").encode()
 
 
+def _serialize_review_job(snapshot: ReviewJobSnapshot) -> dict[str, object]:
+    return {
+        "review_job_id": snapshot.review_job_id,
+        "repository": snapshot.repository,
+        "pull_request_number": snapshot.pull_request_number,
+        "status": snapshot.status,
+        "attempt_count": snapshot.attempt_count,
+        "last_error_code": snapshot.last_error_code,
+        "created_at": snapshot.created_at,
+        "updated_at": snapshot.updated_at,
+        "replayed": snapshot.replayed,
+        "artifact": (
+            {
+                "artifact_id": snapshot.artifact_id,
+                "filename": snapshot.artifact_filename,
+                "warning_count": snapshot.warning_count,
+                "warnings": [{"source": warning.source, "message": warning.message} for warning in snapshot.warnings],
+            }
+            if snapshot.artifact_id is not None and snapshot.artifact_filename is not None
+            else None
+        ),
+    }
+
+
+async def _review_job_authority(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopReviewJobService,
+):
+    principal_id = await authenticator.authenticate(request)
+    if not isinstance(principal_id, PrincipalId):
+        return None, _error_response(
+            status=401,
+            code="authentication_required",
+            message="Authentication required",
+        )
+    try:
+        return service.authority_for_principal(principal_id), None
+    except WorkshopReviewJobAccessDenied as exc:
+        return None, _error_response(status=403, code="access_denied", message=str(exc))
+
+
+async def _read_review_job_payload(request: web.Request) -> dict[str, object] | None:
+    if request.query or request.content_type != "application/json":
+        return None
+    if request.content_length is not None and request.content_length > _MAX_REVIEW_JOB_BODY_BYTES:
+        return None
+    raw = await request.content.read(_MAX_REVIEW_JOB_BODY_BYTES + 1)
+    if len(raw) > _MAX_REVIEW_JOB_BODY_BYTES:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def _handle_review_jobs(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopReviewJobService,
+) -> web.Response:
+    authority, error = await _review_job_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.method == "GET":
+        if request.can_read_body or set(request.query).difference({"limit"}):
+            return _error_response(status=400, code="invalid_request", message="Invalid review request")
+        try:
+            limit = int(request.query.get("limit", "20"))
+            jobs = await service.list_recent(authority, limit=limit)
+            options = await service.submission_options(authority)
+        except (ValueError, WorkshopReviewJobValidationError) as exc:
+            return _error_response(status=400, code="invalid_request", message=str(exc))
+        return _json_response(
+            {
+                "version": 1,
+                "jobs": [_serialize_review_job(job) for job in jobs],
+                "submission": {
+                    "repositories": list(options.repositories),
+                    "active_workspace": options.active_workspace,
+                    "active_workspace_repository": options.active_workspace_repository,
+                    "inferred_repository": options.inferred_repository,
+                },
+            },
+            status=200,
+        )
+    payload = await _read_review_job_payload(request)
+    if payload is None or set(payload) != _REVIEW_JOB_SUBMISSION_FIELDS:
+        return _error_response(status=400, code="invalid_request", message="Invalid review submission")
+    repository = payload.get("repository")
+    pull_request_number = payload.get("pull_request_number")
+    operation_id = payload.get("client_operation_id")
+    if (
+        (repository is not None and not isinstance(repository, str))
+        or not isinstance(pull_request_number, int)
+        or isinstance(pull_request_number, bool)
+        or not isinstance(operation_id, str)
+        or not _CLIENT_OPERATION_ID_PATTERN.fullmatch(operation_id)
+    ):
+        return _error_response(status=400, code="invalid_request", message="Invalid review submission")
+    try:
+        snapshot = await service.submit(
+            authority,
+            repository=repository,
+            pull_request_number=pull_request_number,
+            idempotency_key=operation_id,
+        )
+    except WorkshopReviewJobValidationError as exc:
+        return _error_response(status=400, code="invalid_request", message=str(exc))
+    except WorkshopReviewJobAccessDenied as exc:
+        return _error_response(status=403, code="access_denied", message=str(exc))
+    return _json_response(
+        {"version": 1, "job": _serialize_review_job(snapshot)}, status=200 if snapshot.replayed else 202
+    )
+
+
+async def _handle_review_job(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopReviewJobService,
+) -> web.Response:
+    authority, error = await _review_job_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid review request")
+    try:
+        snapshot = await service.inspect(authority, request.match_info["review_job_id"])
+    except WorkshopReviewJobAccessDenied:
+        return _error_response(status=404, code="review_not_found", message="Review not found")
+    return _json_response({"version": 1, "job": _serialize_review_job(snapshot)}, status=200)
+
+
+async def _handle_review_job_mutation(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopReviewJobService,
+    retry: bool,
+) -> web.Response:
+    authority, error = await _review_job_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    payload = await _read_review_job_payload(request)
+    if payload is None or set(payload) != {"client_operation_id"}:
+        return _error_response(status=400, code="invalid_request", message="Invalid review mutation")
+    operation_id = payload.get("client_operation_id")
+    if not isinstance(operation_id, str) or not _CLIENT_OPERATION_ID_PATTERN.fullmatch(operation_id):
+        return _error_response(status=400, code="invalid_request", message="Invalid review mutation")
+    try:
+        operation = service.retry if retry else service.cancel
+        snapshot = await operation(authority, request.match_info["review_job_id"])
+    except WorkshopReviewJobAccessDenied:
+        return _error_response(status=404, code="review_not_found", message="Review not found")
+    return _json_response({"version": 1, "job": _serialize_review_job(snapshot)}, status=200)
+
+
+async def _handle_review_job_artifact(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopReviewJobService,
+) -> web.Response:
+    authority, error = await _review_job_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    if set(request.query).difference({"download"}) or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid review artifact request")
+    try:
+        artifact = await service.artifact(authority, request.match_info["review_job_id"])
+    except WorkshopReviewJobAccessDenied:
+        return _error_response(status=404, code="artifact_not_found", message="Review artifact not found")
+    response = web.Response(body=artifact.body, content_type=artifact.media_type)
+    if request.query.get("download") == "1":
+        response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(artifact.filename)}"
+    response.headers["X-Kai-Collection-Warnings"] = str(len(artifact.warnings))
+    return response
+
+
 async def _scheduled_job_principal(
     request: web.Request,
     *,
@@ -9495,6 +9695,7 @@ def register_workshop_read_routes(
     collaboration_policy: WorkshopCollaborationPolicyService | None = None,
     standing_participation: WorkshopStandingParticipationService | None = None,
     scheduler: WorkshopCanonicalScheduler | None = None,
+    review_jobs: WorkshopReviewJobService | None = None,
     invalidate_agent_context: Callable[[AgentId], Awaitable[tuple[int, int]]] | None = None,
 ) -> None:
     """Register authenticated Workshop client routes on an application."""
@@ -9971,6 +10172,70 @@ def register_workshop_read_routes(
             operation_id="scheduled_jobs.manage",
             entrypoint="scheduled_job_cancel",
         )
+
+    if review_jobs is not None:
+
+        async def handle_review_jobs(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_review_jobs(request, authenticator=authenticator, service=review_jobs)
+
+        async def handle_review_job(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_review_job(request, authenticator=authenticator, service=review_jobs)
+
+        async def handle_review_job_cancel(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_review_job_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=review_jobs,
+                    retry=False,
+                )
+
+        async def handle_review_job_retry(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_review_job_mutation(
+                    request,
+                    authenticator=authenticator,
+                    service=review_jobs,
+                    retry=True,
+                )
+
+        async def handle_review_job_artifact(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_review_job_artifact(
+                    request,
+                    authenticator=authenticator,
+                    service=review_jobs,
+                )
+
+        app.router.add_get(_REVIEW_JOBS_PATH, handle_review_jobs)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _REVIEW_JOBS_PATH,
+            handle_review_jobs,
+            operation_id="integration.github.review",
+            entrypoint="review_submit",
+        )
+        app.router.add_get(_REVIEW_JOB_PATH, handle_review_job)
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _REVIEW_JOB_CANCEL_PATH,
+            handle_review_job_cancel,
+            operation_id="integration.github.review",
+            entrypoint="review_cancel",
+        )
+        _register_workshop_capability_route(
+            app,
+            "POST",
+            _REVIEW_JOB_RETRY_PATH,
+            handle_review_job_retry,
+            operation_id="integration.github.review",
+            entrypoint="review_retry",
+        )
+        app.router.add_get(_REVIEW_JOB_ARTIFACT_PATH, handle_review_job_artifact)
 
     app.router.add_get(_CLIENT_NAVIGATION_PATH, handle_client_navigation)
     app.router.add_get(_CLIENT_CAPABILITIES_PATH, handle_client_capabilities)

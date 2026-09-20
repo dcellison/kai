@@ -670,7 +670,6 @@ CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
             disposition=AdapterDisposition.ACTION_PALETTE,
             palette=True,
             input_shape=CapabilityInputShape.PULL_REQUEST_REFERENCE,
-            implemented=False,
         ),
         implementation_state=ImplementationState.CANONICAL,
         mutates_state=True,

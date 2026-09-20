@@ -81,6 +81,20 @@ class ReviewJobSnapshot:
     attempt_count: int
     replayed: bool
     last_error_code: str | None
+    created_at: str | None = None
+    updated_at: str | None = None
+    artifact_id: str | None = None
+    artifact_filename: str | None = None
+    warning_count: int = 0
+    warnings: tuple[review.CollectionWarning, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSubmissionOptions:
+    repositories: tuple[str, ...]
+    active_workspace: str
+    active_workspace_repository: str | None
+    inferred_repository: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,14 +283,18 @@ class WorkshopReviewJobService:
     ) -> ReviewJobSnapshot:
         self._validate_authority(authority)
         async with self._store.connection.execute(
-            "SELECT review_job_id, principal_id, runtime_profile_id, repository, "
-            "pull_request_number, status, attempt_count, last_error_code "
-            "FROM workshop_review_jobs WHERE review_job_id = ? AND principal_id = ?",
+            "SELECT j.review_job_id, j.principal_id, j.runtime_profile_id, j.repository, "
+            "j.pull_request_number, j.status, j.attempt_count, j.last_error_code, "
+            "j.created_at, j.updated_at, a.artifact_id, a.filename, a.warnings_json "
+            "FROM workshop_review_jobs j LEFT JOIN workshop_review_artifacts a "
+            "ON a.review_job_id = j.review_job_id "
+            "WHERE j.review_job_id = ? AND j.principal_id = ?",
             (review_job_id, authority.principal_id),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
             raise WorkshopReviewJobAccessDenied("Review job is not visible to this principal")
+        warnings = self._decode_warnings(row[12])
         return ReviewJobSnapshot(
             review_job_id=str(row[0]),
             principal_id=PrincipalId(str(row[1])),
@@ -287,6 +305,87 @@ class WorkshopReviewJobService:
             attempt_count=int(row[6]),
             replayed=replayed,
             last_error_code=str(row[7]) if row[7] else None,
+            created_at=str(row[8]),
+            updated_at=str(row[9]),
+            artifact_id=str(row[10]) if row[10] else None,
+            artifact_filename=str(row[11]) if row[11] else None,
+            warning_count=len(warnings),
+            warnings=warnings,
+        )
+
+    async def list_recent(
+        self,
+        authority: ReviewJobAuthority,
+        *,
+        limit: int = 20,
+    ) -> tuple[ReviewJobSnapshot, ...]:
+        """Return a bounded newest-first principal-scoped job history."""
+        self._validate_authority(authority)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise WorkshopReviewJobValidationError("Review history limit must be between 1 and 100")
+        async with self._store.connection.execute(
+            "SELECT j.review_job_id, j.principal_id, j.runtime_profile_id, j.repository, "
+            "j.pull_request_number, j.status, j.attempt_count, j.last_error_code, "
+            "j.created_at, j.updated_at, a.artifact_id, a.filename, a.warnings_json "
+            "FROM workshop_review_jobs j LEFT JOIN workshop_review_artifacts a "
+            "ON a.review_job_id = j.review_job_id "
+            "WHERE j.principal_id = ? ORDER BY j.created_at DESC, j.review_job_id DESC LIMIT ?",
+            (authority.principal_id, limit),
+        ) as cursor:
+            rows = tuple(await cursor.fetchall())
+        return tuple(
+            ReviewJobSnapshot(
+                review_job_id=str(row[0]),
+                principal_id=PrincipalId(str(row[1])),
+                runtime_profile_id=RuntimeProfileId(str(row[2])),
+                repository=str(row[3]),
+                pull_request_number=int(row[4]),
+                status=str(row[5]),
+                attempt_count=int(row[6]),
+                replayed=False,
+                last_error_code=str(row[7]) if row[7] else None,
+                created_at=str(row[8]),
+                updated_at=str(row[9]),
+                artifact_id=str(row[10]) if row[10] else None,
+                artifact_filename=str(row[11]) if row[11] else None,
+                warning_count=len(warnings),
+                warnings=warnings,
+            )
+            for row in rows
+            for warnings in (self._decode_warnings(row[12]),)
+        )
+
+    async def submission_options(self, authority: ReviewJobAuthority) -> ReviewSubmissionOptions:
+        """Describe the repositories and active workspace available to one requester."""
+        self._validate_authority(authority)
+        baseline = await self._baseline_repositories(authority.principal_id)
+        workspace = await self._runtime_pool.get_effective_workspace(authority.runtime_profile_id)
+        workspace_remote_raw = await review._resolve_workspace_remote_repo(str(workspace))
+        workspace_remote = workspace_remote_raw.strip().lower() if workspace_remote_raw else None
+        inferred = (
+            workspace_remote if workspace_remote in baseline else next(iter(baseline)) if len(baseline) == 1 else None
+        )
+        return ReviewSubmissionOptions(
+            repositories=tuple(sorted(baseline)),
+            active_workspace=str(workspace),
+            active_workspace_repository=workspace_remote,
+            inferred_repository=inferred,
+        )
+
+    @staticmethod
+    def _decode_warnings(value: object) -> tuple[review.CollectionWarning, ...]:
+        if value is None:
+            return ()
+        decoded = json.loads(str(value))
+        if not isinstance(decoded, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("source"), str)
+            or not isinstance(item.get("message"), str)
+            for item in decoded
+        ):
+            raise WorkshopReviewJobError("Stored review warnings are invalid")
+        return tuple(
+            review.CollectionWarning(source=str(item["source"]), message=str(item["message"])) for item in decoded
         )
 
     async def wait_for_terminal(

@@ -2840,6 +2840,83 @@ button:disabled {
   box-shadow: 0 1.2rem 4rem color-mix(in srgb, var(--color-overlay-shadow) 55%, transparent);
 }
 
+.review-dialog {
+  display: grid;
+  width: min(34rem, 100%);
+  max-height: min(38rem, calc(100vh - 2rem));
+  overflow: auto;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.55rem;
+  background: var(--color-panel);
+  box-shadow: 0 1.2rem 4rem color-mix(in srgb, var(--color-overlay-shadow) 55%, transparent);
+  padding: 1rem;
+}
+
+.review-dialog > header,
+.github-reviews-actions,
+.github-review-list > li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.review-dialog h2,
+.review-dialog .overline {
+  margin: 0;
+}
+
+.review-dialog h2 {
+  margin-top: 0.15rem;
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: 540;
+}
+
+.review-dialog form {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.9rem;
+}
+
+.review-dialog label {
+  color: var(--color-text-strong);
+  font-size: 0.72rem;
+  font-weight: 680;
+}
+
+.review-dialog input,
+.review-dialog select {
+  width: 100%;
+  min-height: 2.45rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  background: var(--color-canvas-inset);
+  color: var(--color-text-strong);
+  padding: 0.55rem 0.65rem;
+  font-size: 0.76rem;
+}
+
+.review-context {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+  margin-top: 0.25rem;
+  padding: 0.65rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  background: var(--color-canvas-inset);
+  font-size: 0.7rem;
+}
+
+.review-context span,
+.review-context small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .action-palette > header {
   display: flex;
   align-items: start;
@@ -5467,6 +5544,71 @@ button:disabled {
 
 .settings-card-column > .settings-card {
   width: 100%;
+}
+
+.github-reviews-card > summary {
+  cursor: pointer;
+  color: var(--color-text-strong);
+  font-family: var(--serif);
+  font-size: 0.82rem;
+}
+
+.github-reviews-actions {
+  margin-top: 0.65rem;
+}
+
+.github-review-list {
+  display: grid;
+  gap: 0;
+  margin: 0.65rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.github-review-list > li {
+  padding: 0.55rem 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.github-review-list > li > div:first-child,
+.github-review-list small {
+  display: block;
+  min-width: 0;
+}
+
+.github-review-list strong,
+.github-review-list small {
+  overflow-wrap: anywhere;
+}
+
+.github-review-list strong {
+  color: var(--color-text-strong);
+  font-size: 0.72rem;
+}
+
+.github-review-list small {
+  margin-top: 0.15rem;
+  color: var(--color-text-muted);
+  font-size: 0.64rem;
+}
+
+.github-review-list .review-warning {
+  color: var(--color-warning);
+}
+
+.review-warnings {
+  margin-top: 0.25rem;
+  color: var(--color-text-muted);
+  font-size: 0.64rem;
+}
+
+.review-warnings summary {
+  cursor: pointer;
+}
+
+.review-warnings ul {
+  margin: 0.25rem 0 0;
+  padding-left: 1rem;
 }
 
 .settings-card p {

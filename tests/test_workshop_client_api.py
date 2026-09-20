@@ -16,6 +16,7 @@ from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 
+from kai.review import CollectionWarning
 from kai.workshop.agent_creation_options import (
     AgentCreationBackendOption,
     AgentCreationOptions,
@@ -141,6 +142,7 @@ from kai.workshop.model_catalogue import (
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.principal_policies import WorkshopPrincipalPolicyService
 from kai.workshop.projection import CanonicalConversationProjection
+from kai.workshop.review_jobs import ReviewArtifact, ReviewJobAuthority, ReviewJobSnapshot, ReviewSubmissionOptions
 from kai.workshop.routing_eligibility import (
     CapabilityAssessment,
     CapabilitySupport,
@@ -1252,6 +1254,7 @@ async def _open_client(
     standing_participation=None,
     runtime_lane_status=None,
     scheduler=None,
+    review_jobs=None,
     invalidate_agent_context=None,
 ) -> TestClient:
     app = web.Application()
@@ -1284,6 +1287,7 @@ async def _open_client(
         standing_participation=standing_participation,
         runtime_lane_status=runtime_lane_status,
         scheduler=scheduler,
+        review_jobs=review_jobs,
         invalidate_agent_context=invalidate_agent_context,
     )
     client = TestClient(TestServer(app))
@@ -7614,6 +7618,114 @@ async def test_scheduled_jobs_api_uses_authenticated_principal_and_replay_safe_c
         assert (await cancelled.json())["result"]["changed"] is True
         scheduler.cancel_principal_job.assert_awaited_once_with(7, alice_id, "cancel-job-7")
         anonymous = await client.get("/v1/client/scheduled-jobs")
+        assert anonymous.status == 401
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_review_jobs_api_uses_canonical_principal_scoped_service(tmp_path: Path) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    authority = ReviewJobAuthority(alice_id, RuntimeProfileId("rtp_" + "1" * 32))
+    pending = ReviewJobSnapshot(
+        review_job_id="rvj_" + "2" * 32,
+        principal_id=alice_id,
+        runtime_profile_id=authority.runtime_profile_id,
+        repository="owner/repo",
+        pull_request_number=42,
+        status="pending",
+        attempt_count=0,
+        replayed=False,
+        last_error_code=None,
+        created_at="2026-09-20T12:00:00Z",
+        updated_at="2026-09-20T12:00:00Z",
+    )
+    succeeded = replace(
+        pending,
+        status="succeeded",
+        artifact_id="rva_" + "3" * 32,
+        artifact_filename="owner-repo-pr-42-review.md",
+        warning_count=1,
+        warnings=(CollectionWarning("related_context", "Unavailable"),),
+    )
+    service = SimpleNamespace(
+        authority_for_principal=MagicMock(return_value=authority),
+        list_recent=AsyncMock(return_value=(succeeded,)),
+        submission_options=AsyncMock(
+            return_value=ReviewSubmissionOptions(
+                repositories=("owner/repo", "owner/second"),
+                active_workspace="/Users/alice/work/repo",
+                active_workspace_repository="owner/repo",
+                inferred_repository="owner/repo",
+            )
+        ),
+        submit=AsyncMock(return_value=pending),
+        inspect=AsyncMock(return_value=succeeded),
+        cancel=AsyncMock(return_value=replace(pending, status="cancelled")),
+        retry=AsyncMock(return_value=pending),
+        artifact=AsyncMock(
+            return_value=ReviewArtifact(
+                artifact_id="rva_" + "3" * 32,
+                review_job_id=pending.review_job_id,
+                filename="owner-repo-pr-42-review.md",
+                media_type="text/markdown",
+                body=b"# Review\n\nNo blocking findings.\n",
+                sha256="4" * 64,
+                warnings=(),
+            )
+        ),
+    )
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        review_jobs=service,
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        listed = await client.get("/v1/client/reviews?limit=20", headers=headers)
+        assert listed.status == 200
+        listed_payload = await listed.json()
+        assert listed_payload["submission"]["inferred_repository"] == "owner/repo"
+        assert listed_payload["jobs"][0]["artifact"]["warning_count"] == 1
+        assert listed_payload["jobs"][0]["artifact"]["warnings"] == [
+            {"source": "related_context", "message": "Unavailable"}
+        ]
+
+        submitted = await client.post(
+            "/v1/client/reviews",
+            headers=headers,
+            json={
+                "repository": "owner/repo",
+                "pull_request_number": 42,
+                "client_operation_id": "workshop-review:test-42",
+            },
+        )
+        assert submitted.status == 202
+        service.submit.assert_awaited_once_with(
+            authority,
+            repository="owner/repo",
+            pull_request_number=42,
+            idempotency_key="workshop-review:test-42",
+        )
+
+        cancelled = await client.post(
+            f"/v1/client/reviews/{pending.review_job_id}/cancel",
+            headers=headers,
+            json={"client_operation_id": "workshop-review:cancel-42"},
+        )
+        assert cancelled.status == 200
+        assert (await cancelled.json())["job"]["status"] == "cancelled"
+
+        artifact = await client.get(
+            f"/v1/client/reviews/{pending.review_job_id}/artifact?download=1",
+            headers=headers,
+        )
+        assert artifact.status == 200
+        assert await artifact.read() == b"# Review\n\nNo blocking findings.\n"
+        assert "owner-repo-pr-42-review.md" in artifact.headers["Content-Disposition"]
+
+        anonymous = await client.get("/v1/client/reviews")
         assert anonymous.status == 401
     finally:
         await client.close()

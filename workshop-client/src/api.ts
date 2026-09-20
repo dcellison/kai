@@ -37,6 +37,8 @@ import type {
   WorkshopContextSource,
   WorkshopGitHubSettings,
   WorkshopGitHubSettingsChange,
+  WorkshopReviewJob,
+  WorkshopReviewJobs,
   WorkshopNotificationPreferences,
   WorkshopNotificationPreferenceChange,
   WorkshopChannelNotificationPolicy,
@@ -4823,6 +4825,156 @@ export async function updateGitHubSettings(
     throw new Error(safeErrorMessage(payload, "Could not update GitHub settings."));
   }
   return parseGitHubSettings(payload);
+}
+
+function parseReviewJob(value: unknown): WorkshopReviewJob {
+  if (
+    !isRecord(value) ||
+    typeof value.review_job_id !== "string" ||
+    typeof value.repository !== "string" ||
+    !Number.isSafeInteger(value.pull_request_number) ||
+    !["pending", "executing", "succeeded", "failed", "cancelled", "timed_out"].includes(String(value.status)) ||
+    !Number.isSafeInteger(value.attempt_count) ||
+    (value.last_error_code !== null && typeof value.last_error_code !== "string") ||
+    typeof value.created_at !== "string" ||
+    typeof value.updated_at !== "string" ||
+    typeof value.replayed !== "boolean" ||
+    (value.artifact !== null && (
+      !isRecord(value.artifact) ||
+      typeof value.artifact.artifact_id !== "string" ||
+      typeof value.artifact.filename !== "string" ||
+      !Number.isSafeInteger(value.artifact.warning_count) ||
+      !Array.isArray(value.artifact.warnings) ||
+      value.artifact.warnings.some((warning) =>
+        !isRecord(warning) || typeof warning.source !== "string" || typeof warning.message !== "string"
+      )
+    ))
+  ) {
+    throw new Error("Kai returned an unsupported review job.");
+  }
+  const artifact = value.artifact as Record<string, unknown> | null;
+  return {
+    artifact: artifact === null ? null : {
+      artifactId: artifact.artifact_id as string,
+      filename: artifact.filename as string,
+      warningCount: artifact.warning_count as number,
+      warnings: (artifact.warnings as Record<string, unknown>[]).map((warning) => ({
+        message: warning.message as string,
+        source: warning.source as string,
+      })),
+    },
+    attemptCount: value.attempt_count as number,
+    createdAt: value.created_at,
+    lastErrorCode: value.last_error_code as string | null,
+    pullRequestNumber: value.pull_request_number as number,
+    repository: value.repository,
+    replayed: value.replayed,
+    reviewJobId: value.review_job_id,
+    status: value.status as WorkshopReviewJob["status"],
+    updatedAt: value.updated_at,
+  };
+}
+
+export async function loadReviewJobs(session: WorkshopSession): Promise<WorkshopReviewJobs> {
+  const response = await authorizedFetch(session, "/v1/client/reviews?limit=20");
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load pull-request reviews."));
+  if (
+    !isRecord(payload) || payload.version !== 1 || !Array.isArray(payload.jobs) ||
+    !isRecord(payload.submission) || !Array.isArray(payload.submission.repositories) ||
+    payload.submission.repositories.some((item) => typeof item !== "string") ||
+    typeof payload.submission.active_workspace !== "string" ||
+    (payload.submission.active_workspace_repository !== null && typeof payload.submission.active_workspace_repository !== "string") ||
+    (payload.submission.inferred_repository !== null && typeof payload.submission.inferred_repository !== "string")
+  ) {
+    throw new Error("Kai returned unsupported pull-request review options.");
+  }
+  return {
+    jobs: payload.jobs.map(parseReviewJob),
+    submission: {
+      activeWorkspace: payload.submission.active_workspace,
+      activeWorkspaceRepository: payload.submission.active_workspace_repository as string | null,
+      inferredRepository: payload.submission.inferred_repository as string | null,
+      repositories: payload.submission.repositories as string[],
+    },
+  };
+}
+
+export async function submitReviewJob(
+  session: WorkshopSession,
+  repository: string | null,
+  pullRequestNumber: number,
+  clientOperationId: string,
+): Promise<WorkshopReviewJob> {
+  const response = await authorizedFetch(session, "/v1/client/reviews", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      repository,
+      pull_request_number: pullRequestNumber,
+      client_operation_id: clientOperationId,
+    }),
+  });
+  const payload = await responsePayload(response);
+  if (!response.ok || !isRecord(payload) || payload.version !== 1) {
+    throw new Error(safeErrorMessage(payload, "Could not start the pull-request review."));
+  }
+  return parseReviewJob(payload.job);
+}
+
+export async function mutateReviewJob(
+  session: WorkshopSession,
+  reviewJobId: string,
+  action: "cancel" | "retry",
+  clientOperationId: string,
+): Promise<WorkshopReviewJob> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/client/reviews/${encodeURIComponent(reviewJobId)}/${action}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_operation_id: clientOperationId }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok || !isRecord(payload) || payload.version !== 1) {
+    throw new Error(safeErrorMessage(payload, `Could not ${action} the pull-request review.`));
+  }
+  return parseReviewJob(payload.job);
+}
+
+export async function loadReviewArtifact(
+  session: WorkshopSession,
+  reviewJobId: string,
+): Promise<Blob> {
+  const response = await authorizedFetch(
+    session,
+    `/v1/client/reviews/${encodeURIComponent(reviewJobId)}/artifact`,
+  );
+  if (!response.ok) {
+    const payload = await responsePayload(response);
+    throw new Error(safeErrorMessage(payload, "Could not open the review artifact."));
+  }
+  return response.blob();
+}
+
+export async function downloadReviewArtifact(
+  session: WorkshopSession,
+  job: WorkshopReviewJob,
+): Promise<void> {
+  if (!job.artifact) throw new Error("This review has no artifact.");
+  const response = await authorizedFetch(
+    session,
+    `/v1/client/reviews/${encodeURIComponent(job.reviewJobId)}/artifact?download=1`,
+  );
+  if (!response.ok) throw new Error("Could not download the review artifact.");
+  const url = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = job.artifact.filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 export async function loadNotificationPreferences(

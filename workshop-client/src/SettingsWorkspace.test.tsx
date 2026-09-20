@@ -7,6 +7,7 @@ import {
   deactivateOperatorModel,
   loadAppearancePreferences,
   loadGitHubSettings,
+  loadReviewJobs,
   loadHumanProfile,
   loadHumanAvatar,
   loadNotificationPreferences,
@@ -46,6 +47,7 @@ import { WORKSHOP_THEME_CATALOG } from "./theme";
 import type {
   WorkshopPreferenceDocument,
   WorkshopGitHubSettings,
+  WorkshopReviewJobs,
   WorkshopModelCatalogue,
   WorkshopNotificationPreferences,
   WorkshopChannelNotificationPolicy,
@@ -63,6 +65,7 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     loadPreferenceDocument: vi.fn(),
     loadGitHubSettings: vi.fn(),
+    loadReviewJobs: vi.fn(),
     loadHumanProfile: vi.fn(),
     loadHumanAvatar: vi.fn(),
     loadNotificationPreferences: vi.fn(),
@@ -328,6 +331,16 @@ const githubSettings: WorkshopGitHubSettings = {
   tokenStored: true,
 };
 
+const reviewJobs: WorkshopReviewJobs = {
+  jobs: [],
+  submission: {
+    activeWorkspace: "/srv/kai",
+    activeWorkspaceRepository: "dcellison/kai",
+    inferredRepository: "dcellison/kai",
+    repositories: ["dcellison/kai"],
+  },
+};
+
 const notificationPreferences: WorkshopNotificationPreferences = {
   destinations: [
     {
@@ -483,6 +496,7 @@ describe("Settings workspace", () => {
     vi.mocked(loadSettingsWorkspace).mockResolvedValue(runtime);
     vi.mocked(loadModelCatalogue).mockResolvedValue(modelCatalogue);
     vi.mocked(loadGitHubSettings).mockResolvedValue(githubSettings);
+    vi.mocked(loadReviewJobs).mockResolvedValue(reviewJobs);
     vi.mocked(loadHumanProfile).mockResolvedValue(humanProfile);
     vi.mocked(loadHumanAvatar).mockResolvedValue(humanAvatar);
     vi.mocked(loadNotificationPreferences).mockResolvedValue(notificationPreferences);
