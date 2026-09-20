@@ -230,6 +230,27 @@ class TestDefaultWorkshopBootstrap:
         assert second.agent_id == first.agent_id
         assert second_events == first_events
 
+    async def test_rerun_projects_only_events_after_the_existing_checkpoint(
+        self,
+        store,
+        monkeypatch,
+    ):
+        await bootstrap_default_workshop(store, [_human(101, "Admin", role="admin")])
+        original_read_events = store.read_events
+        observed_boundaries: list[int] = []
+
+        async def observe_read_events(*, after_position: int = 0, limit: int | None = None):
+            observed_boundaries.append(after_position)
+            return await original_read_events(after_position=after_position, limit=limit)
+
+        monkeypatch.setattr(store, "read_events", observe_read_events)
+
+        second = await bootstrap_default_workshop(store, [_human(101, "Admin", role="admin")])
+
+        assert second.created_events == 0
+        assert observed_boundaries
+        assert set(observed_boundaries) == {18}
+
     async def test_rerun_adds_one_runtime_assignment_without_replacing_transport_identity(
         self,
         store,

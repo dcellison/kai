@@ -602,7 +602,13 @@ async def bootstrap_default_workshop(
             payload={"channel_id": channel_id, "agent_id": agent_id},
         )
 
-    await store.rebuild_projection(CanonicalConversationProjection())
+    # Bootstrap is part of every service start, while the canonical event log
+    # grows for the lifetime of the installation. Replaying the complete log
+    # here made startup cost grow linearly and did the same work again when a
+    # notification-channel bootstrap followed. The incremental path still
+    # rebuilds from position zero when the projection is absent or its version
+    # advances, and otherwise applies only events inserted above.
+    await store.project_pending(CanonicalConversationProjection())
     if profile_ownership_supported:
         await store.connection.execute(
             "INSERT OR IGNORE INTO runtime_profile_owners (runtime_profile_id, principal_id) "
