@@ -4159,7 +4159,7 @@ class TestExtractAndStorePerUserDispatch:
         # Claude user receives the claude-registry stage-1 model;
         # codex user receives the codex-registry stage-1 model. The
         # exact literals come from MODEL_REGISTRY[MEMORY_EXTRACTION].
-        assert captured_models == ["claude-haiku-4-5-20251001", "gpt-5.4-mini"]
+        assert captured_models == ["claude-haiku-4-5-20251001", "gpt-5.6-luna"]
 
     @pytest.mark.asyncio
     async def test_per_user_override_wins_over_global(self, monkeypatch):

@@ -645,11 +645,11 @@ class TestInitMemory:
         assert payload["extraction_model"] is None
         assert payload["extraction_models"] == {
             "claude": "claude-haiku-4-5-20251001",
-            "codex": "gpt-5.4-mini",
+            "codex": "gpt-5.6-luna",
         }
         assert payload["episode_models"] == {
             "claude": "claude-haiku-4-5-20251001",
-            "codex": "gpt-5.4-mini",
+            "codex": "gpt-5.6-luna",
         }
         assert payload["extraction_binaries"] == {
             "claude": "/fake/claude-binary",

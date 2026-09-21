@@ -2206,8 +2206,8 @@ class TestMemoryReasonerModelResolution:
         monkeypatch.setenv("DEFAULT_BACKEND", "codex")
         monkeypatch.setenv("DEFAULT_MODEL", "gpt-5.4-mini")
         load_config()
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.4-mini"
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.6-luna"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.6-luna"
 
     def test_legacy_extraction_model_env_var_is_ignored(self, monkeypatch, caplog):
         """The retired MEMORY_EXTRACTION_MODEL env var no longer has
@@ -4437,9 +4437,10 @@ class TestModelRegistryTripleKey:
         to the larger acceptance loop above."""
         assert MODEL_REGISTRY[("claude", "anthropic", ModelRole.PR_REVIEW)] == "sonnet"
         # codex balanced tier picks the current frontier (gpt-5.5);
-        # cheap tier stays at gpt-5.4-mini for high-volume roles.
+        # cheap tier uses the currently advertised gpt-5.6-luna for
+        # high-volume roles.
         assert MODEL_REGISTRY[("codex", "openai", ModelRole.PR_REVIEW)] == "gpt-5.5"
-        assert MODEL_REGISTRY[("codex", "openai", ModelRole.MEMORY_EXTRACTION)] == "gpt-5.4-mini"
+        assert MODEL_REGISTRY[("codex", "openai", ModelRole.MEMORY_EXTRACTION)] == "gpt-5.6-luna"
         # opencode-on-deepseek balanced tier resolves to V4 Pro for
         # the reasoning-heavy PR review role; V4 Flash covers the
         # cheap tier elsewhere. The legacy `deepseek-chat` alias is
