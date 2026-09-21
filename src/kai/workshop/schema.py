@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 88
+WORKSHOP_SCHEMA_VERSION = 89
 
 
 @dataclass(frozen=True, slots=True)
@@ -4291,6 +4291,38 @@ _TEMPORAL_MEMORY_LIFECYCLE_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_ATOMIC_MEMORY_FACT_MUTATION_SCHEMA = SchemaMigration(
+    version=89,
+    name="atomic_memory_fact_mutation_authority",
+    statements=(
+        "ALTER TABLE memory_fact_revisions ADD COLUMN vector_metadata_json TEXT NOT NULL "
+        "DEFAULT '{}' CHECK (json_valid(vector_metadata_json) AND json_type(vector_metadata_json) = 'object')",
+        """
+        CREATE TABLE memory_fact_vector_operations (
+            event_position INTEGER PRIMARY KEY REFERENCES event_log(position) ON DELETE RESTRICT,
+            claim_id TEXT NOT NULL REFERENCES memory_fact_claims(claim_id) ON DELETE CASCADE,
+            revision_id TEXT NOT NULL,
+            prior_revision_id TEXT,
+            operation TEXT NOT NULL CHECK (operation IN ('upsert', 'replace', 'delete')),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'succeeded', 'failed')),
+            memory_id TEXT CHECK (memory_id IS NULL OR length(memory_id) BETWEEN 1 AND 256),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            last_error_code TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 128),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY (revision_id, claim_id)
+                REFERENCES memory_fact_revisions(revision_id, claim_id) ON DELETE CASCADE,
+            FOREIGN KEY (prior_revision_id, claim_id)
+                REFERENCES memory_fact_revisions(revision_id, claim_id) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX memory_fact_vector_status_idx ON memory_fact_vector_operations (status, event_position)",
+        "CREATE INDEX memory_fact_vector_memory_idx ON memory_fact_vector_operations (memory_id, event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4380,6 +4412,7 @@ _MIGRATIONS = (
     _CANONICAL_REVIEW_JOB_SCHEMA,
     _MEMORY_EXTRACTION_RECEIPT_SCHEMA,
     _TEMPORAL_MEMORY_LIFECYCLE_SCHEMA,
+    _ATOMIC_MEMORY_FACT_MUTATION_SCHEMA,
 )
 
 

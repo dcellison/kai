@@ -171,6 +171,7 @@ class TestEventEnvelope:
             "memory_fact.expired",
             "memory_fact.conflict_opened",
             "memory_fact.conflict_resolved",
+            "memory_fact.restored",
             "memory_episode.recorded",
             "memory_episode.followup_recorded",
         }
@@ -611,6 +612,7 @@ class TestWorkshopSchema:
                     86,
                     87,
                     88,
+                    89,
                 ]
         finally:
             await upgraded.close()

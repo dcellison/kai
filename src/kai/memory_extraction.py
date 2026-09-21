@@ -27,6 +27,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from kai import memory
@@ -51,6 +52,8 @@ from kai.oneshot import (
 )
 from kai.oneshot import _ensure_extractor_cwd as _ensure_extractor_cwd
 from kai.prompt_utils import encode_untrusted_json_record, make_untrusted_json_envelope
+from kai.workshop.domain import PrincipalId, RuntimeProfileId
+from kai.workshop.fact_lifecycle import FactRevisionInput
 from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptClaim,
     MemoryExtractionReceiptCompletion,
@@ -3090,7 +3093,11 @@ def _store_facts(
     receipt_decisions: list[MemoryExtractionStorageDecision] | None = None,
 ) -> tuple[int, int, int]:
     """
-    Persist validated facts via memory.add_structured, branching on intent.
+    Persist non-canonical evaluation/compatibility facts through Mem0.
+
+    Production attempts with canonical provenance use
+    `_store_canonical_facts`; this legacy helper remains for replay/evaluation
+    callers that intentionally have no Workshop authority.
 
     Returns `(stored, replaced, skipped)`:
     - `stored`: facts that actually landed in the store. Sums `new`-with-add
@@ -3127,7 +3134,8 @@ def _store_facts(
     `_paraphrase_neighbor` because consolidation already happened
     upstream at the extractor layer.
 
-    Mem0 exposes no atomic replace primitive: `update_of` is implemented
+    Mem0 exposes no atomic replace primitive: this compatibility path's
+    `update_of` is implemented
     as `delete_by_id` followed by `add_structured`. The race window is
     bounded by the per-user `asyncio.Semaphore(1)` already held by
     `extract_and_store`, so concurrent retrievals for the SAME user
@@ -3135,7 +3143,8 @@ def _store_facts(
     fact; concurrent retrievals for OTHER users are unaffected. A
     delete-success-add-failure leaves the old fact gone and the new one
     lost; the operator-facing signal is the WARNING-level
-    `add_failed_after_delete` outcome on `_emit_intent_log`.
+    `add_failed_after_delete` outcome on `_emit_intent_log`. Canonical
+    production extraction never enters this delete-then-add path.
     """
     stored = 0
     replaced = 0
@@ -3454,6 +3463,298 @@ def _store_facts(
     # lets shadow-log analysis trace a scoped row back to the
     # write-time decision that produced it; episode-side writes emit
     # their own line from `_generate_episode`.
+    _emit_scope_log(
+        user_id=user_id,
+        source="facts",
+        active_project=active_project,
+        hinted=scope_hinted,
+        defaulted=scope_defaulted,
+        stored_global=stored_by_scope.get(memory.SCOPE_GLOBAL, 0),
+        stored_project=stored_by_scope.get(memory.SCOPE_PROJECT, 0),
+    )
+    return stored, replaced, skipped
+
+
+async def _store_canonical_facts(
+    facts: list[dict],
+    *,
+    user_id: str,
+    session_id: str | None,
+    config: Config,
+    active_project: ActiveMemoryProject | None,
+    user_log: LogEntry | None,
+    assistant_log: LogEntry | None,
+    canonical_provenance: dict[str, object],
+    runtime_profile_id: str,
+    receipt_id: str,
+    backend: str,
+    provider: str,
+    model: str,
+    receipt_decisions: list[MemoryExtractionStorageDecision],
+) -> tuple[int, int, int]:
+    """Store production facts through canonical revision authority."""
+    from kai import sessions
+
+    stored = replaced = skipped = 0
+    scope_hinted = scope_defaulted = 0
+    stored_by_scope: dict[str, int] = {memory.SCOPE_GLOBAL: 0, memory.SCOPE_PROJECT: 0}
+    principal_id = PrincipalId(user_id)
+    canonical_runtime_profile_id = RuntimeProfileId(runtime_profile_id)
+    source_message_id = str(canonical_provenance[memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY])
+    result_message_id = str(canonical_provenance[memory.WORKSHOP_RESULT_MESSAGE_ID_KEY])
+    run_id = str(canonical_provenance[memory.WORKSHOP_RUN_ID_KEY])
+
+    def record_decision(
+        *,
+        index: int,
+        intent: object,
+        outcome: str,
+        new_memory_id: str | None = None,
+        replaced_memory_id: object = None,
+        scope_meta: dict[str, object] | None = None,
+    ) -> None:
+        receipt_decisions.append(
+            MemoryExtractionStorageDecision(
+                index=index,
+                intent=str(intent) if isinstance(intent, str) and intent else "invalid",
+                outcome=outcome,
+                new_memory_id=new_memory_id,
+                replaced_memory_id=(
+                    str(replaced_memory_id) if isinstance(replaced_memory_id, str) and replaced_memory_id else None
+                ),
+                scope=str(scope_meta["scope"]) if scope_meta is not None else None,
+                project_id=(
+                    str(scope_meta["project_id"])
+                    if scope_meta is not None and scope_meta.get("project_id") is not None
+                    else None
+                ),
+            )
+        )
+
+    def tally_scope(scope_meta: dict[str, object]) -> None:
+        nonlocal scope_hinted, scope_defaulted
+        if scope_meta["scope_source"] == memory.SCOPE_SOURCE_CLASSIFIER:
+            scope_hinted += 1
+        else:
+            scope_defaulted += 1
+        scope = str(scope_meta["scope"])
+        stored_by_scope[scope] = stored_by_scope.get(scope, 0) + 1
+
+    for index, fact in enumerate(facts):
+        content = fact.get("content")
+        intent = fact.get("intent")
+        existing_id = fact.get("existing_id")
+        if not isinstance(content, str) or not content.strip():
+            record_decision(index=index, intent=intent, outcome="validation_rejected")
+            continue
+        scope_meta = _route_write_scope(fact.get("scope_hint"), active_project)
+        if intent == "skip_redundant":
+            _emit_intent_log(
+                user_id=user_id,
+                intent="skip_redundant",
+                original_intent=None,
+                new_id=None,
+                replaced_id=existing_id,
+                outcome="skipped",
+            )
+            skipped += 1
+            record_decision(
+                index=index,
+                intent=intent,
+                outcome="duplicate_skipped",
+                replaced_memory_id=existing_id,
+                scope_meta=scope_meta,
+            )
+            continue
+        if intent not in {"new", "update_of"}:
+            record_decision(
+                index=index,
+                intent=intent,
+                outcome="validation_rejected",
+                scope_meta=scope_meta,
+            )
+            continue
+        if intent == "new":
+            neighbor = await asyncio.to_thread(
+                _paraphrase_neighbor,
+                content,
+                user_id,
+                threshold=config.memory_duplicate_threshold,
+                active_project=active_project,
+                runtime_profile_id=runtime_profile_id,
+            )
+            if neighbor is not None:
+                _emit_intent_log(
+                    user_id=user_id,
+                    intent="new",
+                    original_intent=None,
+                    new_id=None,
+                    replaced_id=neighbor.id,
+                    outcome="dropped_duplicate",
+                    cosine=round(neighbor.score, 3),
+                    content_preview=content[:100],
+                )
+                record_decision(
+                    index=index,
+                    intent=intent,
+                    outcome="duplicate_skipped",
+                    replaced_memory_id=neighbor.id,
+                    scope_meta=scope_meta,
+                )
+                continue
+
+        metadata: dict[str, object] = {
+            "source": "extracted",
+            "speaker": fact.get("speaker") or "assistant",
+            "confidence": fact.get("confidence"),
+            "session_id": session_id or "",
+            "prompt_version": _EXTRACTION_PROMPT_VERSION,
+            "tags": list(fact.get("tags") or ()),
+            **canonical_provenance,
+            memory.EXTRACTION_RECEIPT_ID_KEY: receipt_id,
+            **scope_meta,
+        }
+        if "confirmation_quote" in fact:
+            metadata["confirmation_quote"] = fact["confirmation_quote"]
+        if user_log is not None and assistant_log is not None:
+            metadata.update(
+                {
+                    memory.SOURCE_CHAT_ID_KEY: user_log.chat_id,
+                    memory.SOURCE_DATE_KEY: user_log.date,
+                    memory.SOURCE_USER_TS_KEY: user_log.ts,
+                    memory.SOURCE_USER_TEXT_SHA256_KEY: user_log.sha256,
+                    memory.SOURCE_ASSISTANT_TS_KEY: assistant_log.ts,
+                }
+            )
+        raw_confidence = fact.get("confidence")
+        confidence = (
+            float(raw_confidence)
+            if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool)
+            else 0.5
+        )
+        now_value = datetime.now(UTC)
+        existing: MemoryResult | None = None
+        if intent == "update_of" and isinstance(existing_id, str) and existing_id:
+            existing = await asyncio.to_thread(
+                memory.get_by_id,
+                user_id=user_id,
+                memory_id=existing_id,
+                runtime_profile_id=runtime_profile_id,
+            )
+            if existing is None:
+                record_decision(
+                    index=index,
+                    intent=intent,
+                    outcome="stale_existing_fact",
+                    replaced_memory_id=existing_id,
+                    scope_meta=scope_meta,
+                )
+                continue
+        try:
+            mutation = await sessions.apply_canonical_extracted_fact(
+                principal_id,
+                canonical_runtime_profile_id,
+                FactRevisionInput(
+                    content=content,
+                    scope_kind=str(scope_meta["scope"]),
+                    scope_key=str(scope_meta.get("project_id") or ""),
+                    reason=(
+                        "Model proposed a revision to an existing fact."
+                        if intent == "update_of"
+                        else "Model extracted a new durable fact."
+                    ),
+                    evidence=(
+                        {
+                            "kind": "canonical_message",
+                            "reference_id": source_message_id,
+                            "sha256": None,
+                        },
+                    ),
+                    vector_metadata=metadata,
+                    confidence=confidence,
+                    asserted_at=now_value,
+                    observed_at=now_value,
+                    valid_from=now_value,
+                    source_receipt_id=receipt_id,
+                    source_run_id=run_id,
+                    source_message_id=source_message_id,
+                    result_message_id=result_message_id,
+                    backend=backend,
+                    provider=provider,
+                    model=model,
+                    prompt_version=_EXTRACTION_PROMPT_VERSION,
+                    schema_version=_FACT_SCHEMA_VERSION,
+                ),
+                idempotency_key=f"memory-fact-extraction:{receipt_id}:{index}:{intent}",
+                stable_claim_key=f"extraction:{receipt_id}:{index}",
+                existing=existing,
+            )
+        except Exception:
+            log.exception("Canonical memory-fact lifecycle mutation failed")
+            record_decision(
+                index=index,
+                intent=intent,
+                outcome="storage_failed",
+                replaced_memory_id=existing_id,
+                scope_meta=scope_meta,
+            )
+            continue
+        if mutation.projection_status != "succeeded":
+            record_decision(
+                index=index,
+                intent=intent,
+                outcome="storage_failed",
+                replaced_memory_id=existing_id,
+                scope_meta=scope_meta,
+            )
+            continue
+        if mutation.state == "conflicted":
+            _emit_intent_log(
+                user_id=user_id,
+                intent="update_of",
+                original_intent=None,
+                new_id=None,
+                replaced_id=existing_id,
+                outcome="conflict_opened",
+            )
+            record_decision(
+                index=index,
+                intent=intent,
+                outcome="conflict_opened",
+                replaced_memory_id=existing_id,
+                scope_meta=scope_meta,
+            )
+            continue
+        if mutation.memory_id is None:
+            record_decision(
+                index=index,
+                intent=intent,
+                outcome="storage_failed",
+                replaced_memory_id=existing_id,
+                scope_meta=scope_meta,
+            )
+            continue
+        _emit_intent_log(
+            user_id=user_id,
+            intent=str(intent),
+            original_intent=None,
+            new_id=mutation.memory_id,
+            replaced_id=existing_id,
+            outcome="stored",
+        )
+        stored += 1
+        if intent == "update_of":
+            replaced += 1
+        tally_scope(scope_meta)
+        record_decision(
+            index=index,
+            intent=intent,
+            outcome="replaced" if intent == "update_of" else "stored",
+            new_memory_id=mutation.memory_id,
+            replaced_memory_id=existing_id,
+            scope_meta=scope_meta,
+        )
+
     _emit_scope_log(
         user_id=user_id,
         source="facts",
@@ -3949,13 +4250,8 @@ async def extract_and_store(
             # so stage-1 facts are durably stored before stage 2 is even
             # scheduled (see task #142).
             if result.facts:
-                loop = asyncio.get_running_loop()
-                # _store_facts is sync (memory.add_structured is sync).
-                # Run it off the event loop to avoid blocking while Mem0
-                # embeds each fact.
-                stored, replaced, skipped = await loop.run_in_executor(
-                    None,
-                    lambda: _store_facts(
+                if receipt_claim is not None and canonical_provenance is not None and runtime_profile_id is not None:
+                    stored, replaced, skipped = await _store_canonical_facts(
                         result.facts,
                         user_id=user_id,
                         session_id=session_id,
@@ -3965,10 +4261,33 @@ async def extract_and_store(
                         assistant_log=assistant_log,
                         canonical_provenance=canonical_provenance,
                         runtime_profile_id=runtime_profile_id,
-                        receipt_id=(receipt_claim.receipt.receipt_id if receipt_claim is not None else None),
+                        receipt_id=receipt_claim.receipt.receipt_id,
+                        backend=effective_backend,
+                        provider=effective_provider,
+                        model=fact_model,
                         receipt_decisions=receipt_decisions,
-                    ),
-                )
+                    )
+                else:
+                    loop = asyncio.get_running_loop()
+                    # Legacy/evaluation callers retain the synchronous Mem0
+                    # path. Production attempts always use canonical lifecycle
+                    # authority above.
+                    stored, replaced, skipped = await loop.run_in_executor(
+                        None,
+                        lambda: _store_facts(
+                            result.facts,
+                            user_id=user_id,
+                            session_id=session_id,
+                            config=config,
+                            active_project=active_project,
+                            user_log=user_log,
+                            assistant_log=assistant_log,
+                            canonical_provenance=canonical_provenance,
+                            runtime_profile_id=runtime_profile_id,
+                            receipt_id=None,
+                            receipt_decisions=receipt_decisions,
+                        ),
+                    )
             else:
                 stored = replaced = skipped = 0
             fact_duration_ms = int((time.monotonic() - start) * 1000)

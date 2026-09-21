@@ -553,7 +553,7 @@ async def test_retry_rollback_rebuild_and_cross_channel_isolation_are_exact(tmp_
             assert int((await cursor.fetchone())[0]) == 0
 
         checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
-        assert checkpoint.version == 33
+        assert checkpoint.version == 34
         rebuilt = await observation.inspect(channel_id, agent_id, current_at=_NOW + timedelta(seconds=2))
         assert rebuilt == before
     finally:

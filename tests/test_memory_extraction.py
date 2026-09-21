@@ -19,6 +19,7 @@ import json
 import logging
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -46,6 +47,7 @@ from kai.memory_extraction import (
     _render_candidate_line,
     _render_candidate_source,
     _route_write_scope,
+    _store_canonical_facts,
     _store_facts,
     _strip_role_labels,
     _validate_episode,
@@ -1906,6 +1908,73 @@ class TestBuildPayloadCandidates:
 
 
 # ── _store_facts: branching on intent ───────────────────────────────
+
+
+async def test_canonical_update_uses_lifecycle_without_delete_then_add(monkeypatch):
+    from kai import sessions
+
+    existing = MemoryResult(
+        id="fact-old",
+        text="The old fact",
+        score=0.9,
+        memory_type="fact",
+        metadata={"source": "extracted", "scope": "global"},
+        created_at="2026-09-01T00:00:00Z",
+        updated_at="2026-09-01T00:00:00Z",
+    )
+    monkeypatch.setattr(memory_extraction.memory, "get_by_id", lambda **_kwargs: existing)
+    monkeypatch.setattr(
+        memory_extraction.memory,
+        "delete_by_id",
+        lambda **_kwargs: pytest.fail("canonical replacement must not delete before committing its revision"),
+    )
+    calls = []
+
+    async def apply(principal_id, runtime_profile_id, spec, **kwargs):
+        calls.append((principal_id, runtime_profile_id, spec, kwargs))
+        assert kwargs["existing"] is existing
+        return SimpleNamespace(
+            state="active",
+            memory_id="fact-old",
+            projection_status="succeeded",
+        )
+
+    monkeypatch.setattr(sessions, "apply_canonical_extracted_fact", apply)
+    decisions = []
+    stored, replaced, skipped = await _store_canonical_facts(
+        [
+            {
+                "content": "The corrected fact",
+                "intent": "update_of",
+                "existing_id": "fact-old",
+                "speaker": "user",
+                "confidence": 0.98,
+                "tags": ["preference"],
+                "scope_hint": "global",
+            }
+        ],
+        user_id="prn_" + "1" * 32,
+        session_id="session-1",
+        config=_cfg(),
+        active_project=None,
+        user_log=None,
+        assistant_log=None,
+        canonical_provenance={
+            memory_extraction.memory.WORKSHOP_RUN_ID_KEY: "run_" + "2" * 32,
+            memory_extraction.memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY: "msg_" + "3" * 32,
+            memory_extraction.memory.WORKSHOP_RESULT_MESSAGE_ID_KEY: "msg_" + "4" * 32,
+        },
+        runtime_profile_id="rtp_" + "5" * 32,
+        receipt_id="mxr_" + "6" * 32,
+        backend="codex",
+        provider="openai",
+        model="gpt-5.6-sol",
+        receipt_decisions=decisions,
+    )
+
+    assert (stored, replaced, skipped) == (1, 1, 0)
+    assert len(calls) == 1
+    assert decisions[0].outcome == "replaced"
 
 
 class TestStoreFactsIntent:

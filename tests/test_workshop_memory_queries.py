@@ -58,6 +58,66 @@ class _RuntimePool:
         return self.workspace
 
 
+class _FactLifecycleStub:
+    """Keep legacy query-service tests focused on adapter behavior."""
+
+    def __init__(self) -> None:
+        self._memory_ids: dict[str, str] = {}
+
+    async def authority_for(self, principal_id, runtime_profile_id):
+        return SimpleNamespace(principal_id=principal_id, runtime_profile_id=runtime_profile_id)
+
+    async def create(self, authority, spec, *, idempotency_key, stable_claim_key):
+        del idempotency_key, stable_claim_key
+        memory_id = memory.add_structured(
+            spec.content,
+            user_id=str(authority.principal_id),
+            memory_type="fact",
+            tags=spec.vector_metadata.get("tags"),
+            metadata=spec.vector_metadata,
+            runtime_profile_id=str(authority.runtime_profile_id),
+        )
+        return SimpleNamespace(memory_id=memory_id, projection_status="succeeded" if memory_id else "failed")
+
+    async def adopt_legacy(self, authority, row, *, idempotency_key):
+        del authority, idempotency_key
+        claim_id = f"claim:{row.id}"
+        revision_id = f"revision:{row.id}"
+        self._memory_ids[claim_id] = row.id
+        return SimpleNamespace(
+            claim_id=claim_id,
+            revision_id=revision_id,
+            memory_id=row.id,
+            projection_status="succeeded",
+        )
+
+    async def supersede(self, authority, claim_id, revision_id, spec, *, idempotency_key, source):
+        del revision_id, idempotency_key, source
+        memory_id = self._memory_ids[claim_id]
+        updated = memory.update_metadata(
+            user_id=str(authority.principal_id),
+            memory_id=memory_id,
+            data=spec.content,
+            metadata=spec.vector_metadata,
+        )
+        current = memory.get_by_id(user_id=str(authority.principal_id), memory_id=memory_id)
+        succeeded = bool(updated) or (
+            current is not None
+            and current.text == spec.content
+            and all(current.metadata.get(key) == value for key, value in spec.vector_metadata.items())
+        )
+        return SimpleNamespace(
+            memory_id=memory_id if succeeded else None,
+            projection_status="succeeded" if succeeded else "pending",
+        )
+
+    async def retract(self, authority, claim_id, revision_id, *, reason, idempotency_key):
+        del revision_id, reason, idempotency_key
+        memory_id = self._memory_ids[claim_id]
+        deleted = memory.delete_by_id(user_id=str(authority.principal_id), memory_id=memory_id)
+        return SimpleNamespace(projection_status="succeeded" if deleted else "pending")
+
+
 def _result(
     memory_id: str,
     text: str,
@@ -113,6 +173,7 @@ def _service(tmp_path: Path):
         runtime_pool,  # type: ignore[arg-type]
         WorkshopExecutionStateRegistry((namespace,)),
     )
+    service._fact_lifecycle = _FactLifecycleStub()  # type: ignore[assignment]
     return service, service.authority_for_principal(principal_id), principal_id
 
 
@@ -184,6 +245,106 @@ async def test_transport_authority_resolves_identity_and_current_channel_members
                 external_subject="unknown",
                 external_channel_id="101",
             )
+    finally:
+        await store.close()
+
+
+async def test_explicit_fact_create_and_edit_share_canonical_revision_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = await WorkshopEventStore.open(tmp_path / "kai.db")
+    rows: dict[str, memory.MemoryResult] = {}
+    delete_calls = 0
+
+    def add_structured(content: str, **kwargs):
+        memory_id = "canonical-fact"
+        rows[memory_id] = memory.MemoryResult(
+            id=memory_id,
+            text=content,
+            score=1.0,
+            memory_type="fact",
+            metadata=dict(kwargs["metadata"]),
+            created_at="2026-09-21T00:00:00Z",
+            updated_at="2026-09-21T00:00:00Z",
+        )
+        return memory_id
+
+    def update_metadata(*, memory_id: str, data: str, metadata, **_kwargs):
+        previous = rows[memory_id]
+        rows[memory_id] = memory.MemoryResult(
+            id=memory_id,
+            text=data,
+            score=previous.score,
+            memory_type=previous.memory_type,
+            metadata=dict(metadata),
+            created_at=previous.created_at,
+            updated_at="2026-09-21T00:01:00Z",
+        )
+        return True
+
+    def delete_by_id(**_kwargs):
+        nonlocal delete_calls
+        delete_calls += 1
+        return True
+
+    monkeypatch.setattr(memory, "get_all", lambda **_kwargs: list(rows.values()))
+    monkeypatch.setattr(memory, "get_by_id", lambda **kwargs: rows.get(kwargs["memory_id"]))
+    monkeypatch.setattr(memory, "add_structured", add_structured)
+    monkeypatch.setattr(memory, "update_metadata", update_metadata)
+    monkeypatch.setattr(memory, "delete_by_id", delete_by_id)
+    try:
+        await bootstrap_default_workshop(
+            store,
+            (BootstrapHuman("Alice", "admin", "telegram", "101", "101", profile_id(101)),),
+        )
+        async with store.connection.execute(
+            "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = '101'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        principal_id = PrincipalId(str(row[0]))
+        namespace = WorkshopExecutionStateNamespace(
+            principal_id=principal_id,
+            channel_id=ChannelId("chn_" + "2" * 32),
+            agent_id=AgentId("agt_" + "3" * 32),
+            runtime_profile_id=profile_id(101),
+            legacy_runtime_key=101,
+        )
+        service = WorkshopMemoryQueryService(
+            Config(
+                telegram_bot_token="unused",
+                allowed_user_ids=set(),
+                default_backend="codex",
+                default_model="gpt-5.6-sol",
+            ),
+            store,
+            _RuntimePool(tmp_path),  # type: ignore[arg-type]
+            WorkshopExecutionStateRegistry((namespace,)),
+        )
+        authority = service.authority_for_principal(principal_id)
+        created = await service.create_fact(
+            authority,
+            content="Original canonical fact",
+            tags=("qualification",),
+            scope="global",
+            project_id=None,
+            request_id="canonical-create",
+        )
+        edited = await service.edit(
+            authority,
+            created.record.record.memory_id,
+            revision=created.record.record.revision,
+            request_id="canonical-edit",
+            edit=MemoryFactEdit("Corrected canonical fact", ("qualification",)),
+        )
+
+        assert edited.record.content == "Corrected canonical fact"
+        assert delete_calls == 0
+        async with store.connection.execute(
+            "SELECT state, COUNT(*) FROM memory_fact_revision_states GROUP BY state ORDER BY state"
+        ) as cursor:
+            assert [tuple(row) for row in await cursor.fetchall()] == [("active", 1), ("superseded", 1)]
     finally:
         await store.close()
 
@@ -820,7 +981,7 @@ async def test_edit_recovers_when_provider_reports_failure_after_committing(
         edit=MemoryFactEdit("Committed correction", ("new",)),
     )
 
-    assert saved.idempotent_replay is True
+    assert saved.idempotent_replay is False
     assert saved.record.content == "Committed correction"
     assert saved.record.record.tags == ("new",)
 

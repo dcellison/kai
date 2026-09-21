@@ -21,6 +21,12 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
 )
+from kai.workshop.fact_lifecycle import (
+    FactLifecycleConflict,
+    FactMutationSource,
+    FactRevisionInput,
+    MemoryFactLifecycleService,
+)
 from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptAccessDenied,
     MemoryExtractionReceiptService,
@@ -419,6 +425,11 @@ class WorkshopMemoryQueryService:
             by_principal.setdefault(namespace.principal_id, []).append(namespace)
         self._namespaces = {principal_id: tuple(namespaces) for principal_id, namespaces in by_principal.items()}
         self._mutation_locks: dict[PrincipalId, asyncio.Lock] = {}
+        self._fact_lifecycle = MemoryFactLifecycleService(store)
+
+    async def recover_fact_projections(self) -> int:
+        """Recover canonical fact projections interrupted by a prior process."""
+        return await self._fact_lifecycle.recover_pending()
 
     def authority_for_principal(
         self,
@@ -899,7 +910,8 @@ class WorkshopMemoryQueryService:
                 )
                 raise WorkshopMemoryConflict(_memory_revision(existing))
 
-            now = datetime.now(UTC).isoformat()
+            now_value = datetime.now(UTC)
+            now = now_value.isoformat()
             metadata: dict[str, object] = {
                 "source": "explicit",
                 "speaker": "user",
@@ -909,16 +921,32 @@ class WorkshopMemoryQueryService:
                 "operator_creation_request_id": checked_request_id,
                 **scope_metadata,
             }
-            memory_id = await asyncio.to_thread(
-                memory.add_structured,
-                cleaned_content,
-                user_id=str(authority.principal_id),
-                memory_type="fact",
-                tags=list(cleaned_tags),
-                metadata=metadata,
-                runtime_profile_id=str(namespace.runtime_profile_id),
+            lifecycle_authority = await self._fact_lifecycle.authority_for(
+                authority.principal_id,
+                namespace.runtime_profile_id,
             )
-            if not isinstance(memory_id, str) or not memory_id:
+            mutation = await self._fact_lifecycle.create(
+                lifecycle_authority,
+                FactRevisionInput(
+                    content=cleaned_content,
+                    scope_kind=scope,
+                    scope_key=project_id or "",
+                    reason="Explicit fact created by its owning principal.",
+                    evidence=({"kind": "operator", "reference_id": checked_request_id, "sha256": None},),
+                    vector_metadata={**metadata, "tags": list(cleaned_tags)},
+                    confidence=1.0,
+                    asserted_at=now_value,
+                    observed_at=now_value,
+                    valid_from=now_value,
+                ),
+                idempotency_key=(
+                    f"workshop-memory:create:{authority.principal_id}:{namespace.runtime_profile_id}:"
+                    f"{checked_request_id}"
+                ),
+                stable_claim_key=f"operator:{checked_request_id}",
+            )
+            memory_id = mutation.memory_id
+            if not isinstance(memory_id, str) or not memory_id or mutation.projection_status != "succeeded":
                 self._audit_content_mutation(
                     authority,
                     operation="create",
@@ -926,7 +954,7 @@ class WorkshopMemoryQueryService:
                     changed_fields=("content", "tags", "scope"),
                     outcome="failed",
                 )
-                raise WorkshopMemoryMutationFailed("Memory creation failed")
+                raise WorkshopMemoryMutationFailed("Memory creation is canonical but its search projection is pending")
             stored = await asyncio.to_thread(
                 memory.get_by_id,
                 user_id=str(authority.principal_id),
@@ -1089,14 +1117,63 @@ class WorkshopMemoryQueryService:
                     "operator_edit_request_id": checked_request_id,
                 }
             )
-            updated = await asyncio.to_thread(
-                memory.update_metadata,
-                user_id=str(authority.principal_id),
-                memory_id=memory_id,
-                data=data,
-                metadata=merged,
-                runtime_profile_id=str(namespace.runtime_profile_id),
+            lifecycle_authority = await self._fact_lifecycle.authority_for(
+                authority.principal_id,
+                namespace.runtime_profile_id,
             )
+            if isinstance(normalized, MemoryFactEdit):
+                adopted = await self._fact_lifecycle.adopt_legacy(
+                    lifecycle_authority,
+                    existing,
+                    idempotency_key=(
+                        f"workshop-memory:adopt:{authority.principal_id}:{namespace.runtime_profile_id}:{memory_id}"
+                    ),
+                )
+                if adopted.projection_status != "succeeded" or adopted.memory_id is None:
+                    raise WorkshopMemoryMutationFailed(
+                        "Memory adoption is canonical but its search projection is pending"
+                    )
+                resolved_scope = memory.resolve_memory_scope(existing.metadata)
+                mutation = await self._fact_lifecycle.supersede(
+                    lifecycle_authority,
+                    adopted.claim_id,
+                    adopted.revision_id,
+                    FactRevisionInput(
+                        content=data,
+                        scope_kind=(
+                            resolved_scope.scope if resolved_scope.scope in {"global", "project"} else "global"
+                        ),
+                        scope_key=(
+                            str(resolved_scope.project_id)
+                            if resolved_scope.scope == "project" and resolved_scope.project_id
+                            else ""
+                        ),
+                        reason="Explicit fact edit by its owning principal.",
+                        evidence=({"kind": "operator", "reference_id": checked_request_id, "sha256": None},),
+                        vector_metadata=merged,
+                        confidence=1.0,
+                        asserted_at=datetime.now(UTC),
+                        observed_at=datetime.now(UTC),
+                        valid_from=datetime.now(UTC),
+                    ),
+                    idempotency_key=(
+                        f"workshop-memory:edit:{authority.principal_id}:{namespace.runtime_profile_id}:"
+                        f"{checked_request_id}"
+                    ),
+                    source=FactMutationSource.HUMAN,
+                )
+                updated = mutation.projection_status == "succeeded"
+                if not updated:
+                    raise WorkshopMemoryMutationFailed("Memory edit is canonical but its search projection is pending")
+            else:
+                updated = await asyncio.to_thread(
+                    memory.update_metadata,
+                    user_id=str(authority.principal_id),
+                    memory_id=memory_id,
+                    data=data,
+                    metadata=merged,
+                    runtime_profile_id=str(namespace.runtime_profile_id),
+                )
             current = await asyncio.to_thread(
                 memory.get_by_id,
                 user_id=str(authority.principal_id),
@@ -1193,6 +1270,7 @@ class WorkshopMemoryQueryService:
             scope=scope,
             project_id=project_id,
         )
+        namespace = self._namespace_for_mutation(authority)
         allowed_project_id = await self._allowed_project_id(authority)
         results: list[MemoryMutationResult] = []
         lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
@@ -1214,13 +1292,70 @@ class WorkshopMemoryQueryService:
                         merged.update(scope_metadata)
                         mutation_raised = False
                         try:
-                            updated = await asyncio.to_thread(
-                                memory.update_metadata,
-                                user_id=str(authority.principal_id),
-                                memory_id=memory_id,
-                                data=record.text,
-                                metadata=merged,
-                            )
+                            if _record_kind(record) == "fact":
+                                lifecycle_authority = await self._fact_lifecycle.authority_for(
+                                    authority.principal_id,
+                                    namespace.runtime_profile_id,
+                                )
+                                adopted = await self._fact_lifecycle.adopt_legacy(
+                                    lifecycle_authority,
+                                    record,
+                                    idempotency_key=(
+                                        f"workshop-memory:adopt:{authority.principal_id}:"
+                                        f"{namespace.runtime_profile_id}:{memory_id}"
+                                    ),
+                                )
+                                resolved_scope = memory.resolve_memory_scope(merged)
+                                now_value = datetime.now(UTC)
+                                mutation = await self._fact_lifecycle.supersede(
+                                    lifecycle_authority,
+                                    adopted.claim_id,
+                                    adopted.revision_id,
+                                    FactRevisionInput(
+                                        content=record.text,
+                                        scope_kind=(
+                                            resolved_scope.scope
+                                            if resolved_scope.scope in {"global", "project"}
+                                            else "global"
+                                        ),
+                                        scope_key=(
+                                            str(resolved_scope.project_id)
+                                            if resolved_scope.scope == "project" and resolved_scope.project_id
+                                            else ""
+                                        ),
+                                        reason="Explicit fact scope change by its owning principal.",
+                                        evidence=(
+                                            {
+                                                "kind": "operator",
+                                                "reference_id": _memory_revision(record),
+                                                "sha256": None,
+                                            },
+                                        ),
+                                        vector_metadata=merged,
+                                        confidence=float(record.metadata.get("confidence", 1.0)),
+                                        asserted_at=now_value,
+                                        observed_at=now_value,
+                                        valid_from=now_value,
+                                    ),
+                                    idempotency_key=(
+                                        f"workshop-memory:scope:{authority.principal_id}:"
+                                        f"{namespace.runtime_profile_id}:{memory_id}:"
+                                        f"{_memory_revision(record)}:{resolved_scope.scope}:"
+                                        f"{resolved_scope.project_id or ''}"
+                                    ),
+                                    source=FactMutationSource.HUMAN,
+                                )
+                                updated = mutation.projection_status == "succeeded"
+                            else:
+                                updated = await asyncio.to_thread(
+                                    memory.update_metadata,
+                                    user_id=str(authority.principal_id),
+                                    memory_id=memory_id,
+                                    data=record.text,
+                                    metadata=merged,
+                                )
+                        except FactLifecycleConflict:
+                            updated = False
                         except Exception:
                             log.exception("Workshop memory scope mutation failed for %s", memory_id)
                             updated = False
@@ -1270,6 +1405,7 @@ class WorkshopMemoryQueryService:
     ) -> MemoryMutationBatch:
         checked = self._validate_memory_ids(memory_ids)
         revisions = self._validate_expected_revisions(checked, expected_revisions)
+        namespace = self._namespace_for_mutation(authority)
         allowed_project_id = await self._allowed_project_id(authority)
         results: list[MemoryMutationResult] = []
         lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
@@ -1289,11 +1425,38 @@ class WorkshopMemoryQueryService:
                     else:
                         mutation_raised = False
                         try:
-                            deleted = await asyncio.to_thread(
-                                memory.delete_by_id,
-                                user_id=str(authority.principal_id),
-                                memory_id=memory_id,
-                            )
+                            if _record_kind(record) == "fact":
+                                lifecycle_authority = await self._fact_lifecycle.authority_for(
+                                    authority.principal_id,
+                                    namespace.runtime_profile_id,
+                                )
+                                adopted = await self._fact_lifecycle.adopt_legacy(
+                                    lifecycle_authority,
+                                    record,
+                                    idempotency_key=(
+                                        f"workshop-memory:adopt:{authority.principal_id}:"
+                                        f"{namespace.runtime_profile_id}:{memory_id}"
+                                    ),
+                                )
+                                mutation = await self._fact_lifecycle.retract(
+                                    lifecycle_authority,
+                                    adopted.claim_id,
+                                    adopted.revision_id,
+                                    reason="Explicit fact deletion by its owning principal.",
+                                    idempotency_key=(
+                                        f"workshop-memory:delete:{authority.principal_id}:"
+                                        f"{namespace.runtime_profile_id}:{memory_id}:{adopted.revision_id}"
+                                    ),
+                                )
+                                deleted = mutation.projection_status == "succeeded"
+                            else:
+                                deleted = await asyncio.to_thread(
+                                    memory.delete_by_id,
+                                    user_id=str(authority.principal_id),
+                                    memory_id=memory_id,
+                                )
+                        except FactLifecycleConflict:
+                            deleted = False
                         except Exception:
                             log.exception("Workshop memory deletion failed for %s", memory_id)
                             deleted = False

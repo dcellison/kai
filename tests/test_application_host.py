@@ -190,6 +190,14 @@ class _FakePostRunEffects:
         self.ready = False
 
 
+class _FakeMemoryQueries:
+    def __init__(self, *dependencies) -> None:
+        self.dependencies = dependencies
+
+    async def recover_fact_projections(self) -> int:
+        return 0
+
+
 class _FakeIntegrationNotifications:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -418,12 +426,7 @@ def host_dependencies(monkeypatch):
     monkeypatch.setattr(
         host_module,
         "WorkshopMemoryQueryService",
-        lambda config, store, pool, execution_state: (
-            config,
-            store,
-            pool,
-            execution_state,
-        ),
+        _FakeMemoryQueries,
     )
     return events
 
