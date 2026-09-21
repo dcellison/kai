@@ -420,6 +420,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Confirm a mutating mode. Without it, --apply/--rollback print the planned change count and exit with status 2.",
     )
 
+    reconciliation = sub.add_parser(
+        "reconciliation",
+        help="Audit and explicitly reconcile existing facts and episodes",
+        description=(
+            "Create a private read-only candidate audit, review every candidate, seal the decisions, "
+            "and apply only approved canonical lifecycle actions. The audit itself never changes memory."
+        ),
+    )
+    reconciliation_sub = reconciliation.add_subparsers(dest="reconciliation_command", required=True)
+    reconciliation_audit = reconciliation_sub.add_parser("audit", help="Create a read-only reconciliation audit")
+    reconciliation_audit.add_argument("principal", help="Canonical human principal or external identity subject")
+    reconciliation_audit.add_argument("runtime_profile", help="Canonical runtime profile owned by the principal")
+    reconciliation_audit.add_argument("--out-dir", default=None, help="Private artifact directory")
+    reconciliation_template = reconciliation_sub.add_parser(
+        "review-template", help="Create an editable decision template for an immutable audit"
+    )
+    reconciliation_template.add_argument("audit", help="Immutable audit JSON path")
+    reconciliation_template.add_argument("--out", default=None, help="Editable review JSON path")
+    reconciliation_seal = reconciliation_sub.add_parser(
+        "seal-review", help="Validate and immutably seal a completed review"
+    )
+    reconciliation_seal.add_argument("audit", help="Immutable audit JSON path")
+    reconciliation_seal.add_argument("review", help="Completed editable review JSON path")
+    reconciliation_seal.add_argument("--reviewer", required=True, help="Human reviewer name or stable identifier")
+    reconciliation_seal.add_argument("--out", default=None, help="Immutable sealed-review JSON path")
+    reconciliation_apply = reconciliation_sub.add_parser(
+        "apply", help="Apply approved decisions through canonical lifecycle events"
+    )
+    reconciliation_apply.add_argument("audit", help="Immutable audit JSON path")
+    reconciliation_apply.add_argument("review", help="Immutable sealed-review JSON path")
+    reconciliation_apply.add_argument("--out-dir", default=None, help="Private receipt directory")
+    reconciliation_apply.add_argument(
+        "--yes", action="store_true", help="Authorize the reviewed mutation batch; absent means no changes"
+    )
+
     quality = sub.add_parser(
         "quality-corpus",
         help="Build, review, seal, and score a private production memory-quality corpus",
@@ -1373,6 +1408,134 @@ def _cmd_quality_corpus(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_reconciliation(args: argparse.Namespace) -> int:
+    """Dispatch private, review-gated memory reconciliation."""
+    from datetime import UTC, datetime
+
+    from kai import memory_reconciliation as reconciliation
+    from kai.config import load_config
+    from kai.memory_quality_corpus import resolve_human_principal
+
+    try:
+        config = load_config()
+        db_path = Path(config.session_db_path)
+        if db_path.is_symlink() or not db_path.is_file():
+            raise reconciliation.MemoryReconciliationError("Canonical Workshop database is unavailable")
+
+        if args.reconciliation_command == "audit":
+            connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                principal_id = resolve_human_principal(connection, args.principal)
+                owned = reconciliation.runtime_profiles_for_principal(connection, principal_id)
+            finally:
+                connection.close()
+            if args.runtime_profile not in owned:
+                raise reconciliation.MemoryReconciliationError(
+                    "Runtime profile is not canonically owned by the selected principal"
+                )
+            out_dir = (
+                Path(args.out_dir)
+                if args.out_dir
+                else _default_human_report_directory(config, principal_id, "memory-reconciliation")
+            )
+            if _initialize_memory(config) is None:
+                return 1
+            from kai import memory
+
+            rows = memory.get_all_for_lifecycle_projection(
+                user_id=principal_id,
+                runtime_profile_id=args.runtime_profile,
+            )
+            audit = reconciliation.build_audit(
+                principal_id=principal_id,
+                runtime_profile_id=args.runtime_profile,
+                rows=rows,
+                prior_decisions=reconciliation.prior_dispositions(out_dir),
+            )
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+            out_path = out_dir / f"audit-{audit['audit_id']}-{stamp}.json"
+            reconciliation.write_audit(out_path, audit)
+            markdown_path = out_path.with_suffix(".md")
+            reconciliation.write_private_text(markdown_path, reconciliation.render_audit_markdown(audit))
+            print(
+                "memory reconciliation: read-only audit complete; "
+                f"rows={audit['corpus_count']}, candidates={audit['candidate_count']}, "
+                f"suppressed unchanged={audit['suppressed_unchanged_count']}"
+            )
+            print(f"memory reconciliation: audit: {out_path}")
+            print(f"memory reconciliation: human report: {markdown_path}")
+            print("memory reconciliation: no memory or canonical state was changed")
+            return 0
+
+        audit_path = Path(args.audit)
+        audit = reconciliation.load_document(audit_path, kind=reconciliation.AUDIT_KIND)
+        if args.reconciliation_command == "review-template":
+            template = reconciliation.build_review_template(audit)
+            out_path = Path(args.out) if args.out else audit_path.with_name(f"{audit_path.stem}-review.json")
+            reconciliation.write_review_template(out_path, template)
+            print(f"memory reconciliation: editable review: {out_path}")
+            return 0
+        if args.reconciliation_command == "seal-review":
+            try:
+                editable = json.loads(Path(args.review).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise reconciliation.MemoryReconciliationError(f"Cannot read editable review: {exc}") from exc
+            if not isinstance(editable, dict):
+                raise reconciliation.MemoryReconciliationError("Editable review must be a JSON object")
+            sealed = reconciliation.seal_review(audit, editable, reviewer=args.reviewer)
+            review_path = Path(args.review)
+            out_path = Path(args.out) if args.out else review_path.with_name(f"{review_path.stem}-sealed.json")
+            reconciliation.write_sealed_review(out_path, sealed)
+            print(f"memory reconciliation: sealed review: {out_path}")
+            return 0
+        if args.reconciliation_command == "apply":
+            review = reconciliation.load_document(Path(args.review), kind=reconciliation.REVIEW_KIND)
+            approvals = sum(item.get("disposition") == "approve" for item in review.get("decisions", []))
+            if not args.yes:
+                print(
+                    f"memory reconciliation: would apply {approvals} approved candidate(s); "
+                    "rejected and deferred decisions would be receipted without mutation"
+                )
+                print("memory reconciliation: re-run with --yes to execute")
+                return 2
+            out_dir = (
+                Path(args.out_dir)
+                if args.out_dir
+                else _default_human_report_directory(config, str(audit["principal_id"]), "memory-reconciliation")
+            )
+            receipt_path = out_dir / f"receipt-mrr_{str(review['sha256'])[:32]}.json"
+            if receipt_path.exists():
+                prior = reconciliation.load_document(receipt_path, kind=reconciliation.RECEIPT_KIND)
+                if prior.get("review_sha256") != review["sha256"]:
+                    raise reconciliation.MemoryReconciliationError("Existing receipt conflicts with this review")
+                print(f"memory reconciliation: batch already applied; receipt: {receipt_path}")
+                return 0
+            if _initialize_memory(config) is None:
+                return 1
+            from kai import memory
+
+            rows = memory.get_all_for_lifecycle_projection(
+                user_id=str(audit["principal_id"]),
+                runtime_profile_id=str(audit["runtime_profile_id"]),
+            )
+            if reconciliation.corpus_sha256(rows) != audit["corpus_sha256"]:
+                raise reconciliation.MemoryReconciliationError(
+                    "Memory corpus changed after audit; create and review a fresh audit"
+                )
+            receipt = asyncio.run(reconciliation.apply_review(db_path=db_path, audit=audit, review=review))
+            reconciliation.write_receipt(receipt_path, receipt)
+            print(
+                f"memory reconciliation: batch complete; approved={approvals}, "
+                f"unchanged={len(review['decisions']) - approvals}"
+            )
+            print(f"memory reconciliation: durable receipt: {receipt_path}")
+            return 0
+    except (reconciliation.MemoryReconciliationError, OSError, sqlite3.Error, RuntimeError) as exc:
+        print(f"memory reconciliation: {exc}", file=sys.stderr)
+        return 1
+    return 2
+
+
 def cli(argv: list[str]) -> None:
     """Dispatch entry point. Called from `__main__.py` with argv[2:].
 
@@ -1394,6 +1557,8 @@ def cli(argv: list[str]) -> None:
         sys.exit(_cmd_review_legacy_scope(args))
     if args.command == "backfill-provenance":
         sys.exit(_cmd_backfill_provenance(args))
+    if args.command == "reconciliation":
+        sys.exit(_cmd_reconciliation(args))
     if args.command == "quality-corpus":
         sys.exit(_cmd_quality_corpus(args))
     # argparse's required=True on the subparsers guarantees a known
