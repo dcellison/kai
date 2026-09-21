@@ -59,6 +59,7 @@ def _receipt(*, role: str = "fact_extraction", suffix: str = "1") -> ProductionR
             "decisions": [decision],
         },
         memory_scopes=({"scope": "global"},),
+        candidate_ids=(),
         created_at="2026-09-21T00:00:00Z",
         completed_at="2026-09-21T00:00:01Z",
         channel_id="chn_general",
@@ -255,15 +256,17 @@ def _create_receipt_database(path):
             schema_version TEXT, policy_version TEXT, status TEXT, decision_outcome TEXT,
             classifier_result INTEGER, proposed_intents_json TEXT,
             validation_outcome_json TEXT, storage_outcome_json TEXT,
-            memory_scope_json TEXT, created_at TEXT, completed_at TEXT
+            memory_scope_json TEXT, candidate_ids_json TEXT,
+            created_at TEXT, completed_at TEXT
         );
         CREATE TABLE runs (
-            id TEXT, requested_by_principal_id TEXT, channel_id TEXT, agent_id TEXT
+            id TEXT, requested_by_principal_id TEXT, channel_id TEXT, agent_id TEXT,
+            inbound_message_id TEXT, result_message_id TEXT, status TEXT
         );
         CREATE TABLE channels (id TEXT, kind TEXT, name TEXT);
         CREATE TABLE agents (id TEXT, principal_id TEXT);
         CREATE TABLE agent_definitions (agent_id TEXT, handle TEXT);
-        CREATE TABLE messages (id TEXT, body TEXT);
+        CREATE TABLE messages (id TEXT, body TEXT, created_event_position INTEGER);
         """
     )
     connection.execute("INSERT INTO principals VALUES ('prn_owner', 'human', 'Daniel')")
@@ -273,12 +276,15 @@ def _create_receipt_database(path):
     connection.execute("INSERT INTO channels VALUES ('chn_general', 'group', 'General')")
     connection.execute("INSERT INTO agents VALUES ('agt_kai', 'prn_agent')")
     connection.execute("INSERT INTO agent_definitions VALUES ('agt_kai', 'kai')")
-    connection.execute("INSERT INTO messages VALUES ('msg_source', 'Hello')")
-    connection.execute("INSERT INTO messages VALUES ('msg_result', 'Hi')")
-    connection.execute("INSERT INTO runs VALUES ('run_1', 'prn_owner', 'chn_general', 'agt_kai')")
+    connection.execute("INSERT INTO messages VALUES ('msg_source', 'Hello', 2)")
+    connection.execute("INSERT INTO messages VALUES ('msg_result', 'Hi', 3)")
+    connection.execute(
+        "INSERT INTO runs VALUES "
+        "('run_1', 'prn_owner', 'chn_general', 'agt_kai', 'msg_source', 'msg_result', 'completed')"
+    )
     receipt = _receipt()
     connection.execute(
-        "INSERT INTO memory_extraction_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO memory_extraction_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             receipt.receipt_id,
             receipt.principal_id,
@@ -300,6 +306,7 @@ def _create_receipt_database(path):
             json.dumps(receipt.validation_outcome),
             json.dumps(receipt.storage_outcome),
             json.dumps(receipt.memory_scopes),
+            json.dumps(receipt.candidate_ids),
             receipt.created_at,
             receipt.completed_at,
         ),

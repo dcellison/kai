@@ -469,6 +469,57 @@ def _build_parser() -> argparse.ArgumentParser:
     quality_score.add_argument("snapshot", help="Immutable snapshot JSON path")
     quality_score.add_argument("review", help="Sealed-review JSON path")
     quality_score.add_argument("--out", default=None, help="Score JSON path; a Markdown peer is also written")
+
+    quality_evaluation_template = quality_sub.add_parser(
+        "evaluation-template",
+        help="Create an editable, policy-bounded model-comparison plan",
+    )
+    quality_evaluation_template.add_argument("snapshot", help="Immutable version-2 snapshot JSON path")
+    quality_evaluation_template.add_argument("review", help="Sealed corpus-review JSON path")
+    quality_evaluation_template.add_argument("runtime_profile", help="Canonical runtime profile to authorize calls")
+    quality_evaluation_template.add_argument("--out", default=None, help="Editable evaluation-plan JSON path")
+
+    quality_evaluate = quality_sub.add_parser(
+        "evaluate",
+        help="Replay a sealed corpus through every authorized model arm without writing memory",
+    )
+    quality_evaluate.add_argument("snapshot", help="Immutable version-2 snapshot JSON path")
+    quality_evaluate.add_argument("review", help="Sealed corpus-review JSON path")
+    quality_evaluate.add_argument("plan", help="Completed editable evaluation-plan JSON path")
+    quality_evaluate.add_argument("--out", default=None, help="Immutable evaluation JSON path")
+
+    quality_evaluation_review = quality_sub.add_parser(
+        "evaluation-review-template",
+        help="Create a model-blind review template for one evaluation run",
+    )
+    quality_evaluation_review.add_argument("snapshot", help="Immutable version-2 snapshot JSON path")
+    quality_evaluation_review.add_argument("review", help="Sealed corpus-review JSON path")
+    quality_evaluation_review.add_argument("evaluation", help="Immutable evaluation JSON path")
+    quality_evaluation_review.add_argument("--out", default=None, help="Editable blind-review JSON path")
+
+    quality_evaluation_seal = quality_sub.add_parser(
+        "seal-evaluation-review",
+        help="Validate and immutably seal a completed blind model review",
+    )
+    quality_evaluation_seal.add_argument("snapshot", help="Immutable version-2 snapshot JSON path")
+    quality_evaluation_seal.add_argument("review", help="Sealed corpus-review JSON path")
+    quality_evaluation_seal.add_argument("evaluation", help="Immutable evaluation JSON path")
+    quality_evaluation_seal.add_argument("evaluation_review", help="Completed blind-review JSON path")
+    quality_evaluation_seal.add_argument("--reviewer", required=True, help="Human reviewer name or stable identifier")
+    quality_evaluation_seal.add_argument("--out", default=None, help="Sealed model-review JSON path")
+
+    quality_evaluation_score = quality_sub.add_parser(
+        "score-evaluation",
+        help="Score reviewed model arms and emit explicit promotion and rollback decisions",
+    )
+    quality_evaluation_score.add_argument("snapshot", help="Immutable version-2 snapshot JSON path")
+    quality_evaluation_score.add_argument("review", help="Sealed corpus-review JSON path")
+    quality_evaluation_score.add_argument("sealed_plan", help="Immutable sealed evaluation-plan JSON path")
+    quality_evaluation_score.add_argument("evaluation", help="Immutable evaluation JSON path")
+    quality_evaluation_score.add_argument("evaluation_review", help="Sealed model-review JSON path")
+    quality_evaluation_score.add_argument(
+        "--out", default=None, help="Score JSON path; a Markdown peer is also written"
+    )
     return parser
 
 
@@ -1083,7 +1134,9 @@ def _cmd_quality_corpus(args: argparse.Namespace) -> int:
     """Dispatch private memory-quality corpus operations."""
     from datetime import UTC, datetime
 
+    from kai import memory_model_evaluation as model_evaluation
     from kai import memory_quality_corpus as quality
+    from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 
     try:
         if args.quality_command == "sample":
@@ -1171,7 +1224,94 @@ def _cmd_quality_corpus(args: argparse.Namespace) -> int:
             print(quality.render_markdown_report(report), end="")
             print(f"memory quality: wrote score artifacts to {out_path} and {out_path.with_suffix('.md')}")
             return 0
-    except (quality.MemoryQualityCorpusError, OSError, sqlite3.Error) as exc:
+        if args.quality_command == "evaluation-template":
+            review = quality.load_review(Path(args.review))
+            template = model_evaluation.build_plan_template(
+                snapshot,
+                review,
+                runtime_profile_id=args.runtime_profile,
+            )
+            out_path = (
+                Path(args.out) if args.out else snapshot_path.with_name(f"{snapshot_path.stem}-evaluation-plan.json")
+            )
+            model_evaluation.write_plan_template(out_path, template)
+            print(f"memory quality: wrote editable model-evaluation plan to {out_path}")
+            return 0
+        if args.quality_command == "evaluate":
+            from kai.config import load_config
+            from kai.workshop.runtime_profiles import WorkshopRuntimeProfileRegistry
+
+            review = quality.load_review(Path(args.review))
+            plan_path = Path(args.plan)
+            plan = model_evaluation.load_plan(plan_path)
+            config = load_config()
+            registry = WorkshopRuntimeProfileRegistry.load(config)
+            sealed_plan, profile = model_evaluation.seal_plan(plan, snapshot, review, registry)
+            evaluation = asyncio.run(
+                model_evaluation.run_evaluation(
+                    snapshot,
+                    review,
+                    sealed_plan,
+                    profile,
+                    config,
+                )
+            )
+            out_path = Path(args.out) if args.out else plan_path.with_name(f"{plan_path.stem}-evaluation.json")
+            sealed_plan_path = out_path.with_name(f"{out_path.stem}-sealed-plan.json")
+            model_evaluation.write_sealed_plan(sealed_plan_path, sealed_plan)
+            model_evaluation.write_evaluation(out_path, evaluation)
+            print(f"memory quality: wrote sealed evaluation plan to {sealed_plan_path}")
+            print(f"memory quality: wrote immutable model evaluation to {out_path}")
+            return 0
+        if args.quality_command == "evaluation-review-template":
+            review = quality.load_review(Path(args.review))
+            evaluation_path = Path(args.evaluation)
+            evaluation = model_evaluation.load_evaluation(evaluation_path)
+            template = model_evaluation.build_blind_review_template(snapshot, review, evaluation)
+            out_path = (
+                Path(args.out) if args.out else evaluation_path.with_name(f"{evaluation_path.stem}-blind-review.json")
+            )
+            model_evaluation.write_evaluation_review_template(out_path, template)
+            print(f"memory quality: wrote editable blind model review to {out_path}")
+            return 0
+        if args.quality_command == "seal-evaluation-review":
+            review = quality.load_review(Path(args.review))
+            evaluation_path = Path(args.evaluation)
+            evaluation = model_evaluation.load_evaluation(evaluation_path)
+            model_evaluation._validate_evaluation(evaluation, snapshot, review)
+            editable_path = Path(args.evaluation_review)
+            editable = model_evaluation.load_evaluation_review(editable_path)
+            sealed = model_evaluation.seal_evaluation_review(
+                editable,
+                evaluation,
+                reviewer=args.reviewer,
+            )
+            out_path = Path(args.out) if args.out else editable_path.with_name(f"{editable_path.stem}-sealed.json")
+            model_evaluation.write_sealed_evaluation_review(out_path, sealed)
+            print(f"memory quality: wrote immutable reviewed model comparison to {out_path}")
+            return 0
+        if args.quality_command == "score-evaluation":
+            review = quality.load_review(Path(args.review))
+            sealed_plan = model_evaluation.load_plan(Path(args.sealed_plan))
+            evaluation = model_evaluation.load_evaluation(Path(args.evaluation))
+            evaluation_review = model_evaluation.load_evaluation_review(Path(args.evaluation_review))
+            report = model_evaluation.score_evaluation(
+                snapshot,
+                review,
+                sealed_plan,
+                evaluation,
+                evaluation_review,
+            )
+            out_path = (
+                Path(args.out)
+                if args.out
+                else Path(args.evaluation_review).with_name(f"{Path(args.evaluation_review).stem}-score.json")
+            )
+            model_evaluation.write_score(out_path, report)
+            print(model_evaluation.render_report(report), end="")
+            print(f"memory quality: wrote comparison score to {out_path} and {out_path.with_suffix('.md')}")
+            return 0
+    except (quality.MemoryQualityCorpusError, WorkshopRuntimeProfileError, OSError, sqlite3.Error) as exc:
         print(f"memory quality: {exc}", file=sys.stderr)
         return 1
     return 2
