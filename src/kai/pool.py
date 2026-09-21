@@ -673,6 +673,14 @@ class SubprocessPool:
             if private and not self._config.memory_enabled
             else omitted
         )
+        from kai.workshop.memory_current_truth import current_truth_revision
+
+        memory_truth_revision = await asyncio.to_thread(
+            current_truth_revision,
+            Path(self._config.session_db_path),
+            principal_id=str(context.principal_id),
+            runtime_profile_id=str(context.runtime_profile_id),
+        )
         payload = {
             "version": 1,
             "lane": {
@@ -684,6 +692,7 @@ class SubprocessPool:
             "principal_policy": policy,
             "personal_preferences": preferences,
             "file_memory": file_memory,
+            "memory_current_truth": memory_truth_revision,
             "agent_definition": hashlib.sha256(agent_definition_context.encode("utf-8")).hexdigest(),
             "workspace": str(workspace.resolve()),
             "workspace_prompt": hashlib.sha256(workspace_prompt.encode("utf-8")).hexdigest(),
