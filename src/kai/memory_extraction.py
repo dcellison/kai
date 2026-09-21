@@ -34,6 +34,8 @@ from kai import memory
 from kai.config import Config, ModelRole, resolve_user_model
 from kai.history import LogEntry
 from kai.memory import MemoryResult
+from kai.memory_consolidation import retrieve_consolidation_candidates
+from kai.memory_consolidation import scope_admitted as _scope_admitted
 from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
 from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
 from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
@@ -1028,9 +1030,9 @@ def _capped_assistant(text: str) -> str:
 
     The cap constant lives on `memory._MAX_ASSISTANT_CHARS` because the
     whole-text length is computed once per extraction and consumed by
-    BOTH the candidate-set fetch (which embeds this string to search
-    for related existing facts) AND the extractor payload (which shows
-    this string to Haiku as the ASSISTANT segment). If the two sites
+    BOTH the hybrid candidate retrieval (which derives semantic and
+    lexical evidence from this response) AND the extractor payload
+    (which shows this string as the ASSISTANT segment). If the two sites
     capped independently, a future divergence - a 50KB paste fetched
     against the full text while the payload sees only the first 1KB -
     would silently produce candidate sets that do not match what the
@@ -1203,7 +1205,7 @@ def _build_extraction_payload(
     The payload is delivered via stdin, not argv - see `_run_extractor`.
     """
     # Cap the user side locally; the assistant side was capped by the
-    # caller via `_capped_assistant` so both the candidate-set fetch
+    # caller via `_capped_assistant` so both candidate retrieval
     # and this payload saw identical input. Capping here, inline, would
     # reintroduce the divergence risk documented on `_capped_assistant`.
     # Confirmation quotes sit inside the user turn but are short by
@@ -1246,8 +1248,7 @@ def _build_extraction_payload(
         cand_lines = "\n".join(_render_candidate_line(c) for c in candidates)
         envelope_start, envelope_end = make_untrusted_json_envelope("EXISTING MEMORY CANDIDATES")
         candidate_block = (
-            "EXISTING FACTS FOR THIS USER (most semantically related first):\n"
-            f"{envelope_start}\n{cand_lines}\n{envelope_end}\n\n"
+            f"EXISTING FACTS FOR THIS USER (most relevant first):\n{envelope_start}\n{cand_lines}\n{envelope_end}\n\n"
         )
     return (
         f"Extract facts from this exchange.\n\n"
@@ -1901,24 +1902,6 @@ def _allowed_write_project_id(active_project: ActiveMemoryProject | None) -> str
     if active_project is None or not active_project.memory_enabled:
         return None
     return active_project.project_id
-
-
-def _scope_admitted(metadata: dict | None, allowed_project_id: str | None) -> bool:
-    """
-    True when a stored row has authority in this extraction run.
-
-    Thin composition of the read side's resolver and admission helper
-    so write-time reads (consolidation candidates, the dedup gate)
-    apply EXACTLY the rule retrieval uses: explicit global rows are
-    admitted, unresolved legacy and invalid rows are quarantined,
-    project rows require a matching allowed_project_id, and task rows
-    are never admitted. Write-time reads control
-    deletion (`update_of`) and suppression (`skip_redundant`, dedup),
-    so their candidate authority must be at least as scoped as the
-    write authority they gate.
-    """
-    resolved = memory.resolve_memory_scope(metadata)
-    return memory._scoped_memory_admission_reason(resolved, allowed_project_id=allowed_project_id) is None
 
 
 def _paraphrase_neighbor(
@@ -4126,31 +4109,31 @@ async def extract_and_store(
             # identical input. See `_capped_assistant` for the
             # divergence failure mode this guards against.
             assistant_capped = _capped_assistant(assistant_text)
-            # Fetch the candidate set off the event loop (memory.search
-            # is sync). Skipped entirely when consolidation is disabled
-            # via the kill switch (n == 0); skipped silently when the
-            # search call raises so a broken store never strands
-            # extraction.
+            # Retrieve consolidation context off the event loop. The
+            # bounded hybrid strategy uses both sides of the exchange,
+            # claim-focused semantic queries, and a lexical rescue scan
+            # for changed values / negations that are poor paraphrases.
+            # Scope authority is applied inside the retriever before a
+            # row can contribute ranking evidence.
             candidates: list[MemoryResult] = []
             n_candidates = config.memory_consolidation_candidates_n
+            retrieval = None
             if n_candidates > 0:
                 loop = asyncio.get_running_loop()
                 try:
-                    candidates = await loop.run_in_executor(
+                    retrieval = await loop.run_in_executor(
                         None,
-                        lambda: memory.search(
-                            assistant_capped,
-                            **(
-                                {
-                                    "user_id": user_id,
-                                    "limit": n_candidates,
-                                    "runtime_profile_id": runtime_profile_id,
-                                }
-                                if runtime_profile_id is not None
-                                else {"user_id": user_id, "limit": n_candidates}
-                            ),
+                        lambda: retrieve_consolidation_candidates(
+                            user_text=user_text,
+                            assistant_text=assistant_capped,
+                            user_id=user_id,
+                            runtime_profile_id=runtime_profile_id,
+                            allowed_project_id=_allowed_write_project_id(active_project),
+                            limit=n_candidates,
+                            semantic_floor=config.memory_search_floor,
                         ),
                     )
+                    candidates = list(retrieval.candidates)
                 except Exception:
                     # Match `_paraphrase_neighbor`'s search-failure posture: a
                     # broken store does not strand extraction. The
@@ -4167,24 +4150,7 @@ async def extract_and_store(
                 # `or []` collapses both None and a falsy empty result
                 # to the documented contract (a list).
                 candidates = candidates or []
-            # Scope admission for consolidation candidates. The fetch
-            # above is user-wide; without this filter, a project row
-            # from ANOTHER project can enter the EXISTING FACTS block,
-            # where an `update_of` would delete-and-rewrite it under
-            # the current project's scope and a `skip_redundant` would
-            # suppress a valid current-project write. Consolidation is
-            # a write-time read that controls deletion and storage, so
-            # its candidate authority must match the write authority:
-            # the same admission rule retrieval uses, keyed on the
-            # detected project. Excluded candidates also never reach
-            # `candidate_id_set`, so an extractor that hallucinates a
-            # filtered id falls into the existing hallucinated-id drop.
-            excluded_by_scope = 0
-            if candidates:
-                write_project_id = _allowed_write_project_id(active_project)
-                admitted = [c for c in candidates if _scope_admitted(c.metadata, write_project_id)]
-                excluded_by_scope = len(candidates) - len(admitted)
-                candidates = admitted
+            excluded_by_scope = retrieval.excluded_by_scope if retrieval is not None else 0
             candidate_id_set = {c.id for c in candidates}
             # Per-id metadata lookup for `_validate_facts` Rule 4b
             # (issue #414): the rule needs the existing row's stored
@@ -4207,6 +4173,12 @@ async def extract_and_store(
                         "n_candidates": len(candidates),
                         "candidate_ids": [c.id for c in candidates],
                         "excluded_by_scope": excluded_by_scope,
+                        "query_kinds": list(retrieval.query_kinds) if retrieval is not None else [],
+                        "semantic_hits": retrieval.semantic_hits if retrieval is not None else 0,
+                        "lexical_hits": retrieval.lexical_hits if retrieval is not None else 0,
+                        "excluded_below_floor": retrieval.excluded_below_floor if retrieval is not None else 0,
+                        "scanned_rows": retrieval.scanned_rows if retrieval is not None else 0,
+                        "search_failures": retrieval.search_failures if retrieval is not None else 0,
                     },
                     separators=(",", ":"),
                 ),

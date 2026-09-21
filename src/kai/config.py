@@ -1732,18 +1732,19 @@ class Config:
 
     # Number of existing facts surfaced to the extractor per call as
     # consolidation candidates (intent: update_of / skip_redundant).
-    # Selected by semantic similarity to the assistant payload, capped
-    # at this value. Set to 0 to disable consolidation entirely: the
-    # candidate fetch is skipped, the EXISTING FACTS data block is
+    # Selected by a bounded hybrid retrieval over user assertions,
+    # assistant responses, semantic neighbours, and lexical changed-value
+    # neighbours, capped at this value. Set to 0 to disable consolidation
+    # entirely: the candidate fetch is skipped, the EXISTING FACTS data block is
     # omitted from the Haiku payload, and the extractor falls back to
     # always emitting intent="new" (anchored by the CONSOLIDATION
     # prompt section, which is retained even when the data block is
     # empty). Storage then uses the existing _paraphrase_neighbor semantics.
-    # Tradeoff: each candidate adds ~50-100 chars to the Haiku payload
-    # and contributes to per-call cache-creation tokens. Default 8 is
-    # 2x the per-call fact cap (5), which gives the model enough to
-    # find 1-2 update targets per proposed fact without doubling the
-    # per-call cost.
+    # Tradeoff: each candidate adds ~50-100 chars to the extractor payload
+    # and contributes to per-call cache-creation tokens. This is an
+    # independent prompt-context budget, deliberately not derived from
+    # the schema's maximum emitted-fact count. Default 8 bounds context
+    # while leaving room for competing old/new values and paraphrases.
     memory_consolidation_candidates_n: int = 8
 
     # Stage-2 episode generation (issue #385). Conditional second extractor
