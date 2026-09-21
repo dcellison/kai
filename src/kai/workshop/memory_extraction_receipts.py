@@ -15,6 +15,7 @@ _ROLES = frozenset({"fact_extraction", "episode_generation"})
 _TERMINAL_STATUSES = frozenset({"completed", "failed"})
 _MAX_CANDIDATES = 32
 _MAX_DECISIONS = 32
+_MAX_POLICY_FIELDS = 16
 _PROCESS_CLAIM_OWNER = secrets.token_hex(16)
 
 
@@ -83,6 +84,7 @@ class MemoryExtractionReceiptCompletion:
     skipped_count: int
     memory_scopes: tuple[tuple[str, str | None], ...]
     duration_ms: int
+    policy_outcome: tuple[tuple[str, str | int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +176,8 @@ def _completion_payload(completion: MemoryExtractionReceiptCompletion) -> dict[s
         raise MemoryExtractionReceiptValidationError("Too many extraction candidates")
     if len(completion.proposed_intents) > _MAX_DECISIONS or len(completion.storage_decisions) > _MAX_DECISIONS:
         raise MemoryExtractionReceiptValidationError("Too many extraction decisions")
+    if len(completion.policy_outcome) > _MAX_POLICY_FIELDS:
+        raise MemoryExtractionReceiptValidationError("Too many extraction policy fields")
     for value in (
         completion.raw_count,
         completion.accepted_count,
@@ -223,6 +227,27 @@ def _completion_payload(completion: MemoryExtractionReceiptCompletion) -> dict[s
         }
         for scope, project_id in completion.memory_scopes
     )
+    policy: dict[str, str | int] = {}
+    for key, value in completion.policy_outcome:
+        bounded_key = _bounded(key, field="policy field", maximum=64)
+        if bounded_key in policy:
+            raise MemoryExtractionReceiptValidationError("Duplicate extraction policy field")
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise MemoryExtractionReceiptValidationError("Invalid extraction policy value")
+        if isinstance(value, int):
+            if value < 0:
+                raise MemoryExtractionReceiptValidationError("Invalid extraction policy count")
+            policy[bounded_key] = value
+        else:
+            policy[bounded_key] = _bounded(value, field="policy value", maximum=64)
+    validation: dict[str, object] = {
+        "outcome": _bounded(completion.validation_outcome, field="validation outcome", maximum=64),
+        "raw_count": completion.raw_count,
+        "accepted_count": completion.accepted_count,
+        "rejected_count": completion.raw_count - completion.accepted_count,
+    }
+    if policy:
+        validation["policy"] = policy
     return {
         "status": completion.status,
         "decision_outcome": completion.decision_outcome,
@@ -230,12 +255,7 @@ def _completion_payload(completion: MemoryExtractionReceiptCompletion) -> dict[s
         "candidate_ids": candidates,
         "classifier_result": completion.classifier_result,
         "proposed_intents": proposed,
-        "validation_outcome": {
-            "outcome": _bounded(completion.validation_outcome, field="validation outcome", maximum=64),
-            "raw_count": completion.raw_count,
-            "accepted_count": completion.accepted_count,
-            "rejected_count": completion.raw_count - completion.accepted_count,
-        },
+        "validation_outcome": validation,
         "storage_outcome": {
             "stored_count": completion.stored_count,
             "replaced_count": completion.replaced_count,

@@ -243,7 +243,11 @@ class WorkshopPostRunEffectService:
                 await self._settle(effect.run_id)
                 return
             async with self._store.connection.execute(
-                "SELECT source.body, result.body FROM messages source, messages result "
+                "SELECT source.body, result.body, "
+                "coalesce(json_extract(event.metadata_json, '$.source'), '') "
+                "FROM messages source "
+                "JOIN event_log event ON event.position = source.created_event_position, "
+                "messages result "
                 "WHERE source.id = ? AND result.id = ?",
                 (effect.source_message_id, effect.result_message_id),
             ) as cursor:
@@ -266,6 +270,9 @@ class WorkshopPostRunEffectService:
                     result_message_id=effect.result_message_id,
                 ),
                 canonical_prior_pairs=prior_pairs,
+                source_kind=str(bodies[2]),
+                run_kind=run.kind.value,
+                parent_run_id=str(run.parent_run_id) if run.parent_run_id is not None else None,
             )
             await self._settle(effect.run_id)
         except asyncio.CancelledError:

@@ -43,6 +43,9 @@ class WorkshopProfileRuntimeState:
         workspace: str,
         canonical_provenance: CanonicalMemoryProvenance,
         canonical_prior_pairs: tuple[tuple[str, str], ...],
+        source_kind: str,
+        run_kind: str,
+        parent_run_id: str | None,
     ) -> None:
         effective_backend, effective_provider = self._runtime_pool.get_backend_provider(self._profile.profile_id)
         await ingest_conversation_memory(
@@ -61,6 +64,9 @@ class WorkshopProfileRuntimeState:
             effective_backend=effective_backend,
             effective_provider=effective_provider,
             os_user_override=self._profile.os_user,
+            source_kind=source_kind,
+            run_kind=run_kind,
+            parent_run_id=parent_run_id,
         )
 
     async def has_memory_for_run(self, run_id: str) -> bool:

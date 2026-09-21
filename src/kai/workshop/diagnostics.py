@@ -2057,6 +2057,29 @@ def workshop_memory_extraction_receipt_status(db_path: Path) -> str:
             total, fact, episode, completed, failed, running, zero_memory = (
                 tuple(int(value or 0) for value in row) if row is not None else (0, 0, 0, 0, 0, 0, 0)
             )
+            policy_row = connection.execute(
+                "SELECT "
+                "SUM(json_extract(validation_outcome_json, '$.policy.admission') = 'admitted'), "
+                "SUM(json_extract(validation_outcome_json, '$.policy.admission') = 'suppressed'), "
+                "SUM(json_extract(validation_outcome_json, '$.policy.admission') IS NULL), "
+                "SUM(CASE WHEN json_extract(validation_outcome_json, '$.policy.admission') = 'admitted' "
+                "AND json_extract(validation_outcome_json, '$.raw_count') = 0 THEN 1 ELSE 0 END), "
+                "SUM(coalesce(json_extract(validation_outcome_json, '$.raw_count'), 0)), "
+                "SUM(coalesce(json_extract(validation_outcome_json, '$.accepted_count'), 0)), "
+                "SUM(coalesce(json_extract(validation_outcome_json, '$.policy.fragmentation_rejected'), 0)), "
+                "SUM(coalesce(json_extract(storage_outcome_json, '$.stored_count'), 0)) "
+                "FROM memory_extraction_receipts WHERE extraction_role = 'fact_extraction'"
+            ).fetchone()
+            (
+                admitted,
+                suppressed,
+                policy_unclassified,
+                empty_admitted,
+                raw_facts,
+                accepted_facts,
+                fragmented_facts,
+                stored_facts,
+            ) = tuple(int(value or 0) for value in policy_row) if policy_row is not None else (0,) * 8
             integrity_gaps = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM memory_extraction_receipts receipt "
@@ -2082,9 +2105,16 @@ def workshop_memory_extraction_receipt_status(db_path: Path) -> str:
     except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
     state = "active" if running == 0 and integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    empty_rate = empty_admitted / admitted if admitted else 0.0
+    facts_per_admitted = accepted_facts / admitted if admitted else 0.0
+    fragmentation_rate = fragmented_facts / raw_facts if raw_facts else 0.0
     return (
         f"{prefix} {state}; receipts={total} (fact={fact}, episode={episode}, "
         f"completed={completed}, failed={failed}, running={running}), zero-memory={zero_memory}; "
+        f"policy=(admitted={admitted}, suppressed={suppressed}, unclassified={policy_unclassified}, batch<=1), "
+        f"facts=(raw={raw_facts}, accepted={accepted_facts}, stored={stored_facts}), "
+        f"empty-pass rate={empty_rate:.3f}, memories/admitted={facts_per_admitted:.3f}, "
+        f"fragmentation rate={fragmentation_rate:.3f}; "
         f"integrity gaps={integrity_gaps}, replay gaps={replay_gaps}; "
         "authority=canonical/privacy-bounded, legacy provenance=read-time classified"
     )
