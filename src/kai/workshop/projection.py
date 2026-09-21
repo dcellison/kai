@@ -2103,6 +2103,13 @@ class CanonicalConversationProjection:
 
     async def prepare_rebuild(self, connection: aiosqlite.Connection) -> None:
         """Preserve durable coordination rows that reference this projection."""
+        # Durable coordination records such as terminal memory-extraction
+        # receipts intentionally retain RESTRICT references to canonical
+        # projection rows. A rebuild replaces those rows inside this same
+        # transaction, so defer their foreign-key checks until replay has
+        # restored the complete canonical graph. The commit still fails closed
+        # if any referenced row is absent after replay.
+        await connection.execute("PRAGMA defer_foreign_keys = ON")
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
             existing_tables = {str(row[0]) for row in await cursor.fetchall()}
         if "agent_provisioning_operations" not in existing_tables:
