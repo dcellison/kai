@@ -18,7 +18,7 @@ import os
 import random
 import sqlite3
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -26,7 +26,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from kai.memory import MemoryResult
 
-CORPUS_VERSION = 1
+CORPUS_VERSION = 2
+SUPPORTED_CORPUS_VERSIONS = frozenset({1, CORPUS_VERSION})
 REVIEW_VERSION = 1
 
 QUALITY_LABELS = frozenset(
@@ -91,6 +92,7 @@ class ProductionReceipt:
     validation_outcome: dict[str, object]
     storage_outcome: dict[str, object]
     memory_scopes: tuple[dict[str, object], ...]
+    candidate_ids: tuple[str, ...]
     created_at: str
     completed_at: str | None
     channel_id: str
@@ -100,6 +102,7 @@ class ProductionReceipt:
     agent_display_name: str
     source_body: str
     result_body: str
+    prior_pairs: tuple[tuple[str, str], ...] = ()
 
 
 def _now() -> str:
@@ -182,10 +185,13 @@ def load_production_receipts(
     *,
     limit: int,
     seed: int,
+    context_turns: int = 3,
 ) -> list[ProductionReceipt]:
     """Load a deterministic, role-balanced sample owned by one principal."""
     if limit < 1 or limit > 1000:
         raise MemoryQualityCorpusError("Sample limit must be between 1 and 1000")
+    if isinstance(context_turns, bool) or not isinstance(context_turns, int) or not 0 <= context_turns <= 10:
+        raise MemoryQualityCorpusError("Context turns must be between 0 and 10")
     rows = connection.execute(
         "SELECT receipt.receipt_id, receipt.principal_id, receipt.runtime_profile_id, "
         "receipt.run_id, receipt.source_message_id, receipt.result_message_id, "
@@ -193,8 +199,8 @@ def load_production_receipts(
         "receipt.prompt_version, receipt.schema_version, receipt.policy_version, "
         "receipt.status, receipt.decision_outcome, receipt.classifier_result, "
         "receipt.proposed_intents_json, receipt.validation_outcome_json, "
-        "receipt.storage_outcome_json, receipt.memory_scope_json, receipt.created_at, "
-        "receipt.completed_at, run.channel_id, channel.kind, channel.name, definition.handle, "
+        "receipt.storage_outcome_json, receipt.memory_scope_json, receipt.candidate_ids_json, "
+        "receipt.created_at, receipt.completed_at, run.channel_id, channel.kind, channel.name, definition.handle, "
         "agent_principal.display_name, source.body, result.body "
         "FROM memory_extraction_receipts receipt "
         "JOIN runtime_profile_owners owner "
@@ -230,7 +236,37 @@ def load_production_receipts(
             if receipts:
                 next_roles.append(role)
         roles = next_roles
-    return selected
+    return [
+        replace(
+            receipt,
+            prior_pairs=_load_prior_pairs(connection, receipt.run_id, limit=context_turns),
+        )
+        for receipt in selected
+    ]
+
+
+def _load_prior_pairs(
+    connection: sqlite3.Connection,
+    run_id: str,
+    *,
+    limit: int,
+) -> tuple[tuple[str, str], ...]:
+    if limit == 0:
+        return ()
+    rows = connection.execute(
+        "SELECT prior_source.body, prior_result.body FROM runs current "
+        "JOIN messages current_source ON current_source.id = current.inbound_message_id "
+        "JOIN runs prior ON prior.channel_id = current.channel_id "
+        "AND prior.agent_id = current.agent_id "
+        "AND prior.requested_by_principal_id = current.requested_by_principal_id "
+        "JOIN messages prior_source ON prior_source.id = prior.inbound_message_id "
+        "JOIN messages prior_result ON prior_result.id = prior.result_message_id "
+        "WHERE current.id = ? AND prior.status = 'completed' "
+        "AND prior_source.created_event_position < current_source.created_event_position "
+        "ORDER BY prior_source.created_event_position DESC, prior.id DESC LIMIT ?",
+        (run_id, limit),
+    ).fetchall()
+    return tuple((str(row[0]), str(row[1])) for row in reversed(rows))
 
 
 def _receipt_from_row(row: Iterable[object]) -> ProductionReceipt:
@@ -256,15 +292,16 @@ def _receipt_from_row(row: Iterable[object]) -> ProductionReceipt:
         validation_outcome=dict(json.loads(str(values[17]))),
         storage_outcome=dict(json.loads(str(values[18]))),
         memory_scopes=tuple(json.loads(str(values[19]))),
-        created_at=str(values[20]),
-        completed_at=str(values[21]) if values[21] is not None else None,
-        channel_id=str(values[22]),
-        channel_kind=str(values[23]),
-        channel_name=str(values[24]) if values[24] is not None else None,
-        agent_handle=str(values[25]) if values[25] is not None else None,
-        agent_display_name=str(values[26]),
-        source_body=str(values[27]),
-        result_body=str(values[28]),
+        candidate_ids=tuple(str(value) for value in json.loads(str(values[20]))),
+        created_at=str(values[21]),
+        completed_at=str(values[22]) if values[22] is not None else None,
+        channel_id=str(values[23]),
+        channel_kind=str(values[24]),
+        channel_name=str(values[25]) if values[25] is not None else None,
+        agent_handle=str(values[26]) if values[26] is not None else None,
+        agent_display_name=str(values[27]),
+        source_body=str(values[28]),
+        result_body=str(values[29]),
     )
 
 
@@ -310,6 +347,10 @@ def build_snapshot(
                 "agent_display_name": receipt.agent_display_name,
                 "user": receipt.source_body,
                 "assistant": receipt.result_body,
+                "prior_pairs": [
+                    {"user": user_text, "assistant": assistant_text}
+                    for user_text, assistant_text in receipt.prior_pairs
+                ],
             },
             "pipeline": {
                 "backend": receipt.backend,
@@ -324,6 +365,13 @@ def build_snapshot(
                 "proposed_intents": list(receipt.proposed_intents),
                 "validation_outcome": receipt.validation_outcome,
                 "memory_scopes": list(receipt.memory_scopes),
+                "candidate_context": [
+                    _encode_memory(
+                        memory_lookup(principal_id, receipt.runtime_profile_id, memory_id),
+                        memory_id,
+                    )
+                    for memory_id in receipt.candidate_ids
+                ],
                 "storage_decisions": encoded_decisions,
             },
         }
@@ -359,7 +407,10 @@ def _encode_memory(row: MemoryResult | None, memory_id: str) -> dict[str, object
 
 
 def validate_snapshot(document: dict[str, object]) -> None:
-    if document.get("artifact") != "kai_memory_quality_snapshot" or document.get("version") != CORPUS_VERSION:
+    if (
+        document.get("artifact") != "kai_memory_quality_snapshot"
+        or document.get("version") not in SUPPORTED_CORPUS_VERSIONS
+    ):
         raise MemoryQualityCorpusError("Unsupported memory-quality snapshot")
     expected = document.get("snapshot_sha256")
     if not isinstance(expected, str) or expected != _document_digest(document, "snapshot_sha256"):
