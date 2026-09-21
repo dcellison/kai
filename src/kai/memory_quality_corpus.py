@@ -50,6 +50,8 @@ QUALITY_LABELS = frozenset(
 SCENARIO_TAGS = frozenset(
     {
         "changed_value",
+        "refinement",
+        "repeat",
         "negation",
         "preference_reversal",
         "renamed_resource",
