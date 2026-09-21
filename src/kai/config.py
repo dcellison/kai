@@ -396,7 +396,7 @@ class ModelRole(StrEnum):
     # Memory extraction roles. Resolved per-user at extraction time:
     # `get_model_for(MEMORY_EXTRACTION, effective_backend)` picks the
     # registry row matching the user's effective agent_backend. Codex
-    # users get the codex registry value (gpt-5.4-mini); claude users
+    # users get the codex registry value (gpt-5.6-luna); claude users
     # get the claude registry value. MEMORY_EPISODE is a distinct row
     # so operators can adjust one stage without touching the other; both
     # are runtime-only (no env-var override surface, no Config field).
@@ -426,7 +426,7 @@ _TIER_BY_ROLE: dict[ModelRole, str] = {
 # because the same underlying model is named differently across
 # backends:
 #  - claude CLI takes anthropic aliases ("sonnet", "haiku")
-#  - codex CLI takes its own model identifiers ("gpt-5.4-mini")
+#  - codex CLI takes its own model identifiers ("gpt-5.6-luna")
 #  - opencode takes full "provider/model" strings, structurally
 #    validated by is_opencode_model_shape
 #  - goose takes the provider's native model name verbatim
@@ -445,10 +445,12 @@ _BACKEND_PROVIDER_TIER_MODELS: dict[tuple[str, str], dict[str, str]] = {
     # reproducible across CLI version bumps.
     ("claude", "anthropic"): {"agent": "sonnet", "balanced": "sonnet", "cheap": "claude-haiku-4-5-20251001"},
     # Codex CLI accepts the OpenAI model surface. gpt-5.5 is the
-    # current frontier reasoning model; gpt-5.4-mini stays as the
-    # cheap tier for high-volume roles (memory extraction, episode
-    # generation, behavioral judge).
-    ("codex", "openai"): {"agent": CODEX_DEFAULT_MODEL, "balanced": "gpt-5.5", "cheap": "gpt-5.4-mini"},
+    # balanced reasoning model; gpt-5.6-luna is the currently
+    # advertised low-cost model for high-volume roles (memory
+    # extraction, episode generation, behavioral judge). The prior
+    # gpt-5.4-mini choice is retained in CODEX_MODELS for persisted
+    # operator selections but is no longer an executable role default.
+    ("codex", "openai"): {"agent": CODEX_DEFAULT_MODEL, "balanced": "gpt-5.5", "cheap": "gpt-5.6-luna"},
     # OpenCode/Anthropic surface uses the `anthropic/<model>`
     # provider-prefixed shape; the model halves match the current
     # Claude SKUs (Sonnet 4.6 and Haiku 4.5 as of 2026-06-09).

@@ -295,8 +295,8 @@ class TestMakeBackendConfig:
 
         config = g.make_backend_config(_BASE_CONFIG, "codex")
         assert config.default_backend == "codex"
-        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.4-mini"
-        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.4-mini"
+        assert get_model_for(ModelRole.MEMORY_EXTRACTION, "codex", "openai") == "gpt-5.6-luna"
+        assert get_model_for(ModelRole.MEMORY_EPISODE, "codex", "openai") == "gpt-5.6-luna"
 
     def test_stamps_eval_provider_for_extraction(self):
         """The eval provider is stamped into `default_provider` so the
