@@ -926,7 +926,7 @@ class TestAtomicTerminalTransactions:
         profile_state.has_memory_for_run.assert_awaited_once_with(str(run.run_id))
         profile_state.ingest_memory.assert_awaited_once()
 
-    async def test_projection_rebuild_preserves_terminal_memory_extraction_receipt(self, tmp_path: Path):
+    async def test_projection_version_upgrade_preserves_terminal_memory_extraction_receipt(self, tmp_path: Path):
         store, authority, claim = await _started_run(tmp_path / "kai.db")
         run = await WorkshopRunLifecycle(store).state(claim.run_id)
         try:
@@ -994,7 +994,13 @@ class TestAtomicTerminalTransactions:
                 before = await cursor.fetchone()
             assert before is not None
 
-            checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
+            await store.connection.execute(
+                "UPDATE projection_checkpoints SET version = ? WHERE name = ?",
+                (CanonicalConversationProjection.version - 1, CanonicalConversationProjection.name),
+            )
+            await store.connection.commit()
+
+            checkpoint = await store.project_pending(CanonicalConversationProjection())
 
             async with store.connection.execute(
                 "SELECT * FROM memory_extraction_receipts WHERE receipt_id = ?",
