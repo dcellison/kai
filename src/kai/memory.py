@@ -2040,20 +2040,35 @@ def search(
         user_id,
         runtime_profile_id=runtime_profile_id,
     )
+    current_truth_enabled = namespace is not None and bool(getattr(_config, "protected_install", False))
+    provider_limit = max(effective_limit, 1000) if current_truth_enabled else effective_limit
 
     try:
         result = _memory.search(
             query,
             filters={"user_id": storage_user_id},
-            top_k=effective_limit,
+            top_k=provider_limit,
         )
         # Mem0 v2.0.0 wraps results in {"results": [...]}
         raw_results = result.get("results", []) if isinstance(result, dict) else result
-        return [
+        rows = [
             wrapped
             for raw in raw_results
             if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
         ]
+        if current_truth_enabled:
+            from kai.workshop.memory_current_truth import project_current_truth
+
+            assert namespace is not None
+            rows = list(
+                project_current_truth(
+                    rows,
+                    db_path=Path(_config.session_db_path),
+                    principal_id=str(namespace.principal_id),
+                    runtime_profile_id=str(namespace.runtime_profile_id),
+                ).rows
+            )
+        return rows[:effective_limit]
     except Exception:
         log.warning("Memory search failed", exc_info=True)
         return []
@@ -2121,6 +2136,17 @@ def _format_memory_result_line(
         "created_at": created_at,
         "content": content,
     }
+    if source == "episode":
+        # Episodes are evidence about what happened, never assertions about
+        # what remains true now. Keep that distinction inside each record so
+        # it survives section reordering and adapter-specific presentation.
+        record["temporal_role"] = "historical_episode"
+        record["current_truth"] = False
+    else:
+        temporal_role = metadata.get("canonical_memory_temporal_role")
+        if temporal_role == "current_fact":
+            record["temporal_role"] = temporal_role
+            record["current_truth"] = True
     if outcome_quality is not None:
         record["outcome_quality"] = outcome_quality
     return encode_untrusted_json_record(record)
@@ -3409,14 +3435,29 @@ def get_all(
         user_id,
         runtime_profile_id=runtime_profile_id,
     )
+    current_truth_enabled = namespace is not None and bool(getattr(_config, "protected_install", False))
+    provider_limit = 100_000 if current_truth_enabled else effective_top_k
     try:
-        result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=effective_top_k)
+        result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=provider_limit)
         raw_results = result.get("results", []) if isinstance(result, dict) else result
-        return [
+        rows = [
             wrapped
             for raw in raw_results
             if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
         ]
+        if current_truth_enabled:
+            from kai.workshop.memory_current_truth import project_current_truth
+
+            assert namespace is not None
+            rows = list(
+                project_current_truth(
+                    rows,
+                    db_path=Path(_config.session_db_path),
+                    principal_id=str(namespace.principal_id),
+                    runtime_profile_id=str(namespace.runtime_profile_id),
+                ).rows
+            )
+        return rows if limit is None else rows[:limit]
     except Exception:
         log.warning("Memory get_all failed", exc_info=True)
         return []
@@ -3432,6 +3473,30 @@ def get_all_for_admin(*, user_id: str) -> list[MemoryResult]:
     if _memory is None:
         raise RuntimeError("Semantic memory is not initialized")
     storage_user_id, namespace = _canonical_memory_owner(user_id)
+    result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=100_000)
+    raw_results = result.get("results", []) if isinstance(result, dict) else result
+    return [
+        wrapped for raw in raw_results if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
+    ]
+
+
+def get_all_for_lifecycle_projection(
+    *,
+    user_id: str,
+    runtime_profile_id: str,
+) -> list[MemoryResult]:
+    """Return exact owner rows for the trusted canonical projection worker.
+
+    This explicit bypass is deliberately separate from ordinary retrieval:
+    the worker must find and repair stale vectors that the current-truth gate
+    correctly withholds from users and models.
+    """
+    if _memory is None:
+        return []
+    storage_user_id, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
     result = _memory.get_all(filters={"user_id": storage_user_id}, top_k=100_000)
     raw_results = result.get("results", []) if isinstance(result, dict) else result
     return [
@@ -3875,7 +3940,71 @@ def get_by_id(
         return None
 
     result = _wrap_result(row)
+    if not _memory_result_belongs_to_principal(result, namespace):
+        return None
+    if namespace is not None and bool(getattr(_config, "protected_install", False)):
+        from kai.workshop.memory_current_truth import project_current_truth
+
+        projected = project_current_truth(
+            (result,),
+            db_path=Path(_config.session_db_path),
+            principal_id=str(namespace.principal_id),
+            runtime_profile_id=str(namespace.runtime_profile_id),
+        ).rows
+        return projected[0] if projected else None
+    return result
+
+
+def get_by_id_for_lifecycle_projection(
+    *,
+    user_id: str,
+    memory_id: str,
+    runtime_profile_id: str,
+) -> MemoryResult | None:
+    """Read one exact vector for the trusted lifecycle projection worker."""
+    if _memory is None:
+        return None
+    try:
+        row = _memory.get(memory_id=memory_id)
+    except Exception:
+        log.warning("Lifecycle projection get failed for %s", memory_id, exc_info=True)
+        return None
+    if row is None:
+        return None
+    storage_user_id, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
+    if row.get("user_id") != storage_user_id:
+        return None
+    result = _wrap_result(row)
     return result if _memory_result_belongs_to_principal(result, namespace) else None
+
+
+def delete_by_id_for_lifecycle_projection(
+    *,
+    user_id: str,
+    memory_id: str,
+    runtime_profile_id: str,
+) -> bool:
+    """Delete one owner-verified vector on behalf of canonical lifecycle."""
+    if (
+        get_by_id_for_lifecycle_projection(
+            user_id=user_id,
+            memory_id=memory_id,
+            runtime_profile_id=runtime_profile_id,
+        )
+        is None
+    ):
+        return True
+    if _memory is None:
+        return False
+    try:
+        _memory.delete(memory_id=memory_id)
+    except Exception:
+        log.warning("Lifecycle projection delete failed for %s", memory_id, exc_info=True)
+        return False
+    return True
 
 
 def delete_by_id(

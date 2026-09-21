@@ -22,12 +22,14 @@ from kai.workshop.domain import (
     WorkshopEventType,
     WorkshopId,
 )
+from kai.workshop.memory_current_truth import (
+    CANONICAL_CLAIM_ID_KEY,
+    CANONICAL_LIFECYCLE_STATE_KEY,
+    CANONICAL_REVISION_ID_KEY,
+)
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 
-CANONICAL_CLAIM_ID_KEY = "canonical_memory_claim_id"
-CANONICAL_REVISION_ID_KEY = "canonical_memory_revision_id"
-CANONICAL_LIFECYCLE_STATE_KEY = "canonical_memory_lifecycle_state"
 _ADOPT_MEMORY_ID_KEY = "_canonical_adopt_memory_id"
 
 AUTOMATIC_SUPERSESSION_CONFIDENCE = 0.9
@@ -133,7 +135,7 @@ class Mem0FactVectorAdapter:
 
     async def get(self, authority: FactLifecycleAuthority, memory_id: str) -> memory.MemoryResult | None:
         return await asyncio.to_thread(
-            memory.get_by_id,
+            memory.get_by_id_for_lifecycle_projection,
             user_id=str(authority.principal_id),
             memory_id=memory_id,
             runtime_profile_id=str(authority.runtime_profile_id),
@@ -145,9 +147,8 @@ class Mem0FactVectorAdapter:
         revision_id: MemoryRevisionId,
     ) -> memory.MemoryResult | None:
         rows = await asyncio.to_thread(
-            memory.get_all,
+            memory.get_all_for_lifecycle_projection,
             user_id=str(authority.principal_id),
-            limit=None,
             runtime_profile_id=str(authority.runtime_profile_id),
         )
         return next(
@@ -201,7 +202,7 @@ class Mem0FactVectorAdapter:
         if current is None:
             return True
         return await asyncio.to_thread(
-            memory.delete_by_id,
+            memory.delete_by_id_for_lifecycle_projection,
             user_id=str(authority.principal_id),
             memory_id=memory_id,
             runtime_profile_id=str(authority.runtime_profile_id),

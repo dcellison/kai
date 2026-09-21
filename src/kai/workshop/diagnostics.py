@@ -2031,6 +2031,104 @@ def workshop_memory_authority_status(db_path: Path, *, memory_enabled: bool | No
     )
 
 
+def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool | None) -> str:
+    """Describe current-truth admission without reading semantic content."""
+    prefix = "Workshop memory current truth:"
+    if memory_enabled is False:
+        return f"{prefix} disabled by policy"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical lifecycle schema unavailable"
+    required = {
+        "memory_fact_claims",
+        "memory_fact_revisions",
+        "memory_fact_revision_states",
+        "memory_fact_vector_operations",
+        "workshop_memory_authority_migrations",
+    }
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not required.issubset(tables):
+                return f"{prefix} pending; canonical lifecycle schema unavailable"
+            claims = _scalar(connection, "SELECT COUNT(*) FROM memory_fact_claims")
+            revisions = _scalar(connection, "SELECT COUNT(*) FROM memory_fact_revisions")
+            active = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_fact_revisions r "
+                "JOIN memory_fact_revision_states s ON s.revision_id = r.revision_id "
+                "WHERE s.state = 'active' "
+                "AND r.migration_classification IN ('canonical', 'legacy_complete') "
+                "AND (r.valid_from IS NULL OR julianday(r.valid_from) <= julianday('now')) "
+                "AND (r.valid_until IS NULL OR julianday(r.valid_until) > julianday('now'))",
+            )
+            inactive = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_fact_revision_states WHERE state != 'active'",
+            )
+            quarantined = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_fact_revisions "
+                "WHERE migration_classification IN ('legacy_incomplete', 'legacy_quarantined')",
+            )
+            validity_excluded = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_fact_revisions r "
+                "JOIN memory_fact_revision_states s ON s.revision_id = r.revision_id "
+                "WHERE s.state = 'active' AND ("
+                "(r.valid_from IS NOT NULL AND julianday(r.valid_from) > julianday('now')) OR "
+                "(r.valid_until IS NOT NULL AND julianday(r.valid_until) <= julianday('now')))",
+            )
+            projection_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_fact_revisions r "
+                "JOIN memory_fact_revision_states s ON s.revision_id = r.revision_id "
+                "WHERE s.state = 'active' AND r.migration_classification IN ('canonical', 'legacy_complete') "
+                "AND (r.valid_from IS NULL OR julianday(r.valid_from) <= julianday('now')) "
+                "AND (r.valid_until IS NULL OR julianday(r.valid_until) > julianday('now')) "
+                "AND NOT EXISTS (SELECT 1 FROM memory_fact_vector_operations v "
+                "WHERE v.event_position = (SELECT MAX(latest.event_position) "
+                "FROM memory_fact_vector_operations latest WHERE latest.claim_id = r.claim_id) "
+                "AND v.revision_id = r.revision_id AND v.operation IN ('upsert', 'replace') "
+                "AND v.status = 'succeeded' AND v.memory_id IS NOT NULL)",
+            )
+            malformed = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_fact_revisions r WHERE NOT EXISTS ("
+                "SELECT 1 FROM memory_fact_revision_states s WHERE s.revision_id = r.revision_id "
+                "AND s.claim_id = r.claim_id)",
+            )
+            baseline = _scalar(
+                connection,
+                "SELECT COALESCE(SUM(total_count), 0) FROM workshop_memory_authority_migrations",
+            )
+            adopted = _scalar(
+                connection,
+                "SELECT COUNT(DISTINCT json_extract(vector_metadata_json, '$._canonical_adopt_memory_id')) "
+                "FROM memory_fact_revisions "
+                "WHERE json_extract(vector_metadata_json, '$._canonical_adopt_memory_id') IS NOT NULL",
+            )
+            legacy_unclassified = max(baseline - adopted, 0)
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    gaps = malformed + quarantined + projection_gaps + legacy_unclassified
+    state = "active" if memory_enabled is True and gaps == 0 else "INCOMPLETE"
+    if memory_enabled is None:
+        state = "NOT VERIFIED"
+    return (
+        f"{prefix} {state}; claims={claims}, revisions={revisions}, current={active}, "
+        f"inactive={inactive}, validity excluded={validity_excluded}, quarantined={quarantined}, "
+        f"legacy unclassified={legacy_unclassified}, projection gaps={projection_gaps}, "
+        f"integrity gaps={malformed}; authority=canonical/current-only"
+    )
+
+
 def workshop_memory_extraction_receipt_status(db_path: Path) -> str:
     """Report durable extraction provenance without reading memory content."""
     prefix = "Workshop memory extraction receipts:"
