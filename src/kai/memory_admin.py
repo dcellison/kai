@@ -499,7 +499,7 @@ async def _run_and_close_sessions(coro):
         await sessions.close_db()
 
 
-def _initialize_memory() -> Config | None:
+def _initialize_memory(config: Config | None = None) -> Config | None:
     """Load config and call `init_memory()`; return the Config on success.
 
     The admin CLI reuses the same init path as the bot so the same
@@ -519,7 +519,8 @@ def _initialize_memory() -> Config | None:
         from kai.config import load_config
         from kai.memory import init_offline_memory, is_enabled
 
-        config = load_config()
+        if config is None:
+            config = load_config()
         init_offline_memory(config)
         if not is_enabled():
             # is_enabled returns False when MEMORY_ENABLED=false or when
@@ -1086,9 +1087,9 @@ def _cmd_quality_corpus(args: argparse.Namespace) -> int:
 
     try:
         if args.quality_command == "sample":
-            config = _initialize_memory()
-            if config is None:
-                return 1
+            from kai.config import load_config
+
+            config = load_config()
             db_path = Path(config.session_db_path)
             if db_path.is_symlink() or not db_path.is_file():
                 raise quality.MemoryQualityCorpusError("Canonical Workshop database is unavailable")
@@ -1104,34 +1105,43 @@ def _cmd_quality_corpus(args: argparse.Namespace) -> int:
             finally:
                 connection.close()
             if not receipts:
-                raise quality.MemoryQualityCorpusError("No terminal production extraction receipts were found")
+                raise quality.MemoryQualityCorpusError(
+                    "No post-cutover terminal production extraction receipts were found; "
+                    "complete an agent run and wait for memory extraction before sampling"
+                )
 
             from kai import memory
 
-            def lookup(owner: str, runtime_profile_id: str, memory_id: str):
-                return memory.get_by_id(
-                    user_id=owner,
-                    runtime_profile_id=runtime_profile_id,
-                    memory_id=memory_id,
-                )
+            try:
+                if _initialize_memory(config) is None:
+                    return 1
 
-            snapshot = quality.build_snapshot(
-                principal_id=principal_id,
-                receipts=receipts,
-                memory_lookup=lookup,
-                seed=args.seed,
-            )
-            out_dir = (
-                Path(args.out_dir)
-                if args.out_dir
-                else _default_human_report_directory(config, principal_id, "memory-quality")
-            )
-            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            out_path = out_dir / f"snapshot-{stamp}-{str(snapshot['snapshot_sha256'])[:12]}.json"
-            quality.write_snapshot(out_path, snapshot)
-            print(f"memory quality: wrote {len(receipts)} private case(s) to {out_path}")
-            print(f"memory quality: snapshot sha256 {snapshot['snapshot_sha256']}")
-            return 0
+                def lookup(owner: str, runtime_profile_id: str, memory_id: str):
+                    return memory.get_by_id(
+                        user_id=owner,
+                        runtime_profile_id=runtime_profile_id,
+                        memory_id=memory_id,
+                    )
+
+                snapshot = quality.build_snapshot(
+                    principal_id=principal_id,
+                    receipts=receipts,
+                    memory_lookup=lookup,
+                    seed=args.seed,
+                )
+                out_dir = (
+                    Path(args.out_dir)
+                    if args.out_dir
+                    else _default_human_report_directory(config, principal_id, "memory-quality")
+                )
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                out_path = out_dir / f"snapshot-{stamp}-{str(snapshot['snapshot_sha256'])[:12]}.json"
+                quality.write_snapshot(out_path, snapshot)
+                print(f"memory quality: wrote {len(receipts)} private case(s) to {out_path}")
+                print(f"memory quality: snapshot sha256 {snapshot['snapshot_sha256']}")
+                return 0
+            finally:
+                memory.close_memory()
 
         snapshot_path = Path(args.snapshot)
         snapshot = quality.load_snapshot(snapshot_path)

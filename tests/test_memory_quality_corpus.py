@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -343,3 +344,50 @@ def test_quality_corpus_parser_exposes_all_four_stages():
         == "seal-review"
     )
     assert parser.parse_args(["quality-corpus", "score", "snapshot.json", "sealed.json"]).quality_command == "score"
+
+
+def test_empty_receipt_ledger_fails_before_memory_initialization(tmp_path, monkeypatch, capsys):
+    connection = _create_receipt_database(tmp_path / "kai.db")
+    connection.execute("DELETE FROM memory_extraction_receipts")
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr("kai.config.load_config", lambda: SimpleNamespace(session_db_path=str(tmp_path / "kai.db")))
+
+    def unexpected_initialization(_config=None):
+        pytest.fail("empty-ledger sampling must not initialize semantic memory")
+
+    monkeypatch.setattr(memory_admin, "_initialize_memory", unexpected_initialization)
+    args = memory_admin._build_parser().parse_args(
+        ["quality-corpus", "sample", "prn_owner", "--out-dir", str(tmp_path / "output")]
+    )
+
+    assert memory_admin._cmd_quality_corpus(args) == 1
+    assert "No post-cutover terminal production extraction receipts" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_sample_closes_offline_memory_on_success_and_failure(tmp_path, monkeypatch, snapshot_fails):
+    connection = _create_receipt_database(tmp_path / "kai.db")
+    connection.close()
+    config = SimpleNamespace(session_db_path=str(tmp_path / "kai.db"))
+    monkeypatch.setattr("kai.config.load_config", lambda: config)
+    monkeypatch.setattr(memory_admin, "_initialize_memory", lambda loaded: loaded)
+
+    close_calls = []
+    monkeypatch.setattr("kai.memory.close_memory", lambda: close_calls.append(True))
+    monkeypatch.setattr(
+        "kai.memory.get_by_id",
+        lambda *, user_id, runtime_profile_id, memory_id: _memory(user_id, runtime_profile_id, memory_id),
+    )
+    if snapshot_fails:
+        monkeypatch.setattr(
+            "kai.memory_quality_corpus.build_snapshot",
+            lambda **_kwargs: (_ for _ in ()).throw(MemoryQualityCorpusError("snapshot failed")),
+        )
+    args = memory_admin._build_parser().parse_args(
+        ["quality-corpus", "sample", "prn_owner", "--out-dir", str(tmp_path / "output")]
+    )
+
+    expected = 1 if snapshot_fails else 0
+    assert memory_admin._cmd_quality_corpus(args) == expected
+    assert close_calls == [True]
