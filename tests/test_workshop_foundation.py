@@ -165,6 +165,14 @@ class TestEventEnvelope:
             "collaboration_operation.decided",
             "collaboration_reaction.recorded",
             "collaboration_publication.recorded",
+            "memory_fact.recorded",
+            "memory_fact.superseded",
+            "memory_fact.retracted",
+            "memory_fact.expired",
+            "memory_fact.conflict_opened",
+            "memory_fact.conflict_resolved",
+            "memory_episode.recorded",
+            "memory_episode.followup_recorded",
         }
 
     def test_create_builds_a_versioned_transport_independent_envelope(self):
@@ -602,6 +610,7 @@ class TestWorkshopSchema:
                     85,
                     86,
                     87,
+                    88,
                 ]
         finally:
             await upgraded.close()
