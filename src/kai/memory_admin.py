@@ -359,6 +359,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Dominance ratio the winner must clear over the runner-up. Default: 2.0.",
     )
+
     bp.add_argument(
         "--overlap-shingle-n",
         dest="overlap_shingle_n",
@@ -417,6 +418,57 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Confirm a mutating mode. Without it, --apply/--rollback print the planned change count and exit with status 2.",
     )
+
+    quality = sub.add_parser(
+        "quality-corpus",
+        help="Build, review, seal, and score a private production memory-quality corpus",
+        description=(
+            "Create hash-sealed, principal-authorized memory-quality artifacts outside "
+            "the source tree. Snapshot files contain private conversation and memory "
+            "content and are written with owner-only permissions."
+        ),
+    )
+    quality_sub = quality.add_subparsers(dest="quality_command", required=True)
+
+    quality_sample = quality_sub.add_parser(
+        "sample",
+        help="Sample production extraction receipts into an immutable private snapshot",
+    )
+    quality_sample.add_argument(
+        "principal",
+        help="Canonical human principal ID or an unambiguous external identity subject",
+    )
+    quality_sample.add_argument("--limit", type=int, default=100, help="Maximum cases (default: 100; max: 1000)")
+    quality_sample.add_argument("--seed", type=int, default=1706, help="Deterministic sampling seed (default: 1706)")
+    quality_sample.add_argument(
+        "--out-dir",
+        default=None,
+        help="Private artifact directory. Default: <DATA_DIR>/home/<principal>/docs/memory-quality/.",
+    )
+
+    quality_template = quality_sub.add_parser(
+        "review-template",
+        help="Create an editable review template bound to one immutable snapshot",
+    )
+    quality_template.add_argument("snapshot", help="Immutable snapshot JSON path")
+    quality_template.add_argument("--out", default=None, help="Review-template JSON path")
+
+    quality_seal = quality_sub.add_parser(
+        "seal-review",
+        help="Validate a completed review and seal its decisions immutably",
+    )
+    quality_seal.add_argument("snapshot", help="Immutable snapshot JSON path")
+    quality_seal.add_argument("review", help="Completed review-template JSON path")
+    quality_seal.add_argument("--reviewer", required=True, help="Human reviewer name or stable identifier")
+    quality_seal.add_argument("--out", default=None, help="Sealed-review JSON path")
+
+    quality_score = quality_sub.add_parser(
+        "score",
+        help="Score a sealed review and emit private JSON and Markdown baselines",
+    )
+    quality_score.add_argument("snapshot", help="Immutable snapshot JSON path")
+    quality_score.add_argument("review", help="Sealed-review JSON path")
+    quality_score.add_argument("--out", default=None, help="Score JSON path; a Markdown peer is also written")
     return parser
 
 
@@ -1026,6 +1078,95 @@ def _cmd_backfill_provenance(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_quality_corpus(args: argparse.Namespace) -> int:
+    """Dispatch private memory-quality corpus operations."""
+    from datetime import UTC, datetime
+
+    from kai import memory_quality_corpus as quality
+
+    try:
+        if args.quality_command == "sample":
+            config = _initialize_memory()
+            if config is None:
+                return 1
+            db_path = Path(config.session_db_path)
+            if db_path.is_symlink() or not db_path.is_file():
+                raise quality.MemoryQualityCorpusError("Canonical Workshop database is unavailable")
+            connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                principal_id = quality.resolve_human_principal(connection, args.principal)
+                receipts = quality.load_production_receipts(
+                    connection,
+                    principal_id,
+                    limit=args.limit,
+                    seed=args.seed,
+                )
+            finally:
+                connection.close()
+            if not receipts:
+                raise quality.MemoryQualityCorpusError("No terminal production extraction receipts were found")
+
+            from kai import memory
+
+            def lookup(owner: str, runtime_profile_id: str, memory_id: str):
+                return memory.get_by_id(
+                    user_id=owner,
+                    runtime_profile_id=runtime_profile_id,
+                    memory_id=memory_id,
+                )
+
+            snapshot = quality.build_snapshot(
+                principal_id=principal_id,
+                receipts=receipts,
+                memory_lookup=lookup,
+                seed=args.seed,
+            )
+            out_dir = (
+                Path(args.out_dir)
+                if args.out_dir
+                else _default_human_report_directory(config, principal_id, "memory-quality")
+            )
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            out_path = out_dir / f"snapshot-{stamp}-{str(snapshot['snapshot_sha256'])[:12]}.json"
+            quality.write_snapshot(out_path, snapshot)
+            print(f"memory quality: wrote {len(receipts)} private case(s) to {out_path}")
+            print(f"memory quality: snapshot sha256 {snapshot['snapshot_sha256']}")
+            return 0
+
+        snapshot_path = Path(args.snapshot)
+        snapshot = quality.load_snapshot(snapshot_path)
+        if args.quality_command == "review-template":
+            review = quality.build_review_template(snapshot)
+            out_path = Path(args.out) if args.out else snapshot_path.with_name(f"{snapshot_path.stem}-review.json")
+            quality.write_review_template(out_path, review)
+            print(f"memory quality: wrote editable review template to {out_path}")
+            return 0
+        if args.quality_command == "seal-review":
+            review = quality.load_review(Path(args.review))
+            sealed = quality.seal_review(snapshot, review, reviewer=args.reviewer)
+            out_path = (
+                Path(args.out) if args.out else Path(args.review).with_name(f"{Path(args.review).stem}-sealed.json")
+            )
+            quality.write_sealed_review(out_path, sealed, snapshot)
+            print(f"memory quality: wrote immutable sealed review to {out_path}")
+            print(f"memory quality: review sha256 {sealed['review_sha256']}")
+            return 0
+        if args.quality_command == "score":
+            review = quality.load_review(Path(args.review))
+            report = quality.score_review(snapshot, review)
+            out_path = (
+                Path(args.out) if args.out else Path(args.review).with_name(f"{Path(args.review).stem}-score.json")
+            )
+            quality.write_score(out_path, report)
+            print(quality.render_markdown_report(report), end="")
+            print(f"memory quality: wrote score artifacts to {out_path} and {out_path.with_suffix('.md')}")
+            return 0
+    except (quality.MemoryQualityCorpusError, OSError, sqlite3.Error) as exc:
+        print(f"memory quality: {exc}", file=sys.stderr)
+        return 1
+    return 2
+
+
 def cli(argv: list[str]) -> None:
     """Dispatch entry point. Called from `__main__.py` with argv[2:].
 
@@ -1047,6 +1188,8 @@ def cli(argv: list[str]) -> None:
         sys.exit(_cmd_review_legacy_scope(args))
     if args.command == "backfill-provenance":
         sys.exit(_cmd_backfill_provenance(args))
+    if args.command == "quality-corpus":
+        sys.exit(_cmd_quality_corpus(args))
     # argparse's required=True on the subparsers guarantees a known
     # command reaches this point, so the else branch is unreachable
     # under normal invocation. Guarded anyway in case a future
