@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -186,3 +188,189 @@ def test_markdown_report_is_private_operator_facing():
     assert "read only; no memory was changed" in report
     assert "Sensitive fact" in report
     assert "Model provenance" in report
+
+
+def _reconciliation_cli_database(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE principals (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+        CREATE TABLE runtime_profile_owners (
+            runtime_profile_id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL
+        );
+        INSERT INTO principals VALUES ('prn_30000000000000000000000000000001', 'human');
+        INSERT INTO runtime_profile_owners VALUES (
+            'rtp_30000000000000000000000000000001',
+            'prn_30000000000000000000000000000001'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
+@pytest.mark.parametrize("lookup_fails", [False, True])
+def test_reconciliation_audit_closes_offline_memory_on_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lookup_fails: bool
+):
+    db_path = tmp_path / "kai.db"
+    _reconciliation_cli_database(db_path)
+    config = SimpleNamespace(session_db_path=db_path, protected_install=False)
+    monkeypatch.setattr("kai.config.load_config", lambda: config)
+    monkeypatch.setattr(memory_admin, "_initialize_memory", lambda loaded: loaded)
+    close_calls: list[bool] = []
+    monkeypatch.setattr("kai.memory.close_memory", lambda: close_calls.append(True))
+    if lookup_fails:
+        monkeypatch.setattr(
+            "kai.memory.get_all_for_lifecycle_projection",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("lookup failed")),
+        )
+    else:
+        monkeypatch.setattr("kai.memory.get_all_for_lifecycle_projection", lambda **_kwargs: [_row("mem_1", "Fact")])
+    args = memory_admin._build_parser().parse_args(
+        ["reconciliation", "audit", PRINCIPAL, RUNTIME, "--out-dir", str(tmp_path / "reports")]
+    )
+
+    assert memory_admin._cmd_reconciliation(args) == (1 if lookup_fails else 0)
+    assert close_calls == [True]
+
+
+@pytest.mark.parametrize("apply_fails", [False, True])
+def test_reconciliation_apply_closes_offline_memory_on_success_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, apply_fails: bool
+):
+    db_path = tmp_path / "kai.db"
+    sqlite3.connect(db_path).close()
+    rows = [_row("mem_1", "Same"), _row("mem_2", "Same")]
+    audit = reconciliation.build_audit(
+        principal_id=PRINCIPAL,
+        runtime_profile_id=RUNTIME,
+        rows=rows,
+        now=NOW,
+    )
+    review = reconciliation.build_review_template(audit)
+    for decision in review["decisions"]:
+        decision["disposition"] = "reject"
+    sealed = reconciliation.seal_review(audit, review, reviewer="Daniel")
+    audit_path = tmp_path / "audit.json"
+    review_path = tmp_path / "review.json"
+    reconciliation.write_audit(audit_path, audit)
+    reconciliation.write_sealed_review(review_path, sealed)
+    config = SimpleNamespace(session_db_path=db_path, protected_install=False)
+    monkeypatch.setattr("kai.config.load_config", lambda: config)
+    monkeypatch.setattr(memory_admin, "_initialize_memory", lambda loaded: loaded)
+    monkeypatch.setattr("kai.memory.get_all_for_lifecycle_projection", lambda **_kwargs: rows)
+    close_calls: list[bool] = []
+    monkeypatch.setattr("kai.memory.close_memory", lambda: close_calls.append(True))
+
+    async def fake_apply_review(**_kwargs):
+        if apply_fails:
+            raise RuntimeError("apply failed")
+        return {"kind": reconciliation.RECEIPT_KIND, "version": 1, "sha256": "receipt"}
+
+    monkeypatch.setattr(reconciliation, "apply_review", fake_apply_review)
+    args = memory_admin._build_parser().parse_args(
+        [
+            "reconciliation",
+            "apply",
+            str(audit_path),
+            str(review_path),
+            "--out-dir",
+            str(tmp_path / "receipts"),
+            "--yes",
+        ]
+    )
+
+    assert memory_admin._cmd_reconciliation(args) == (1 if apply_fails else 0)
+    assert close_calls == [True]
+
+
+def test_default_reconciliation_artifacts_keep_private_modes_and_transfer_to_runtime_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class FakeRegistry:
+        @staticmethod
+        def load(_config):
+            return FakeRegistry()
+
+        def resolve(self, runtime_profile_id):
+            assert runtime_profile_id == RUNTIME
+            return SimpleNamespace(os_user="daniel")
+
+    monkeypatch.setattr("kai.workshop.runtime_profiles.WorkshopRuntimeProfileRegistry", FakeRegistry)
+    monkeypatch.setattr(memory_admin.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(memory_admin.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=501, pw_gid=20))
+    owner = memory_admin._reconciliation_artifact_owner(SimpleNamespace(protected_install=True), RUNTIME)
+    assert owner == (501, 20)
+
+    chowns: list[tuple[Path, int, int]] = []
+    monkeypatch.setattr(
+        memory_admin.os,
+        "chown",
+        lambda path, uid, gid, **_kwargs: chowns.append((Path(path), uid, gid)),
+    )
+    report_dir = tmp_path / "reports"
+    memory_admin._prepare_reconciliation_directory(report_dir, owner)
+    report = report_dir / "audit.md"
+    report.write_text("private", encoding="utf-8")
+    os.chmod(report, 0o400)
+    memory_admin._claim_reconciliation_artifact(report, owner)
+
+    assert chowns == [(report_dir, 501, 20), (report, 501, 20)]
+    assert report_dir.stat().st_mode & 0o777 == 0o700
+    assert report.stat().st_mode & 0o777 == 0o400
+
+
+def test_explicit_reconciliation_output_keeps_caller_ownership(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    db_path = tmp_path / "kai.db"
+    _reconciliation_cli_database(db_path)
+    config = SimpleNamespace(session_db_path=db_path, protected_install=True)
+    monkeypatch.setattr("kai.config.load_config", lambda: config)
+    monkeypatch.setattr(memory_admin, "_initialize_memory", lambda loaded: loaded)
+    monkeypatch.setattr("kai.memory.get_all_for_lifecycle_projection", lambda **_kwargs: [_row("mem_1", "Fact")])
+    monkeypatch.setattr("kai.memory.close_memory", lambda: None)
+    monkeypatch.setattr(
+        memory_admin,
+        "_reconciliation_artifact_owner",
+        lambda *_args: pytest.fail("explicit output must not resolve or change principal ownership"),
+    )
+    out_dir = tmp_path / "explicit"
+    args = memory_admin._build_parser().parse_args(
+        ["reconciliation", "audit", PRINCIPAL, RUNTIME, "--out-dir", str(out_dir)]
+    )
+
+    assert memory_admin._cmd_reconciliation(args) == 0
+    artifacts = list(out_dir.iterdir())
+    assert len(artifacts) == 2
+    assert all(path.stat().st_uid == os.geteuid() for path in artifacts)
+    assert all(path.stat().st_mode & 0o777 == 0o400 for path in artifacts)
+
+
+def test_default_reconciliation_audit_claims_directory_and_artifacts_for_principal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = tmp_path / "kai.db"
+    _reconciliation_cli_database(db_path)
+    config = SimpleNamespace(session_db_path=db_path, protected_install=True)
+    monkeypatch.setattr("kai.config.load_config", lambda: config)
+    monkeypatch.setattr(memory_admin, "_initialize_memory", lambda loaded: loaded)
+    monkeypatch.setattr("kai.memory.get_all_for_lifecycle_projection", lambda **_kwargs: [_row("mem_1", "Fact")])
+    monkeypatch.setattr("kai.memory.close_memory", lambda: None)
+    out_dir = tmp_path / "canonical" / "memory-reconciliation"
+    monkeypatch.setattr(memory_admin, "_default_human_report_directory", lambda *_args: out_dir)
+    monkeypatch.setattr(memory_admin, "_reconciliation_artifact_owner", lambda *_args: (501, 20))
+    chowns: list[tuple[Path, int, int]] = []
+    monkeypatch.setattr(
+        memory_admin.os,
+        "chown",
+        lambda path, uid, gid, **_kwargs: chowns.append((Path(path), uid, gid)),
+    )
+    args = memory_admin._build_parser().parse_args(["reconciliation", "audit", PRINCIPAL, RUNTIME])
+
+    assert memory_admin._cmd_reconciliation(args) == 0
+    artifacts = sorted(out_dir.iterdir())
+    assert len(artifacts) == 2
+    assert chowns == [(out_dir, 501, 20)] + [(artifact, 501, 20) for artifact in artifacts]
+    assert out_dir.stat().st_mode & 0o777 == 0o700
+    assert all(path.stat().st_mode & 0o777 == 0o400 for path in artifacts)

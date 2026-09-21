@@ -62,6 +62,8 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import pwd
 import sqlite3
 import sys
 from pathlib import Path
@@ -105,6 +107,44 @@ def _default_human_report_directory(config: Config, user_id: str, report_name: s
         # condition --out-dir already handles.
         return DATA_DIR / "home" / user_id / "docs" / report_name
     return DATA_DIR / "home" / str(rows[0][0]) / "docs" / report_name
+
+
+def _reconciliation_artifact_owner(config: Config, runtime_profile_id: str) -> tuple[int, int] | None:
+    """Resolve the protected human owner for default reconciliation artifacts.
+
+    Protected memory administration runs as root because both the canonical
+    database and embedded vector store are private to the Kai service.  The
+    resulting reports are nevertheless principal-owned review material.  Only
+    root needs to transfer ownership; development and already-unprivileged
+    invocations preserve the caller's ownership naturally.
+    """
+    if not getattr(config, "protected_install", False) or os.geteuid() != 0:
+        return None
+    from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError, WorkshopRuntimeProfileRegistry
+
+    try:
+        profile = WorkshopRuntimeProfileRegistry.load(config).resolve(runtime_profile_id)
+    except WorkshopRuntimeProfileError as exc:
+        raise RuntimeError(f"Could not resolve reconciliation artifact owner: {exc}") from exc
+    if profile.os_user is None:
+        raise RuntimeError("Protected runtime profile has no OS user for reconciliation artifact ownership")
+    try:
+        account = pwd.getpwnam(profile.os_user)
+    except KeyError:
+        raise RuntimeError("Protected runtime profile OS user does not exist") from None
+    return account.pw_uid, account.pw_gid
+
+
+def _prepare_reconciliation_directory(path: Path, owner: tuple[int, int] | None) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+    if owner is not None:
+        os.chown(path, *owner, follow_symlinks=False)
+
+
+def _claim_reconciliation_artifact(path: Path, owner: tuple[int, int] | None) -> None:
+    if owner is not None:
+        os.chown(path, *owner, follow_symlinks=False)
 
 
 # ── Known source values ─────────────────────────────────────────────
@@ -1433,30 +1473,38 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                 raise reconciliation.MemoryReconciliationError(
                     "Runtime profile is not canonically owned by the selected principal"
                 )
+            default_output = args.out_dir is None
             out_dir = (
                 Path(args.out_dir)
-                if args.out_dir
+                if not default_output
                 else _default_human_report_directory(config, principal_id, "memory-reconciliation")
             )
-            if _initialize_memory(config) is None:
-                return 1
+            artifact_owner = _reconciliation_artifact_owner(config, args.runtime_profile) if default_output else None
+            _prepare_reconciliation_directory(out_dir, artifact_owner)
             from kai import memory
 
-            rows = memory.get_all_for_lifecycle_projection(
-                user_id=principal_id,
-                runtime_profile_id=args.runtime_profile,
-            )
-            audit = reconciliation.build_audit(
-                principal_id=principal_id,
-                runtime_profile_id=args.runtime_profile,
-                rows=rows,
-                prior_decisions=reconciliation.prior_dispositions(out_dir),
-            )
-            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
-            out_path = out_dir / f"audit-{audit['audit_id']}-{stamp}.json"
-            reconciliation.write_audit(out_path, audit)
-            markdown_path = out_path.with_suffix(".md")
-            reconciliation.write_private_text(markdown_path, reconciliation.render_audit_markdown(audit))
+            try:
+                if _initialize_memory(config) is None:
+                    return 1
+                rows = memory.get_all_for_lifecycle_projection(
+                    user_id=principal_id,
+                    runtime_profile_id=args.runtime_profile,
+                )
+                audit = reconciliation.build_audit(
+                    principal_id=principal_id,
+                    runtime_profile_id=args.runtime_profile,
+                    rows=rows,
+                    prior_decisions=reconciliation.prior_dispositions(out_dir),
+                )
+                stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+                out_path = out_dir / f"audit-{audit['audit_id']}-{stamp}.json"
+                reconciliation.write_audit(out_path, audit)
+                _claim_reconciliation_artifact(out_path, artifact_owner)
+                markdown_path = out_path.with_suffix(".md")
+                reconciliation.write_private_text(markdown_path, reconciliation.render_audit_markdown(audit))
+                _claim_reconciliation_artifact(markdown_path, artifact_owner)
+            finally:
+                memory.close_memory()
             print(
                 "memory reconciliation: read-only audit complete; "
                 f"rows={audit['corpus_count']}, candidates={audit['candidate_count']}, "
@@ -1469,10 +1517,19 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
 
         audit_path = Path(args.audit)
         audit = reconciliation.load_document(audit_path, kind=reconciliation.AUDIT_KIND)
+        default_dir = _default_human_report_directory(config, str(audit["principal_id"]), "memory-reconciliation")
         if args.reconciliation_command == "review-template":
             template = reconciliation.build_review_template(audit)
             out_path = Path(args.out) if args.out else audit_path.with_name(f"{audit_path.stem}-review.json")
+            owner = (
+                _reconciliation_artifact_owner(config, str(audit["runtime_profile_id"]))
+                if args.out is None and out_path.parent.resolve() == default_dir.resolve()
+                else None
+            )
+            if owner is not None:
+                _prepare_reconciliation_directory(out_path.parent, owner)
             reconciliation.write_review_template(out_path, template)
+            _claim_reconciliation_artifact(out_path, owner)
             print(f"memory reconciliation: editable review: {out_path}")
             return 0
         if args.reconciliation_command == "seal-review":
@@ -1485,7 +1542,15 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
             sealed = reconciliation.seal_review(audit, editable, reviewer=args.reviewer)
             review_path = Path(args.review)
             out_path = Path(args.out) if args.out else review_path.with_name(f"{review_path.stem}-sealed.json")
+            owner = (
+                _reconciliation_artifact_owner(config, str(audit["runtime_profile_id"]))
+                if args.out is None and out_path.parent.resolve() == default_dir.resolve()
+                else None
+            )
+            if owner is not None:
+                _prepare_reconciliation_directory(out_path.parent, owner)
             reconciliation.write_sealed_review(out_path, sealed)
+            _claim_reconciliation_artifact(out_path, owner)
             print(f"memory reconciliation: sealed review: {out_path}")
             return 0
         if args.reconciliation_command == "apply":
@@ -1498,11 +1563,10 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                 )
                 print("memory reconciliation: re-run with --yes to execute")
                 return 2
-            out_dir = (
-                Path(args.out_dir)
-                if args.out_dir
-                else _default_human_report_directory(config, str(audit["principal_id"]), "memory-reconciliation")
-            )
+            default_output = args.out_dir is None
+            out_dir = Path(args.out_dir) if not default_output else default_dir
+            owner = _reconciliation_artifact_owner(config, str(audit["runtime_profile_id"])) if default_output else None
+            _prepare_reconciliation_directory(out_dir, owner)
             receipt_path = out_dir / f"receipt-mrr_{str(review['sha256'])[:32]}.json"
             if receipt_path.exists():
                 prior = reconciliation.load_document(receipt_path, kind=reconciliation.RECEIPT_KIND)
@@ -1510,20 +1574,24 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                     raise reconciliation.MemoryReconciliationError("Existing receipt conflicts with this review")
                 print(f"memory reconciliation: batch already applied; receipt: {receipt_path}")
                 return 0
-            if _initialize_memory(config) is None:
-                return 1
             from kai import memory
 
-            rows = memory.get_all_for_lifecycle_projection(
-                user_id=str(audit["principal_id"]),
-                runtime_profile_id=str(audit["runtime_profile_id"]),
-            )
-            if reconciliation.corpus_sha256(rows) != audit["corpus_sha256"]:
-                raise reconciliation.MemoryReconciliationError(
-                    "Memory corpus changed after audit; create and review a fresh audit"
+            try:
+                if _initialize_memory(config) is None:
+                    return 1
+                rows = memory.get_all_for_lifecycle_projection(
+                    user_id=str(audit["principal_id"]),
+                    runtime_profile_id=str(audit["runtime_profile_id"]),
                 )
-            receipt = asyncio.run(reconciliation.apply_review(db_path=db_path, audit=audit, review=review))
-            reconciliation.write_receipt(receipt_path, receipt)
+                if reconciliation.corpus_sha256(rows) != audit["corpus_sha256"]:
+                    raise reconciliation.MemoryReconciliationError(
+                        "Memory corpus changed after audit; create and review a fresh audit"
+                    )
+                receipt = asyncio.run(reconciliation.apply_review(db_path=db_path, audit=audit, review=review))
+                reconciliation.write_receipt(receipt_path, receipt)
+                _claim_reconciliation_artifact(receipt_path, owner)
+            finally:
+                memory.close_memory()
             print(
                 f"memory reconciliation: batch complete; approved={approvals}, "
                 f"unchanged={len(review['decisions']) - approvals}"
