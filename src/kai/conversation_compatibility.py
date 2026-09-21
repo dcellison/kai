@@ -82,6 +82,9 @@ async def ingest_conversation_memory(
     runtime_profile_id: str | None = None,
     os_user_override: str | None = None,
     effective_provider: str | None = None,
+    source_kind: str | None = None,
+    run_kind: str | None = None,
+    parent_run_id: str | None = None,
 ) -> None:
     """Run one memory ingestion to completion for a canonical owner.
 
@@ -141,6 +144,9 @@ async def ingest_conversation_memory(
                     effective_backend_override=backend,
                     effective_provider_override=effective_provider,
                     await_episode=True,
+                    source_kind=source_kind,
+                    run_kind=run_kind,
+                    parent_run_id=parent_run_id,
                 )
         except Exception:
             log.warning("Memory ingestion failed", exc_info=True)

@@ -36,6 +36,9 @@ async def test_profile_state_ingests_memory_with_only_canonical_authority(monkey
         workspace="/workspace/project",
         canonical_provenance=provenance,
         canonical_prior_pairs=(("Earlier", "Exchange"),),
+        source_kind="workshop_client",
+        run_kind="respond",
+        parent_run_id=None,
     )
 
     runtime_pool.runtime_profile.assert_called_once_with(profile_id(101))
@@ -56,6 +59,9 @@ async def test_profile_state_ingests_memory_with_only_canonical_authority(monkey
         effective_backend="codex",
         effective_provider="openai",
         os_user_override="daniel",
+        source_kind="workshop_client",
+        run_kind="respond",
+        parent_run_id=None,
     )
 
 

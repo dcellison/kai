@@ -36,6 +36,12 @@ from kai.history import LogEntry
 from kai.memory import MemoryResult
 from kai.memory_consolidation import retrieve_consolidation_candidates
 from kai.memory_consolidation import scope_admitted as _scope_admitted
+from kai.memory_extraction_policy import (
+    POLICY_VERSION,
+    ExtractionAdmission,
+    apply_fragmentation_policy,
+    decide_extraction_admission,
+)
 from kai.memory_projects import ActiveMemoryProject, detect_active_memory_project, merged_registry
 from kai.oneshot import _EXTRACTOR_CWD as _EXTRACTOR_CWD
 from kai.oneshot import _SUBPROCESS_ENV_ALLOWLIST as _SUBPROCESS_ENV_ALLOWLIST
@@ -170,7 +176,11 @@ log = logging.getLogger(__name__)
 # can no longer fabricate candidate fields, prompt sections, roles, or
 # the closing boundary; the prompt explicitly treats candidate content
 # as untrusted historical data rather than instructions.
-_EXTRACTION_PROMPT_VERSION: str = "13"
+# v14 (2026-09-21): makes the anti-fragmentation contract explicit.
+# The extractor should normally emit at most two facts and may emit a
+# third only for a materially independent durable claim. Facets of one
+# preference, decision, constraint, or configuration must be merged.
+_EXTRACTION_PROMPT_VERSION: str = "14"
 
 # Sibling of _EXTRACTION_PROMPT_VERSION for stage-2 episode generation.
 # Stored in each episode's metadata so future cleanups can target a
@@ -182,7 +192,7 @@ _EXTRACTION_PROMPT_VERSION: str = "13"
 _EPISODE_PROMPT_VERSION: str = "2"
 _FACT_SCHEMA_VERSION: str = "1"
 _EPISODE_SCHEMA_VERSION: str = "1"
-_FACT_POLICY_VERSION: str = "1"
+_FACT_POLICY_VERSION: str = POLICY_VERSION
 _EPISODE_POLICY_VERSION: str = "1"
 
 # Consecutive stage-1 subprocess failures across all users in this
@@ -377,6 +387,9 @@ class ExtractionResult:
     model: str | None = None
     outcome: str = "succeeded"
     raw_fact_count: int = 0
+    pre_fragmentation_fact_count: int = 0
+    fragmentation_outcome: str = "not_applied"
+    fragmentation_rejected_count: int = 0
 
 
 _FACT_SCHEMA: dict = {
@@ -572,6 +585,11 @@ CONFIDENCE:
 - Only store facts you can phrase as a single clear sentence.
 - Each fact must have a concrete subject and predicate. Vague
   impressions do not qualify.
+- Prefer one or two durable facts for an exchange. Emit a third only
+  when it is materially independent of the others. If several details
+  are facets of one preference, decision, constraint, identity, or
+  configuration, merge them into one self-contained fact instead of
+  fragmenting the situation across multiple memories.
 - If nothing qualifies, return {"facts": []}. An empty result is
   correct and preferred over low-quality facts.
 
@@ -2369,12 +2387,17 @@ async def _run_extractor(
         user_window_text=user_window_text,
         assistant_window_text=assistant_window_text,
     )
+    fragmentation = apply_fragmentation_policy(validated)
+    accepted = list(fragmentation.facts)
     return ExtractionResult(
-        facts=validated,
+        facts=accepted,
         has_episode=has_episode,
         model=model,
-        outcome="validation_rejection" if raw_fact_count and not validated else "succeeded",
+        outcome="validation_rejection" if raw_fact_count and not accepted else "succeeded",
         raw_fact_count=raw_fact_count,
+        pre_fragmentation_fact_count=len(validated),
+        fragmentation_outcome=fragmentation.outcome,
+        fragmentation_rejected_count=fragmentation.rejected_count,
     )
 
 
@@ -3835,6 +3858,7 @@ def _fact_receipt_completion(
     replaced: int,
     skipped: int,
     duration_ms: int,
+    admission: ExtractionAdmission | None = None,
 ) -> MemoryExtractionReceiptCompletion:
     raw_count = max(result.raw_fact_count, len(result.facts))
     failure_outcomes = {
@@ -3845,7 +3869,12 @@ def _fact_receipt_completion(
         "policy_rejection",
     }
     storage_failed = any("failed" in decision.outcome for decision in decisions)
-    if result.outcome in failure_outcomes:
+    if result.outcome == "admission_suppressed":
+        status = "completed"
+        decision_outcome = "admission_suppressed"
+        failure_code = None
+        validation_outcome = "not_attempted"
+    elif result.outcome in failure_outcomes:
         status = "failed"
         decision_outcome = result.outcome
         failure_code = result.outcome
@@ -3902,6 +3931,14 @@ def _fact_receipt_completion(
         skipped_count=skipped,
         memory_scopes=_receipt_memory_scopes(decisions),
         duration_ms=duration_ms,
+        policy_outcome=(
+            (admission.receipt_fields() if admission is not None else ())
+            + (
+                ("fragmentation", result.fragmentation_outcome),
+                ("fragmentation_rejected", result.fragmentation_rejected_count),
+                ("pre_fragmentation_count", result.pre_fragmentation_fact_count),
+            )
+        ),
     )
 
 
@@ -3925,6 +3962,9 @@ async def extract_and_store(
     canonical_provenance: dict[str, object] | None = None,
     runtime_profile_id: str | None = None,
     await_episode: bool = False,
+    source_kind: str | None = None,
+    run_kind: str | None = None,
+    parent_run_id: str | None = None,
 ) -> int:
     """
     Run Haiku extraction on an exchange and store the resulting facts.
@@ -3979,6 +4019,12 @@ async def extract_and_store(
     copied to every fact and episode produced from this exchange. JSONL
     locators remain supplemental migration/archive provenance and never
     determine protected memory ownership.
+
+    Canonical callers also supply the message source and run shape. Those
+    content-free attributes, plus narrow routine-traffic recognizers, drive
+    deterministic admission before candidate retrieval or model execution.
+    Compatibility/evaluation callers omit them and preserve their historical
+    behavior.
     """
     if config is None:
         from kai.config import load_config
@@ -4051,6 +4097,14 @@ async def extract_and_store(
         schema_version=_FACT_SCHEMA_VERSION,
         policy_version=_FACT_POLICY_VERSION,
     )
+    admission = decide_extraction_admission(
+        source_kind=source_kind,
+        run_kind=run_kind,
+        parent_run_id=parent_run_id,
+        user_text=user_text,
+        assistant_text=assistant_text,
+        canonical=receipt_spec is not None,
+    )
     try:
         receipt_claim = await _claim_canonical_receipt(receipt_spec)
     except Exception:
@@ -4081,6 +4135,33 @@ async def extract_and_store(
                 _pending_episode_tasks.add(ep_task)
                 ep_task.add_done_callback(_pending_episode_tasks.discard)
         return prior.stored_count
+    if not admission.admitted:
+        await _complete_canonical_receipt(
+            receipt_claim,
+            _fact_receipt_completion(
+                result=ExtractionResult(
+                    [],
+                    False,
+                    fact_model,
+                    "admission_suppressed",
+                    fragmentation_outcome="not_attempted",
+                ),
+                candidate_ids=set(),
+                decisions=[],
+                stored=0,
+                replaced=0,
+                skipped=0,
+                duration_ms=0,
+                admission=admission,
+            ),
+        )
+        log.info(
+            "memory.extract.policy user_id=%s admission=suppressed reason=%s cadence=%s",
+            user_id,
+            admission.reason,
+            admission.cadence,
+        )
+        return 0
 
     sem = _get_semaphore(user_id)
     # Pre-initialize the storage counters so the post-try summary log
@@ -4273,6 +4354,7 @@ async def extract_and_store(
                     replaced=replaced,
                     skipped=skipped,
                     duration_ms=fact_duration_ms,
+                    admission=admission,
                 ),
             )
             # Stage-2 spawn (issue #385). Scheduled AFTER _store_facts
@@ -4337,6 +4419,7 @@ async def extract_and_store(
                 replaced=replaced,
                 skipped=skipped,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                admission=admission,
             ),
         )
         return 0
@@ -4355,6 +4438,7 @@ async def extract_and_store(
                 replaced=replaced,
                 skipped=skipped,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                admission=admission,
             ),
         )
         return 0
@@ -4387,6 +4471,7 @@ async def extract_and_store(
                 skipped_count=skipped,
                 memory_scopes=_receipt_memory_scopes(receipt_decisions),
                 duration_ms=int((time.monotonic() - start) * 1000),
+                policy_outcome=admission.receipt_fields(),
             ),
         )
         raise
@@ -4402,6 +4487,7 @@ async def extract_and_store(
                 replaced=replaced,
                 skipped=skipped,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                admission=admission,
             ),
         )
         return 0

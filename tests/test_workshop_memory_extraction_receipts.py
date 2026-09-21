@@ -188,7 +188,11 @@ class TestMemoryExtractionReceiptAuthority:
 
         assert workshop_memory_extraction_receipt_status(path) == (
             "Workshop memory extraction receipts: active; receipts=1 (fact=1, episode=0, "
-            "completed=1, failed=0, running=0), zero-memory=1; integrity gaps=0, replay gaps=0; "
+            "completed=1, failed=0, running=0), zero-memory=1; "
+            "policy=(admitted=0, suppressed=0, unclassified=1, batch<=1), "
+            "facts=(raw=0, accepted=0, stored=0), empty-pass rate=0.000, "
+            "memories/admitted=0.000, fragmentation rate=0.000; "
+            "integrity gaps=0, replay gaps=0; "
             "authority=canonical/privacy-bounded, legacy provenance=read-time classified"
         )
 
@@ -302,6 +306,36 @@ class TestMemoryExtractionReceiptAuthority:
                 {"decisions": [], "replaced_count": 0, "skipped_count": 0, "stored_count": 0},
                 [],
             ]
+        finally:
+            await store.close()
+
+    async def test_receipt_records_bounded_policy_decisions(self, tmp_path: Path):
+        store = await _seed_completed_run(tmp_path / "kai.db")
+        service = MemoryExtractionReceiptService(store.connection)
+        try:
+            claim = await service.claim(_spec())
+            completion = replace(
+                _zero_memory_completion(),
+                decision_outcome="admission_suppressed",
+                validation_outcome="not_attempted",
+                policy_outcome=(
+                    ("admission", "suppressed"),
+                    ("admission_reason", "routine_workflow_ack"),
+                    ("cadence", "suppressed"),
+                    ("batch_size", 1),
+                    ("batch_limit", 1),
+                ),
+            )
+
+            receipt = await service.complete(claim.receipt.receipt_id, _PRINCIPAL_ID, completion)
+
+            assert receipt.validation_outcome["policy"] == {
+                "admission": "suppressed",
+                "admission_reason": "routine_workflow_ack",
+                "cadence": "suppressed",
+                "batch_size": 1,
+                "batch_limit": 1,
+            }
         finally:
             await store.close()
 

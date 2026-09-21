@@ -1068,9 +1068,8 @@ class TestExtractAndStoreOutcomes:
         assert "confirmation_quote" not in md
 
     @pytest.mark.asyncio
-    async def test_five_facts_stored(self, monkeypatch):
-        """maxItems in the schema is 5. Fan-out storage should handle
-        the full batch without any per-fact short-circuit."""
+    async def test_fragmentation_policy_caps_five_distinct_facts_at_three(self, monkeypatch):
+        """The schema accepts five proposals, but policy stores only three."""
         monkeypatch.setattr("kai.memory_extraction.memory.is_enabled", lambda: False)
 
         facts = [{"content": f"Fact {i}", "tags": ["fact"], "confidence": 0.8, "intent": "new"} for i in range(5)]
@@ -1086,8 +1085,52 @@ class TestExtractAndStoreOutcomes:
         )
 
         n = await extract_and_store("u", "a", user_id="u1", config=_cfg())
-        assert n == 5
-        assert len(stored_calls) == 5
+        assert n == 3
+        assert len(stored_calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_canonical_routine_traffic_is_receipted_without_running_model(self, monkeypatch):
+        claim = SimpleNamespace(
+            claimed=True,
+            receipt=SimpleNamespace(receipt_id="mer_policy", principal_id="prn_owner"),
+        )
+        claim_receipt = AsyncMock(return_value=claim)
+        complete_receipt = AsyncMock()
+        run_extractor = AsyncMock(side_effect=AssertionError("model must not run"))
+        monkeypatch.setattr(memory_extraction, "_claim_canonical_receipt", claim_receipt)
+        monkeypatch.setattr(memory_extraction, "_complete_canonical_receipt", complete_receipt)
+        monkeypatch.setattr(memory_extraction, "_run_extractor", run_extractor)
+
+        stored = await extract_and_store(
+            "Installed.",
+            "Acknowledged.",
+            user_id="prn_owner",
+            config=_cfg(),
+            canonical_provenance={
+                memory_extraction.memory.WORKSHOP_RUN_ID_KEY: "run_policy",
+                memory_extraction.memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY: "msg_source",
+                memory_extraction.memory.WORKSHOP_RESULT_MESSAGE_ID_KEY: "msg_result",
+            },
+            runtime_profile_id="rtp_owner",
+            source_kind="workshop_client",
+            run_kind="respond",
+        )
+
+        assert stored == 0
+        run_extractor.assert_not_awaited()
+        completion = complete_receipt.await_args.args[1]
+        assert completion.status == "completed"
+        assert completion.decision_outcome == "admission_suppressed"
+        assert dict(completion.policy_outcome) == {
+            "admission": "suppressed",
+            "admission_reason": "routine_workflow_ack",
+            "batch_limit": 1,
+            "batch_size": 1,
+            "cadence": "suppressed",
+            "fragmentation": "not_attempted",
+            "fragmentation_rejected": 0,
+            "pre_fragmentation_count": 0,
+        }
 
     @pytest.mark.asyncio
     async def test_malformed_json_returns_zero(self, monkeypatch):
@@ -2797,7 +2840,7 @@ class TestExtractionPromptSoftVocab:
     def test_extraction_prompt_version_bumped(self):
         """The version stamp on every fact's metadata; bumped
         whenever the schema or prompt changes meaningfully."""
-        assert _EXTRACTION_PROMPT_VERSION == "13"
+        assert _EXTRACTION_PROMPT_VERSION == "14"
 
     def test_extraction_prompt_version_history_extended(self):
         """The prompt-version history comment block (the sequence

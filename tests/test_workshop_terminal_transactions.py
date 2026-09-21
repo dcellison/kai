@@ -798,6 +798,9 @@ class TestAtomicTerminalTransactions:
         assert call["canonical_provenance"].run_id == run.run_id
         assert call["canonical_provenance"].source_message_id == run.inbound_message_id
         assert call["canonical_provenance"].result_message_id == result.execution.run.result_message_id
+        assert call["source_kind"] == "workshop_client"
+        assert call["run_kind"] == "respond"
+        assert call["parent_run_id"] is None
 
         restarted = await WorkshopPostRunEffectService.open_and_start(
             database,
