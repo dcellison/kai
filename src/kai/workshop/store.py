@@ -334,20 +334,29 @@ class WorkshopEventStore:
         ) as cursor:
             checkpoint_row = await cursor.fetchone()
 
-        if checkpoint_row is None or int(checkpoint_row[0]) < projection.version:
+        rebuilding = checkpoint_row is None
+        after_position = 0
+        if checkpoint_row is not None:
+            stored_version = int(checkpoint_row[0])
+            if stored_version < projection.version:
+                rebuilding = True
+            elif stored_version > projection.version:
+                raise RuntimeError(
+                    f"Projection {projection.name!r} is newer than this build: "
+                    f"stored={stored_version}, supported={projection.version}"
+                )
+            else:
+                after_position = int(checkpoint_row[1])
+        if rebuilding:
+            if isinstance(projection, ProjectionRebuildHooks):
+                await projection.prepare_rebuild(self._connection)
             await projection.reset(self._connection)
-            after_position = 0
-        elif int(checkpoint_row[0]) > projection.version:
-            raise RuntimeError(
-                f"Projection {projection.name!r} is newer than this build: "
-                f"stored={int(checkpoint_row[0])}, supported={projection.version}"
-            )
-        else:
-            after_position = int(checkpoint_row[1])
 
         events = await self.read_events(after_position=after_position)
         for event in events:
             await projection.apply(self._connection, event)
+        if rebuilding and isinstance(projection, ProjectionRebuildHooks):
+            await projection.finish_rebuild(self._connection)
         last_position = events[-1].position if events else after_position
         updated_at = _format_timestamp(datetime.now(UTC))
         await self._connection.execute(
