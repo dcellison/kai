@@ -110,6 +110,7 @@ from kai.workshop.diagnostics import (
     workshop_memory_current_truth_status,
     workshop_memory_extraction_receipt_status,
     workshop_memory_project_registry_status,
+    workshop_memory_reconciliation_status,
     workshop_operational_state_status,
     workshop_runtime_session_status,
     workshop_standing_observation_status,
@@ -10037,6 +10038,7 @@ def _cmd_status() -> None:
             memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
         )
     )
+    print(workshop_memory_reconciliation_status(Path(data_dir) / "kai.db"))
     print(
         workshop_episode_history_status(
             Path(data_dir) / "kai.db",

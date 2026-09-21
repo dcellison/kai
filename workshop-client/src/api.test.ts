@@ -438,6 +438,24 @@ function memoryRecord(): Record<string, unknown> {
   };
 }
 
+function memoryLifecycle(): Record<string, unknown> {
+  return {
+    authority: "legacy",
+    createdAt: "2026-08-24T10:00:00Z",
+    currentRevisionId: null,
+    currentState: "requires_review",
+    events: [],
+    followups: [],
+    identity: "memory-1",
+    kind: "fact",
+    migrationClassification: "unclassified",
+    migrationGaps: ["canonical provenance"],
+    revisions: [],
+    runtimeProfileId: null,
+    scope: { key: null, kind: "global" },
+  };
+}
+
 function settingsPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     version: 1,
@@ -1145,6 +1163,7 @@ describe("Workshop client API", () => {
           content: "Daniel prefers concise output.",
           compact_recall: "{\"record_type\":\"memory\"}",
           confirmation_quote: null,
+          lifecycle: memoryLifecycle(),
           prompt_version: "v1",
           episode: null,
         },
@@ -1171,6 +1190,7 @@ describe("Workshop client API", () => {
     await expect(
       loadMemoryRecords("session-secret", {
         kind: "fact",
+        lifecycle: "active",
         projectId: "kai",
         limit: 25,
         order: "oldest",
@@ -1201,7 +1221,7 @@ describe("Workshop client API", () => {
       result: null,
     });
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      "/v1/memory/records?kind=fact&project_id=kai&limit=25&order=oldest",
+      "/v1/memory/records?kind=fact&lifecycle=active&project_id=kai&limit=25&order=oldest",
     );
     expect(fetchMock.mock.calls[2]?.[0]).toBe(
       "/v1/memory/search?tag=preference&scope=project&q=concise+output",
@@ -2165,6 +2185,7 @@ describe("Workshop client API", () => {
       content: "Daniel prefers concise output.",
       compact_recall: '{"record_type":"memory"}',
       confirmation_quote: null,
+      lifecycle: memoryLifecycle(),
       prompt_version: "v1",
       episode: null,
     };

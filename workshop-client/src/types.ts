@@ -1182,6 +1182,7 @@ export interface WorkshopMemoryPage {
 
 export interface WorkshopMemoryFilters {
   kind?: "fact" | "episode";
+  lifecycle?: "active" | "historical" | "legacy";
   memoryType?: string;
   projectId?: string;
   scope?: "global" | "project" | "task";
@@ -1204,7 +1205,67 @@ export interface WorkshopMemoryDetail extends WorkshopMemoryRecord {
   confirmationQuote: string | null;
   content: string;
   episode: WorkshopMemoryEpisodeFields | null;
+  lifecycle: WorkshopMemoryLifecycle;
   promptVersion: string | null;
+}
+
+export interface WorkshopMemoryLifecycleRevision {
+  assertedAt?: string | null;
+  backend?: string | null;
+  content: string;
+  evidence?: unknown[];
+  migrationClassification?: string;
+  migrationGaps?: unknown[];
+  model?: string | null;
+  observedAt?: string | null;
+  occurredFrom?: string | null;
+  occurredUntil?: string | null;
+  promptVersion?: string | null;
+  provider?: string | null;
+  reason: string;
+  revisionId: string;
+  schemaVersion?: string | null;
+  state: string;
+  stateReason?: string;
+  stateUpdatedAt?: string;
+  storedAt: string;
+  supersedesRevisionId?: string | null;
+  validFrom?: string | null;
+  validUntil?: string | null;
+}
+
+export interface WorkshopMemoryLifecycleEvent {
+  eventPosition: number;
+  newState: string;
+  occurredAt: string;
+  previousState: string | null;
+  reason: string;
+  revisionId: string;
+  transition: string;
+}
+
+export interface WorkshopMemoryEpisodeFollowup {
+  createdAt: string;
+  reason: string;
+  relationship: string;
+  sourceEpisodeId: string;
+  targetEpisodeId: string;
+}
+
+export interface WorkshopMemoryLifecycle {
+  authority: "canonical" | "legacy";
+  createdAt: string;
+  currentRevisionId: string | null;
+  currentState: string;
+  events: WorkshopMemoryLifecycleEvent[];
+  followups: WorkshopMemoryEpisodeFollowup[];
+  identity: string;
+  kind: "fact" | "episode";
+  migrationClassification?: string;
+  migrationGaps?: string[];
+  revisions: WorkshopMemoryLifecycleRevision[];
+  runtimeProfileId: string | null;
+  scope: { key: string | null; kind: string };
 }
 
 export interface WorkshopMemoryEditResult {
@@ -1280,6 +1341,76 @@ export interface WorkshopMemorySearch {
   activeProjectId: string | null;
   hits: WorkshopMemorySearchHit[];
   reason: string;
+}
+
+export type WorkshopMemoryReconciliationDisposition =
+  | "pending"
+  | "approve"
+  | "reject"
+  | "defer";
+
+export interface WorkshopMemoryReconciliationSummary {
+  actionCounts: Record<string, number>;
+  appliedAt: string | null;
+  auditId: string;
+  candidateCount: number;
+  categoryCounts: Record<string, number>;
+  corpusCount: number;
+  dispositionCounts: Record<WorkshopMemoryReconciliationDisposition, number>;
+  generatedAt: string;
+  gapCounts: Record<string, number>;
+  kindCounts: Record<string, number>;
+  reviewVersion: number;
+  runtimeProfileId: string;
+  status: "open" | "applied";
+  uncertaintyCounts: Record<string, number>;
+}
+
+export interface WorkshopMemoryReconciliationEvidence {
+  assertedAt: string | null;
+  backend: string | null;
+  confidence: number;
+  createdAt: string | null;
+  kind: "fact" | "episode";
+  memoryId: string;
+  migrationClassification: string;
+  migrationGaps: string[];
+  model: string | null;
+  observedAt: string | null;
+  occurredFrom: string | null;
+  occurredUntil: string | null;
+  projectId: string | null;
+  promptVersion: string | null;
+  provider: string | null;
+  schemaVersion: string | null;
+  scope: string;
+  source: string | null;
+  text: string;
+  updatedAt: string | null;
+  validFrom: string | null;
+  validUntil: string | null;
+}
+
+export interface WorkshopMemoryReconciliationCandidate {
+  candidateId: string;
+  category: string;
+  decision: {
+    action: Record<string, unknown>;
+    disposition: WorkshopMemoryReconciliationDisposition;
+    operatorNote: string;
+    stateVersion: number;
+  };
+  evidence: WorkshopMemoryReconciliationEvidence[];
+  proposedAction: Record<string, unknown>;
+  rationale: string;
+  stateSha256: string;
+  uncertainty: string;
+}
+
+export interface WorkshopMemoryReconciliationPage {
+  audit: WorkshopMemoryReconciliationSummary;
+  candidates: WorkshopMemoryReconciliationCandidate[];
+  nextOffset: number | null;
 }
 
 export interface TimelineMessage {

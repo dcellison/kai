@@ -1463,6 +1463,11 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
             raise reconciliation.MemoryReconciliationError("Canonical Workshop database is unavailable")
 
         if args.reconciliation_command == "audit":
+            from kai.workshop.memory_reconciliation_review import (
+                prior_reconciliation_dispositions,
+                record_reconciliation_audit,
+            )
+
             connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
             try:
                 principal_id = resolve_human_principal(connection, args.principal)
@@ -1490,11 +1495,19 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                     user_id=principal_id,
                     runtime_profile_id=args.runtime_profile,
                 )
+                prior_decisions = reconciliation.prior_dispositions(out_dir)
+                prior_decisions.update(
+                    prior_reconciliation_dispositions(
+                        db_path,
+                        principal_id=principal_id,
+                        runtime_profile_id=args.runtime_profile,
+                    )
+                )
                 audit = reconciliation.build_audit(
                     principal_id=principal_id,
                     runtime_profile_id=args.runtime_profile,
                     rows=rows,
-                    prior_decisions=reconciliation.prior_dispositions(out_dir),
+                    prior_decisions=prior_decisions,
                 )
                 stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
                 out_path = out_dir / f"audit-{audit['audit_id']}-{stamp}.json"
@@ -1503,6 +1516,7 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                 markdown_path = out_path.with_suffix(".md")
                 reconciliation.write_private_text(markdown_path, reconciliation.render_audit_markdown(audit))
                 _claim_reconciliation_artifact(markdown_path, artifact_owner)
+                recorded = record_reconciliation_audit(db_path, audit)
             finally:
                 memory.close_memory()
             print(
@@ -1512,6 +1526,7 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
             )
             print(f"memory reconciliation: audit: {out_path}")
             print(f"memory reconciliation: human report: {markdown_path}")
+            print("memory reconciliation: Workshop review queue: " + ("recorded" if recorded else "already recorded"))
             print("memory reconciliation: no memory or canonical state was changed")
             return 0
 

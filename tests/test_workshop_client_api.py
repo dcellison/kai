@@ -130,6 +130,10 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryConflict,
     WorkshopMemoryNotFound,
 )
+from kai.workshop.memory_reconciliation_review import (
+    ReconciliationAuditSummary,
+    ReconciliationCandidatePage,
+)
 from kai.workshop.model_catalogue import (
     ModelCatalogueEntry,
     ModelCatalogueEntryStatus,
@@ -748,10 +752,96 @@ class _SettingsWorkspaces:
 
 
 @dataclass
+class _ReconciliationQueries:
+    principal_id: PrincipalId
+    calls: list[tuple[str, object]] = field(default_factory=list)
+
+    @staticmethod
+    def summary(*, review_version: int = 0) -> ReconciliationAuditSummary:
+        return ReconciliationAuditSummary(
+            action_counts={"manual_edit_required": 1},
+            audit_id="mra_test",
+            runtime_profile_id="rtp_test",
+            generated_at="2026-09-21T18:00:00Z",
+            gap_counts={"source_receipt_id": 1},
+            corpus_count=1,
+            candidate_count=1,
+            status="open",
+            review_version=review_version,
+            disposition_counts={"pending": 1, "approve": 0, "reject": 0, "defer": 0},
+            category_counts={"malformed_provenance": 1},
+            kind_counts={"fact": 1},
+            uncertainty_counts={"high": 1},
+            applied_at=None,
+        )
+
+    async def latest(self, principal_id):
+        assert principal_id == self.principal_id
+        return self.summary()
+
+    async def candidates(self, principal_id, audit_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("candidates", kwargs))
+        return ReconciliationCandidatePage(
+            audit=self.summary(),
+            candidates=(
+                {
+                    "candidate_id": "mrc_test",
+                    "state_sha256": "a" * 64,
+                    "category": "malformed_provenance",
+                    "uncertainty": "high",
+                    "rationale": "Missing provenance.",
+                    "proposed_action": {"kind": "manual_edit_required"},
+                    "evidence": [],
+                    "decision": {
+                        "disposition": "pending",
+                        "action": {"kind": "manual_edit_required"},
+                        "operator_note": "",
+                        "state_version": 0,
+                    },
+                },
+            ),
+            next_offset=None,
+        )
+
+    async def decide(self, principal_id, audit_id, candidate_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("decide", kwargs))
+        return {
+            "audit_id": audit_id,
+            "candidate_id": candidate_id,
+            "disposition": kwargs["disposition"],
+            "state_version": 1,
+            "review_version": 1,
+            "replayed": False,
+        }
+
+    async def bulk_decide(self, principal_id, audit_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("bulk", kwargs))
+        return {
+            "audit_id": audit_id,
+            "changed": len(kwargs["candidate_ids"]),
+            "disposition": kwargs["disposition"],
+            "review_version": 1,
+            "replayed": False,
+        }
+
+    async def apply(self, principal_id, audit_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("apply", kwargs))
+        return {"audit_id": audit_id, "receipt": {"receipt_id": "mrr_test"}, "replayed": False}
+
+
+@dataclass
 class _MemoryQueries:
     principal_id: PrincipalId
     mutations: list[tuple[str, tuple[str, ...], str | None, str | None]] = field(default_factory=list)
     content_mutations: list[tuple[str, object]] = field(default_factory=list)
+    reconciliation: _ReconciliationQueries = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.reconciliation = _ReconciliationQueries(self.principal_id)
 
     def authority_for_principal(self, principal_id):
         if principal_id != self.principal_id:
@@ -768,6 +858,9 @@ class _MemoryQueries:
             by_scope={"global": 1},
             allowed_projects=(MemoryProjectOption("kai", "Kai"),),
         )
+
+    async def allowed_projects(self, _authority):
+        return (MemoryProjectOption("kai", "Kai"),)
 
     async def list_records(self, _authority, *, filters, limit, cursor, order):
         assert filters.source == "extracted"
@@ -1570,6 +1663,83 @@ async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
         )
         assert foreign.status == 404
         assert await foreign.json() == {"error": {"code": "memory_not_found", "message": "Memory not found"}}
+    finally:
+        await client.close()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_reconciliation_api_is_principal_authorized_typed_and_confirmation_gated(
+    tmp_path: Path,
+) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    queries = _MemoryQueries(alice_id)
+    client = await _open_client(
+        store,
+        _Authenticator({"alice-token": alice_id}),
+        memory_queries=queries,
+    )
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        latest = await client.get("/v1/memory/reconciliation", headers=headers)
+        assert latest.status == 200
+        assert (await latest.json())["audit"]["audit_id"] == "mra_test"
+
+        page = await client.get(
+            "/v1/memory/reconciliation/mra_test/candidates?disposition=pending&limit=25",
+            headers=headers,
+        )
+        assert page.status == 200
+        assert (await page.json())["candidates"][0]["candidate_id"] == "mrc_test"
+
+        decision = await client.patch(
+            "/v1/memory/reconciliation/mra_test/candidates/mrc_test/decision",
+            headers=headers,
+            json={
+                "disposition": "defer",
+                "action": {"kind": "manual_edit_required"},
+                "operator_note": "Review later.",
+                "expected_state_version": 0,
+                "client_operation_id": "decision-1",
+            },
+        )
+        assert decision.status == 200
+        assert (await decision.json())["review_version"] == 1
+
+        bulk_approve = await client.post(
+            "/v1/memory/reconciliation/mra_test/actions/bulk",
+            headers=headers,
+            json={
+                "candidate_ids": ["mrc_test"],
+                "disposition": "approve",
+                "operator_note": "Unsafe.",
+                "expected_review_version": 1,
+                "client_operation_id": "bulk-1",
+            },
+        )
+        assert bulk_approve.status == 400
+
+        unconfirmed = await client.post(
+            "/v1/memory/reconciliation/mra_test/apply",
+            headers=headers,
+            json={
+                "expected_review_version": 1,
+                "client_operation_id": "apply-1",
+                "confirmation": "yes",
+            },
+        )
+        assert unconfirmed.status == 400
+        applied = await client.post(
+            "/v1/memory/reconciliation/mra_test/apply",
+            headers=headers,
+            json={
+                "expected_review_version": 1,
+                "client_operation_id": "apply-2",
+                "confirmation": "apply reviewed memory decisions",
+            },
+        )
+        assert applied.status == 200
+        assert (await applied.json())["receipt"]["receipt_id"] == "mrr_test"
     finally:
         await client.close()
         await store.close()

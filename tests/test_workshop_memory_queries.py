@@ -340,6 +340,17 @@ async def test_explicit_fact_create_and_edit_share_canonical_revision_authority(
         )
 
         assert edited.record.content == "Corrected canonical fact"
+        assert edited.record.lifecycle["authority"] == "canonical"
+        assert edited.record.lifecycle["currentState"] == "active"
+        assert [revision["state"] for revision in edited.record.lifecycle["revisions"]] == [
+            "active",
+            "superseded",
+        ]
+        assert [event["transition"] for event in edited.record.lifecycle["events"]] == [
+            "recorded",
+            "superseded",
+            "recorded",
+        ]
         assert delete_calls == 0
         async with store.connection.execute(
             "SELECT state, COUNT(*) FROM memory_fact_revision_states GROUP BY state ORDER BY state"
@@ -449,6 +460,34 @@ async def test_list_is_visible_filtered_deterministic_and_cursor_bound(
         await service.list_records(authority, order="relevance")
 
 
+def test_lifecycle_filters_distinguish_active_history_and_legacy() -> None:
+    active = _result("active", "Current canonical fact")
+    active.metadata["canonical_memory_claim_id"] = "claim-active"
+    revised = _result("revised", "Current revision with history")
+    revised.metadata["canonical_memory_claim_id"] = "claim-revised"
+    episode = _result("episode", "Historical episode", source="episode")
+    episode.metadata["canonical_memory_episode_id"] = "episode-history"
+    legacy = _result("legacy", "Legacy evidence")
+
+    assert WorkshopMemoryQueryService._matches(
+        active,
+        MemoryQueryFilters(lifecycle="active"),
+        active_claim_ids=frozenset({"claim-active", "claim-revised"}),
+    )
+    assert WorkshopMemoryQueryService._matches(
+        revised,
+        MemoryQueryFilters(lifecycle="historical"),
+        historical_claim_ids=frozenset({"claim-revised"}),
+    )
+    assert WorkshopMemoryQueryService._matches(
+        episode,
+        MemoryQueryFilters(lifecycle="historical"),
+        episode_ids=frozenset({"episode-history"}),
+    )
+    assert WorkshopMemoryQueryService._matches(legacy, MemoryQueryFilters(lifecycle="legacy"))
+    assert not WorkshopMemoryQueryService._matches(active, MemoryQueryFilters(lifecycle="legacy"))
+
+
 async def test_stats_and_detail_expose_only_bounded_stable_fields(
     tmp_path: Path,
     monkeypatch,
@@ -481,6 +520,8 @@ async def test_stats_and_detail_expose_only_bounded_stable_fields(
     detail = await service.detail(authority, episode.id)
     assert detail.content == "Deploy succeeded."
     assert detail.extraction_provenance == "legacy"
+    assert detail.lifecycle["currentState"] == "requires_review"
+    assert detail.lifecycle["migrationGaps"] == ["canonical provenance"]
     assert detail.extraction_receipt is None
     assert detail.episode == {
         "goal": "Deploy Kai",

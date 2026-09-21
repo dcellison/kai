@@ -25,6 +25,7 @@ import {
   searchMemories,
 } from "./api";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { MemoryReconciliation, MemoryReviewIcon } from "./MemoryReconciliation";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 import type {
   WorkshopMemoryDetail,
@@ -41,6 +42,7 @@ import type {
 
 interface ExplorerFilters {
   kind: "" | "fact" | "episode";
+  lifecycle: "" | "active" | "historical" | "legacy";
   projectId: string;
   scope: "" | "global" | "project" | "task";
   tag: string;
@@ -57,6 +59,7 @@ interface MemoryDetailPanelLayout {
 
 const EMPTY_FILTERS: ExplorerFilters = {
   kind: "",
+  lifecycle: "",
   projectId: "",
   scope: "",
   tag: "",
@@ -79,6 +82,7 @@ function SearchIcon(): React.JSX.Element {
 function apiFilters(filters: ExplorerFilters): WorkshopMemoryFilters {
   return {
     kind: filters.kind || undefined,
+    lifecycle: filters.lifecycle || undefined,
     projectId: filters.projectId || undefined,
     scope: filters.scope || undefined,
     tag: filters.tag.trim() || undefined,
@@ -430,6 +434,68 @@ function MemoryDetailPane({
         <MarkdownMessage body={detail.content} />
       </section>
 
+      <section className="memory-detail-section memory-lifecycle-history">
+        <p className="memory-section-label">Lifecycle and provenance</p>
+        <div className="memory-lifecycle-summary">
+          <span className={`memory-review-state ${detail.lifecycle.currentState}`}>
+            {episodeLabel(detail.lifecycle.currentState)}
+          </span>
+          <strong>
+            {detail.lifecycle.authority === "canonical" ? "Canonical authority" : "Legacy evidence"}
+          </strong>
+        </div>
+        {detail.lifecycle.authority === "legacy" ? (
+          <>
+            <p>
+              This memory predates canonical lifecycle provenance and requires review. That does not mean it is false.
+            </p>
+            <p className="memory-review-gaps">
+              Missing: {(detail.lifecycle.migrationGaps ?? ["canonical provenance"])
+                .map(episodeLabel).join(", ")}
+            </p>
+          </>
+        ) : (
+          <>
+            <dl className="memory-metadata-grid">
+              <div><dt>Scope</dt><dd>{episodeLabel(detail.lifecycle.scope.kind)}</dd></div>
+              <div><dt>Recorded</dt><dd>{formatDate(detail.lifecycle.createdAt)}</dd></div>
+              <div><dt>Revisions</dt><dd>{detail.lifecycle.revisions.length}</dd></div>
+              <div><dt>History events</dt><dd>{detail.lifecycle.events.length}</dd></div>
+            </dl>
+            <div className="memory-lifecycle-timeline">
+              {detail.lifecycle.revisions.map((revision) => (
+                <article key={revision.revisionId}>
+                  <header>
+                    <span className={`memory-review-state ${revision.state}`}>{episodeLabel(revision.state)}</span>
+                    <time>{formatDate(revision.storedAt)}</time>
+                  </header>
+                  <MarkdownMessage body={revision.content} />
+                  <p>{revision.reason}</p>
+                  <dl className="memory-metadata-grid">
+                    <div><dt>Model</dt><dd>{revision.model ?? "Not recorded"}</dd></div>
+                    <div><dt>Prompt</dt><dd>{revision.promptVersion ?? "Not recorded"}</dd></div>
+                    <div><dt>Valid from</dt><dd>{revision.validFrom ? formatDate(revision.validFrom) : "Unbounded"}</dd></div>
+                    <div><dt>Valid until</dt><dd>{revision.validUntil ? formatDate(revision.validUntil) : "Current"}</dd></div>
+                  </dl>
+                </article>
+              ))}
+              {detail.lifecycle.followups.map((followup) => (
+                <article key={`${followup.sourceEpisodeId}:${followup.targetEpisodeId}:${followup.relationship}`}>
+                  <header>
+                    <span className="memory-review-state historical">{episodeLabel(followup.relationship)}</span>
+                    <time>{formatDate(followup.createdAt)}</time>
+                  </header>
+                  <p>{followup.reason}</p>
+                  <small>
+                    {followup.sourceEpisodeId === detail.lifecycle.identity ? "Followed by" : "Follows"} another episode.
+                  </small>
+                </article>
+              ))}
+            </div>
+          </>
+        )}
+      </section>
+
       {detail.episode && Object.keys(detail.episode).length > 0 && (
         <section className="memory-detail-section">
           <p className="memory-section-label">Episode structure</p>
@@ -588,6 +654,7 @@ function MemoryExplorerContent({
   const [mutationRunning, setMutationRunning] = useState(false);
   const [mutationReport, setMutationReport] = useState<string | null>(null);
   const [editorDetail, setEditorDetail] = useState<WorkshopMemoryDetail | "create" | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const recordRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   useEffect(() => {
@@ -876,6 +943,18 @@ function MemoryExplorerContent({
 
   const resultCount = searchQuery ? searchHits.length : records.length;
 
+  if (reviewOpen) {
+    return (
+      <MemoryReconciliation
+        allowedProjects={allowedProjects}
+        detailPanelLayout={detailPanelLayout}
+        onAuthenticationFailure={onAuthenticationFailure}
+        onBack={() => setReviewOpen(false)}
+        token={token}
+      />
+    );
+  }
+
   return (
     <section className="memory-workspace" aria-label="Memory workspace">
       <div className="memory-browser-pane">
@@ -885,6 +964,15 @@ function MemoryExplorerContent({
             <h1>Memory</h1>
           </div>
           <div className="memory-header-actions">
+            <button
+              className="panel-icon-button"
+              type="button"
+              aria-label="Review legacy memory"
+              title="Review legacy memory"
+              onClick={() => setReviewOpen(true)}
+            >
+              <MemoryReviewIcon />
+            </button>
             <button
               className="nav-add-button memory-add-button"
               type="button"
@@ -959,6 +1047,21 @@ function MemoryExplorerContent({
           </form>
 
           <form className="memory-filters" onSubmit={applyFilters}>
+            <label>
+              Lifecycle
+              <select
+                value={filterDraft.lifecycle}
+                onChange={(event) => setFilterDraft((current) => ({
+                  ...current,
+                  lifecycle: event.target.value as ExplorerFilters["lifecycle"],
+                }))}
+              >
+                <option value="">Current projection and legacy</option>
+                <option value="active">Active current facts</option>
+                <option value="historical">History-bearing facts and episodes</option>
+                <option value="legacy">Legacy memories requiring review</option>
+              </select>
+            </label>
             <label>
               Kind
               <select

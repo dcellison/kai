@@ -11,10 +11,26 @@ import pytest
 from kai import memory_admin
 from kai import memory_reconciliation as reconciliation
 from kai.memory import MemoryResult
+from kai.workshop import memory_reconciliation_review
 
 PRINCIPAL = "prn_30000000000000000000000000000001"
 RUNTIME = "rtp_30000000000000000000000000000001"
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_workshop_review_projection(monkeypatch: pytest.MonkeyPatch):
+    """The CLI unit database intentionally contains only ownership authority."""
+    monkeypatch.setattr(
+        memory_reconciliation_review,
+        "prior_reconciliation_dispositions",
+        lambda *_args, **_kwargs: set(),
+    )
+    monkeypatch.setattr(
+        memory_reconciliation_review,
+        "record_reconciliation_audit",
+        lambda *_args, **_kwargs: True,
+    )
 
 
 def _row(memory_id: str, text: str, **metadata) -> MemoryResult:
@@ -69,6 +85,59 @@ def test_review_requires_every_decision_and_rejects_overlapping_approvals():
         decision["disposition"] = "approve"
     with pytest.raises(reconciliation.MemoryReconciliationError, match="overlap"):
         reconciliation.seal_review(audit, review, reviewer="Daniel")
+
+
+def test_review_accepts_a_bounded_operator_corrected_fact():
+    audit = reconciliation.build_audit(
+        principal_id=PRINCIPAL,
+        runtime_profile_id=RUNTIME,
+        rows=[_row("mem_1", "Daniel uses an obsolete model")],
+        now=NOW,
+    )
+    review = reconciliation.build_review_template(audit)
+    for decision in review["decisions"]:
+        decision["disposition"] = "reject"
+    decision = review["decisions"][0]
+    candidate = next(item for item in audit["candidates"] if item["candidate_id"] == decision["candidate_id"])
+    decision["disposition"] = "approve"
+    decision["action"] = {
+        "kind": "adopt_corrected",
+        "source_memory_id": candidate["evidence"][0]["memory_id"],
+        "replacement": {
+            "content": "Daniel currently uses the configured runtime model.",
+            "scope_kind": "global",
+            "scope_key": "",
+            "confidence": 0.95,
+            "valid_from": NOW.isoformat(),
+            "valid_until": None,
+        },
+    }
+
+    sealed = reconciliation.seal_review(audit, review, reviewer="Daniel")
+
+    assert sealed["decisions"][0]["action"]["kind"] == "adopt_corrected"
+
+
+def test_corrected_fact_rejects_invalid_scope_and_validity():
+    audit = reconciliation.build_audit(
+        principal_id=PRINCIPAL,
+        runtime_profile_id=RUNTIME,
+        rows=[_row("mem_1", "A legacy fact")],
+        now=NOW,
+    )
+    candidate = audit["candidates"][0]
+    action = {
+        "kind": "adopt_corrected",
+        "replacement": {
+            "content": "A corrected fact",
+            "scope_kind": "project",
+            "scope_key": "",
+            "confidence": 0.8,
+        },
+    }
+
+    with pytest.raises(reconciliation.MemoryReconciliationError, match="requires a project"):
+        reconciliation.validate_candidate_action(candidate, action)
 
 
 def test_rejected_and_deferred_candidates_are_suppressed_until_evidence_changes(tmp_path: Path):

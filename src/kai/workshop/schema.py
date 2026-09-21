@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 90
+WORKSHOP_SCHEMA_VERSION = 91
 
 
 @dataclass(frozen=True, slots=True)
@@ -4363,6 +4363,71 @@ _IMMUTABLE_EPISODE_HISTORY_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_MEMORY_RECONCILIATION_REVIEW_SCHEMA = SchemaMigration(
+    version=91,
+    name="canonical_memory_reconciliation_review",
+    statements=(
+        """
+        CREATE TABLE memory_reconciliation_audits (
+            audit_id TEXT PRIMARY KEY CHECK (length(audit_id) BETWEEN 1 AND 128),
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            runtime_profile_id TEXT NOT NULL CHECK (length(runtime_profile_id) BETWEEN 1 AND 128),
+            audit_sha256 TEXT NOT NULL CHECK (length(audit_sha256) = 64),
+            corpus_sha256 TEXT NOT NULL CHECK (length(corpus_sha256) = 64),
+            generated_at TEXT NOT NULL,
+            candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+            audit_json TEXT NOT NULL CHECK (json_valid(audit_json) AND json_type(audit_json) = 'object'),
+            status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'applied')),
+            review_version INTEGER NOT NULL DEFAULT 0 CHECK (review_version >= 0),
+            created_at TEXT NOT NULL,
+            applied_at TEXT,
+            UNIQUE (principal_id, runtime_profile_id, corpus_sha256)
+        )
+        """,
+        "CREATE INDEX memory_reconciliation_audit_owner_idx "
+        "ON memory_reconciliation_audits (principal_id, generated_at DESC)",
+        """
+        CREATE TABLE memory_reconciliation_decisions (
+            audit_id TEXT NOT NULL REFERENCES memory_reconciliation_audits(audit_id) ON DELETE CASCADE,
+            candidate_id TEXT NOT NULL CHECK (length(candidate_id) BETWEEN 1 AND 128),
+            state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64),
+            disposition TEXT NOT NULL DEFAULT 'pending' CHECK (
+                disposition IN ('pending', 'approve', 'reject', 'defer')
+            ),
+            action_json TEXT NOT NULL CHECK (json_valid(action_json) AND json_type(action_json) = 'object'),
+            operator_note TEXT NOT NULL DEFAULT '' CHECK (length(operator_note) <= 4096),
+            state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (audit_id, candidate_id)
+        )
+        """,
+        "CREATE INDEX memory_reconciliation_decision_state_idx "
+        "ON memory_reconciliation_decisions (audit_id, disposition, candidate_id)",
+        """
+        CREATE TABLE memory_reconciliation_receipts (
+            receipt_id TEXT PRIMARY KEY CHECK (length(receipt_id) BETWEEN 1 AND 128),
+            audit_id TEXT NOT NULL UNIQUE REFERENCES memory_reconciliation_audits(audit_id) ON DELETE RESTRICT,
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            review_sha256 TEXT NOT NULL CHECK (length(review_sha256) = 64),
+            receipt_sha256 TEXT NOT NULL CHECK (length(receipt_sha256) = 64),
+            receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json) AND json_type(receipt_json) = 'object'),
+            applied_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE memory_reconciliation_operations (
+            principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+            client_operation_id TEXT NOT NULL CHECK (length(client_operation_id) BETWEEN 1 AND 128),
+            request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+            response_json TEXT NOT NULL CHECK (json_valid(response_json) AND json_type(response_json) = 'object'),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, client_operation_id)
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4454,6 +4519,7 @@ _MIGRATIONS = (
     _TEMPORAL_MEMORY_LIFECYCLE_SCHEMA,
     _ATOMIC_MEMORY_FACT_MUTATION_SCHEMA,
     _IMMUTABLE_EPISODE_HISTORY_SCHEMA,
+    _MEMORY_RECONCILIATION_REVIEW_SCHEMA,
 )
 
 

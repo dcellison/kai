@@ -28,11 +28,17 @@ from kai.workshop.fact_lifecycle import (
     FactRevisionInput,
     MemoryFactLifecycleService,
 )
+from kai.workshop.memory_current_truth import (
+    CANONICAL_CLAIM_ID_KEY,
+    CANONICAL_EPISODE_ID_KEY,
+    CANONICAL_REVISION_ID_KEY,
+)
 from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptAccessDenied,
     MemoryExtractionReceiptService,
     MemoryExtractionReceiptSnapshot,
 )
+from kai.workshop.memory_reconciliation_review import WorkshopMemoryReconciliationReviewService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from kai.workspace_utils import is_workspace_allowed
@@ -57,6 +63,7 @@ _CURSOR_VERSION = 1
 _REVISION_VERSION = 1
 _VALID_KINDS = frozenset({"fact", "episode"})
 _VALID_SCOPES = frozenset({"global", "project", "task"})
+_VALID_LIFECYCLE_FILTERS = frozenset({"active", "historical", "legacy"})
 _VALID_ORDERS = frozenset({"newest", "oldest"})
 _VALID_MUTATION_SCOPES = frozenset({memory.SCOPE_GLOBAL, memory.SCOPE_PROJECT})
 _VALID_OUTCOME_QUALITIES = frozenset({"success", "partial", "failure"})
@@ -114,6 +121,7 @@ class MemoryQueryFilters:
     tag: str | None = None
     scope: str | None = None
     project_id: str | None = None
+    lifecycle: str | None = None
 
 
 EMPTY_MEMORY_FILTERS = MemoryQueryFilters()
@@ -158,6 +166,7 @@ class MemoryRecordDetail:
     source_reference: MemorySourceReference | None = None
     extraction_provenance: str = "not_applicable"
     extraction_receipt: MemoryExtractionReceiptSnapshot | None = None
+    lifecycle: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +295,14 @@ def _bounded_text(value: object, *, maximum: int) -> str | None:
     return value[:maximum]
 
 
+def _stored_json_list(value: object) -> list[object]:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def _record_kind(result: memory.MemoryResult) -> str:
     return "episode" if result.metadata.get("source") == "episode" else "fact"
 
@@ -353,6 +370,7 @@ def _filter_fingerprint(filters: MemoryQueryFilters, *, order: str) -> str:
             "tag": filters.tag,
             "scope": filters.scope,
             "project_id": filters.project_id,
+            "lifecycle": filters.lifecycle,
             "order": order,
         },
         sort_keys=True,
@@ -428,6 +446,10 @@ class WorkshopMemoryQueryService:
         self._mutation_locks: dict[PrincipalId, asyncio.Lock] = {}
         self._fact_lifecycle = MemoryFactLifecycleService(store)
         self._episode_history = MemoryEpisodeHistoryService(store)
+        self.reconciliation = WorkshopMemoryReconciliationReviewService(
+            store,
+            db_path=Path(config.session_db_path),
+        )
 
     async def recover_fact_projections(self) -> int:
         """Recover canonical fact and episode projections interrupted by a prior process."""
@@ -483,6 +505,7 @@ class WorkshopMemoryQueryService:
             filters.tag,
             filters.scope,
             filters.project_id,
+            filters.lifecycle,
         ):
             if value is not None and (not value or len(value) > 128):
                 raise WorkshopMemoryValidationError("Invalid memory filter")
@@ -490,6 +513,8 @@ class WorkshopMemoryQueryService:
             raise WorkshopMemoryValidationError("Invalid memory kind")
         if filters.scope is not None and filters.scope not in _VALID_SCOPES:
             raise WorkshopMemoryValidationError("Invalid memory scope")
+        if filters.lifecycle is not None and filters.lifecycle not in _VALID_LIFECYCLE_FILTERS:
+            raise WorkshopMemoryValidationError("Invalid memory lifecycle filter")
 
     async def _all_visible(
         self,
@@ -613,8 +638,26 @@ class WorkshopMemoryQueryService:
     def _matches(
         result: memory.MemoryResult,
         filters: MemoryQueryFilters,
+        *,
+        active_claim_ids: frozenset[str] = frozenset(),
+        historical_claim_ids: frozenset[str] = frozenset(),
+        episode_ids: frozenset[str] = frozenset(),
     ) -> bool:
         resolved = memory.resolve_memory_scope(result.metadata)
+        claim_id = result.metadata.get(CANONICAL_CLAIM_ID_KEY)
+        episode_id = result.metadata.get(CANONICAL_EPISODE_ID_KEY)
+        lifecycle_matches = (
+            filters.lifecycle is None
+            or (filters.lifecycle == "active" and isinstance(claim_id, str) and claim_id in active_claim_ids)
+            or (
+                filters.lifecycle == "historical"
+                and (
+                    (isinstance(claim_id, str) and claim_id in historical_claim_ids)
+                    or (isinstance(episode_id, str) and episode_id in episode_ids)
+                )
+            )
+            or (filters.lifecycle == "legacy" and not isinstance(claim_id, str) and not isinstance(episode_id, str))
+        )
         return all(
             (
                 filters.kind is None or _record_kind(result) == filters.kind,
@@ -623,8 +666,35 @@ class WorkshopMemoryQueryService:
                 filters.tag is None or filters.tag in _tags(result),
                 filters.scope is None or resolved.scope == filters.scope,
                 filters.project_id is None or resolved.project_id == filters.project_id,
+                lifecycle_matches,
             )
         )
+
+    async def _lifecycle_filter_sets(
+        self,
+        authority: MemoryQueryAuthority,
+        lifecycle: str | None,
+    ) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+        if lifecycle is None or lifecycle == "legacy":
+            return frozenset(), frozenset(), frozenset()
+        async with self._store.connection.execute(
+            "SELECT c.claim_id, "
+            "MAX(CASE WHEN s.state = 'active' THEN 1 ELSE 0 END), COUNT(r.revision_id) "
+            "FROM memory_fact_claims c "
+            "JOIN memory_fact_revisions r ON r.claim_id = c.claim_id "
+            "JOIN memory_fact_revision_states s ON s.claim_id = r.claim_id AND s.revision_id = r.revision_id "
+            "WHERE c.owner_principal_id = ? GROUP BY c.claim_id",
+            (str(authority.principal_id),),
+        ) as cursor:
+            fact_rows = await cursor.fetchall()
+        active = frozenset(str(row[0]) for row in fact_rows if int(row[1]) == 1)
+        historical = frozenset(str(row[0]) for row in fact_rows if int(row[2]) > 1)
+        async with self._store.connection.execute(
+            "SELECT episode_id FROM memory_episodes WHERE owner_principal_id = ?",
+            (str(authority.principal_id),),
+        ) as cursor:
+            episodes = frozenset(str(row[0]) for row in await cursor.fetchall())
+        return active, historical, episodes
 
     async def list_records(
         self,
@@ -641,7 +711,18 @@ class WorkshopMemoryQueryService:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_SIZE:
             raise WorkshopMemoryValidationError(f"Memory page size must be between 1 and {MAX_PAGE_SIZE}")
         anchor = _decode_cursor(cursor, filters, order=order) if cursor is not None else None
-        rows = [row for row in await self._all_visible(authority) if self._matches(row, filters)]
+        lifecycle_sets = await self._lifecycle_filter_sets(authority, filters.lifecycle)
+        rows = [
+            row
+            for row in await self._all_visible(authority)
+            if self._matches(
+                row,
+                filters,
+                active_claim_ids=lifecycle_sets[0],
+                historical_claim_ids=lifecycle_sets[1],
+                episode_ids=lifecycle_sets[2],
+            )
+        ]
         reverse = order == "newest"
         rows.sort(key=_sort_key, reverse=reverse)
         if anchor is not None:
@@ -1497,6 +1578,201 @@ class WorkshopMemoryQueryService:
                 self._audit_mutation(authority, operation="delete", result=result)
         return MemoryMutationBatch("delete", tuple(results))
 
+    async def _fact_lifecycle_detail(
+        self,
+        authority: MemoryQueryAuthority,
+        claim_id: str,
+        projected_revision_id: str | None,
+    ) -> dict[str, object] | None:
+        async with self._store.connection.execute(
+            "SELECT c.runtime_profile_id, c.scope_kind, c.scope_key, c.created_at, "
+            "r.revision_id, r.content, r.asserted_at, r.observed_at, r.stored_at, "
+            "r.valid_from, r.valid_until, r.reason, r.evidence_json, r.backend, r.provider, "
+            "r.model, r.prompt_version, r.schema_version, r.supersedes_revision_id, "
+            "r.migration_classification, r.migration_gaps_json, s.state, s.state_reason, s.updated_at "
+            "FROM memory_fact_claims c "
+            "JOIN runtime_profile_owners rpo ON rpo.runtime_profile_id = c.runtime_profile_id "
+            "AND rpo.principal_id = c.owner_principal_id "
+            "JOIN memory_fact_revisions r ON r.claim_id = c.claim_id "
+            "JOIN memory_fact_revision_states s ON s.claim_id = r.claim_id AND s.revision_id = r.revision_id "
+            "WHERE c.claim_id = ? AND c.owner_principal_id = ? "
+            "ORDER BY r.created_event_position DESC",
+            (claim_id, str(authority.principal_id)),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        if not rows:
+            return None
+        async with self._store.connection.execute(
+            "SELECT revision_id, transition, previous_state, new_state, reason, occurred_at, event_position "
+            "FROM memory_fact_lifecycle_events WHERE claim_id = ? ORDER BY event_position DESC",
+            (claim_id,),
+        ) as cursor:
+            events = list(await cursor.fetchall())
+        return {
+            "authority": "canonical",
+            "kind": "fact",
+            "identity": claim_id,
+            "runtimeProfileId": str(rows[0][0]),
+            "scope": {"kind": str(rows[0][1]), "key": str(rows[0][2]) or None},
+            "createdAt": str(rows[0][3]),
+            "currentRevisionId": projected_revision_id,
+            "currentState": next(
+                (str(row[21]) for row in rows if str(row[4]) == projected_revision_id),
+                str(rows[0][21]),
+            ),
+            "revisions": [
+                {
+                    "revisionId": str(row[4]),
+                    "content": str(row[5]),
+                    "assertedAt": None if row[6] is None else str(row[6]),
+                    "observedAt": None if row[7] is None else str(row[7]),
+                    "storedAt": str(row[8]),
+                    "validFrom": None if row[9] is None else str(row[9]),
+                    "validUntil": None if row[10] is None else str(row[10]),
+                    "reason": str(row[11]),
+                    "evidence": _stored_json_list(row[12]),
+                    "backend": None if row[13] is None else str(row[13]),
+                    "provider": None if row[14] is None else str(row[14]),
+                    "model": None if row[15] is None else str(row[15]),
+                    "promptVersion": None if row[16] is None else str(row[16]),
+                    "schemaVersion": None if row[17] is None else str(row[17]),
+                    "supersedesRevisionId": None if row[18] is None else str(row[18]),
+                    "migrationClassification": str(row[19]),
+                    "migrationGaps": _stored_json_list(row[20]),
+                    "state": str(row[21]),
+                    "stateReason": str(row[22]),
+                    "stateUpdatedAt": str(row[23]),
+                }
+                for row in rows
+            ],
+            "events": [
+                {
+                    "revisionId": str(row[0]),
+                    "transition": str(row[1]),
+                    "previousState": None if row[2] is None else str(row[2]),
+                    "newState": str(row[3]),
+                    "reason": str(row[4]),
+                    "occurredAt": str(row[5]),
+                    "eventPosition": int(row[6]),
+                }
+                for row in events
+            ],
+            "followups": [],
+        }
+
+    async def _episode_lifecycle_detail(
+        self,
+        authority: MemoryQueryAuthority,
+        episode_id: str,
+    ) -> dict[str, object] | None:
+        async with self._store.connection.execute(
+            "SELECT e.runtime_profile_id, e.scope_kind, e.scope_key, e.content, e.occurred_from, "
+            "e.occurred_until, e.observed_at, e.stored_at, e.reason, e.evidence_json, e.backend, "
+            "e.provider, e.model, e.prompt_version, e.schema_version, e.migration_classification, "
+            "e.migration_gaps_json "
+            "FROM memory_episodes e "
+            "JOIN runtime_profile_owners rpo ON rpo.runtime_profile_id = e.runtime_profile_id "
+            "AND rpo.principal_id = e.owner_principal_id "
+            "WHERE e.episode_id = ? AND e.owner_principal_id = ?",
+            (episode_id, str(authority.principal_id)),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        async with self._store.connection.execute(
+            "SELECT f.source_episode_id, f.target_episode_id, f.relationship, f.reason, f.created_at "
+            "FROM memory_episode_followups f "
+            "WHERE f.owner_principal_id = ? AND (f.source_episode_id = ? OR f.target_episode_id = ?) "
+            "ORDER BY f.created_event_position",
+            (str(authority.principal_id), episode_id, episode_id),
+        ) as cursor:
+            followups = list(await cursor.fetchall())
+        return {
+            "authority": "canonical",
+            "kind": "episode",
+            "identity": episode_id,
+            "runtimeProfileId": str(row[0]),
+            "scope": {"kind": str(row[1]), "key": str(row[2]) or None},
+            "createdAt": str(row[7]),
+            "currentRevisionId": None,
+            "currentState": "historical",
+            "revisions": [
+                {
+                    "revisionId": episode_id,
+                    "content": str(row[3]),
+                    "occurredFrom": None if row[4] is None else str(row[4]),
+                    "occurredUntil": None if row[5] is None else str(row[5]),
+                    "observedAt": None if row[6] is None else str(row[6]),
+                    "storedAt": str(row[7]),
+                    "reason": str(row[8]),
+                    "evidence": _stored_json_list(row[9]),
+                    "backend": None if row[10] is None else str(row[10]),
+                    "provider": None if row[11] is None else str(row[11]),
+                    "model": None if row[12] is None else str(row[12]),
+                    "promptVersion": None if row[13] is None else str(row[13]),
+                    "schemaVersion": None if row[14] is None else str(row[14]),
+                    "migrationClassification": str(row[15]),
+                    "migrationGaps": _stored_json_list(row[16]),
+                    "state": "historical",
+                }
+            ],
+            "events": [],
+            "followups": [
+                {
+                    "sourceEpisodeId": str(item[0]),
+                    "targetEpisodeId": str(item[1]),
+                    "relationship": str(item[2]),
+                    "reason": str(item[3]),
+                    "createdAt": str(item[4]),
+                }
+                for item in followups
+            ],
+        }
+
+    async def _lifecycle_detail(
+        self,
+        authority: MemoryQueryAuthority,
+        result: memory.MemoryResult,
+    ) -> dict[str, object]:
+        claim_id = result.metadata.get(CANONICAL_CLAIM_ID_KEY)
+        revision_id = result.metadata.get(CANONICAL_REVISION_ID_KEY)
+        if isinstance(claim_id, str) and claim_id:
+            canonical = await self._fact_lifecycle_detail(
+                authority,
+                claim_id,
+                revision_id if isinstance(revision_id, str) else None,
+            )
+            if canonical is not None:
+                return canonical
+        episode_id = result.metadata.get(CANONICAL_EPISODE_ID_KEY)
+        if isinstance(episode_id, str) and episode_id:
+            canonical = await self._episode_lifecycle_detail(authority, episode_id)
+            if canonical is not None:
+                return canonical
+        migration_gaps = result.metadata.get("migration_gaps")
+        return {
+            "authority": "legacy",
+            "kind": _record_kind(result),
+            "identity": result.id,
+            "runtimeProfileId": None,
+            "scope": {
+                "kind": memory.resolve_memory_scope(result.metadata).scope,
+                "key": memory.resolve_memory_scope(result.metadata).project_id,
+            },
+            "createdAt": result.created_at,
+            "currentRevisionId": None,
+            "currentState": "requires_review",
+            "revisions": [],
+            "events": [],
+            "followups": [],
+            "migrationClassification": str(result.metadata.get("migration_classification") or "unclassified"),
+            "migrationGaps": (
+                [str(value) for value in migration_gaps if isinstance(value, str)]
+                if isinstance(migration_gaps, list)
+                else ["canonical provenance"]
+            ),
+        }
+
     async def detail(
         self,
         authority: MemoryQueryAuthority,
@@ -1606,6 +1882,7 @@ class WorkshopMemoryQueryService:
             source_reference=source_reference,
             extraction_provenance=extraction_provenance,
             extraction_receipt=extraction_receipt,
+            lifecycle=await self._lifecycle_detail(authority, result),
         )
 
     async def search(
@@ -1633,12 +1910,19 @@ class WorkshopMemoryQueryService:
             ),
             limit=limit,
         )
+        lifecycle_sets = await self._lifecycle_filter_sets(authority, filters.lifecycle)
         hits: list[MemorySearchHit] = []
         for hit in scoped.hits:
             result = hit.result
             if result.metadata.get("source") not in memory.USER_VISIBLE_SOURCES:
                 continue
-            if not self._matches(result, filters):
+            if not self._matches(
+                result,
+                filters,
+                active_claim_ids=lifecycle_sets[0],
+                historical_claim_ids=lifecycle_sets[1],
+                episode_ids=lifecycle_sets[2],
+            ):
                 continue
             hits.append(
                 MemorySearchHit(

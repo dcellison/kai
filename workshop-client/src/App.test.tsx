@@ -1108,6 +1108,21 @@ describe("Workshop React client", () => {
       confirmationQuote: null,
       content: "Workshop memory navigation works.",
       episode: null,
+      lifecycle: {
+        authority: "legacy",
+        createdAt: memoryRecord.createdAt,
+        currentRevisionId: null,
+        currentState: "requires_review",
+        events: [],
+        followups: [],
+        identity: memoryId,
+        kind: "fact",
+        migrationClassification: "unclassified",
+        migrationGaps: ["canonical provenance"],
+        revisions: [],
+        runtimeProfileId: null,
+        scope: { key: null, kind: "global" },
+      },
       promptVersion: "v1",
     }));
     vi.mocked(loadMemorySource).mockResolvedValue({
