@@ -17,6 +17,7 @@ from kai import memory
 from kai.config import Config
 from kai.workshop.authorization import CanonicalChannelAuthorizer
 from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.episode_history import MemoryEpisodeHistoryService
 from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
@@ -426,10 +427,13 @@ class WorkshopMemoryQueryService:
         self._namespaces = {principal_id: tuple(namespaces) for principal_id, namespaces in by_principal.items()}
         self._mutation_locks: dict[PrincipalId, asyncio.Lock] = {}
         self._fact_lifecycle = MemoryFactLifecycleService(store)
+        self._episode_history = MemoryEpisodeHistoryService(store)
 
     async def recover_fact_projections(self) -> int:
-        """Recover canonical fact projections interrupted by a prior process."""
-        return await self._fact_lifecycle.recover_pending()
+        """Recover canonical fact and episode projections interrupted by a prior process."""
+        facts = await self._fact_lifecycle.recover_pending()
+        episodes = await self._episode_history.recover_pending()
+        return facts + episodes
 
     def authority_for_principal(
         self,
@@ -1031,6 +1035,10 @@ class WorkshopMemoryQueryService:
             )
             if existing is None:
                 raise WorkshopMemoryNotFound("Memory not found")
+            if existing.metadata.get("canonical_memory_episode_id"):
+                raise WorkshopMemoryValidationError(
+                    "Canonical episodes are immutable; record a linked follow-up instead"
+                )
             if isinstance(normalized, MemoryFactEdit) and _record_kind(existing) != "fact":
                 raise WorkshopMemoryValidationError("Memory kind does not match the edit request")
             if isinstance(normalized, MemoryEpisodeEdit) and _record_kind(existing) != "episode":
@@ -1285,7 +1293,9 @@ class WorkshopMemoryQueryService:
                     result = MemoryMutationResult(memory_id, "not_found", None, None)
                 else:
                     prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
-                    if revisions and _memory_revision(record) != revisions[memory_id]:
+                    if record.metadata.get("canonical_memory_episode_id"):
+                        result = MemoryMutationResult(memory_id, "failed", prior, prior)
+                    elif revisions and _memory_revision(record) != revisions[memory_id]:
                         result = MemoryMutationResult(memory_id, "stale", prior, prior)
                     else:
                         merged = dict(record.metadata)
@@ -1420,7 +1430,9 @@ class WorkshopMemoryQueryService:
                     result = MemoryMutationResult(memory_id, "not_found", None, None)
                 else:
                     prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
-                    if revisions and _memory_revision(record) != revisions[memory_id]:
+                    if record.metadata.get("canonical_memory_episode_id"):
+                        result = MemoryMutationResult(memory_id, "failed", prior, prior)
+                    elif revisions and _memory_revision(record) != revisions[memory_id]:
                         result = MemoryMutationResult(memory_id, "stale", prior, prior)
                     else:
                         mutation_raised = False

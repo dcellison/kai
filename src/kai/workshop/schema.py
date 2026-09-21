@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 89
+WORKSHOP_SCHEMA_VERSION = 90
 
 
 @dataclass(frozen=True, slots=True)
@@ -4323,6 +4323,46 @@ _ATOMIC_MEMORY_FACT_MUTATION_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_IMMUTABLE_EPISODE_HISTORY_SCHEMA = SchemaMigration(
+    version=90,
+    name="immutable_episode_history",
+    statements=(
+        "ALTER TABLE memory_episodes ADD COLUMN goal TEXT",
+        "ALTER TABLE memory_episodes ADD COLUMN context TEXT",
+        "ALTER TABLE memory_episodes ADD COLUMN approach TEXT",
+        "ALTER TABLE memory_episodes ADD COLUMN outcome TEXT",
+        "ALTER TABLE memory_episodes ADD COLUMN outcome_quality TEXT CHECK ("
+        "outcome_quality IS NULL OR outcome_quality IN ('success', 'partial', 'failure'))",
+        "ALTER TABLE memory_episodes ADD COLUMN lessons TEXT",
+        "ALTER TABLE memory_episodes ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]' CHECK ("
+        "json_valid(tags_json) AND json_type(tags_json) = 'array' AND json_array_length(tags_json) <= 5)",
+        "ALTER TABLE memory_episodes ADD COLUMN actors_json TEXT NOT NULL DEFAULT '[]' CHECK ("
+        "json_valid(actors_json) AND json_type(actors_json) = 'array' AND json_array_length(actors_json) <= 10)",
+        "ALTER TABLE memory_episodes ADD COLUMN vector_metadata_json TEXT NOT NULL DEFAULT '{}' CHECK ("
+        "json_valid(vector_metadata_json) AND json_type(vector_metadata_json) = 'object')",
+        "ALTER TABLE memory_episodes ADD COLUMN similarity_fingerprint TEXT CHECK ("
+        "similarity_fingerprint IS NULL OR length(similarity_fingerprint) = 64)",
+        """
+        CREATE TABLE memory_episode_vector_operations (
+            event_position INTEGER PRIMARY KEY REFERENCES event_log(position) ON DELETE RESTRICT,
+            episode_id TEXT NOT NULL UNIQUE REFERENCES memory_episodes(episode_id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'succeeded', 'failed')),
+            memory_id TEXT CHECK (memory_id IS NULL OR length(memory_id) BETWEEN 1 AND 256),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            last_error_code TEXT CHECK (last_error_code IS NULL OR length(last_error_code) BETWEEN 1 AND 128),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """,
+        "CREATE INDEX memory_episode_vector_status_idx ON memory_episode_vector_operations (status, event_position)",
+        "CREATE INDEX memory_episode_vector_memory_idx ON memory_episode_vector_operations (memory_id, event_position)",
+        "CREATE INDEX memory_episode_similarity_idx ON memory_episodes ("
+        "owner_principal_id, runtime_profile_id, scope_kind, scope_key, similarity_fingerprint)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4413,6 +4453,7 @@ _MIGRATIONS = (
     _MEMORY_EXTRACTION_RECEIPT_SCHEMA,
     _TEMPORAL_MEMORY_LIFECYCLE_SCHEMA,
     _ATOMIC_MEMORY_FACT_MUTATION_SCHEMA,
+    _IMMUTABLE_EPISODE_HISTORY_SCHEMA,
 )
 
 

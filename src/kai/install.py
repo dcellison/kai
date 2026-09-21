@@ -99,6 +99,7 @@ from kai.workshop.diagnostics import (
     workshop_context_manifest_status,
     workshop_conversation_observation_status,
     workshop_delivery_authority_status,
+    workshop_episode_history_status,
     workshop_execution_state_status,
     workshop_human_avatar_status,
     workshop_human_handle_status,
@@ -10032,6 +10033,12 @@ def _cmd_status() -> None:
     )
     print(
         workshop_memory_current_truth_status(
+            Path(data_dir) / "kai.db",
+            memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
+        )
+    )
+    print(
+        workshop_episode_history_status(
             Path(data_dir) / "kai.db",
             memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
         )

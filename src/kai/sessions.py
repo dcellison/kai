@@ -70,6 +70,11 @@ from kai.workshop.domain import (
     RuntimeProfileId,
     WorkshopId,
 )
+from kai.workshop.episode_history import (
+    EpisodeInput,
+    EpisodeMutationResult,
+    MemoryEpisodeHistoryService,
+)
 from kai.workshop.execution_state import (
     WorkshopExecutionStateMigration,
     WorkshopExecutionStateNamespace,
@@ -461,6 +466,22 @@ async def apply_canonical_extracted_fact(
             stable_claim_key=stable_claim_key,
             existing=existing,
         )
+
+
+async def record_canonical_episode(
+    principal_id: PrincipalId,
+    runtime_profile_id: RuntimeProfileId,
+    spec: EpisodeInput,
+    *,
+    idempotency_key: str,
+) -> EpisodeMutationResult:
+    """Record one extracted episode under canonical history and shared DB locks."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        service = MemoryEpisodeHistoryService(WorkshopEventStore.from_initialized_connection(_get_db()))
+        authority = await service.authority_for(principal_id, runtime_profile_id)
+        return await service.record(authority, spec, idempotency_key=idempotency_key)
 
 
 async def reconcile_initial_workshop_human(

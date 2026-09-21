@@ -19,13 +19,19 @@ CANONICAL_CLAIM_ID_KEY = "canonical_memory_claim_id"
 CANONICAL_REVISION_ID_KEY = "canonical_memory_revision_id"
 CANONICAL_LIFECYCLE_STATE_KEY = "canonical_memory_lifecycle_state"
 CANONICAL_TEMPORAL_ROLE_KEY = "canonical_memory_temporal_role"
+CANONICAL_EPISODE_ID_KEY = "canonical_memory_episode_id"
 
-_REQUIRED_TABLES = {
+_FACT_TABLES = {
     "memory_fact_claims",
     "memory_fact_revisions",
     "memory_fact_revision_states",
     "memory_fact_lifecycle_events",
     "memory_fact_vector_operations",
+}
+_EPISODE_TABLES = {
+    "memory_episodes",
+    "memory_episode_followups",
+    "memory_episode_vector_operations",
 }
 _ADMITTED_MIGRATION_CLASSES = {"canonical", "legacy_complete"}
 
@@ -63,6 +69,22 @@ class _CanonicalRevision:
     operation_status: str | None
     operation: str | None
     memory_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalEpisode:
+    episode_id: str
+    content: str
+    scope_kind: str
+    scope_key: str
+    stored_at: str
+    migration_classification: str
+    vector_metadata: dict[str, Any]
+    structured: dict[str, Any]
+    provenance: dict[str, str | None]
+    operation_status: str | None
+    memory_id: str | None
+    relationships: tuple[dict[str, str], ...]
 
 
 def _read_only_connection(db_path: Path) -> sqlite3.Connection:
@@ -201,6 +223,159 @@ def _project_row(
     return replace(row, text=revision.content, memory_type="fact", metadata=metadata), None
 
 
+def _load_episode(
+    connection: sqlite3.Connection,
+    *,
+    episode_id: str,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> _CanonicalEpisode | None:
+    row = connection.execute(
+        "SELECT e.episode_id, e.content, e.scope_kind, e.scope_key, e.stored_at, "
+        "e.migration_classification, e.vector_metadata_json, e.goal, e.context, e.approach, "
+        "e.outcome, e.outcome_quality, e.lessons, e.tags_json, e.actors_json, "
+        "e.occurred_from, e.occurred_until, e.observed_at, e.reason, e.evidence_json, "
+        "e.source_receipt_id, e.source_run_id, e.source_message_id, e.result_message_id, "
+        "e.backend, e.provider, e.model, e.prompt_version, e.schema_version, "
+        "v.status, v.memory_id FROM memory_episodes e "
+        "LEFT JOIN memory_episode_vector_operations v ON v.episode_id = e.episode_id "
+        "WHERE e.episode_id = ? AND e.owner_principal_id = ? AND e.runtime_profile_id = ?",
+        (episode_id, principal_id, runtime_profile_id),
+    ).fetchone()
+    if row is None:
+        return None
+    vector_metadata = json.loads(str(row[6]))
+    tags = json.loads(str(row[13]))
+    actors = json.loads(str(row[14]))
+    evidence = json.loads(str(row[19]))
+    if not isinstance(vector_metadata, dict) or not isinstance(tags, list) or not isinstance(actors, list):
+        raise ValueError("canonical episode metadata is malformed")
+    if not isinstance(evidence, list):
+        raise ValueError("canonical episode evidence is malformed")
+    relationships = tuple(
+        {
+            "direction": "outgoing" if str(link[0]) == episode_id else "incoming",
+            "episode_id": str(link[1]) if str(link[0]) == episode_id else str(link[0]),
+            "relationship": str(link[2]),
+            "reason": str(link[3]),
+        }
+        for link in connection.execute(
+            "SELECT source_episode_id, target_episode_id, relationship, reason "
+            "FROM memory_episode_followups WHERE source_episode_id = ? OR target_episode_id = ? "
+            "ORDER BY created_event_position",
+            (episode_id, episode_id),
+        ).fetchall()
+    )
+    return _CanonicalEpisode(
+        episode_id=str(row[0]),
+        content=str(row[1]),
+        scope_kind=str(row[2]),
+        scope_key=str(row[3]),
+        stored_at=str(row[4]),
+        migration_classification=str(row[5]),
+        vector_metadata=vector_metadata,
+        structured={
+            "goal": str(row[7]),
+            "context": str(row[8]),
+            "approach": str(row[9]),
+            "outcome": str(row[10]),
+            "outcome_quality": str(row[11]),
+            "lessons": str(row[12]) if row[12] is not None else None,
+            "tags": tags,
+            "actors": actors,
+            "occurred_from": str(row[15]) if row[15] is not None else None,
+            "occurred_until": str(row[16]) if row[16] is not None else None,
+            "observed_at": str(row[17]) if row[17] is not None else None,
+            "reason": str(row[18]),
+            "evidence": evidence,
+        },
+        provenance={
+            "source_receipt_id": str(row[20]) if row[20] is not None else None,
+            "source_run_id": str(row[21]) if row[21] is not None else None,
+            "source_message_id": str(row[22]) if row[22] is not None else None,
+            "result_message_id": str(row[23]) if row[23] is not None else None,
+            "backend": str(row[24]) if row[24] is not None else None,
+            "provider": str(row[25]) if row[25] is not None else None,
+            "model": str(row[26]) if row[26] is not None else None,
+            "prompt_version": str(row[27]) if row[27] is not None else None,
+            "schema_version": str(row[28]) if row[28] is not None else None,
+        },
+        operation_status=str(row[29]) if row[29] is not None else None,
+        memory_id=str(row[30]) if row[30] is not None else None,
+        relationships=relationships,
+    )
+
+
+def _project_episode(
+    row: MemoryResult,
+    episode: _CanonicalEpisode,
+) -> tuple[MemoryResult | None, str | None]:
+    if episode.migration_classification not in _ADMITTED_MIGRATION_CLASSES:
+        return None, "quarantined"
+    if episode.operation_status != "succeeded" or episode.memory_id != row.id:
+        return None, "projection_not_current"
+    metadata = dict(episode.vector_metadata)
+    metadata.update(episode.structured)
+    metadata.update(episode.provenance)
+    metadata.update(
+        {
+            "source": "episode",
+            CANONICAL_EPISODE_ID_KEY: episode.episode_id,
+            CANONICAL_TEMPORAL_ROLE_KEY: "historical_episode",
+            "scope": episode.scope_kind,
+            "project_id": episode.scope_key if episode.scope_kind == "project" else None,
+            "stored_at": episode.stored_at,
+            "migration_classification": episode.migration_classification,
+            "episode_followups": list(episode.relationships),
+        }
+    )
+    return replace(row, text=episode.content, memory_type="episode", metadata=metadata), None
+
+
+def _order_episode_chains(rows: list[MemoryResult]) -> list[MemoryResult]:
+    """Order related episode occurrences newest-first without moving unrelated recall."""
+    episode_indexes = {
+        str(row.metadata[CANONICAL_EPISODE_ID_KEY]): index
+        for index, row in enumerate(rows)
+        if isinstance(row.metadata.get(CANONICAL_EPISODE_ID_KEY), str)
+    }
+    adjacency: dict[str, set[str]] = {episode_id: set() for episode_id in episode_indexes}
+    for episode_id, index in episode_indexes.items():
+        links = rows[index].metadata.get("episode_followups")
+        if not isinstance(links, list):
+            continue
+        for link in links:
+            related = link.get("episode_id") if isinstance(link, dict) else None
+            if isinstance(related, str) and related in adjacency:
+                adjacency[episode_id].add(related)
+                adjacency[related].add(episode_id)
+    ordered = list(rows)
+    visited: set[str] = set()
+    for root in adjacency:
+        if root in visited:
+            continue
+        pending = [root]
+        component: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in component:
+                continue
+            component.add(current)
+            pending.extend(adjacency[current] - component)
+        visited.update(component)
+        if len(component) < 2:
+            continue
+        positions = sorted(episode_indexes[value] for value in component)
+        chain_rows = sorted(
+            (rows[episode_indexes[value]] for value in component),
+            key=lambda value: str(value.metadata.get("stored_at") or ""),
+            reverse=True,
+        )
+        for position, row in zip(positions, chain_rows, strict=True):
+            ordered[position] = row
+    return ordered
+
+
 def project_current_truth(
     rows: Iterable[MemoryResult],
     *,
@@ -222,10 +397,38 @@ def project_current_truth(
     try:
         connection = _read_only_connection(db_path)
         try:
-            if not _REQUIRED_TABLES.issubset(_tables(connection)):
+            available_tables = _tables(connection)
+            if not _FACT_TABLES.issubset(available_tables):
                 return CurrentTruthProjection((), {"authority_unavailable": len(candidates)})
             connection.execute("BEGIN")
             for row in candidates:
+                episode_id = row.metadata.get(CANONICAL_EPISODE_ID_KEY)
+                if episode_id is not None:
+                    if not _EPISODE_TABLES.issubset(available_tables):
+                        excluded["authority_unavailable"] += 1
+                        continue
+                    if not isinstance(episode_id, str) or not episode_id:
+                        excluded["malformed_lifecycle"] += 1
+                        continue
+                    try:
+                        episode = _load_episode(
+                            connection,
+                            episode_id=episode_id,
+                            principal_id=principal_id,
+                            runtime_profile_id=runtime_profile_id,
+                        )
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        excluded["malformed_lifecycle"] += 1
+                        continue
+                    if episode is None:
+                        excluded["unknown_episode"] += 1
+                        continue
+                    projected, reason = _project_episode(row, episode)
+                    if projected is None:
+                        excluded[reason or "invalid_lifecycle"] += 1
+                    else:
+                        admitted.append(projected)
+                    continue
                 claim_id = row.metadata.get(CANONICAL_CLAIM_ID_KEY)
                 revision_id = row.metadata.get(CANONICAL_REVISION_ID_KEY)
                 lifecycle_state = row.metadata.get(CANONICAL_LIFECYCLE_STATE_KEY)
@@ -268,7 +471,7 @@ def project_current_truth(
             connection.close()
     except (OSError, sqlite3.Error):
         return CurrentTruthProjection((), {"authority_unavailable": len(candidates)})
-    return CurrentTruthProjection(tuple(admitted), dict(sorted(excluded.items())))
+    return CurrentTruthProjection(tuple(_order_episode_chains(admitted)), dict(sorted(excluded.items())))
 
 
 def current_truth_revision(db_path: Path, *, principal_id: str, runtime_profile_id: str) -> str:
@@ -276,7 +479,8 @@ def current_truth_revision(db_path: Path, *, principal_id: str, runtime_profile_
     try:
         connection = _read_only_connection(db_path)
         try:
-            if not _REQUIRED_TABLES.issubset(_tables(connection)):
+            available_tables = _tables(connection)
+            if not _FACT_TABLES.issubset(available_tables):
                 return "unavailable"
             rows = connection.execute(
                 "SELECT r.claim_id, r.revision_id, s.state, s.state_event_position, "
@@ -292,6 +496,21 @@ def current_truth_revision(db_path: Path, *, principal_id: str, runtime_profile_
                 "ORDER BY r.claim_id, r.revision_id",
                 (principal_id, runtime_profile_id),
             ).fetchall()
+            episode_rows = (
+                connection.execute(
+                    "SELECT e.episode_id, e.stored_at, e.migration_classification, "
+                    "v.status, v.memory_id, f.source_episode_id, f.target_episode_id, f.relationship, "
+                    "f.created_event_position FROM memory_episodes e "
+                    "LEFT JOIN memory_episode_vector_operations v ON v.episode_id = e.episode_id "
+                    "LEFT JOIN memory_episode_followups f ON "
+                    "f.source_episode_id = e.episode_id OR f.target_episode_id = e.episode_id "
+                    "WHERE e.owner_principal_id = ? AND e.runtime_profile_id = ? "
+                    "ORDER BY e.episode_id, f.created_event_position",
+                    (principal_id, runtime_profile_id),
+                ).fetchall()
+                if _EPISODE_TABLES.issubset(available_tables)
+                else []
+            )
         finally:
             connection.close()
     except (OSError, sqlite3.Error):
@@ -313,5 +532,9 @@ def current_truth_revision(db_path: Path, *, principal_id: str, runtime_profile_
                 else "current"
             )
         normalized.append((*tuple(row), validity))
-    encoded = json.dumps(normalized, separators=(",", ":"), sort_keys=False)
+    encoded = json.dumps(
+        {"facts": normalized, "episodes": [tuple(row) for row in episode_rows]},
+        separators=(",", ":"),
+        sort_keys=False,
+    )
     return hashlib.sha256(encoded.encode()).hexdigest()

@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -868,6 +869,51 @@ class TestStage2Storage:
         # as null. Mirror of the "reason omitted on success" rule.
         assert "memory_id" not in payload
         assert payload["reason"]  # non-empty
+
+    @pytest.mark.asyncio
+    async def test_canonical_episode_uses_immutable_history_authority(self, monkeypatch):
+        """Production Workshop extraction must not write around canonical history."""
+        from kai import sessions
+
+        async def _fake_exec(*args, **kwargs):
+            return _make_proc(stdout=_stage2_envelope(_valid_episode()))
+
+        claim = SimpleNamespace(
+            claimed=True,
+            receipt=SimpleNamespace(receipt_id="mer_" + "6" * 32),
+        )
+        record = AsyncMock(return_value=SimpleNamespace(memory_id="canonical-episode", projection_status="succeeded"))
+        monkeypatch.setattr(memory_extraction.asyncio, "create_subprocess_exec", _fake_exec)
+        monkeypatch.setattr(memory_extraction, "_claim_canonical_receipt", AsyncMock(return_value=claim))
+        monkeypatch.setattr(memory_extraction, "_complete_canonical_receipt", AsyncMock())
+        monkeypatch.setattr(sessions, "record_canonical_episode", record)
+        monkeypatch.setattr(
+            memory_extraction.memory,
+            "add_structured",
+            lambda *args, **kwargs: pytest.fail("canonical extraction bypassed episode history"),
+        )
+
+        await _generate_episode(
+            user_text="u",
+            assistant_text="a",
+            user_id="prn_" + "1" * 32,
+            session_id="session-1",
+            config=_cfg(),
+            effective_backend="claude",
+            effective_provider="anthropic",
+            canonical_provenance={
+                memory_extraction.memory.WORKSHOP_RUN_ID_KEY: "run_" + "2" * 32,
+                memory_extraction.memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY: "msg_" + "3" * 32,
+                memory_extraction.memory.WORKSHOP_RESULT_MESSAGE_ID_KEY: "msg_" + "4" * 32,
+            },
+            runtime_profile_id="rtp_" + "5" * 32,
+        )
+
+        assert record.await_count == 1
+        spec = record.await_args.args[2]
+        assert spec.goal == _valid_episode()["goal"]
+        assert spec.source_run_id == "run_" + "2" * 32
+        assert record.await_args.kwargs["idempotency_key"] == "memory-episode:mer_" + "6" * 32
 
 
 # ── §5.2/§5.3 Subprocess command assembly ───────────────────────────

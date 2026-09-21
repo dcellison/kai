@@ -2800,24 +2800,82 @@ async def _generate_episode(
                         extra[memory.SOURCE_ASSISTANT_TS_KEY] = assistant_log.ts
                         if assistant_log.date != user_log.date:
                             extra[memory.SOURCE_DATE_END_KEY] = assistant_log.date
-                    # add_structured is sync (Mem0 is sync). Run off
-                    # the event loop so the embedding step does not
-                    # block other stage-2 tasks queued behind this
-                    # user's semaphore.
-                    loop = asyncio.get_running_loop()
-                    add_kwargs: dict[str, object] = {
-                        "content": content,
-                        "user_id": user_id,
-                        "memory_type": "episode",
-                        "tags": episode["tags"],
-                        "metadata": extra,
-                    }
-                    if runtime_profile_id is not None:
-                        add_kwargs["runtime_profile_id"] = runtime_profile_id
-                    mem_id = await loop.run_in_executor(
-                        None,
-                        lambda: memory.add_structured(**add_kwargs),
-                    )
+                    if (
+                        canonical_provenance is not None
+                        and runtime_profile_id is not None
+                        and receipt_claim is not None
+                    ):
+                        from kai import sessions
+                        from kai.workshop.episode_history import EpisodeInput
+
+                        def log_timestamp(entry: LogEntry | None) -> datetime | None:
+                            if entry is None:
+                                return None
+                            try:
+                                parsed = datetime.fromisoformat(entry.ts.replace("Z", "+00:00"))
+                            except ValueError:
+                                return None
+                            return parsed if parsed.tzinfo is not None else None
+
+                        source_message_id = str(canonical_provenance[memory.WORKSHOP_SOURCE_MESSAGE_ID_KEY])
+                        result_message_id = str(canonical_provenance[memory.WORKSHOP_RESULT_MESSAGE_ID_KEY])
+                        run_id = str(canonical_provenance[memory.WORKSHOP_RUN_ID_KEY])
+                        mutation = await sessions.record_canonical_episode(
+                            PrincipalId(user_id),
+                            RuntimeProfileId(runtime_profile_id),
+                            EpisodeInput(
+                                goal=str(episode["goal"]),
+                                context=str(episode["context"]),
+                                approach=str(episode["approach"]),
+                                outcome=str(episode["outcome"]),
+                                outcome_quality=str(episode["outcome_quality"]),
+                                lessons=(str(episode["lessons"]) if "lessons" in episode else None),
+                                tags=tuple(str(value) for value in episode["tags"]),
+                                actors=tuple(str(value) for value in episode["actors"]),
+                                scope_kind=str(scope_meta["scope"]),
+                                scope_key=(
+                                    str(scope_meta["project_id"]) if scope_meta.get("project_id") is not None else ""
+                                ),
+                                reason="Episode extracted from a completed canonical conversation run.",
+                                evidence=(
+                                    {"kind": "message", "reference_id": source_message_id, "sha256": None},
+                                    {"kind": "message", "reference_id": result_message_id, "sha256": None},
+                                    {"kind": "run", "reference_id": run_id, "sha256": None},
+                                ),
+                                vector_metadata=extra,
+                                occurred_from=log_timestamp(user_log),
+                                occurred_until=log_timestamp(assistant_log),
+                                observed_at=datetime.now(UTC),
+                                source_receipt_id=receipt_claim.receipt.receipt_id,
+                                source_run_id=run_id,
+                                source_message_id=source_message_id,
+                                result_message_id=result_message_id,
+                                backend=effective_backend,
+                                provider=effective_provider,
+                                model=episode_model,
+                                prompt_version=_EPISODE_PROMPT_VERSION,
+                                schema_version=_EPISODE_SCHEMA_VERSION,
+                            ),
+                            idempotency_key=(f"memory-episode:{receipt_claim.receipt.receipt_id}"),
+                        )
+                        mem_id = mutation.memory_id if mutation.projection_status == "succeeded" else None
+                    else:
+                        # Compatibility and evaluation paths remain direct;
+                        # production Workshop extraction is canonical above.
+                        loop = asyncio.get_running_loop()
+                        add_kwargs: dict[str, object] = {
+                            "content": content,
+                            "user_id": user_id,
+                            "memory_type": "episode",
+                            "tags": episode["tags"],
+                            "metadata": extra,
+                        }
+                        if runtime_profile_id is not None:
+                            add_kwargs["runtime_profile_id"] = runtime_profile_id
+                        mem_id = await loop.run_in_executor(
+                            None,
+                            lambda: memory.add_structured(**add_kwargs),
+                        )
                     # add_structured returns the new memory ID on
                     # success or None when the underlying Mem0 call
                     # failed (backend error, content rejected).

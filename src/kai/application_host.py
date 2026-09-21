@@ -477,11 +477,11 @@ class KaiApplicationHost:
                 runtime_pool,
                 self._execution_state,
             )
-            recovered_fact_projections = await memory_queries.recover_fact_projections()
-            if recovered_fact_projections:
+            recovered_memory_projections = await memory_queries.recover_fact_projections()
+            if recovered_memory_projections:
                 log.info(
-                    "Recovered %d canonical memory-fact vector projection(s)",
-                    recovered_fact_projections,
+                    "Recovered %d canonical memory vector projection(s)",
+                    recovered_memory_projections,
                 )
             preference_documents = WorkshopPreferenceService(
                 Path(self._config.session_db_path).parent,

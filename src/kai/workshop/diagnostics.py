@@ -2129,6 +2129,76 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
     )
 
 
+def workshop_episode_history_status(db_path: Path, *, memory_enabled: bool | None) -> str:
+    """Describe immutable episode authority without reading episode content."""
+    prefix = "Workshop episode history:"
+    if memory_enabled is False:
+        return f"{prefix} disabled by policy"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical episode schema unavailable"
+    required = {
+        "memory_episodes",
+        "memory_episode_followups",
+        "memory_episode_vector_operations",
+    }
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not required.issubset(tables):
+                return f"{prefix} pending; canonical episode schema unavailable"
+            episodes = _scalar(connection, "SELECT COUNT(*) FROM memory_episodes")
+            canonical = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_episodes WHERE migration_classification = 'canonical'",
+            )
+            legacy = episodes - canonical
+            followups = _scalar(connection, "SELECT COUNT(*) FROM memory_episode_followups")
+            repeated = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_episode_followups WHERE relationship = 'repeated'",
+            )
+            pending = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_episode_vector_operations WHERE status IN ('pending', 'executing')",
+            )
+            failed = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_episode_vector_operations WHERE status = 'failed'",
+            )
+            provenance_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_episodes WHERE migration_classification = 'canonical' AND ("
+                "goal IS NULL OR context IS NULL OR approach IS NULL OR outcome IS NULL "
+                "OR outcome_quality IS NULL OR json_array_length(evidence_json) = 0 "
+                "OR source_receipt_id IS NULL OR source_run_id IS NULL OR source_message_id IS NULL "
+                "OR result_message_id IS NULL OR backend IS NULL OR provider IS NULL OR model IS NULL "
+                "OR prompt_version IS NULL OR schema_version IS NULL)",
+            )
+            projection_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_episodes e WHERE e.migration_classification = 'canonical' "
+                "AND NOT EXISTS (SELECT 1 FROM memory_episode_vector_operations v "
+                "WHERE v.episode_id = e.episode_id)",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    gaps = provenance_gaps + projection_gaps
+    state = "active" if pending == 0 and failed == 0 and gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; episodes={episodes} (canonical={canonical}, legacy={legacy}), "
+        f"followups={followups} (repeated={repeated}), projections=(pending={pending}, failed={failed}), "
+        f"integrity gaps={gaps} (provenance={provenance_gaps}, projection={projection_gaps}); "
+        "authority=immutable/canonical"
+    )
+
+
 def workshop_memory_extraction_receipt_status(db_path: Path) -> str:
     """Report durable extraction provenance without reading memory content."""
     prefix = "Workshop memory extraction receipts:"

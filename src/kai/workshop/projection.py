@@ -2175,6 +2175,7 @@ class CanonicalConversationProjection:
             )
         for table in (
             "memory_fact_vector_operations",
+            "memory_episode_vector_operations",
             "memory_episode_followups",
             "memory_episodes",
             "memory_fact_lifecycle_events",

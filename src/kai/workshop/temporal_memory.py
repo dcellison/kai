@@ -221,6 +221,13 @@ def _vector_metadata(payload: dict[str, Any]) -> str:
     return encoded
 
 
+def _string_list(value: object, *, field: str, maximum_items: int, maximum_length: int) -> str:
+    if not isinstance(value, list) or not 1 <= len(value) <= maximum_items:
+        raise ValueError(f"Temporal episode {field} must be a bounded non-empty list")
+    normalized = [_required_text(item, field=f"{field} item", maximum=maximum_length) for item in value]
+    return json.dumps(normalized, separators=(",", ":"))
+
+
 async def _require_owner_runtime(
     connection: aiosqlite.Connection,
     *,
@@ -750,8 +757,8 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
 
 async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEvent) -> None:
     envelope = event.envelope
-    if envelope.aggregate_type != "memory_episode" or envelope.event_version != 1:
-        raise ValueError("Temporal episode event requires a version-one memory episode aggregate")
+    if envelope.aggregate_type != "memory_episode" or envelope.event_version not in {1, 2}:
+        raise ValueError("Temporal episode event requires a supported memory episode aggregate")
     episode_id = MemoryEpisodeId(str(envelope.aggregate_id))
     payload = envelope.payload
     if envelope.event_type == WorkshopEventType.MEMORY_EPISODE_RECORDED:
@@ -779,7 +786,20 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
             "migration_classification",
             "migration_gaps",
         }
-        if set(payload) != expected:
+        structured = {
+            "goal",
+            "context",
+            "approach",
+            "outcome",
+            "outcome_quality",
+            "lessons",
+            "tags",
+            "actors",
+            "vector_metadata",
+            "similarity_fingerprint",
+        }
+        required = expected | structured if envelope.event_version == 2 else expected
+        if set(payload) != required:
             raise ValueError("Temporal episode payload has an invalid shape")
         owner = PrincipalId(_required_text(payload.get("owner_principal_id"), field="owner_principal_id", maximum=128))
         runtime = RuntimeProfileId(
@@ -800,13 +820,36 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
         occurred_until = _timestamp(payload.get("occurred_until"), field="occurred_until")
         if occurred_from is not None and occurred_until is not None and occurred_until < occurred_from:
             raise ValueError("Temporal episode occurrence interval is invalid")
+        goal = context = approach = outcome = outcome_quality = lessons = None
+        tags_json = actors_json = "[]"
+        vector_metadata_json = "{}"
+        similarity_fingerprint = None
+        if envelope.event_version == 2:
+            goal = _required_text(payload.get("goal"), field="goal", maximum=300)
+            context = _required_text(payload.get("context"), field="context", maximum=500)
+            approach = _required_text(payload.get("approach"), field="approach", maximum=500)
+            outcome = _required_text(payload.get("outcome"), field="outcome", maximum=500)
+            outcome_quality = _required_text(payload.get("outcome_quality"), field="outcome_quality", maximum=16)
+            if outcome_quality not in {"success", "partial", "failure"}:
+                raise ValueError("Temporal episode outcome_quality is invalid")
+            lessons = _optional_text(payload.get("lessons"), field="lessons", maximum=500)
+            tags_json = _string_list(payload.get("tags"), field="tags", maximum_items=5, maximum_length=50)
+            actors_json = _string_list(payload.get("actors"), field="actors", maximum_items=10, maximum_length=100)
+            vector_metadata_json = _vector_metadata(payload)
+            similarity_fingerprint = _required_text(
+                payload.get("similarity_fingerprint"), field="similarity_fingerprint", maximum=64
+            )
+            if not _SHA256_PATTERN.fullmatch(similarity_fingerprint):
+                raise ValueError("Temporal episode similarity fingerprint is invalid")
         await connection.execute(
             "INSERT INTO memory_episodes ("
             "episode_id, workshop_id, owner_principal_id, runtime_profile_id, scope_kind, scope_key, "
             "content, occurred_from, occurred_until, observed_at, stored_at, reason, evidence_json, "
             "source_receipt_id, source_run_id, source_message_id, result_message_id, backend, provider, "
             "model, prompt_version, schema_version, migration_classification, migration_gaps_json, "
-            "created_event_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_event_position, goal, context, approach, outcome, outcome_quality, lessons, tags_json, "
+            "actors_json, vector_metadata_json, similarity_fingerprint) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 episode_id,
                 envelope.workshop_id,
@@ -833,8 +876,26 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
                 classification,
                 gaps_json,
                 event.position,
+                goal,
+                context,
+                approach,
+                outcome,
+                outcome_quality,
+                lessons,
+                tags_json,
+                actors_json,
+                vector_metadata_json,
+                similarity_fingerprint,
             ),
         )
+        if envelope.event_version == 2:
+            occurred_at = envelope.occurred_at.isoformat()
+            await connection.execute(
+                "INSERT INTO memory_episode_vector_operations "
+                "(event_position, episode_id, status, created_at, updated_at) "
+                "VALUES (?, ?, 'pending', ?, ?)",
+                (event.position, episode_id, occurred_at, occurred_at),
+            )
         return
 
     if envelope.event_type != WorkshopEventType.MEMORY_EPISODE_FOLLOWUP_RECORDED:
