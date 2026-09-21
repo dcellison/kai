@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 87
+WORKSHOP_SCHEMA_VERSION = 88
 
 
 @dataclass(frozen=True, slots=True)
@@ -4065,6 +4065,232 @@ _MEMORY_EXTRACTION_RECEIPT_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_TEMPORAL_MEMORY_LIFECYCLE_SCHEMA = SchemaMigration(
+    version=88,
+    name="canonical_temporal_memory_lifecycle",
+    statements=(
+        """
+        CREATE TABLE memory_fact_claims (
+            claim_id TEXT PRIMARY KEY CHECK (length(claim_id) BETWEEN 1 AND 128),
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            owner_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            runtime_profile_id TEXT NOT NULL CHECK (length(runtime_profile_id) BETWEEN 1 AND 128),
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('global', 'project')),
+            scope_key TEXT NOT NULL CHECK (
+                (scope_kind = 'global' AND scope_key = '')
+                OR (scope_kind = 'project' AND length(scope_key) BETWEEN 1 AND 256)
+            ),
+            claim_identity_sha256 TEXT NOT NULL CHECK (
+                length(claim_identity_sha256) = 64
+                AND claim_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (
+                workshop_id, owner_principal_id, runtime_profile_id,
+                scope_kind, scope_key, claim_identity_sha256
+            )
+        )
+        """,
+        """
+        CREATE TABLE memory_fact_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (length(revision_id) BETWEEN 1 AND 128),
+            claim_id TEXT NOT NULL REFERENCES memory_fact_claims(claim_id) ON DELETE CASCADE,
+            content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 16384),
+            asserted_at TEXT,
+            observed_at TEXT,
+            stored_at TEXT NOT NULL,
+            valid_from TEXT,
+            valid_until TEXT,
+            reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 2048),
+            evidence_json TEXT NOT NULL CHECK (
+                json_valid(evidence_json)
+                AND json_type(evidence_json) = 'array'
+                AND json_array_length(evidence_json) <= 64
+            ),
+            source_receipt_id TEXT REFERENCES memory_extraction_receipts(receipt_id) ON DELETE RESTRICT,
+            source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+            source_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            result_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            backend TEXT,
+            provider TEXT,
+            model TEXT,
+            prompt_version TEXT,
+            schema_version TEXT,
+            supersedes_revision_id TEXT,
+            migration_classification TEXT NOT NULL CHECK (
+                migration_classification IN (
+                    'canonical', 'legacy_complete', 'legacy_incomplete', 'legacy_quarantined'
+                )
+            ),
+            migration_gaps_json TEXT NOT NULL CHECK (
+                json_valid(migration_gaps_json)
+                AND json_type(migration_gaps_json) = 'array'
+                AND json_array_length(migration_gaps_json) <= 16
+            ),
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (revision_id, claim_id),
+            FOREIGN KEY (supersedes_revision_id, claim_id)
+                REFERENCES memory_fact_revisions(revision_id, claim_id) ON DELETE RESTRICT,
+            CHECK (valid_until IS NULL OR valid_from IS NULL OR valid_until > valid_from),
+            CHECK (
+                (migration_classification IN ('canonical', 'legacy_complete')
+                    AND json_array_length(migration_gaps_json) = 0)
+                OR (migration_classification IN ('legacy_incomplete', 'legacy_quarantined')
+                    AND json_array_length(migration_gaps_json) > 0)
+            )
+        )
+        """,
+        """
+        CREATE TABLE memory_fact_revision_states (
+            revision_id TEXT PRIMARY KEY,
+            claim_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN ('active', 'superseded', 'retracted', 'expired', 'unresolved_conflict')
+            ),
+            state_reason TEXT NOT NULL CHECK (length(state_reason) BETWEEN 1 AND 2048),
+            state_event_position INTEGER NOT NULL REFERENCES event_log(position) ON DELETE RESTRICT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (revision_id, claim_id)
+                REFERENCES memory_fact_revisions(revision_id, claim_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE UNIQUE INDEX memory_fact_one_active_revision_idx "
+        "ON memory_fact_revision_states (claim_id) WHERE state = 'active'",
+        "CREATE INDEX memory_fact_revision_state_idx ON memory_fact_revision_states (state, claim_id)",
+        """
+        CREATE TABLE memory_fact_lifecycle_events (
+            event_position INTEGER NOT NULL REFERENCES event_log(position) ON DELETE RESTRICT,
+            claim_id TEXT NOT NULL REFERENCES memory_fact_claims(claim_id) ON DELETE CASCADE,
+            revision_id TEXT NOT NULL,
+            transition TEXT NOT NULL CHECK (
+                transition IN (
+                    'recorded', 'superseded', 'retracted', 'expired',
+                    'conflict_opened', 'conflict_resolved'
+                )
+            ),
+            previous_state TEXT CHECK (
+                previous_state IS NULL OR previous_state IN (
+                    'active', 'superseded', 'retracted', 'expired', 'unresolved_conflict'
+                )
+            ),
+            new_state TEXT NOT NULL CHECK (
+                new_state IN ('active', 'superseded', 'retracted', 'expired', 'unresolved_conflict')
+            ),
+            reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 2048),
+            occurred_at TEXT NOT NULL,
+            PRIMARY KEY (event_position, revision_id),
+            FOREIGN KEY (revision_id, claim_id)
+                REFERENCES memory_fact_revisions(revision_id, claim_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX memory_fact_lifecycle_claim_idx ON memory_fact_lifecycle_events (claim_id, event_position)",
+        """
+        CREATE TABLE memory_episodes (
+            episode_id TEXT PRIMARY KEY CHECK (length(episode_id) BETWEEN 1 AND 128),
+            workshop_id TEXT NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+            owner_principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+            runtime_profile_id TEXT NOT NULL CHECK (length(runtime_profile_id) BETWEEN 1 AND 128),
+            scope_kind TEXT NOT NULL CHECK (scope_kind IN ('global', 'project')),
+            scope_key TEXT NOT NULL CHECK (
+                (scope_kind = 'global' AND scope_key = '')
+                OR (scope_kind = 'project' AND length(scope_key) BETWEEN 1 AND 256)
+            ),
+            content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 65536),
+            occurred_from TEXT,
+            occurred_until TEXT,
+            observed_at TEXT,
+            stored_at TEXT NOT NULL,
+            reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 2048),
+            evidence_json TEXT NOT NULL CHECK (
+                json_valid(evidence_json)
+                AND json_type(evidence_json) = 'array'
+                AND json_array_length(evidence_json) <= 64
+            ),
+            source_receipt_id TEXT REFERENCES memory_extraction_receipts(receipt_id) ON DELETE RESTRICT,
+            source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+            source_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            result_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+            backend TEXT,
+            provider TEXT,
+            model TEXT,
+            prompt_version TEXT,
+            schema_version TEXT,
+            migration_classification TEXT NOT NULL CHECK (
+                migration_classification IN (
+                    'canonical', 'legacy_complete', 'legacy_incomplete', 'legacy_quarantined'
+                )
+            ),
+            migration_gaps_json TEXT NOT NULL CHECK (
+                json_valid(migration_gaps_json)
+                AND json_type(migration_gaps_json) = 'array'
+                AND json_array_length(migration_gaps_json) <= 16
+            ),
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            UNIQUE (
+                episode_id, workshop_id, owner_principal_id,
+                runtime_profile_id, scope_kind, scope_key
+            ),
+            CHECK (
+                occurred_until IS NULL OR occurred_from IS NULL
+                OR occurred_until >= occurred_from
+            ),
+            CHECK (
+                (migration_classification IN ('canonical', 'legacy_complete')
+                    AND json_array_length(migration_gaps_json) = 0)
+                OR (migration_classification IN ('legacy_incomplete', 'legacy_quarantined')
+                    AND json_array_length(migration_gaps_json) > 0)
+            )
+        )
+        """,
+        """
+        CREATE TABLE memory_episode_followups (
+            source_episode_id TEXT NOT NULL,
+            target_episode_id TEXT NOT NULL,
+            workshop_id TEXT NOT NULL,
+            owner_principal_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL,
+            scope_kind TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            relationship TEXT NOT NULL CHECK (
+                relationship IN (
+                    'revisited', 'outcome_changed', 'invalidated_conclusion',
+                    'repeated', 'resolved_by'
+                )
+            ),
+            reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 2048),
+            created_at TEXT NOT NULL,
+            created_event_position INTEGER NOT NULL UNIQUE
+                REFERENCES event_log(position) ON DELETE RESTRICT,
+            PRIMARY KEY (source_episode_id, target_episode_id, relationship),
+            FOREIGN KEY (
+                source_episode_id, workshop_id, owner_principal_id,
+                runtime_profile_id, scope_kind, scope_key
+            ) REFERENCES memory_episodes (
+                episode_id, workshop_id, owner_principal_id,
+                runtime_profile_id, scope_kind, scope_key
+            ) ON DELETE CASCADE,
+            FOREIGN KEY (
+                target_episode_id, workshop_id, owner_principal_id,
+                runtime_profile_id, scope_kind, scope_key
+            ) REFERENCES memory_episodes (
+                episode_id, workshop_id, owner_principal_id,
+                runtime_profile_id, scope_kind, scope_key
+            ) ON DELETE CASCADE,
+            CHECK (source_episode_id != target_episode_id)
+        )
+        """,
+        "CREATE INDEX memory_episode_owner_scope_idx ON memory_episodes "
+        "(owner_principal_id, runtime_profile_id, scope_kind, scope_key, stored_at DESC)",
+        "CREATE INDEX memory_episode_followup_target_idx "
+        "ON memory_episode_followups (target_episode_id, created_event_position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4153,6 +4379,7 @@ _MIGRATIONS = (
     _DURABLE_CHANNEL_NOTIFICATION_POLICY_SCHEMA,
     _CANONICAL_REVIEW_JOB_SCHEMA,
     _MEMORY_EXTRACTION_RECEIPT_SCHEMA,
+    _TEMPORAL_MEMORY_LIFECYCLE_SCHEMA,
 )
 
 

@@ -2148,6 +2148,11 @@ class CanonicalConversationProjection:
             "parent_run_id",
         ):
             await connection.execute("UPDATE runs SET parent_run_id = NULL")
+        if "memory_fact_revisions" in existing_tables:
+            # Break the intra-claim historical link before deleting the
+            # immutable revision projection. Replay restores it from the
+            # supersession event.
+            await connection.execute("UPDATE memory_fact_revisions SET supersedes_revision_id = NULL")
         if "messages" in existing_tables and await _table_has_column(
             connection,
             "messages",
@@ -2162,6 +2167,12 @@ class CanonicalConversationProjection:
                 "run_attempt_id = NULL, collaboration_grant_id = NULL, collaboration_operation = NULL"
             )
         for table in (
+            "memory_episode_followups",
+            "memory_episodes",
+            "memory_fact_lifecycle_events",
+            "memory_fact_revision_states",
+            "memory_fact_revisions",
+            "memory_fact_claims",
             "standing_observation_publications",
             "channel_agent_observation_states",
             "channel_agent_standings",
@@ -2208,6 +2219,21 @@ class CanonicalConversationProjection:
         envelope = event.envelope
         payload = envelope.payload
         occurred_at = envelope.occurred_at.isoformat()
+
+        if envelope.event_type in {
+            WorkshopEventType.MEMORY_FACT_RECORDED,
+            WorkshopEventType.MEMORY_FACT_SUPERSEDED,
+            WorkshopEventType.MEMORY_FACT_RETRACTED,
+            WorkshopEventType.MEMORY_FACT_EXPIRED,
+            WorkshopEventType.MEMORY_FACT_CONFLICT_OPENED,
+            WorkshopEventType.MEMORY_FACT_CONFLICT_RESOLVED,
+            WorkshopEventType.MEMORY_EPISODE_RECORDED,
+            WorkshopEventType.MEMORY_EPISODE_FOLLOWUP_RECORDED,
+        }:
+            from kai.workshop.temporal_memory import apply_temporal_memory_event
+
+            await apply_temporal_memory_event(connection, event)
+            return
 
         if envelope.event_type in {
             WorkshopEventType.CHANNEL_STANDING_PARTICIPATION_POLICY_SET,

@@ -99,6 +99,14 @@ class WorkshopEventType(StrEnum):
     AGENT_DELEGATION_COMPLETED = "agent_delegation.completed"
     AGENT_DELEGATION_FAILED = "agent_delegation.failed"
     AGENT_DELEGATION_CANCELLED = "agent_delegation.cancelled"
+    MEMORY_FACT_RECORDED = "memory_fact.recorded"
+    MEMORY_FACT_SUPERSEDED = "memory_fact.superseded"
+    MEMORY_FACT_RETRACTED = "memory_fact.retracted"
+    MEMORY_FACT_EXPIRED = "memory_fact.expired"
+    MEMORY_FACT_CONFLICT_OPENED = "memory_fact.conflict_opened"
+    MEMORY_FACT_CONFLICT_RESOLVED = "memory_fact.conflict_resolved"
+    MEMORY_EPISODE_RECORDED = "memory_episode.recorded"
+    MEMORY_EPISODE_FOLLOWUP_RECORDED = "memory_episode.followup_recorded"
 
 
 class OpaqueId(str):
@@ -202,6 +210,18 @@ class RuntimeAssignmentId(OpaqueId):
 
 class MessageId(OpaqueId):
     prefix = "msg"
+
+
+class MemoryClaimId(OpaqueId):
+    prefix = "mcl"
+
+
+class MemoryRevisionId(OpaqueId):
+    prefix = "mrv"
+
+
+class MemoryEpisodeId(OpaqueId):
+    prefix = "mep"
 
 
 class HumanNotificationId(OpaqueId):
@@ -313,6 +333,9 @@ _ID_TYPES: dict[str, type[OpaqueId]] = {
         ChannelAgentId,
         RuntimeAssignmentId,
         MessageId,
+        MemoryClaimId,
+        MemoryRevisionId,
+        MemoryEpisodeId,
         HumanNotificationId,
         ChannelReadPositionId,
         ThreadReadPositionId,
