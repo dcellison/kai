@@ -338,8 +338,9 @@ def test_receipt_sampling_excludes_mismatched_runtime_owner(tmp_path):
         connection.close()
 
 
-def test_quality_corpus_parser_exposes_all_four_stages():
+def test_quality_corpus_parser_exposes_provenance_and_review_stages():
     parser = memory_admin._build_parser()
+    assert parser.parse_args(["quality-corpus", "provenance", "prn_owner"]).quality_command == "provenance"
     assert parser.parse_args(["quality-corpus", "sample", "prn_owner"]).quality_command == "sample"
     assert (
         parser.parse_args(["quality-corpus", "review-template", "snapshot.json"]).quality_command == "review-template"
@@ -351,6 +352,45 @@ def test_quality_corpus_parser_exposes_all_four_stages():
         == "seal-review"
     )
     assert parser.parse_args(["quality-corpus", "score", "snapshot.json", "sealed.json"]).quality_command == "score"
+
+
+def test_quality_provenance_is_principal_authorized_and_content_free(tmp_path, monkeypatch, capsys):
+    connection = _create_receipt_database(tmp_path / "kai.db")
+    connection.close()
+    monkeypatch.setattr("kai.config.load_config", lambda: SimpleNamespace(session_db_path=str(tmp_path / "kai.db")))
+    args = memory_admin._build_parser().parse_args(["quality-corpus", "provenance", "42", "--limit", "10"])
+
+    assert memory_admin._cmd_quality_corpus(args) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["count"] == 1
+    assert document["memories"] == [
+        {
+            "backend": "codex",
+            "created_at": "2026-09-21T00:00:00Z",
+            "memory_id": "mem_1",
+            "model": "gpt-test",
+            "outcome": "stored",
+            "prompt_version": "prompt-v1",
+            "provider": "openai",
+            "receipt_id": "mer_1",
+            "role": "fact_extraction",
+        }
+    ]
+    serialized = json.dumps(document)
+    assert "Hello" not in serialized
+    assert "Hi" not in serialized
+    assert "prn_owner" not in serialized
+    assert "rtp_owner" not in serialized
+
+
+def test_quality_provenance_rejects_invalid_pagination_without_traceback(tmp_path, monkeypatch, capsys):
+    connection = _create_receipt_database(tmp_path / "kai.db")
+    connection.close()
+    monkeypatch.setattr("kai.config.load_config", lambda: SimpleNamespace(session_db_path=str(tmp_path / "kai.db")))
+    args = memory_admin._build_parser().parse_args(["quality-corpus", "provenance", "42", "--limit", "0"])
+
+    assert memory_admin._cmd_quality_corpus(args) == 1
+    assert capsys.readouterr().err == "memory quality: limit must be between 1 and 5000\n"
 
 
 def test_empty_receipt_ledger_fails_before_memory_initialization(tmp_path, monkeypatch, capsys):

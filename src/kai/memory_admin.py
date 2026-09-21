@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sqlite3
 import sys
@@ -429,6 +430,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     quality_sub = quality.add_subparsers(dest="quality_command", required=True)
+
+    quality_provenance = quality_sub.add_parser(
+        "provenance",
+        help="List content-free model provenance for canonical memory writes",
+    )
+    quality_provenance.add_argument(
+        "principal",
+        help="Canonical human principal ID or an unambiguous external identity subject",
+    )
+    quality_provenance.add_argument("--limit", type=int, default=100, help="Receipt rows (default: 100; max: 5000)")
+    quality_provenance.add_argument("--offset", type=int, default=0, help="Receipt-row offset (default: 0)")
 
     quality_sample = quality_sub.add_parser(
         "sample",
@@ -1139,6 +1151,50 @@ def _cmd_quality_corpus(args: argparse.Namespace) -> int:
     from kai.workshop.runtime_profiles import WorkshopRuntimeProfileError
 
     try:
+        if args.quality_command == "provenance":
+            from kai.config import load_config
+            from kai.workshop.memory_quality_diagnostics import load_memory_route_provenance
+
+            config = load_config()
+            db_path = Path(config.session_db_path)
+            if db_path.is_symlink() or not db_path.is_file():
+                raise quality.MemoryQualityCorpusError("Canonical Workshop database is unavailable")
+            connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                principal_id = quality.resolve_human_principal(connection, args.principal)
+                try:
+                    rows = load_memory_route_provenance(
+                        connection,
+                        principal_id,
+                        limit=args.limit,
+                        offset=args.offset,
+                    )
+                except ValueError as exc:
+                    raise quality.MemoryQualityCorpusError(str(exc)) from exc
+            finally:
+                connection.close()
+            document = {
+                "version": 1,
+                "offset": args.offset,
+                "receipt_limit": args.limit,
+                "count": len(rows),
+                "memories": [
+                    {
+                        "memory_id": row.memory_id,
+                        "outcome": row.outcome,
+                        "role": row.extraction_role,
+                        "backend": row.backend,
+                        "provider": row.provider,
+                        "model": row.model,
+                        "prompt_version": row.prompt_version,
+                        "receipt_id": row.receipt_id,
+                        "created_at": row.created_at,
+                    }
+                    for row in rows
+                ],
+            }
+            print(json.dumps(document, indent=2, sort_keys=True))
+            return 0
         if args.quality_command == "sample":
             from kai.config import load_config
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,11 @@ from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptService,
     MemoryExtractionReceiptSpec,
     MemoryExtractionStorageDecision,
+)
+from kai.workshop.memory_quality_diagnostics import (
+    build_memory_quality_diagnostic,
+    load_memory_route_provenance,
+    workshop_memory_extraction_quality_status,
 )
 from kai.workshop.store import WorkshopEventStore
 
@@ -238,6 +244,127 @@ class TestMemoryExtractionReceiptAuthority:
             assert receipt.memory_scopes == ({"project_id": "project-kai", "scope": "project"},)
         finally:
             await store.close()
+
+    async def test_quality_diagnostics_distinguish_configured_and_actual_routes(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store = await _seed_completed_run(path)
+        service = MemoryExtractionReceiptService(store.connection)
+        try:
+            await store.connection.execute(
+                "INSERT INTO runtime_profile_owners (runtime_profile_id, principal_id) VALUES (?, ?)",
+                (_RUNTIME_ID, _PRINCIPAL_ID),
+            )
+            claim = await service.claim(_spec())
+            completion = replace(
+                _zero_memory_completion(),
+                decision_outcome="replaced",
+                classifier_result=True,
+                raw_count=1,
+                accepted_count=1,
+                validation_outcome="accepted",
+                storage_decisions=(
+                    MemoryExtractionStorageDecision(
+                        index=0,
+                        intent="update_of",
+                        outcome="replaced",
+                        new_memory_id="memory-new",
+                        replaced_memory_id="memory-old",
+                        scope="principal",
+                        project_id=None,
+                    ),
+                ),
+                stored_count=1,
+                replaced_count=1,
+                memory_scopes=(("principal", None),),
+            )
+            await service.complete(claim.receipt.receipt_id, _PRINCIPAL_ID, completion)
+            await store.connection.commit()
+        finally:
+            await store.close()
+
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            f"""version: 1
+runtime_profiles:
+  {_RUNTIME_ID}:
+    display_name: Daniel
+    backend: codex
+    provider: openai
+    model: gpt-5.6-sol
+    timeout_seconds: 600
+    models:
+      memory_extraction: gpt-5.6-sol
+      memory_episode: gpt-5.6-sol
+    allowed_services: []
+    allowed_workspaces: []
+"""
+        )
+        snapshot = build_memory_quality_diagnostic(path, runtime_policy_path=policy)
+        status = workshop_memory_extraction_quality_status(path, runtime_policy_path=policy)
+
+        assert snapshot.state == "active"
+        assert snapshot.configured_roles == (
+            "episode:codex/openai/gpt-5.6-solx1",
+            "fact:codex/openai/gpt-5.6-solx1",
+        )
+        assert snapshot.actual_roles == ("fact:codex/openai/gpt-5.6-solx1",)
+        assert snapshot.prompt_versions == ("fact:v13x1",)
+        assert snapshot.replaced == 1
+        assert snapshot.episode_attempts == 0
+        assert "alerts=none" in status
+        assert "SECRET source message" not in status
+        assert "SECRET result message" not in status
+        assert _PRINCIPAL_ID not in status
+        assert _RUNTIME_ID not in status
+
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            provenance = load_memory_route_provenance(connection, _PRINCIPAL_ID, limit=100)
+        finally:
+            connection.close()
+        assert len(provenance) == 1
+        assert provenance[0].memory_id == "memory-new"
+        assert provenance[0].model == "gpt-5.6-sol"
+        assert provenance[0].prompt_version == "13"
+
+    async def test_quality_diagnostics_alert_on_route_drift_and_malformed_artifact(self, tmp_path: Path):
+        path = tmp_path / "kai.db"
+        store = await _seed_completed_run(path)
+        service = MemoryExtractionReceiptService(store.connection)
+        try:
+            claim = await service.claim(_spec())
+            await service.complete(claim.receipt.receipt_id, _PRINCIPAL_ID, _zero_memory_completion())
+        finally:
+            await store.close()
+
+        policy = tmp_path / "runtime-profiles.yaml"
+        policy.write_text(
+            f"""version: 1
+runtime_profiles:
+  {_RUNTIME_ID}:
+    display_name: Daniel
+    backend: codex
+    provider: openai
+    model: gpt-5.5
+    timeout_seconds: 600
+    models:
+      memory_extraction: gpt-5.5
+    allowed_services: []
+    allowed_workspaces: []
+"""
+        )
+        artifact = tmp_path / "home" / "opaque" / "docs" / "memory-quality" / "bad-score.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("not json")
+
+        snapshot = build_memory_quality_diagnostic(
+            path,
+            runtime_policy_path=policy,
+            quality_root=tmp_path / "home",
+        )
+
+        assert snapshot.state == "DEGRADED"
+        assert snapshot.alerts == ("model_drift:1", "malformed_quality_artifacts:1")
 
     async def test_interrupted_claim_fails_closed_without_duplicate(self, tmp_path: Path):
         store = await _seed_completed_run(tmp_path / "kai.db")
