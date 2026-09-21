@@ -208,6 +208,19 @@ def _evidence(payload: dict[str, Any], *, canonical: bool) -> str:
     return json.dumps(normalized, separators=(",", ":"), sort_keys=True)
 
 
+def _vector_metadata(payload: dict[str, Any]) -> str:
+    raw = payload.get("vector_metadata", {})
+    if not isinstance(raw, dict) or any(not isinstance(key, str) or not key for key in raw):
+        raise ValueError("Temporal memory vector metadata must be an object with string keys")
+    try:
+        encoded = json.dumps(raw, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Temporal memory vector metadata is not JSON serializable") from exc
+    if len(encoded) > 65536:
+        raise ValueError("Temporal memory vector metadata is too large")
+    return encoded
+
+
 async def _require_owner_runtime(
     connection: aiosqlite.Connection,
     *,
@@ -251,8 +264,9 @@ def _revision_values(payload: dict[str, Any]) -> tuple[object, ...]:
         "supersedes_revision_id",
         "migration_classification",
         "migration_gaps",
+        "vector_metadata",
     }
-    if set(payload) != expected:
+    if set(payload) not in {frozenset(expected), frozenset(expected - {"vector_metadata"})}:
         raise ValueError("Temporal fact revision payload has an invalid shape")
     revision_id = MemoryRevisionId(_required_text(payload.get("revision_id"), field="revision_id", maximum=128))
     classification, gaps_json = _migration(payload)
@@ -289,6 +303,7 @@ def _revision_values(payload: dict[str, Any]) -> tuple[object, ...]:
         supersedes,
         classification,
         gaps_json,
+        _vector_metadata(payload),
     )
 
 
@@ -308,8 +323,8 @@ async def _insert_revision(
         "revision_id, claim_id, content, asserted_at, observed_at, stored_at, valid_from, valid_until, "
         "reason, evidence_json, source_receipt_id, source_run_id, source_message_id, result_message_id, "
         "backend, provider, model, prompt_version, schema_version, supersedes_revision_id, "
-        "migration_classification, migration_gaps_json, created_event_position"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "migration_classification, migration_gaps_json, vector_metadata_json, created_event_position"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (values[0], claim_id, *values[1:], event.position),
     )
     reason = str(values[7])
@@ -331,6 +346,26 @@ async def _insert_revision(
         reason=reason,
     )
     return revision_id
+
+
+async def _queue_vector_operation(
+    connection: aiosqlite.Connection,
+    *,
+    event: StoredEvent,
+    claim_id: MemoryClaimId,
+    revision_id: MemoryRevisionId,
+    operation: str,
+    prior_revision_id: MemoryRevisionId | None = None,
+) -> None:
+    if operation not in {"upsert", "replace", "delete"}:
+        raise ValueError("Temporal memory vector operation is invalid")
+    occurred_at = event.envelope.occurred_at.isoformat()
+    await connection.execute(
+        "INSERT INTO memory_fact_vector_operations "
+        "(event_position, claim_id, revision_id, prior_revision_id, operation, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+        (event.position, claim_id, revision_id, prior_revision_id, operation, occurred_at, occurred_at),
+    )
 
 
 async def _record_fact_history(
@@ -470,6 +505,13 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
             state=FactLifecycleState.ACTIVE,
             transition=FactLifecycleTransition.RECORDED,
         )
+        await _queue_vector_operation(
+            connection,
+            event=event,
+            claim_id=claim_id,
+            revision_id=MemoryRevisionId(str(revision_payload["revision_id"])),
+            operation="upsert",
+        )
         return
 
     async with connection.execute(
@@ -482,7 +524,10 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
 
     reason = _required_text(payload.get("reason"), field="reason", maximum=2048)
     if envelope.event_type == WorkshopEventType.MEMORY_FACT_SUPERSEDED:
-        if set(payload) != {"prior_revision_id", "reason", "revision"} or not isinstance(payload.get("revision"), dict):
+        expected = {"prior_revision_id", "reason", "revision", "scope_kind", "scope_key"}
+        if set(payload) not in (expected, expected - {"scope_kind", "scope_key"}) or not isinstance(
+            payload.get("revision"), dict
+        ):
             raise ValueError("Temporal fact supersession payload has an invalid shape")
         prior = MemoryRevisionId(
             _required_text(payload.get("prior_revision_id"), field="prior_revision_id", maximum=128)
@@ -500,7 +545,7 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
             new_state=FactLifecycleState.SUPERSEDED,
             reason=reason,
         )
-        await _insert_revision(
+        successor = await _insert_revision(
             connection,
             claim_id=claim_id,
             payload=revision_payload,
@@ -508,6 +553,20 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
             state=FactLifecycleState.ACTIVE,
             transition=FactLifecycleTransition.RECORDED,
         )
+        await _queue_vector_operation(
+            connection,
+            event=event,
+            claim_id=claim_id,
+            revision_id=successor,
+            prior_revision_id=prior,
+            operation="replace",
+        )
+        if "scope_kind" in payload:
+            scope_kind, scope_key = _scope(payload)
+            await connection.execute(
+                "UPDATE memory_fact_claims SET scope_kind = ?, scope_key = ? WHERE claim_id = ?",
+                (scope_kind, scope_key, claim_id),
+            )
         return
 
     if envelope.event_type in {WorkshopEventType.MEMORY_FACT_RETRACTED, WorkshopEventType.MEMORY_FACT_EXPIRED}:
@@ -532,6 +591,13 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
                 else FactLifecycleState.EXPIRED
             ),
             reason=reason,
+        )
+        await _queue_vector_operation(
+            connection,
+            event=event,
+            claim_id=claim_id,
+            revision_id=revision_id,
+            operation="delete",
         )
         return
 
@@ -561,6 +627,13 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
             state=FactLifecycleState.UNRESOLVED_CONFLICT,
             transition=FactLifecycleTransition.CONFLICT_OPENED,
         )
+        await _queue_vector_operation(
+            connection,
+            event=event,
+            claim_id=claim_id,
+            revision_id=active,
+            operation="delete",
+        )
         return
 
     if envelope.event_type == WorkshopEventType.MEMORY_FACT_CONFLICT_RESOLVED:
@@ -577,6 +650,13 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
         )
         if len(set(losers)) != len(losers) or winner in losers:
             raise ValueError("Temporal fact conflict resolution revisions are invalid")
+        async with connection.execute(
+            "SELECT revision_id FROM memory_fact_revision_states WHERE claim_id = ? AND state = 'unresolved_conflict'",
+            (claim_id,),
+        ) as cursor:
+            unresolved = {MemoryRevisionId(str(row[0])) for row in await cursor.fetchall()}
+        if unresolved != {winner, *losers}:
+            raise ValueError("Temporal fact conflict resolution must settle every unresolved revision")
         for loser in losers:
             current = await _state(connection, claim_id=claim_id, revision_id=loser)
             if current != FactLifecycleState.UNRESOLVED_CONFLICT:
@@ -606,6 +686,64 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
             new_state=FactLifecycleState.ACTIVE,
             reason=reason,
         )
+        await _queue_vector_operation(
+            connection,
+            event=event,
+            claim_id=claim_id,
+            revision_id=winner,
+            operation="upsert",
+        )
+        return
+
+    if envelope.event_type == WorkshopEventType.MEMORY_FACT_RESTORED:
+        expected = {"prior_revision_id", "reason", "revision", "scope_kind", "scope_key"}
+        if set(payload) not in (expected, expected - {"scope_kind", "scope_key"}) or not isinstance(
+            payload.get("revision"), dict
+        ):
+            raise ValueError("Temporal fact restoration payload has an invalid shape")
+        prior = MemoryRevisionId(
+            _required_text(payload.get("prior_revision_id"), field="prior_revision_id", maximum=128)
+        )
+        prior_state = await _state(connection, claim_id=claim_id, revision_id=prior)
+        if prior_state not in {
+            FactLifecycleState.SUPERSEDED,
+            FactLifecycleState.RETRACTED,
+            FactLifecycleState.EXPIRED,
+        }:
+            raise ValueError("Only an inactive temporal fact revision can be restored")
+        async with connection.execute(
+            "SELECT COUNT(*) FROM memory_fact_revision_states "
+            "WHERE claim_id = ? AND state IN ('active', 'unresolved_conflict')",
+            (claim_id,),
+        ) as cursor:
+            active = await cursor.fetchone()
+        if active is None or int(active[0]) != 0:
+            raise ValueError("A temporal fact cannot be restored while its claim has current truth")
+        revision_payload = dict(payload["revision"])
+        if revision_payload.get("supersedes_revision_id") != str(prior):
+            raise ValueError("A restored temporal fact must link to its prior revision")
+        restored = await _insert_revision(
+            connection,
+            claim_id=claim_id,
+            payload=revision_payload,
+            event=event,
+            state=FactLifecycleState.ACTIVE,
+            transition=FactLifecycleTransition.RECORDED,
+        )
+        await _queue_vector_operation(
+            connection,
+            event=event,
+            claim_id=claim_id,
+            revision_id=restored,
+            prior_revision_id=prior,
+            operation="replace",
+        )
+        if "scope_kind" in payload:
+            scope_kind, scope_key = _scope(payload)
+            await connection.execute(
+                "UPDATE memory_fact_claims SET scope_kind = ?, scope_key = ? WHERE claim_id = ?",
+                (scope_kind, scope_key, claim_id),
+            )
         return
     raise ValueError("Unsupported temporal fact event type")
 
@@ -748,6 +886,7 @@ TEMPORAL_MEMORY_EVENT_TYPES = frozenset(
         WorkshopEventType.MEMORY_FACT_EXPIRED,
         WorkshopEventType.MEMORY_FACT_CONFLICT_OPENED,
         WorkshopEventType.MEMORY_FACT_CONFLICT_RESOLVED,
+        WorkshopEventType.MEMORY_FACT_RESTORED,
         WorkshopEventType.MEMORY_EPISODE_RECORDED,
         WorkshopEventType.MEMORY_EPISODE_FOLLOWUP_RECORDED,
     }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import pwd
 from dataclasses import dataclass
@@ -80,6 +81,8 @@ from kai.workshop.standing_participation import WorkshopStandingParticipationSer
 from kai.workshop.storage_namespaces import WorkshopPrincipalStorageRegistry
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.webhook_diagnostics import WorkshopWebhookDiagnosticsService
+
+log = logging.getLogger(__name__)
 
 
 class KaiApplicationState(StrEnum):
@@ -474,6 +477,12 @@ class KaiApplicationHost:
                 runtime_pool,
                 self._execution_state,
             )
+            recovered_fact_projections = await memory_queries.recover_fact_projections()
+            if recovered_fact_projections:
+                log.info(
+                    "Recovered %d canonical memory-fact vector projection(s)",
+                    recovered_fact_projections,
+                )
             preference_documents = WorkshopPreferenceService(
                 Path(self._config.session_db_path).parent,
                 self._principal_storage,

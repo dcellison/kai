@@ -105,6 +105,7 @@ class WorkshopEventType(StrEnum):
     MEMORY_FACT_EXPIRED = "memory_fact.expired"
     MEMORY_FACT_CONFLICT_OPENED = "memory_fact.conflict_opened"
     MEMORY_FACT_CONFLICT_RESOLVED = "memory_fact.conflict_resolved"
+    MEMORY_FACT_RESTORED = "memory_fact.restored"
     MEMORY_EPISODE_RECORDED = "memory_episode.recorded"
     MEMORY_EPISODE_FOLLOWUP_RECORDED = "memory_episode.followup_recorded"
 

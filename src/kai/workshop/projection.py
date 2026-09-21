@@ -2099,7 +2099,7 @@ class CanonicalConversationProjection:
 
     name = "canonical_conversations"
     # Agent ownership and runtime sponsorship project from explicit authority events.
-    version = 33
+    version = 34
 
     async def prepare_rebuild(self, connection: aiosqlite.Connection) -> None:
         """Preserve durable coordination rows that reference this projection."""
@@ -2167,6 +2167,7 @@ class CanonicalConversationProjection:
                 "run_attempt_id = NULL, collaboration_grant_id = NULL, collaboration_operation = NULL"
             )
         for table in (
+            "memory_fact_vector_operations",
             "memory_episode_followups",
             "memory_episodes",
             "memory_fact_lifecycle_events",
@@ -2227,6 +2228,7 @@ class CanonicalConversationProjection:
             WorkshopEventType.MEMORY_FACT_EXPIRED,
             WorkshopEventType.MEMORY_FACT_CONFLICT_OPENED,
             WorkshopEventType.MEMORY_FACT_CONFLICT_RESOLVED,
+            WorkshopEventType.MEMORY_FACT_RESTORED,
             WorkshopEventType.MEMORY_EPISODE_RECORDED,
             WorkshopEventType.MEMORY_EPISODE_FOLLOWUP_RECORDED,
         }:

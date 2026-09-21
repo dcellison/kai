@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, TypedDict
 import aiosqlite
 
 from kai.job_types import JOB_TYPE_AGENT, LEGACY_JOB_TYPE_AGENT, normalize_job_type
+from kai.memory import MemoryResult
 from kai.workshop.agent_enablement import (
     InitialAgentEnablement,
     enable_initial_workshop_agent,
@@ -74,6 +75,11 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
     WorkshopExecutionStateRegistry,
     reconcile_legacy_execution_state,
+)
+from kai.workshop.fact_lifecycle import (
+    FactMutationResult,
+    FactRevisionInput,
+    MemoryFactLifecycleService,
 )
 from kai.workshop.human_provisioning import WorkshopHumanProvisioner
 from kai.workshop.human_provisioning_migration import (
@@ -430,6 +436,30 @@ async def complete_memory_extraction_receipt(
             receipt_id,
             principal_id,
             completion,
+        )
+
+
+async def apply_canonical_extracted_fact(
+    principal_id: PrincipalId,
+    runtime_profile_id: RuntimeProfileId,
+    spec: FactRevisionInput,
+    *,
+    idempotency_key: str,
+    stable_claim_key: str,
+    existing: MemoryResult | None = None,
+) -> FactMutationResult:
+    """Apply one extracted fact under canonical lifecycle and shared DB locks."""
+    if _workshop_event_lock is None:
+        raise RuntimeError("Database not initialized - call init_db() first")
+    async with _workshop_event_lock:
+        service = MemoryFactLifecycleService(WorkshopEventStore.from_initialized_connection(_get_db()))
+        authority = await service.authority_for(principal_id, runtime_profile_id)
+        return await service.apply_extracted(
+            authority,
+            spec,
+            idempotency_key=idempotency_key,
+            stable_claim_key=stable_claim_key,
+            existing=existing,
         )
 
 
