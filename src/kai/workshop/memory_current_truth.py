@@ -232,7 +232,14 @@ def project_current_truth(
                 if claim_id is None and revision_id is None and lifecycle_state is None:
                     excluded["legacy_unclassified"] += 1
                     continue
-                if not all(isinstance(value, str) and value for value in (claim_id, revision_id, lifecycle_state)):
+                if (
+                    not isinstance(claim_id, str)
+                    or not claim_id
+                    or not isinstance(revision_id, str)
+                    or not revision_id
+                    or not isinstance(lifecycle_state, str)
+                    or not lifecycle_state
+                ):
                     excluded["malformed_lifecycle"] += 1
                     continue
                 try:
