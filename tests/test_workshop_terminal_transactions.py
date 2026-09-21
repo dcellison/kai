@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,12 +26,17 @@ from kai.workshop.domain import (
     RunExecutionOwnerId,
 )
 from kai.workshop.inbound import ClientInboundMessage, InboundMessage, record_inbound_message
-from kai.workshop.memory_extraction_receipts import MemoryExtractionReceiptService, MemoryExtractionReceiptSpec
+from kai.workshop.memory_extraction_receipts import (
+    MemoryExtractionReceiptCompletion,
+    MemoryExtractionReceiptService,
+    MemoryExtractionReceiptSpec,
+)
 from kai.workshop.outbound import (
     OutboundMessage,
     record_outbound_message_with_streaming_finalization,
 )
 from kai.workshop.post_run_effects import WorkshopPostRunEffectService
+from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.run_execution_authority import (
     RunAttemptStatus,
     RunExecutionClaim,
@@ -919,6 +925,97 @@ class TestAtomicTerminalTransactions:
 
         profile_state.has_memory_for_run.assert_awaited_once_with(str(run.run_id))
         profile_state.ingest_memory.assert_awaited_once()
+
+    async def test_projection_rebuild_preserves_terminal_memory_extraction_receipt(self, tmp_path: Path):
+        store, authority, claim = await _started_run(tmp_path / "kai.db")
+        run = await WorkshopRunLifecycle(store).state(claim.run_id)
+        try:
+            result = await WorkshopRunTerminalTransactionCoordinator(authority).complete(
+                claim,
+                body="Canonical result before projection rebuild",
+                occurred_at=_NOW + timedelta(seconds=4),
+                runtime_session=RuntimeSessionSettlement(
+                    channel_id=run.channel_id,
+                    agent_id=run.agent_id,
+                    runtime_profile_id=profile_id(101),
+                    selection=RunExecutionSelection("codex", "gpt-5.6-sol"),
+                    workspace="/private/tmp/kai-workshop-test-workspace",
+                    provider_session_id="provider-session-before-projection-rebuild",
+                    run_id=run.run_id,
+                ),
+            )
+            result_message_id = result.execution.run.result_message_id
+            assert result_message_id is not None
+            receipt_service = MemoryExtractionReceiptService(
+                store.connection,
+                _claim_owner="a" * 32,
+            )
+            receipt_claim = await receipt_service.claim(
+                MemoryExtractionReceiptSpec(
+                    principal_id=str(run.requested_by_principal_id),
+                    runtime_profile_id=profile_id(101),
+                    run_id=str(run.run_id),
+                    source_message_id=str(run.inbound_message_id),
+                    result_message_id=str(result_message_id),
+                    extraction_role="fact_extraction",
+                    backend="codex",
+                    provider="openai",
+                    model="gpt-5.6-sol",
+                    prompt_version="13",
+                    schema_version="1",
+                    policy_version="1",
+                )
+            )
+            await receipt_service.complete(
+                receipt_claim.receipt.receipt_id,
+                run.requested_by_principal_id,
+                MemoryExtractionReceiptCompletion(
+                    status="completed",
+                    decision_outcome="zero_memory",
+                    failure_code=None,
+                    candidate_ids=(),
+                    classifier_result=False,
+                    proposed_intents=(),
+                    raw_count=0,
+                    accepted_count=0,
+                    validation_outcome="empty",
+                    storage_decisions=(),
+                    stored_count=0,
+                    replaced_count=0,
+                    skipped_count=0,
+                    memory_scopes=(),
+                    duration_ms=1,
+                ),
+            )
+            async with store.connection.execute(
+                "SELECT * FROM memory_extraction_receipts WHERE receipt_id = ?",
+                (receipt_claim.receipt.receipt_id,),
+            ) as cursor:
+                before = await cursor.fetchone()
+            assert before is not None
+
+            checkpoint = await store.rebuild_projection(CanonicalConversationProjection())
+
+            async with store.connection.execute(
+                "SELECT * FROM memory_extraction_receipts WHERE receipt_id = ?",
+                (receipt_claim.receipt.receipt_id,),
+            ) as cursor:
+                after = await cursor.fetchone()
+
+            await store.connection.execute("BEGIN IMMEDIATE")
+            await CanonicalConversationProjection().prepare_rebuild(store.connection)
+            await store.connection.execute("DELETE FROM runs WHERE id = ?", (run.run_id,))
+            with pytest.raises(sqlite3.IntegrityError):
+                await store.connection.commit()
+            await store.connection.rollback()
+
+            async with store.connection.execute("PRAGMA foreign_key_check") as cursor:
+                integrity_gaps = await cursor.fetchall()
+            assert checkpoint.version == 34
+            assert after == before
+            assert integrity_gaps == []
+        finally:
+            await store.close()
 
     async def test_stale_fence_rolls_back_every_visible_outcome_row(self, tmp_path: Path):
         store, authority, stale_claim = await _started_run(tmp_path / "kai.db")
