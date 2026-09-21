@@ -89,6 +89,7 @@ from kai.install import (
     _prompt_choice,
     _prompt_optional_choice,
     _protected_install_extras,
+    _read_deployed_default_models,
     _read_users_yaml_text,
     _resolve_codex_bin_prompt_default,
     _retire_install_home_claude,
@@ -5184,6 +5185,20 @@ class TestCheckServiceStatus:
 
 
 class TestCmdStatus:
+    def test_reads_only_valid_deployed_role_model_overrides(self, tmp_path, monkeypatch):
+        deployed_env = tmp_path / "env"
+        deployed_env.write_text(
+            'API_KEY="must-not-leak"\n'
+            'DEFAULT_MODELS_JSON=\'{"memory_extraction":"gpt-fact","memory_episode":"gpt-episode",'
+            '"unknown":"ignored"}\'\n'
+        )
+        monkeypatch.setattr("kai.install.validate_protected_file_metadata", lambda *args, **kwargs: True)
+
+        assert _read_deployed_default_models(deployed_env) == {
+            "memory_episode": "gpt-episode",
+            "memory_extraction": "gpt-fact",
+        }
+
     def test_runs_without_error(self, tmp_path, monkeypatch, capsys):
         """Status subcommand runs without crashing (no install present)."""
         monkeypatch.setattr("kai.install.INSTALL_CONF", tmp_path / "install.conf")

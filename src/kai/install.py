@@ -127,6 +127,7 @@ from kai.workshop.initial_provisioning import (
     WorkshopInitialProvisioningError,
     parse_initial_provisioning,
 )
+from kai.workshop.memory_quality_diagnostics import workshop_memory_extraction_quality_status
 from kai.workshop.runtime_profiles import (
     DEFAULT_MAXIMUM_TIMEOUT_SECONDS,
     WorkshopRuntimeProfileError,
@@ -10030,6 +10031,14 @@ def _cmd_status() -> None:
     )
     print(workshop_memory_extraction_receipt_status(Path(data_dir) / "kai.db"))
     print(
+        workshop_memory_extraction_quality_status(
+            Path(data_dir) / "kai.db",
+            runtime_policy_path=RUNTIME_PROFILES_YAML,
+            default_models=_read_deployed_default_models(_DEPLOYED_ENV_FILE),
+            quality_root=Path(data_dir) / "home",
+        )
+    )
+    print(
         _memory_scope_review_status(
             Path(data_dir) / "memory-scope-review.json",
             memory_enabled=_read_deployed_memory_enabled(_DEPLOYED_ENV_FILE),
@@ -10448,6 +10457,33 @@ def _read_deployed_memory_enabled(env_path: Path) -> bool | None:
         return False
     except (FileNotFoundError, OSError, UnicodeError, ProtectedConfigError):
         return None
+
+
+def _read_deployed_default_models(env_path: Path) -> dict[str, str]:
+    """Read only non-secret role-model overrides from deployed configuration."""
+    try:
+        validate_protected_file_metadata(env_path, max_mode=0o600, require_root_owner=True)
+        with env_path.open(encoding="utf-8") as env_file:
+            for line in env_file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                key, separator, raw_value = stripped.partition("=")
+                if not separator or key.strip() != "DEFAULT_MODELS_JSON":
+                    continue
+                value = raw_value.strip().strip("\"'")
+                parsed = json.loads(value)
+                if not isinstance(parsed, dict):
+                    return {}
+                valid_roles = {role.value for role in ModelRole}
+                return {
+                    str(key).strip().lower(): str(model).strip()
+                    for key, model in parsed.items()
+                    if str(key).strip().lower() in valid_roles and str(model).strip()
+                }
+        return {}
+    except (FileNotFoundError, OSError, UnicodeError, ValueError, ProtectedConfigError):
+        return {}
 
 
 def _read_deployed_initial_provisioning(
