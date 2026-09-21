@@ -15,7 +15,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
@@ -2121,10 +2121,17 @@ async def _handle_memory_reconciliation_bulk(
         }:
             raise MemoryReconciliationReviewValidationError("Invalid bulk reconciliation decision")
         candidate_ids = payload["candidate_ids"]
+        disposition = payload["disposition"]
+        bulk_disposition: Literal["reject", "defer"]
+        if disposition == "reject":
+            bulk_disposition = "reject"
+        elif disposition == "defer":
+            bulk_disposition = "defer"
+        else:
+            raise MemoryReconciliationReviewValidationError("Invalid bulk reconciliation decision")
         if (
             not isinstance(candidate_ids, list)
             or not all(isinstance(value, str) for value in candidate_ids)
-            or payload["disposition"] not in {"reject", "defer"}
             or not isinstance(payload["operator_note"], str)
             or not isinstance(payload["expected_review_version"], int)
             or isinstance(payload["expected_review_version"], bool)
@@ -2135,7 +2142,7 @@ async def _handle_memory_reconciliation_bulk(
             authority.principal_id,
             request.match_info["audit_id"],
             candidate_ids=candidate_ids,
-            disposition=payload["disposition"],
+            disposition=bulk_disposition,
             operator_note=payload["operator_note"],
             expected_review_version=payload["expected_review_version"],
             client_operation_id=payload["client_operation_id"],

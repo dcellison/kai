@@ -511,6 +511,8 @@ class WorkshopMemoryReconciliationReviewService:
                     (audit_id,),
                 ) as review_cursor:
                     review_row = await review_cursor.fetchone()
+                assert version_row is not None
+                assert review_row is not None
                 response = {
                     "audit_id": audit_id,
                     "candidate_id": candidate_id,
@@ -577,6 +579,7 @@ class WorkshopMemoryReconciliationReviewService:
                     (audit_id, *candidate_ids),
                 ) as cursor:
                     count_row = await cursor.fetchone()
+                assert count_row is not None
                 if int(count_row[0]) != len(candidate_ids):
                     raise MemoryReconciliationReviewNotFound("A reconciliation candidate was not found")
                 await connection.execute(
