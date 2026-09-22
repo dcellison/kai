@@ -168,9 +168,10 @@ describe("Memory reconciliation triage", () => {
         <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
       </ConfirmationProvider>,
     );
-    const text = await screen.findByLabelText("Current fact");
+    const text = await screen.findByLabelText("Current wording");
     await user.clear(text);
     await user.type(text, "The corrected current fact");
+    await user.selectOptions(screen.getByLabelText("Lifecycle action"), "adopt");
     await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
@@ -182,6 +183,192 @@ describe("Memory reconciliation triage", () => {
     expect(approveSafeMemoryTriage).not.toHaveBeenCalled();
     expect(recommendMemoryTriage).not.toHaveBeenCalled();
     expect(applyMemoryTriage).not.toHaveBeenCalled();
+  });
+
+  it("turns an ordinary adopt recommendation into unchanged current-truth approval", async () => {
+    const user = userEvent.setup();
+    const recommended = {
+      ...group,
+      classification: "time_sensitive",
+      decision: {
+        ...group.decision,
+        recommendation: { outcome: "adopt", confidence: 0.91, rationale: "The preference still applies." },
+      },
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [recommended], nextOffset: null });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("adopt");
+    const disposition = screen.getByLabelText("Disposition");
+    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeEnabled();
+    await user.selectOptions(disposition, "approve");
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({
+      disposition: "approve",
+      action: { kind: "adopt_as_current" },
+    });
+  });
+
+  it("consolidates every row in a multi-fact recommendation without artificial editing", async () => {
+    const user = userEvent.setup();
+    const consolidated = {
+      ...group,
+      decision: {
+        ...group.decision,
+        recommendation: { outcome: "consolidate", confidence: 0.84, rationale: "Keep one canonical statement." },
+      },
+      evidence: [
+        group.evidence[0],
+        { ...group.evidence[0], memoryId: "mem_second", text: "A similar legacy fact" },
+      ],
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [consolidated], nextOffset: null });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("consolidate");
+    await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({
+      disposition: "approve",
+      action: { kind: "adopt_corrected", replacement: { content: "An inaccurate legacy fact" } },
+    });
+  });
+
+  it("requires an explicit scope before adopting an uncertain-scope fact", async () => {
+    const user = userEvent.setup();
+    const uncertain = {
+      ...group,
+      decision: {
+        ...group.decision,
+        recommendation: { outcome: "adopt", confidence: 0.76, rationale: "Keep after choosing scope." },
+      },
+      evidence: [{ ...group.evidence[0], migrationGaps: ["scope", "source receipt"] }],
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [uncertain], nextOffset: null });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const disposition = await screen.findByLabelText("Disposition");
+    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeDisabled();
+    await user.selectOptions(screen.getByLabelText("Scope"), "global");
+    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeEnabled();
+    await user.selectOptions(disposition, "approve");
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({
+      disposition: "approve",
+      action: { kind: "adopt_corrected", replacement: { scope_kind: "global" } },
+    });
+  });
+
+  it("turns an obsolete recommendation into an explicit retirement action", async () => {
+    const user = userEvent.setup();
+    const obsolete = {
+      ...group,
+      decision: {
+        ...group.decision,
+        recommendation: { outcome: "obsolete", confidence: 0.95, rationale: "This no longer applies." },
+      },
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [obsolete], nextOffset: null });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("obsolete");
+    await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({
+      disposition: "approve",
+      action: { kind: "expire_all" },
+    });
+  });
+
+  it("turns an episode recommendation into explicit immutable-history retention", async () => {
+    const user = userEvent.setup();
+    const episode = {
+      ...group,
+      decision: {
+        ...group.decision,
+        recommendation: { outcome: "adopt", confidence: 0.88, rationale: "Retain this useful history." },
+      },
+      evidence: [{ ...group.evidence[0], kind: "episode" as const, memoryId: "episode_test" }],
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [episode], nextOffset: null });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("retain");
+    await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({
+      disposition: "approve",
+      action: { kind: "record_episode_chain" },
+    });
+  });
+
+  it("shows stable references and navigates legacy cross-group recommendations", async () => {
+    const relatedId = "mtg_a37a772857d24bb5556da8997ff2381e";
+    const source = {
+      ...group,
+      groupId: "mtg_975558625271cc5d41a185bb6533d986",
+      decision: {
+        ...group.decision,
+        recommendation: {
+          outcome: "consolidate",
+          confidence: 0.8,
+          rationale: `Duplicate of another fact; consolidate with ${relatedId}.`,
+        },
+      },
+    };
+    const related = {
+      ...group,
+      evidence: [{ ...group.evidence[0], memoryId: "mem_related", text: "The related canonical fact" }],
+      groupId: relatedId,
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({
+      triage: summary,
+      groups: [source, related],
+      nextOffset: null,
+    });
+    const user = userEvent.setup();
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const linked = await screen.findByRole("button", { name: "Group a37a7728" });
+    expect(screen.getByText(/Group 97555862/)).toBeVisible();
+    expect(screen.getByLabelText("Lifecycle action")).toHaveValue("adopt");
+    expect(within(screen.getByLabelText("Disposition")).getByRole("option", { name: "Approve" })).toBeEnabled();
+    await user.click(linked);
+    expect(await screen.findByLabelText("Current wording")).toHaveValue("The related canonical fact");
   });
 
   it("allows an eligible previously deferred fact to be approved unchanged", async () => {

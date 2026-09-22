@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,7 +28,7 @@ from kai.workshop.memory_reconciliation_review import (
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 
-PROMPT_VERSION = "memory_reconciliation_triage_v1"
+PROMPT_VERSION = "memory_reconciliation_triage_v2"
 MAX_GROUPS = 100
 
 
@@ -56,8 +57,14 @@ _RECOMMENDATION_SCHEMA: dict[str, Any] = {
                     },
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                     "rationale": {"type": "string", "maxLength": 1000},
+                    "related_group_ids": {
+                        "type": "array",
+                        "maxItems": MAX_GROUPS - 1,
+                        "uniqueItems": True,
+                        "items": {"type": "string"},
+                    },
                 },
-                "required": ["group_id", "outcome", "confidence", "rationale"],
+                "required": ["group_id", "outcome", "confidence", "rationale", "related_group_ids"],
             },
         }
     },
@@ -139,6 +146,88 @@ def _unchanged_prior_review_action(
         if boundary is None or validity_end is None or validity_end <= boundary:
             return None
     return {"kind": "adopt_as_current"}
+
+
+def _unchanged_fact_action(
+    group: dict[str, Any],
+    *,
+    audit_boundary: object,
+) -> dict[str, str] | None:
+    """Return unchanged adoption only for one usable, current fact."""
+    evidence = group.get("evidence")
+    if not isinstance(evidence, list) or len(evidence) != 1:
+        return None
+    row = evidence[0]
+    if not isinstance(row, dict) or row.get("kind") != "fact" or row.get("scope") not in {"global", "project"}:
+        return None
+    if row.get("scope") == "project" and not row.get("project_id"):
+        return None
+    gaps = row.get("migration_gaps")
+    if not isinstance(gaps, list) or "scope" in gaps:
+        return None
+    valid_until = row.get("valid_until")
+    if valid_until is not None:
+        boundary = _timestamp(audit_boundary)
+        validity_end = _timestamp(valid_until)
+        if boundary is None or validity_end is None or validity_end <= boundary:
+            return None
+    return {"kind": "adopt_as_current"}
+
+
+def _operator_action_is_authorized(
+    group: dict[str, Any],
+    action: dict[str, Any],
+    *,
+    audit_boundary: object,
+) -> bool:
+    evidence = group.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return False
+    if group.get("deterministic") is True and group.get("bulk_eligible") is True and action == group.get("action"):
+        return True
+    kinds = {item.get("kind") for item in evidence if isinstance(item, dict)}
+    action_kind = action.get("kind")
+    if action_kind == "adopt_as_current":
+        return action == _unchanged_fact_action(group, audit_boundary=audit_boundary)
+    if action_kind in {"adopt_corrected", "expire_all"}:
+        return kinds == {"fact"}
+    if action_kind == "keep_first_retract_rest":
+        return kinds == {"fact"} and len(evidence) > 1
+    if action_kind == "record_episode_chain":
+        return kinds == {"episode"}
+    return False
+
+
+def _approved_outcome_summary(
+    groups: dict[str, dict[str, Any]],
+    decision_rows: Iterable[Any],
+) -> dict[str, int]:
+    """Summarize the operator's saved actions, not the plan's earlier proposals."""
+    counts = {
+        "adopted": 0,
+        "consolidated": 0,
+        "obsolete": 0,
+        "operator_admitted": 0,
+    }
+    for item in decision_rows:
+        if str(item[1]) != "approve":
+            continue
+        group = groups[str(item[0])]
+        action = _load_json(item[2], label="memory triage action")
+        evidence_count = len(group["evidence"])
+        kind = action.get("kind")
+        if kind == "expire_all":
+            counts["obsolete"] += evidence_count
+        elif kind == "keep_first_retract_rest" or (kind == "adopt_corrected" and evidence_count > 1):
+            counts["consolidated"] += evidence_count
+            counts["operator_admitted"] += 1
+        elif kind == "adopt_corrected":
+            counts["adopted"] += evidence_count
+            counts["operator_admitted"] += 1
+        elif kind in {"adopt_as_current", "record_episode_chain"}:
+            counts["adopted"] += evidence_count
+            counts["operator_admitted"] += evidence_count
+    return counts
 
 
 def _load_json(value: object, *, label: str) -> dict[str, Any]:
@@ -635,16 +724,7 @@ class WorkshopMemoryReconciliationTriageService:
         if group is None:
             raise MemoryReconciliationReviewNotFound("Memory triage group not found")
         if disposition == "approve":
-            unchanged_prior_review_action = _unchanged_prior_review_action(
-                group,
-                audit_boundary=plan["generated_at"],
-            )
-            selected_kind = action.get("kind") if isinstance(action, dict) else None
-            if (
-                action != group["action"]
-                and action != unchanged_prior_review_action
-                and selected_kind != "adopt_corrected"
-            ):
+            if not _operator_action_is_authorized(group, action, audit_boundary=plan["generated_at"]):
                 raise MemoryReconciliationReviewValidationError(
                     "Memory triage approval does not match an authorized action"
                 )
@@ -658,6 +738,14 @@ class WorkshopMemoryReconciliationTriageService:
                 for item in group["evidence"]
                 if item.get("scope") == "project" and item.get("project_id")
             }
+            replacement = action.get("replacement")
+            if (
+                action.get("kind") == "adopt_corrected"
+                and isinstance(replacement, dict)
+                and replacement.get("scope_kind") == "project"
+                and replacement.get("scope_key")
+            ):
+                project_ids.add(str(replacement["scope_key"]))
             if project_ids - allowed_project_ids:
                 raise MemoryReconciliationReviewAccessDenied(
                     "Memory triage action references a project outside current authority"
@@ -773,7 +861,9 @@ class WorkshopMemoryReconciliationTriageService:
                 system_prompt=(
                     "You are reviewing incomplete legacy memory evidence. Recommend an outcome for each group. "
                     "Recommendations are advisory and must never claim missing provenance. Use needs_review when "
-                    "evidence is ambiguous. Return every supplied group exactly once."
+                    "evidence is ambiguous. Return every supplied group exactly once. If another supplied group "
+                    "contains related duplicate evidence, list its exact group_id in related_group_ids; otherwise "
+                    "return an empty list. Never invent or mention an unavailable group identifier."
                 ),
                 model=model,
                 timeout=300,
@@ -784,18 +874,30 @@ class WorkshopMemoryReconciliationTriageService:
             expected = {group["group_id"] for group in targets}
             recommendations: dict[str, dict[str, Any]] = {}
             for raw in payload["recommendations"]:
-                if not isinstance(raw, dict) or set(raw) != {"group_id", "outcome", "confidence", "rationale"}:
+                if not isinstance(raw, dict) or set(raw) != {
+                    "group_id",
+                    "outcome",
+                    "confidence",
+                    "rationale",
+                    "related_group_ids",
+                }:
                     raise MemoryReconciliationReviewError("Memory-quality recommendation is malformed")
                 group_id = raw["group_id"]
                 if group_id not in expected or group_id in recommendations:
                     raise MemoryReconciliationReviewError("Memory-quality recommendation references an invalid group")
                 if raw["outcome"] not in {"adopt", "consolidate", "obsolete", "needs_review"}:
                     raise MemoryReconciliationReviewError("Memory-quality recommendation has an invalid outcome")
+                related_group_ids = raw["related_group_ids"]
                 if (
                     isinstance(raw["confidence"], bool)
                     or not isinstance(raw["confidence"], int | float)
                     or not 0 <= float(raw["confidence"]) <= 1
                     or not isinstance(raw["rationale"], str)
+                    or not isinstance(related_group_ids, list)
+                    or not all(isinstance(value, str) for value in related_group_ids)
+                    or len(related_group_ids) != len(set(related_group_ids))
+                    or group_id in related_group_ids
+                    or not set(related_group_ids).issubset(expected)
                 ):
                     raise MemoryReconciliationReviewError("Memory-quality recommendation is malformed")
                 recommendations[str(group_id)] = {
@@ -956,11 +1058,27 @@ class WorkshopMemoryReconciliationTriageService:
             action = _load_json(state[2], label="memory triage action")
             group = groups[str(decision["candidate_id"])]
             if state[1] == "approve":
+                if not _operator_action_is_authorized(group, action, audit_boundary=plan["generated_at"]):
+                    raise MemoryReconciliationReviewValidationError(
+                        "Stored memory triage approval no longer matches an authorized action"
+                    )
+                try:
+                    memory_reconciliation.validate_candidate_action({"evidence": group["evidence"]}, action)
+                except memory_reconciliation.MemoryReconciliationError as exc:
+                    raise MemoryReconciliationReviewValidationError(str(exc)) from exc
                 project_ids = {
                     str(item["project_id"])
                     for item in group["evidence"]
                     if item.get("scope") == "project" and item.get("project_id")
                 }
+                replacement = action.get("replacement")
+                if (
+                    action.get("kind") == "adopt_corrected"
+                    and isinstance(replacement, dict)
+                    and replacement.get("scope_kind") == "project"
+                    and replacement.get("scope_key")
+                ):
+                    project_ids.add(str(replacement["scope_key"]))
                 if project_ids - allowed_project_ids:
                     raise MemoryReconciliationReviewAccessDenied(
                         "Memory triage action references a project outside current authority"
@@ -981,34 +1099,11 @@ class WorkshopMemoryReconciliationTriageService:
         if memory_reconciliation.corpus_sha256(current) != plan["corpus_sha256"]:
             raise MemoryReconciliationReviewConflict("Memory changed after this triage plan")
         receipt = await memory_reconciliation.apply_review(db_path=self._db_path, audit=synthetic, review=sealed)
-        approved_group_ids = {str(item[0]) for item in decision_rows if str(item[1]) == "approve"}
-        operator_admitted = sum(
-            (
-                1
-                if group["action"].get("kind") == "keep_first_retract_rest"
-                else 0
-                if group["action"].get("kind") == "expire_all"
-                else len(group["evidence"])
-            )
-            for group_id, group in groups.items()
-            if group_id in approved_group_ids
-        )
+        approved_outcomes = _approved_outcome_summary(groups, decision_rows)
         summary = {
-            "adopted": sum(
-                len(group["evidence"])
-                for group_id, group in groups.items()
-                if group_id in approved_group_ids and group["resolution"] == "adopt"
-            ),
-            "consolidated": sum(
-                len(group["evidence"])
-                for group_id, group in groups.items()
-                if group_id in approved_group_ids and group["resolution"] == "consolidate"
-            ),
-            "obsolete": sum(
-                len(group["evidence"])
-                for group_id, group in groups.items()
-                if group_id in approved_group_ids and group["resolution"] == "obsolete"
-            ),
+            "adopted": approved_outcomes["adopted"],
+            "consolidated": approved_outcomes["consolidated"],
+            "obsolete": approved_outcomes["obsolete"],
             "deferred": sum(len(groups[str(item[0])]["evidence"]) for item in decision_rows if str(item[1]) == "defer"),
             "rejected": sum(
                 len(groups[str(item[0])]["evidence"]) for item in decision_rows if str(item[1]) == "reject"
@@ -1018,7 +1113,7 @@ class WorkshopMemoryReconciliationTriageService:
             "not_adopted": sum(
                 len(groups[str(item[0])]["evidence"]) for item in decision_rows if str(item[1]) in {"reject", "defer"}
             ),
-            "operator_admitted": operator_admitted,
+            "operator_admitted": approved_outcomes["operator_admitted"],
             "canonicalized_in_quarantine": 0,
         }
         response = {

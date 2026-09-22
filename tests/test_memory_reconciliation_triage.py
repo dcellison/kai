@@ -17,10 +17,14 @@ from kai.oneshot import OneShotResult
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.domain import PrincipalId
 from kai.workshop.memory_reconciliation_review import (
+    MemoryReconciliationReviewAccessDenied,
     MemoryReconciliationReviewValidationError,
     record_reconciliation_audit,
 )
-from kai.workshop.memory_reconciliation_triage import WorkshopMemoryReconciliationTriageService
+from kai.workshop.memory_reconciliation_triage import (
+    WorkshopMemoryReconciliationTriageService,
+    _approved_outcome_summary,
+)
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from tests.workshop_profiles import profile_id
@@ -49,6 +53,31 @@ def _audit(rows: list[MemoryResult]) -> dict[str, Any]:
         rows=rows,
         now=NOW,
     )
+
+
+def test_applied_summary_uses_saved_exception_actions_instead_of_plan_proposals() -> None:
+    groups = {
+        "adopt": {"evidence": [{"memory_id": "a"}], "resolution": "needs_review"},
+        "consolidate": {
+            "evidence": [{"memory_id": "b"}, {"memory_id": "c"}],
+            "resolution": "needs_review",
+        },
+        "obsolete": {"evidence": [{"memory_id": "d"}], "resolution": "needs_review"},
+        "episode": {"evidence": [{"memory_id": "e"}], "resolution": "needs_review"},
+    }
+    decision_rows = [
+        ("adopt", "approve", json.dumps({"kind": "adopt_as_current"})),
+        ("consolidate", "approve", json.dumps({"kind": "adopt_corrected"})),
+        ("obsolete", "approve", json.dumps({"kind": "expire_all"})),
+        ("episode", "approve", json.dumps({"kind": "record_episode_chain"})),
+    ]
+
+    assert _approved_outcome_summary(groups, decision_rows) == {
+        "adopted": 2,
+        "consolidated": 2,
+        "obsolete": 1,
+        "operator_admitted": 3,
+    }
 
 
 def test_triage_partitions_large_legacy_corpus_into_safe_batches() -> None:
@@ -274,6 +303,104 @@ async def test_group_decision_rejects_unchanged_adoption_for_ambiguous_facts(tmp
             allowed_project_ids=frozenset(),
             client_operation_id="unsafe-unchanged-adoption",
         )
+    project_action = {
+        "kind": "adopt_corrected",
+        "source_memory_id": "positive",
+        "replacement": {
+            "content": "Alice uses Telegram alerts.",
+            "scope_kind": "project",
+            "scope_key": "private-project",
+            "confidence": 0.8,
+        },
+    }
+    with pytest.raises(MemoryReconciliationReviewAccessDenied, match="outside current authority"):
+        await service.decide_group(
+            principal,
+            summary.plan_id,
+            page.groups[0]["group_id"],
+            disposition="approve",
+            action=project_action,
+            operator_note="",
+            expected_state_version=0,
+            allowed_project_ids=frozenset(),
+            client_operation_id="unauthorized-corrected-scope",
+        )
+    corrected = await service.decide_group(
+        principal,
+        summary.plan_id,
+        page.groups[0]["group_id"],
+        disposition="approve",
+        action={
+            "kind": "adopt_corrected",
+            "source_memory_id": "positive",
+            "replacement": {
+                "content": "Alice uses Telegram alerts.",
+                "scope_kind": "global",
+                "scope_key": "",
+                "confidence": 0.8,
+            },
+        },
+        operator_note="Resolved the contradiction explicitly.",
+        expected_state_version=0,
+        allowed_project_ids=frozenset(),
+        client_operation_id="resolve-contradiction",
+    )
+    assert corrected["disposition"] == "approve"
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action_kind", ["adopt_as_current", "expire_all"])
+async def test_group_decision_supports_complete_single_fact_outcomes(tmp_path: Path, action_kind: str) -> None:
+    db_path = tmp_path / "kai.db"
+    store = await WorkshopEventStore.open(db_path)
+    await bootstrap_default_workshop(
+        store,
+        (BootstrapHuman("Alice", "admin", "telegram", "101", "101", profile_id(101)),),
+    )
+    async with store.connection.execute(
+        "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = '101'"
+    ) as cursor:
+        principal_row = await cursor.fetchone()
+    assert principal_row is not None
+    principal = PrincipalId(str(principal_row[0]))
+    audit = memory_reconciliation.build_audit(
+        principal_id=str(principal),
+        runtime_profile_id=str(profile_id(101)),
+        rows=[
+            _row(
+                "time-sensitive",
+                "Alice currently prefers direct answers",
+                created_at=(NOW - timedelta(days=200)).isoformat(),
+            )
+        ],
+        now=NOW,
+    )
+    record_reconciliation_audit(db_path, audit)
+    service = WorkshopMemoryReconciliationTriageService(
+        store,
+        db_path=db_path,
+        runtime_pool=cast(WorkshopRuntimePool, object()),
+    )
+    summary = await service.latest(principal)
+    assert summary is not None
+    page = await service.groups(principal, summary.plan_id, exceptions_only=True)
+
+    result = await service.decide_group(
+        principal,
+        summary.plan_id,
+        page.groups[0]["group_id"],
+        disposition="approve",
+        action={"kind": action_kind},
+        operator_note="Explicit operator outcome.",
+        expected_state_version=0,
+        allowed_project_ids=frozenset(),
+        client_operation_id=f"single-fact-{action_kind}",
+    )
+
+    assert result["disposition"] == "approve"
+    decided = await service.groups(principal, summary.plan_id, exceptions_only=True)
+    assert decided.groups[0]["decision"]["action"] == {"kind": action_kind}
     await store.close()
 
 
@@ -297,6 +424,7 @@ class _FakeReasoner:
                 "outcome": "needs_review",
                 "confidence": 0.72,
                 "rationale": "The two statements conflict and need a human decision.",
+                "related_group_ids": [],
             }
             for group in prompt["groups"]
         ]
@@ -358,9 +486,10 @@ async def test_model_recommendations_are_advisory_provenanced_and_do_not_decide(
         "model": "gpt-5.5",
         "outcome": "needs_review",
         "output_sha256": page.groups[0]["decision"]["recommendation"]["output_sha256"],
-        "prompt_version": "memory_reconciliation_triage_v1",
+        "prompt_version": "memory_reconciliation_triage_v2",
         "provider": "openai",
         "rationale": "The two statements conflict and need a human decision.",
+        "related_group_ids": [],
     }
     await store.close()
 
