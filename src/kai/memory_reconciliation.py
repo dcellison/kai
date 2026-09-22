@@ -32,7 +32,9 @@ RECEIPT_KIND = "kai.memory_reconciliation.receipt"
 FORMAT_VERSION = 1
 
 DECISIONS = frozenset({"pending", "approve", "reject", "defer"})
-APPLICABLE_ACTIONS = frozenset({"adopt_as_current", "keep_first_retract_rest", "expire_all", "record_episode_chain"})
+APPLICABLE_ACTIONS = frozenset(
+    {"adopt_as_current", "adopt_corrected", "keep_first_retract_rest", "expire_all", "record_episode_chain"}
+)
 _TOKEN = re.compile(r"[a-z0-9]+")
 _CURRENT_WORDS = frozenset({"currently", "current", "now", "today", "latest"})
 
@@ -505,37 +507,97 @@ def _validate_action(candidate: dict[str, Any], action: dict[str, Any]) -> None:
         return
     if row_kinds != {"fact"}:
         raise MemoryReconciliationError("Fact lifecycle action may contain only fact evidence")
+    if kind == "adopt_corrected":
+        replacement = action.get("replacement")
+        if not isinstance(replacement, dict):
+            raise MemoryReconciliationError("Corrected adoption requires replacement fields")
+        permitted = {
+            "content",
+            "scope_kind",
+            "scope_key",
+            "confidence",
+            "asserted_at",
+            "observed_at",
+            "valid_from",
+            "valid_until",
+        }
+        if not set(replacement).issubset(permitted):
+            raise MemoryReconciliationError("Corrected adoption contains unsupported replacement fields")
+        content = replacement.get("content")
+        if not isinstance(content, str) or not content.strip() or len(content.strip()) > 16_384:
+            raise MemoryReconciliationError("Corrected adoption requires bounded replacement content")
+        scope_kind = replacement.get("scope_kind", rows[0].get("scope"))
+        scope_key = replacement.get("scope_key", rows[0].get("project_id") or "")
+        if scope_kind not in {"global", "project"}:
+            raise MemoryReconciliationError("Corrected adoption scope must be global or project")
+        if scope_kind == "global" and scope_key not in {None, ""}:
+            raise MemoryReconciliationError("Global corrected adoption cannot include a project")
+        if scope_kind == "project" and (not isinstance(scope_key, str) or not scope_key):
+            raise MemoryReconciliationError("Project corrected adoption requires a project")
+        confidence = replacement.get("confidence", rows[0].get("confidence", 0.5))
+        if not isinstance(confidence, int | float) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
+            raise MemoryReconciliationError("Corrected adoption confidence must be between zero and one")
+        for field in ("asserted_at", "observed_at", "valid_from", "valid_until"):
+            value = replacement.get(field)
+            if value is not None and _timestamp(value) is None:
+                raise MemoryReconciliationError(f"Corrected adoption {field} must be timezone-aware")
+        valid_from = _timestamp(replacement.get("valid_from"))
+        valid_until = _timestamp(replacement.get("valid_until"))
+        if valid_from is not None and valid_until is not None and valid_until <= valid_from:
+            raise MemoryReconciliationError("Corrected adoption validity end must follow its start")
+        source_memory_id = action.get("source_memory_id")
+        if source_memory_id is not None and source_memory_id not in {row["memory_id"] for row in rows}:
+            raise MemoryReconciliationError("Corrected adoption source must belong to the candidate")
+        return
     if kind == "keep_first_retract_rest":
         memory_ids = {row["memory_id"] for row in rows}
         if len(memory_ids) < 2 or action.get("keeper_memory_id") not in memory_ids:
             raise MemoryReconciliationError("Duplicate action requires a keeper from a multi-row candidate")
 
 
+def validate_candidate_action(candidate: dict[str, Any], action: dict[str, Any]) -> None:
+    """Validate one operator-selected action before sealing a complete review."""
+    if not isinstance(action, dict) or action.get("kind") not in APPLICABLE_ACTIONS:
+        raise MemoryReconciliationError("Approved candidates require an applicable lifecycle action")
+    _validate_action(candidate, action)
+
+
 def _parse_time(value: object) -> datetime | None:
     return _timestamp(value)
 
 
-def _fact_spec(row: dict[str, Any], *, receipt_id: str, reason: str) -> FactRevisionInput:
+def _fact_spec(
+    row: dict[str, Any],
+    *,
+    receipt_id: str,
+    reason: str,
+    action: dict[str, Any] | None = None,
+    evidence_rows: list[dict[str, Any]] | None = None,
+) -> FactRevisionInput:
     now = datetime.now(UTC)
     metadata = dict(row["metadata"])
     metadata["_canonical_adopt_memory_id"] = row["memory_id"]
-    scope = row["scope"] if row["scope"] in {"global", "project"} else "global"
-    project = row["project_id"] if scope == "project" else None
+    replacement = action.get("replacement", {}) if action is not None else {}
+    scope = replacement.get("scope_kind", row["scope"])
+    scope = scope if scope in {"global", "project"} else "global"
+    project = replacement.get("scope_key", row["project_id"]) if scope == "project" else None
+    source_rows = evidence_rows or [row]
     return FactRevisionInput(
-        content=str(row["text"]),
+        content=str(replacement.get("content", row["text"])).strip(),
         scope_kind=scope,
         scope_key=str(project or ""),
         reason=reason,
-        evidence=(
-            {"kind": "legacy", "reference_id": str(row["memory_id"]), "sha256": str(row["text_sha256"])},
-            {"kind": "operator", "reference_id": receipt_id, "sha256": None},
-        ),
+        evidence=tuple(
+            {"kind": "legacy", "reference_id": str(item["memory_id"]), "sha256": str(item["text_sha256"])}
+            for item in source_rows
+        )
+        + ({"kind": "operator", "reference_id": receipt_id, "sha256": None},),
         vector_metadata=metadata,
-        confidence=_number(row["confidence"]),
-        asserted_at=_parse_time(row["asserted_at"]) or now,
-        observed_at=_parse_time(row["observed_at"]) or now,
-        valid_from=_parse_time(row["valid_from"]),
-        valid_until=_parse_time(row["valid_until"]),
+        confidence=_number(replacement.get("confidence", row["confidence"])),
+        asserted_at=_parse_time(replacement.get("asserted_at", row["asserted_at"])) or now,
+        observed_at=_parse_time(replacement.get("observed_at", row["observed_at"])) or now,
+        valid_from=_parse_time(replacement.get("valid_from", row["valid_from"])),
+        valid_until=_parse_time(replacement.get("valid_until", row["valid_until"])),
         backend=row["backend"],
         provider=row["provider"],
         model=row["model"],
@@ -629,6 +691,26 @@ async def apply_review(
             if any(row["kind"] != "fact" for row in rows):
                 raise MemoryReconciliationError("Fact action contains an episode row")
             mutations = []
+            if kind == "adopt_corrected":
+                source_id = action.get("source_memory_id")
+                source = next(
+                    (row for row in rows if source_id is None or row["memory_id"] == source_id),
+                    rows[0],
+                )
+                adopted = await fact_service.create(
+                    fact_authority,
+                    _fact_spec(
+                        source,
+                        receipt_id=receipt_id,
+                        reason="Operator-corrected reconciliation of existing semantic memory.",
+                        action=action,
+                        evidence_rows=rows,
+                    ),
+                    idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:corrected",
+                    stable_claim_key=f"reconciled:{decision['candidate_id']}",
+                )
+                applied.append({"candidate_id": decision["candidate_id"], "events": [str(adopted.revision_id)]})
+                continue
             keeper = action.get("keeper_memory_id")
             if kind == "keep_first_retract_rest" and keeper not in {row["memory_id"] for row in rows}:
                 raise MemoryReconciliationError("Duplicate action keeper is not part of the candidate")

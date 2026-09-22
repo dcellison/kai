@@ -6499,6 +6499,242 @@ button:disabled {
   font-size: 0.68rem;
 }
 
+.memory-reconciliation-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.memory-reconciliation-summary > div {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 0.42rem;
+  padding: 0.7rem;
+  background: var(--color-panel);
+}
+
+.memory-reconciliation-summary strong {
+  color: var(--color-accent);
+  font-family: var(--mono);
+  font-size: 1rem;
+}
+
+.memory-reconciliation-summary span,
+.memory-review-explanation,
+.memory-review-gaps {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.memory-review-explanation {
+  border-left: 2px solid var(--color-warning);
+  margin: 0.8rem 0;
+  padding-left: 0.7rem;
+}
+
+.memory-reconciliation-filters {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(7rem, 1fr));
+  gap: 0.55rem;
+  border-block: 1px solid var(--color-border);
+  padding: 0.9rem 0;
+}
+
+.memory-reconciliation-filters label,
+.memory-review-correction label,
+.memory-review-decision label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--color-text-muted);
+  font-size: 0.66rem;
+  font-weight: 680;
+}
+
+.memory-reconciliation-filters select,
+.memory-review-correction input,
+.memory-review-correction select,
+.memory-review-correction textarea,
+.memory-review-decision select,
+.memory-review-decision textarea {
+  width: 100%;
+  min-height: 2.15rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.45rem 0.6rem;
+  background: var(--color-canvas-inset);
+  color: var(--color-text-strong);
+  font: 0.72rem/1.45 var(--sans);
+}
+
+.memory-review-correction textarea,
+.memory-review-decision textarea {
+  min-height: 6rem;
+  resize: vertical;
+}
+
+.memory-reconciliation-filters > div,
+.memory-review-toolbar {
+  display: flex;
+  align-items: end;
+  gap: 0.4rem;
+}
+
+.memory-reconciliation-filters button,
+.memory-review-toolbar button,
+.memory-review-decision button {
+  min-height: 2.15rem;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 55%, transparent);
+  border-radius: 0.35rem;
+  padding: 0.45rem 0.65rem;
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  color: var(--color-accent);
+  font-size: 0.7rem;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.memory-reconciliation-filters .quiet-button {
+  border-color: var(--color-border-strong);
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.memory-review-toolbar {
+  align-items: center;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--color-border);
+  padding: 0.65rem 0;
+}
+
+.memory-review-toolbar strong {
+  margin-right: auto;
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+}
+
+.memory-review-toolbar .danger {
+  border-color: color-mix(in srgb, var(--color-danger) 55%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 8%, transparent);
+  color: var(--color-danger);
+}
+
+.memory-review-toolbar button:disabled,
+.memory-review-decision button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.memory-review-state {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  padding: 0.2rem 0.42rem;
+  color: var(--color-text-muted);
+  font-size: 0.58rem;
+  font-weight: 720;
+  text-transform: uppercase;
+}
+
+.memory-review-state.approve {
+  border-color: color-mix(in srgb, var(--color-success) 55%, transparent);
+  color: var(--color-success);
+}
+
+.memory-review-state.reject {
+  border-color: color-mix(in srgb, var(--color-danger) 55%, transparent);
+  color: var(--color-danger);
+}
+
+.memory-review-state.defer {
+  border-color: color-mix(in srgb, var(--color-warning) 55%, transparent);
+  color: var(--color-warning);
+}
+
+.memory-lifecycle-summary,
+.memory-lifecycle-timeline article > header {
+  align-items: center;
+  display: flex;
+  gap: 0.55rem;
+  justify-content: space-between;
+}
+
+.memory-lifecycle-summary strong {
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.memory-lifecycle-timeline {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.memory-lifecycle-timeline article {
+  background: var(--color-canvas-inset);
+  border: 1px solid var(--color-border);
+  border-radius: 0.55rem;
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+}
+
+.memory-lifecycle-timeline article > header time,
+.memory-lifecycle-timeline article > small {
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+}
+
+.memory-review-state.requires_review,
+.memory-review-state.unresolved_conflict {
+  border-color: color-mix(in srgb, var(--color-warning) 55%, transparent);
+  color: var(--color-warning);
+}
+
+.memory-review-state.active {
+  border-color: color-mix(in srgb, var(--color-success) 55%, transparent);
+  color: var(--color-success);
+}
+
+.memory-reconciliation-detail {
+  height: 100%;
+  padding: 0 1.2rem 3rem;
+  overflow-y: auto;
+}
+
+.memory-review-controls {
+  border: 0;
+  display: contents;
+  margin: 0;
+  min-inline-size: 0;
+  padding: 0;
+}
+
+.memory-review-evidence {
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.7rem;
+  background: var(--color-canvas-inset);
+}
+
+.memory-review-evidence + .memory-review-evidence {
+  margin-top: 0.55rem;
+}
+
+.memory-review-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin-top: 0.55rem;
+}
+
+.memory-review-decision {
+  display: grid;
+  gap: 0.65rem;
+}
+
 .memory-retry {
   grid-column: 1 / -1;
   border: 1px solid color-mix(in srgb, var(--color-danger) 35%, transparent);

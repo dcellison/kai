@@ -92,6 +92,21 @@ function detail(item: WorkshopMemoryRecord): WorkshopMemoryDetail {
           tags: ["deployment"],
         }
       : null,
+    lifecycle: {
+      authority: "legacy",
+      createdAt: item.createdAt,
+      currentRevisionId: null,
+      currentState: "requires_review",
+      events: [],
+      followups: [],
+      identity: item.memoryId,
+      kind: item.kind,
+      migrationClassification: "unclassified",
+      migrationGaps: ["canonical provenance"],
+      revisions: [],
+      runtimeProfileId: null,
+      scope: { key: item.scope.projectId, kind: item.scope.scope },
+    },
     promptVersion: "v1",
   };
 }

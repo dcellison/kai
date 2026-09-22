@@ -2129,6 +2129,66 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
     )
 
 
+def workshop_memory_reconciliation_status(db_path: Path) -> str:
+    """Describe private review progress and receipt integrity without reading memory content."""
+    prefix = "Workshop memory reconciliation:"
+    if not db_path.is_file():
+        return f"{prefix} pending; canonical review schema unavailable"
+    required = {
+        "memory_reconciliation_audits",
+        "memory_reconciliation_decisions",
+        "memory_reconciliation_receipts",
+        "memory_reconciliation_operations",
+    }
+    try:
+        connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            if not required.issubset(tables):
+                return f"{prefix} pending; canonical review schema unavailable"
+            audits = _scalar(connection, "SELECT COUNT(*) FROM memory_reconciliation_audits")
+            open_audits = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_audits WHERE status = 'open'",
+            )
+            applied_audits = audits - open_audits
+            decisions = connection.execute(
+                "SELECT disposition, COUNT(*) FROM memory_reconciliation_decisions GROUP BY disposition"
+            ).fetchall()
+            disposition_counts = {str(row[0]): int(row[1]) for row in decisions}
+            receipts = _scalar(connection, "SELECT COUNT(*) FROM memory_reconciliation_receipts")
+            operations = _scalar(connection, "SELECT COUNT(*) FROM memory_reconciliation_operations")
+            integrity_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_audits a WHERE a.candidate_count != ("
+                "SELECT COUNT(*) FROM memory_reconciliation_decisions d WHERE d.audit_id = a.audit_id) "
+                "OR (a.status = 'applied') != EXISTS ("
+                "SELECT 1 FROM memory_reconciliation_receipts r WHERE r.audit_id = a.audit_id)",
+            )
+            replay_gaps = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_operations o "
+                "WHERE json_extract(o.response_json, '$.audit_id') IS NULL",
+            )
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
+    state = "active" if integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
+    return (
+        f"{prefix} {state}; audits={audits} (open={open_audits}, applied={applied_audits}), "
+        f"decisions={sum(disposition_counts.values())} "
+        f"(pending={disposition_counts.get('pending', 0)}, approved={disposition_counts.get('approve', 0)}, "
+        f"rejected={disposition_counts.get('reject', 0)}, deferred={disposition_counts.get('defer', 0)}), "
+        f"receipts={receipts}, operations={operations}; integrity gaps={integrity_gaps}, "
+        f"replay gaps={replay_gaps}; authority=canonical/replay-safe"
+    )
+
+
 def workshop_episode_history_status(db_path: Path, *, memory_enabled: bool | None) -> str:
     """Describe immutable episode authority without reading episode content."""
     prefix = "Workshop episode history:"

@@ -15,7 +15,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import quote
 
 from aiohttp import BodyPartReader, web
@@ -246,6 +246,14 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryQueryService,
     WorkshopMemoryResponseTooLarge,
     WorkshopMemoryValidationError,
+)
+from kai.workshop.memory_reconciliation_review import (
+    MemoryReconciliationReviewAccessDenied,
+    MemoryReconciliationReviewConflict,
+    MemoryReconciliationReviewError,
+    MemoryReconciliationReviewNotFound,
+    MemoryReconciliationReviewValidationError,
+    ReconciliationAuditSummary,
 )
 from kai.workshop.message_reactions import (
     MessageReactionAccessDeniedError,
@@ -530,9 +538,17 @@ _MEMORY_SOURCE_PATH = "/v1/memory/records/{memory_id}/source"
 _MEMORY_SCOPE_PATH = "/v1/memory/records/{memory_id}/scope"
 _MEMORY_BULK_SCOPE_PATH = "/v1/memory/actions/scope"
 _MEMORY_BULK_DELETE_PATH = "/v1/memory/actions/delete"
+_MEMORY_RECONCILIATION_PATH = "/v1/memory/reconciliation"
+_MEMORY_RECONCILIATION_CANDIDATES_PATH = "/v1/memory/reconciliation/{audit_id}/candidates"
+_MEMORY_RECONCILIATION_DECISION_PATH = "/v1/memory/reconciliation/{audit_id}/candidates/{candidate_id}/decision"
+_MEMORY_RECONCILIATION_BULK_PATH = "/v1/memory/reconciliation/{audit_id}/actions/bulk"
+_MEMORY_RECONCILIATION_APPLY_PATH = "/v1/memory/reconciliation/{audit_id}/apply"
+_ALLOWED_MEMORY_RECONCILIATION_FILTERS = frozenset(
+    {"category", "kind", "scope", "uncertainty", "disposition", "action", "gap", "offset", "limit"}
+)
 _ALLOWED_TIMELINE_QUERY_PARAMETERS = frozenset({"cursor", "limit", "tail", "start_message_id"})
 _ALLOWED_EVENT_QUERY_PARAMETERS = frozenset({"after_position"})
-_ALLOWED_MEMORY_FILTERS = frozenset({"kind", "source", "memory_type", "tag", "scope", "project_id"})
+_ALLOWED_MEMORY_FILTERS = frozenset({"kind", "source", "memory_type", "tag", "scope", "project_id", "lifecycle"})
 _ALLOWED_MEMORY_LIST_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"cursor", "limit", "order"}
 _ALLOWED_MEMORY_SEARCH_PARAMETERS = _ALLOWED_MEMORY_FILTERS | {"q", "limit"}
 _ENROLLMENT_REQUEST_FIELDS = frozenset({"enrollment_token", "device_display_name"})
@@ -1756,6 +1772,7 @@ def _serialize_memory_detail(detail: MemoryRecordDetail) -> dict[str, object]:
         "confirmation_quote": detail.confirmation_quote,
         "prompt_version": detail.prompt_version,
         "episode": detail.episode,
+        "lifecycle": detail.lifecycle,
         "extraction_provenance": detail.extraction_provenance,
         "extraction_receipt": (
             {
@@ -1928,6 +1945,246 @@ def _memory_error_response(exc: Exception) -> web.Response:
         code="invalid_memory_query",
         message="Invalid memory query",
     )
+
+
+def _serialize_reconciliation_summary(summary: ReconciliationAuditSummary) -> dict[str, object]:
+    return {
+        "audit_id": summary.audit_id,
+        "runtime_profile_id": summary.runtime_profile_id,
+        "generated_at": summary.generated_at,
+        "corpus_count": summary.corpus_count,
+        "candidate_count": summary.candidate_count,
+        "status": summary.status,
+        "review_version": summary.review_version,
+        "disposition_counts": summary.disposition_counts,
+        "category_counts": summary.category_counts,
+        "kind_counts": summary.kind_counts,
+        "uncertainty_counts": summary.uncertainty_counts,
+        "action_counts": summary.action_counts,
+        "gap_counts": summary.gap_counts,
+        "applied_at": summary.applied_at,
+    }
+
+
+def _reconciliation_error_response(exc: Exception) -> web.Response:
+    if isinstance(exc, MemoryReconciliationReviewNotFound):
+        return _error_response(status=404, code="reconciliation_not_found", message=str(exc))
+    if isinstance(exc, MemoryReconciliationReviewAccessDenied):
+        return _error_response(status=403, code="access_denied", message="Access denied")
+    if isinstance(exc, MemoryReconciliationReviewConflict):
+        return _error_response(status=409, code="reconciliation_conflict", message=str(exc))
+    if isinstance(exc, MemoryReconciliationReviewValidationError):
+        return _error_response(status=400, code="invalid_reconciliation_request", message=str(exc))
+    if isinstance(exc, (KeyError, ValueError, WorkshopMemoryValidationError)):
+        return _error_response(
+            status=400,
+            code="invalid_reconciliation_request",
+            message="Invalid reconciliation request",
+        )
+    return _error_response(
+        status=503,
+        code="reconciliation_unavailable",
+        message="Memory reconciliation is unavailable",
+    )
+
+
+async def _handle_memory_reconciliation_latest(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid reconciliation request")
+    assert authority is not None
+    try:
+        summary = await service.reconciliation.latest(authority.principal_id)
+    except MemoryReconciliationReviewError as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "audit": None if summary is None else _serialize_reconciliation_summary(summary),
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_reconciliation_candidates(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if not set(request.query).issubset(_ALLOWED_MEMORY_RECONCILIATION_FILTERS) or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid reconciliation request")
+    assert authority is not None
+    try:
+        raw_offset = _single_query_value(request, "offset") or "0"
+        raw_limit = _single_query_value(request, "limit") or "25"
+        if not _DECIMAL_INTEGER.fullmatch(raw_offset) or not _DECIMAL_INTEGER.fullmatch(raw_limit):
+            raise MemoryReconciliationReviewValidationError("Invalid reconciliation page")
+        page = await service.reconciliation.candidates(
+            authority.principal_id,
+            request.match_info["audit_id"],
+            category=_single_query_value(request, "category"),
+            kind=_single_query_value(request, "kind"),
+            scope=_single_query_value(request, "scope"),
+            uncertainty=_single_query_value(request, "uncertainty"),
+            disposition=_single_query_value(request, "disposition"),
+            action=_single_query_value(request, "action"),
+            gap=_single_query_value(request, "gap"),
+            offset=int(raw_offset),
+            limit=int(raw_limit),
+        )
+    except (KeyError, ValueError, MemoryReconciliationReviewError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "audit": _serialize_reconciliation_summary(page.audit),
+            "candidates": list(page.candidates),
+            "next_offset": page.next_offset,
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_reconciliation_decision(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid reconciliation request")
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if set(payload) != {"disposition", "action", "operator_note", "expected_state_version", "client_operation_id"}:
+            raise MemoryReconciliationReviewValidationError("Invalid reconciliation decision")
+        if (
+            not isinstance(payload["disposition"], str)
+            or not isinstance(payload["action"], dict)
+            or not isinstance(payload["operator_note"], str)
+            or not isinstance(payload["expected_state_version"], int)
+            or isinstance(payload["expected_state_version"], bool)
+            or not isinstance(payload["client_operation_id"], str)
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid reconciliation decision")
+        allowed_project_ids = frozenset(project.project_id for project in await service.allowed_projects(authority))
+        result = await service.reconciliation.decide(
+            authority.principal_id,
+            request.match_info["audit_id"],
+            request.match_info["candidate_id"],
+            disposition=payload["disposition"],
+            action=payload["action"],
+            operator_note=payload["operator_note"],
+            expected_state_version=payload["expected_state_version"],
+            client_operation_id=payload["client_operation_id"],
+            allowed_project_ids=allowed_project_ids,
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_reconciliation_bulk(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid reconciliation request")
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if set(payload) != {
+            "candidate_ids",
+            "disposition",
+            "operator_note",
+            "expected_review_version",
+            "client_operation_id",
+        }:
+            raise MemoryReconciliationReviewValidationError("Invalid bulk reconciliation decision")
+        candidate_ids = payload["candidate_ids"]
+        disposition = payload["disposition"]
+        bulk_disposition: Literal["reject", "defer"]
+        if disposition == "reject":
+            bulk_disposition = "reject"
+        elif disposition == "defer":
+            bulk_disposition = "defer"
+        else:
+            raise MemoryReconciliationReviewValidationError("Invalid bulk reconciliation decision")
+        if (
+            not isinstance(candidate_ids, list)
+            or not all(isinstance(value, str) for value in candidate_ids)
+            or not isinstance(payload["operator_note"], str)
+            or not isinstance(payload["expected_review_version"], int)
+            or isinstance(payload["expected_review_version"], bool)
+            or not isinstance(payload["client_operation_id"], str)
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid bulk reconciliation decision")
+        result = await service.reconciliation.bulk_decide(
+            authority.principal_id,
+            request.match_info["audit_id"],
+            candidate_ids=candidate_ids,
+            disposition=bulk_disposition,
+            operator_note=payload["operator_note"],
+            expected_review_version=payload["expected_review_version"],
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_reconciliation_apply(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid reconciliation request")
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if (
+            set(payload) != {"expected_review_version", "client_operation_id", "confirmation"}
+            or payload["confirmation"] != "apply reviewed memory decisions"
+            or not isinstance(payload["expected_review_version"], int)
+            or isinstance(payload["expected_review_version"], bool)
+            or not isinstance(payload["client_operation_id"], str)
+        ):
+            raise MemoryReconciliationReviewValidationError("Explicit reconciliation confirmation is required")
+        allowed_project_ids = frozenset(project.project_id for project in await service.allowed_projects(authority))
+        result = await service.reconciliation.apply(
+            authority.principal_id,
+            request.match_info["audit_id"],
+            expected_review_version=payload["expected_review_version"],
+            client_operation_id=payload["client_operation_id"],
+            allowed_project_ids=allowed_project_ids,
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
 
 
 async def _handle_memory_stats(
@@ -11369,6 +11626,46 @@ def register_workshop_read_routes(
                     bulk=True,
                 )
 
+        async def handle_memory_reconciliation_latest(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_reconciliation_latest(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_reconciliation_candidates(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_reconciliation_candidates(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_reconciliation_decision(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_reconciliation_decision(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_reconciliation_bulk(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_reconciliation_bulk(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_reconciliation_apply(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_reconciliation_apply(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
         app.router.add_get(_MEMORY_STATS_PATH, handle_memory_stats)
         app.router.add_get(_MEMORY_RECORDS_PATH, handle_memory_records)
         _register_workshop_capability_route(
@@ -11390,6 +11687,36 @@ def register_workshop_read_routes(
             entrypoint="memory_edit",
         )
         app.router.add_get(_MEMORY_SOURCE_PATH, handle_memory_source)
+        app.router.add_get(_MEMORY_RECONCILIATION_PATH, handle_memory_reconciliation_latest)
+        app.router.add_get(_MEMORY_RECONCILIATION_CANDIDATES_PATH, handle_memory_reconciliation_candidates)
+        for method, path, handler, entrypoint in (
+            (
+                "PATCH",
+                _MEMORY_RECONCILIATION_DECISION_PATH,
+                handle_memory_reconciliation_decision,
+                "memory_reconciliation_decision",
+            ),
+            (
+                "POST",
+                _MEMORY_RECONCILIATION_BULK_PATH,
+                handle_memory_reconciliation_bulk,
+                "memory_reconciliation_bulk",
+            ),
+            (
+                "POST",
+                _MEMORY_RECONCILIATION_APPLY_PATH,
+                handle_memory_reconciliation_apply,
+                "memory_reconciliation_apply",
+            ),
+        ):
+            _register_workshop_capability_route(
+                app,
+                method,
+                path,
+                handler,
+                operation_id="memory.manage",
+                entrypoint=entrypoint,
+            )
         for method, path, handler, entrypoint in (
             ("PATCH", _MEMORY_SCOPE_PATH, handle_memory_scope_mutation, "memory_scope_update"),
             ("DELETE", _MEMORY_DETAIL_PATH, handle_memory_delete_mutation, "memory_delete"),

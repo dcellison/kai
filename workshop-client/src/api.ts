@@ -65,6 +65,10 @@ import type {
   WorkshopMemorySourceContext,
   WorkshopMemorySourceMessage,
   WorkshopMemoryStats,
+  WorkshopMemoryReconciliationCandidate,
+  WorkshopMemoryReconciliationDisposition,
+  WorkshopMemoryReconciliationPage,
+  WorkshopMemoryReconciliationSummary,
   WorkshopArtifactKind,
   WorkshopArtifactSummary,
   WorkshopMessageReaction,
@@ -4043,6 +4047,269 @@ export async function loadMemoryStats(token: string): Promise<WorkshopMemoryStat
   };
 }
 
+function parseReconciliationSummary(value: unknown): WorkshopMemoryReconciliationSummary | null {
+  if (!isRecord(value)) return null;
+  const dispositionCounts = parseCountMap(value.disposition_counts);
+  const categoryCounts = parseCountMap(value.category_counts);
+  const kindCounts = parseCountMap(value.kind_counts);
+  const uncertaintyCounts = parseCountMap(value.uncertainty_counts);
+  const actionCounts = parseCountMap(value.action_counts);
+  const gapCounts = parseCountMap(value.gap_counts);
+  if (
+    typeof value.audit_id !== "string" || typeof value.runtime_profile_id !== "string" ||
+    typeof value.generated_at !== "string" || !Number.isSafeInteger(value.corpus_count) ||
+    !Number.isSafeInteger(value.candidate_count) || !Number.isSafeInteger(value.review_version) ||
+    !["open", "applied"].includes(String(value.status)) ||
+    (value.applied_at !== null && typeof value.applied_at !== "string") ||
+    !dispositionCounts || !categoryCounts || !kindCounts || !uncertaintyCounts || !actionCounts || !gapCounts
+  ) return null;
+  for (const disposition of ["pending", "approve", "reject", "defer"]) {
+    if (!Number.isSafeInteger(dispositionCounts[disposition])) return null;
+  }
+  return {
+    actionCounts,
+    appliedAt: value.applied_at,
+    auditId: value.audit_id,
+    candidateCount: value.candidate_count as number,
+    categoryCounts,
+    corpusCount: value.corpus_count as number,
+    dispositionCounts: dispositionCounts as Record<WorkshopMemoryReconciliationDisposition, number>,
+    generatedAt: value.generated_at,
+    gapCounts,
+    kindCounts,
+    reviewVersion: value.review_version as number,
+    runtimeProfileId: value.runtime_profile_id,
+    status: value.status as "open" | "applied",
+    uncertaintyCounts,
+  };
+}
+
+function parseReconciliationCandidate(value: unknown): WorkshopMemoryReconciliationCandidate | null {
+  if (
+    !isRecord(value) || typeof value.candidate_id !== "string" ||
+    typeof value.state_sha256 !== "string" || typeof value.category !== "string" ||
+    typeof value.uncertainty !== "string" || typeof value.rationale !== "string" ||
+    !isRecord(value.proposed_action) || !isRecord(value.decision) ||
+    !Array.isArray(value.evidence)
+  ) return null;
+  const decision = value.decision;
+  if (
+    !["pending", "approve", "reject", "defer"].includes(String(decision.disposition)) ||
+    !isRecord(decision.action) || typeof decision.operator_note !== "string" ||
+    !Number.isSafeInteger(decision.state_version)
+  ) return null;
+  const evidence = value.evidence.map((item) => {
+    if (
+      !isRecord(item) || typeof item.memory_id !== "string" ||
+      !["fact", "episode"].includes(String(item.kind)) || typeof item.text !== "string" ||
+      typeof item.scope !== "string" || typeof item.confidence !== "number" ||
+      typeof item.migration_classification !== "string" ||
+      !Array.isArray(item.migration_gaps) ||
+      !item.migration_gaps.every((gap) => typeof gap === "string")
+    ) return null;
+    const nullableStrings = [
+      "created_at", "updated_at", "project_id", "source", "backend", "provider", "model",
+      "prompt_version", "schema_version", "valid_from", "valid_until", "asserted_at",
+      "observed_at", "occurred_from", "occurred_until",
+    ];
+    if (nullableStrings.some((field) => item[field] !== null && typeof item[field] !== "string")) return null;
+    return {
+      assertedAt: item.asserted_at,
+      backend: item.backend,
+      confidence: item.confidence,
+      createdAt: item.created_at,
+      kind: item.kind as "fact" | "episode",
+      memoryId: item.memory_id,
+      migrationClassification: item.migration_classification,
+      migrationGaps: item.migration_gaps as string[],
+      model: item.model,
+      observedAt: item.observed_at,
+      occurredFrom: item.occurred_from,
+      occurredUntil: item.occurred_until,
+      projectId: item.project_id,
+      promptVersion: item.prompt_version,
+      provider: item.provider,
+      schemaVersion: item.schema_version,
+      scope: item.scope,
+      source: item.source,
+      text: item.text,
+      updatedAt: item.updated_at,
+      validFrom: item.valid_from,
+      validUntil: item.valid_until,
+    };
+  });
+  if (evidence.some((item) => item === null)) return null;
+  return {
+    candidateId: value.candidate_id,
+    category: value.category,
+    decision: {
+      action: decision.action,
+      disposition: decision.disposition as WorkshopMemoryReconciliationDisposition,
+      operatorNote: decision.operator_note,
+      stateVersion: decision.state_version as number,
+    },
+    evidence: evidence as WorkshopMemoryReconciliationCandidate["evidence"],
+    proposedAction: value.proposed_action,
+    rationale: value.rationale,
+    stateSha256: value.state_sha256,
+    uncertainty: value.uncertainty,
+  };
+}
+
+export async function loadMemoryReconciliation(
+  token: string,
+): Promise<WorkshopMemoryReconciliationSummary | null> {
+  const response = await authorizedFetch({ channelId: "", token }, "/v1/memory/reconciliation");
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load memory reconciliation."));
+  if (!isRecord(payload) || payload.version !== 1 || !("audit" in payload)) {
+    throw new Error("Kai returned an unsupported memory reconciliation summary.");
+  }
+  if (payload.audit === null) return null;
+  const parsed = parseReconciliationSummary(payload.audit);
+  if (!parsed) throw new Error("Kai returned an unsupported memory reconciliation summary.");
+  return parsed;
+}
+
+export async function loadMemoryReconciliationCandidates(
+  token: string,
+  auditId: string,
+  options: {
+    category?: string;
+    kind?: string;
+    scope?: string;
+    uncertainty?: string;
+    disposition?: WorkshopMemoryReconciliationDisposition;
+    action?: string;
+    gap?: string;
+    offset?: number;
+    limit?: number;
+  } = {},
+): Promise<WorkshopMemoryReconciliationPage> {
+  const query = new URLSearchParams();
+  for (const key of ["category", "kind", "scope", "uncertainty", "disposition", "action", "gap"] as const) {
+    if (options[key] !== undefined) query.set(key, options[key]);
+  }
+  if (options.offset !== undefined) query.set("offset", String(options.offset));
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/${encodeURIComponent(auditId)}/candidates?${query}`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load reconciliation candidates."));
+  const audit = isRecord(payload) ? parseReconciliationSummary(payload.audit) : null;
+  if (
+    !isRecord(payload) || payload.version !== 1 || !audit || !Array.isArray(payload.candidates) ||
+    (payload.next_offset !== null && !Number.isSafeInteger(payload.next_offset))
+  ) throw new Error("Kai returned an unsupported reconciliation page.");
+  const candidates = payload.candidates.map(parseReconciliationCandidate);
+  if (candidates.some((candidate) => candidate === null)) {
+    throw new Error("Kai returned an unsupported reconciliation candidate.");
+  }
+  return {
+    audit,
+    candidates: candidates as WorkshopMemoryReconciliationCandidate[],
+    nextOffset: payload.next_offset as number | null,
+  };
+}
+
+export async function saveMemoryReconciliationDecision(
+  token: string,
+  auditId: string,
+  candidateId: string,
+  input: {
+    disposition: Exclude<WorkshopMemoryReconciliationDisposition, "pending">;
+    action: Record<string, unknown>;
+    operatorNote: string;
+    expectedStateVersion: number;
+    clientOperationId?: string;
+  },
+): Promise<{ reviewVersion: number; stateVersion: number }> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/${encodeURIComponent(auditId)}/candidates/${encodeURIComponent(candidateId)}/decision`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        disposition: input.disposition,
+        action: input.action,
+        operator_note: input.operatorNote,
+        expected_state_version: input.expectedStateVersion,
+        client_operation_id: input.clientOperationId ?? mutationRequestId(),
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not save reconciliation decision."));
+  if (
+    !isRecord(payload) || payload.version !== 1 ||
+    !Number.isSafeInteger(payload.review_version) || !Number.isSafeInteger(payload.state_version)
+  ) throw new Error("Kai returned an unsupported reconciliation decision.");
+  return { reviewVersion: payload.review_version as number, stateVersion: payload.state_version as number };
+}
+
+export async function bulkMemoryReconciliationDecision(
+  token: string,
+  auditId: string,
+  input: {
+    candidateIds: string[];
+    disposition: "reject" | "defer";
+    operatorNote: string;
+    expectedReviewVersion: number;
+    clientOperationId?: string;
+  },
+): Promise<{ changed: number; reviewVersion: number }> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/${encodeURIComponent(auditId)}/actions/bulk`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        candidate_ids: input.candidateIds,
+        disposition: input.disposition,
+        operator_note: input.operatorNote,
+        expected_review_version: input.expectedReviewVersion,
+        client_operation_id: input.clientOperationId ?? mutationRequestId(),
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not save bulk reconciliation decision."));
+  if (
+    !isRecord(payload) || payload.version !== 1 ||
+    !Number.isSafeInteger(payload.changed) || !Number.isSafeInteger(payload.review_version)
+  ) throw new Error("Kai returned an unsupported bulk reconciliation decision.");
+  return { changed: payload.changed as number, reviewVersion: payload.review_version as number };
+}
+
+export async function applyMemoryReconciliation(
+  token: string,
+  auditId: string,
+  expectedReviewVersion: number,
+): Promise<void> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/${encodeURIComponent(auditId)}/apply`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_review_version: expectedReviewVersion,
+        client_operation_id: mutationRequestId(),
+        confirmation: "apply reviewed memory decisions",
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not apply memory reconciliation."));
+  if (!isRecord(payload) || payload.version !== 1 || !isRecord(payload.receipt)) {
+    throw new Error("Kai returned an unsupported reconciliation receipt.");
+  }
+}
+
 function parseMemoryMutation(payload: unknown): WorkshopMemoryMutationBatch | null {
   if (!isRecord(payload) || payload.version !== 1 ||
     !["move_scope", "delete"].includes(String(payload.operation)) ||
@@ -4150,6 +4417,7 @@ function memoryQueryParameters(
 ): URLSearchParams {
   const parameters = new URLSearchParams();
   if (options.kind !== undefined) parameters.set("kind", options.kind);
+  if (options.lifecycle !== undefined) parameters.set("lifecycle", options.lifecycle);
   if (options.source !== undefined) parameters.set("source", options.source);
   if (options.memoryType !== undefined) {
     parameters.set("memory_type", options.memoryType);
@@ -4269,12 +4537,50 @@ function parseMemoryEpisode(value: unknown): WorkshopMemoryDetail["episode"] | u
   };
 }
 
+function parseMemoryLifecycle(value: unknown): WorkshopMemoryDetail["lifecycle"] | null {
+  if (
+    !isRecord(value) || !["canonical", "legacy"].includes(String(value.authority)) ||
+    !["fact", "episode"].includes(String(value.kind)) || typeof value.identity !== "string" ||
+    typeof value.createdAt !== "string" || typeof value.currentState !== "string" ||
+    (value.currentRevisionId !== null && typeof value.currentRevisionId !== "string") ||
+    (value.runtimeProfileId !== null && typeof value.runtimeProfileId !== "string") ||
+    !isRecord(value.scope) || typeof value.scope.kind !== "string" ||
+    (value.scope.key !== null && typeof value.scope.key !== "string") ||
+    !Array.isArray(value.revisions) || !Array.isArray(value.events) || !Array.isArray(value.followups)
+  ) return null;
+  const revisions = value.revisions.filter(isRecord);
+  const events = value.events.filter(isRecord);
+  const followups = value.followups.filter(isRecord);
+  if (
+    revisions.length !== value.revisions.length || events.length !== value.events.length ||
+    followups.length !== value.followups.length || revisions.some((revision) => (
+      typeof revision.revisionId !== "string" || typeof revision.content !== "string" ||
+      typeof revision.reason !== "string" || typeof revision.state !== "string" ||
+      typeof revision.storedAt !== "string"
+    )) || events.some((event) => (
+      typeof event.eventPosition !== "number" || typeof event.newState !== "string" ||
+      typeof event.occurredAt !== "string" || typeof event.reason !== "string" ||
+      typeof event.revisionId !== "string" || typeof event.transition !== "string" ||
+      (event.previousState !== null && typeof event.previousState !== "string")
+    )) || followups.some((followup) => (
+      typeof followup.createdAt !== "string" || typeof followup.reason !== "string" ||
+      typeof followup.relationship !== "string" || typeof followup.sourceEpisodeId !== "string" ||
+      typeof followup.targetEpisodeId !== "string"
+    ))
+  ) return null;
+  if (value.migrationGaps !== undefined && (
+    !Array.isArray(value.migrationGaps) || !value.migrationGaps.every((gap) => typeof gap === "string")
+  )) return null;
+  return value as unknown as WorkshopMemoryDetail["lifecycle"];
+}
+
 function parseMemoryDetail(value: unknown): WorkshopMemoryDetail | null {
   if (!isRecord(value)) return null;
   const record = parseMemoryRecord(value);
   const episode = parseMemoryEpisode(value.episode);
+  const lifecycle = parseMemoryLifecycle(value.lifecycle);
   if (
-    !record || episode === undefined || typeof value.content !== "string" ||
+    !record || episode === undefined || !lifecycle || typeof value.content !== "string" ||
     typeof value.compact_recall !== "string" ||
     (value.confirmation_quote !== null && typeof value.confirmation_quote !== "string") ||
     (value.prompt_version !== null && typeof value.prompt_version !== "string")
@@ -4287,6 +4593,7 @@ function parseMemoryDetail(value: unknown): WorkshopMemoryDetail | null {
     confirmationQuote: value.confirmation_quote,
     content: value.content,
     episode,
+    lifecycle,
     promptVersion: value.prompt_version,
   };
 }
