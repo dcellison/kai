@@ -611,6 +611,7 @@ def _fact_spec(
         schema_version=row["schema_version"],
         migration_classification=("legacy_incomplete" if migration_gaps else "legacy_complete"),
         migration_gaps=migration_gaps,
+        admission_authority="operator_review",
     )
 
 
@@ -646,6 +647,7 @@ def _episode_spec(row: dict[str, Any], *, receipt_id: str) -> EpisodeInput:
         schema_version=row["schema_version"],
         migration_classification=("legacy_incomplete" if migration_gaps else "legacy_complete"),
         migration_gaps=migration_gaps,
+        admission_authority="operator_review",
     )
 
 

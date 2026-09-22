@@ -56,6 +56,12 @@ class LegacyMemoryClassification(StrEnum):
     LEGACY_QUARANTINED = "legacy_quarantined"
 
 
+class MemoryAdmissionAuthority(StrEnum):
+    PROVENANCE_VERIFIED = "provenance_verified"
+    OPERATOR_REVIEW = "operator_review"
+    QUARANTINED = "quarantined"
+
+
 class LegacyTemporalGap(StrEnum):
     ASSERTION_TIME = "assertion_time"
     OBSERVATION_TIME = "observation_time"
@@ -187,6 +193,37 @@ def _migration(payload: dict[str, Any]) -> tuple[str, str]:
     return classification.value, json.dumps([gap.value for gap in gaps], separators=(",", ":"))
 
 
+def resolve_memory_admission(
+    migration_classification: str,
+    admission_authority: object = None,
+) -> MemoryAdmissionAuthority:
+    """Resolve explicit admission separately from immutable provenance quality."""
+    classification = LegacyMemoryClassification(migration_classification)
+    if admission_authority is None:
+        return (
+            MemoryAdmissionAuthority.PROVENANCE_VERIFIED
+            if classification in {LegacyMemoryClassification.CANONICAL, LegacyMemoryClassification.LEGACY_COMPLETE}
+            else MemoryAdmissionAuthority.QUARANTINED
+        )
+    authority = MemoryAdmissionAuthority(_required_text(admission_authority, field="admission_authority", maximum=32))
+    if authority == MemoryAdmissionAuthority.PROVENANCE_VERIFIED and classification not in {
+        LegacyMemoryClassification.CANONICAL,
+        LegacyMemoryClassification.LEGACY_COMPLETE,
+    }:
+        raise ValueError("Incomplete temporal memory cannot claim provenance-verified admission")
+    if authority == MemoryAdmissionAuthority.QUARANTINED and classification in {
+        LegacyMemoryClassification.CANONICAL,
+        LegacyMemoryClassification.LEGACY_COMPLETE,
+    }:
+        raise ValueError("Complete temporal memory cannot be quarantined by provenance")
+    if (
+        authority == MemoryAdmissionAuthority.OPERATOR_REVIEW
+        and classification == LegacyMemoryClassification.LEGACY_QUARANTINED
+    ):
+        raise ValueError("Quarantined legacy memory cannot be admitted without correction")
+    return authority
+
+
 def _evidence(payload: dict[str, Any], *, canonical: bool) -> str:
     raw = payload.get("evidence")
     if not isinstance(raw, list) or len(raw) > 64:
@@ -271,9 +308,11 @@ def _revision_values(payload: dict[str, Any]) -> tuple[object, ...]:
         "supersedes_revision_id",
         "migration_classification",
         "migration_gaps",
+        "admission_authority",
         "vector_metadata",
     }
-    if set(payload) not in {frozenset(expected), frozenset(expected - {"vector_metadata"})}:
+    required = expected - {"admission_authority", "vector_metadata"}
+    if not required.issubset(payload) or not set(payload).issubset(expected):
         raise ValueError("Temporal fact revision payload has an invalid shape")
     revision_id = MemoryRevisionId(_required_text(payload.get("revision_id"), field="revision_id", maximum=128))
     classification, gaps_json = _migration(payload)
@@ -310,6 +349,7 @@ def _revision_values(payload: dict[str, Any]) -> tuple[object, ...]:
         supersedes,
         classification,
         gaps_json,
+        resolve_memory_admission(classification, payload.get("admission_authority")).value,
         _vector_metadata(payload),
     )
 
@@ -330,8 +370,9 @@ async def _insert_revision(
         "revision_id, claim_id, content, asserted_at, observed_at, stored_at, valid_from, valid_until, "
         "reason, evidence_json, source_receipt_id, source_run_id, source_message_id, result_message_id, "
         "backend, provider, model, prompt_version, schema_version, supersedes_revision_id, "
-        "migration_classification, migration_gaps_json, vector_metadata_json, created_event_position"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "migration_classification, migration_gaps_json, admission_authority, vector_metadata_json, "
+        "created_event_position"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (values[0], claim_id, *values[1:], event.position),
     )
     reason = str(values[7])
@@ -799,7 +840,7 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
             "similarity_fingerprint",
         }
         required = expected | structured if envelope.event_version == 2 else expected
-        if set(payload) != required:
+        if set(payload) not in {frozenset(required), frozenset(required | {"admission_authority"})}:
             raise ValueError("Temporal episode payload has an invalid shape")
         owner = PrincipalId(_required_text(payload.get("owner_principal_id"), field="owner_principal_id", maximum=128))
         runtime = RuntimeProfileId(
@@ -815,6 +856,10 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
         )
         scope_kind, scope_key = _scope(payload)
         classification, gaps_json = _migration(payload)
+        admission_authority = resolve_memory_admission(
+            classification,
+            payload.get("admission_authority"),
+        ).value
         evidence_json = _evidence(payload, canonical=classification == LegacyMemoryClassification.CANONICAL.value)
         occurred_from = _timestamp(payload.get("occurred_from"), field="occurred_from")
         occurred_until = _timestamp(payload.get("occurred_until"), field="occurred_until")
@@ -847,9 +892,9 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
             "content, occurred_from, occurred_until, observed_at, stored_at, reason, evidence_json, "
             "source_receipt_id, source_run_id, source_message_id, result_message_id, backend, provider, "
             "model, prompt_version, schema_version, migration_classification, migration_gaps_json, "
-            "created_event_position, goal, context, approach, outcome, outcome_quality, lessons, tags_json, "
+            "admission_authority, created_event_position, goal, context, approach, outcome, outcome_quality, lessons, tags_json, "
             "actors_json, vector_metadata_json, similarity_fingerprint) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 episode_id,
                 envelope.workshop_id,
@@ -875,6 +920,7 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
                 _optional_text(payload.get("schema_version"), field="schema_version", maximum=64),
                 classification,
                 gaps_json,
+                admission_authority,
                 event.position,
                 goal,
                 context,

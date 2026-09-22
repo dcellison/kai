@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from kai.workshop.episode_history import (
     EpisodeInput,
     MemoryEpisodeHistoryService,
 )
-from kai.workshop.memory_current_truth import project_current_truth
+from kai.workshop.memory_current_truth import CANONICAL_ADMISSION_AUTHORITY_KEY, project_current_truth
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import WorkshopEventStore
 
@@ -222,6 +223,42 @@ async def test_repeated_occurrence_remains_distinct_and_is_linked(tmp_path: Path
                 "reason": "A distinct later occurrence closely resembles this episode.",
             }
         ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_review_admits_incomplete_episode_as_history(tmp_path: Path) -> None:
+    vector = FakeEpisodeVector()
+    database = tmp_path / "kai.db"
+    store, service, authority = await _service(database, vector)
+    try:
+        recorded = await service.record(
+            authority,
+            replace(
+                _spec(),
+                migration_classification="legacy_incomplete",
+                migration_gaps=("assertion_time", "provenance"),
+                admission_authority="operator_review",
+            ),
+            idempotency_key="episode:operator-reviewed-legacy",
+        )
+
+        projected = project_current_truth(
+            vector.rows.values(),
+            db_path=database,
+            principal_id=str(PRINCIPAL_ID),
+            runtime_profile_id=str(RUNTIME_ID),
+            now=NOW,
+        )
+
+        assert projected.excluded == {}
+        assert len(projected.rows) == 1
+        admitted = projected.rows[0]
+        assert admitted.id == recorded.memory_id
+        assert admitted.metadata["migration_classification"] == "legacy_incomplete"
+        assert admitted.metadata[CANONICAL_ADMISSION_AUTHORITY_KEY] == "operator_review"
+        assert admitted.metadata["canonical_memory_temporal_role"] == "historical_episode"
     finally:
         await store.close()
 

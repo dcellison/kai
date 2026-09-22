@@ -28,14 +28,63 @@ function summarizeEvidence(value: string): string {
   return condensed.length > 88 ? `${condensed.slice(0, 87)}…` : condensed;
 }
 
-function canonicalizesInQuarantine(action: Record<string, unknown>): boolean {
-  return action.migration_classification === "legacy_incomplete";
+interface OperatorAdmissionOutcome {
+  button: string;
+  label: string;
+  operatorAdmits: boolean;
+  verb: string;
+}
+
+function operatorAdmissionOutcome(action: Record<string, unknown>): OperatorAdmissionOutcome | null {
+  switch (action.kind) {
+    case "adopt_as_current":
+    case "adopt_corrected":
+      return {
+        button: "Approve current-truth adoption",
+        label: "Adopt as current truth",
+        operatorAdmits: true,
+        verb: "adopt as current truth",
+      };
+    case "keep_first_retract_rest":
+      return {
+        button: "Approve consolidation",
+        label: "Consolidate into current truth",
+        operatorAdmits: true,
+        verb: "consolidate into current truth",
+      };
+    case "expire_all":
+      return {
+        button: "Approve obsolescence",
+        label: "Mark obsolete",
+        operatorAdmits: false,
+        verb: "mark obsolete",
+      };
+    case "record_episode_chain":
+      return {
+        button: "Approve historical retention",
+        label: "Retain as retrievable history",
+        operatorAdmits: true,
+        verb: "retain as retrievable history",
+      };
+    default:
+      return null;
+  }
+}
+
+function homogeneousOperatorAdmissionOutcome(
+  groups: WorkshopMemoryTriageGroup[],
+): OperatorAdmissionOutcome | null {
+  if (groups.length === 0) return null;
+  const first = operatorAdmissionOutcome(groups[0].proposedAction);
+  if (!first) return null;
+  return groups.every((group) => {
+    const outcome = operatorAdmissionOutcome(group.proposedAction);
+    return outcome?.verb === first.verb;
+  }) ? first : null;
 }
 
 function resolutionLabel(group: WorkshopMemoryTriageGroup): string {
-  return canonicalizesInQuarantine(group.proposedAction)
-    ? "Canonicalize in quarantine"
-    : formatLabel(group.resolution);
+  return operatorAdmissionOutcome(group.proposedAction)?.label ?? formatLabel(group.resolution);
 }
 
 function requestError(caught: unknown, fallback: string): string {
@@ -334,11 +383,12 @@ export function MemoryReconciliation({
   const approveSafe = async (): Promise<void> => {
     if (!safePreview) return;
     const counts = safePreview.resolutionCounts;
-    const quarantine = safePreviewGroups.length > 0
-      && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction));
-    const accepted = await confirm(quarantine
-      ? `Canonicalize ${safePreview.memoryCount} deterministic legacy memories into quarantine? ` +
-        "They will remain excluded from current truth and agent retrieval."
+    const outcome = homogeneousOperatorAdmissionOutcome(safePreviewGroups);
+    const accepted = await confirm(outcome
+      ? `${formatLabel(outcome.verb)} for ${safePreview.memoryCount} deterministic legacy memories? ` +
+        (outcome.operatorAdmits
+          ? "Their original provenance will remain incomplete; your explicit approval supplies separate retrieval admission authority."
+          : "Their original provenance will remain incomplete and the canonical lifecycle will exclude them as obsolete.")
       : `Approve ${safePreview.memoryCount} deterministic memories after reviewing the complete preview: ` +
         `${counts.adopt} adopt, ${counts.consolidate} consolidate, ${counts.obsolete} obsolete? ` +
         "No detected warning is not proof that a fact is true; your approval is the trust decision.");
@@ -347,8 +397,8 @@ export function MemoryReconciliation({
     setError(null);
     try {
       await approveSafeMemoryTriage(token, safePreview);
-      setReport(quarantine
-        ? `${safePreview.memoryCount} deterministic legacy memories approved for canonical quarantine in ${safePreview.groupCount} evidence-bound groups.`
+      setReport(outcome
+        ? `${safePreview.memoryCount} deterministic legacy memories approved to ${outcome.verb} in ${safePreview.groupCount} evidence-bound groups.`
         : `${safePreview.memoryCount} deterministic memories approved in ${safePreview.groupCount} evidence-bound groups.`);
       setRefreshKey((value) => value + 1);
     } catch (caught) {
@@ -388,7 +438,7 @@ export function MemoryReconciliation({
     try {
       const summary = await applyMemoryTriage(token, triage.planId, triage.reviewVersion);
       setReport(
-        `${summary.canonicalized_in_quarantine ?? 0} canonicalized in quarantine, ` +
+        `${summary.operator_admitted ?? 0} operator admitted, ` +
         `${summary.adopted ?? 0} adopted by lifecycle outcome, ${summary.consolidated ?? 0} consolidated, ` +
         `${summary.obsolete ?? 0} obsolete, ${summary.deferred ?? 0} deferred, ` +
         `${summary.rejected ?? 0} rejected, ${summary.failed ?? 0} failed, ` +
@@ -449,13 +499,15 @@ export function MemoryReconciliation({
                   <p className="memory-section-label">Complete deterministic preview</p>
                   <p>
                     {safePreview.memoryCount} memories in {safePreview.groupCount} evidence-bound groups.
-                    {safePreviewGroups.length > 0 && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction))
-                      ? " Canonicalization preserves these records for future review; it does not declare them current truth."
+                    {homogeneousOperatorAdmissionOutcome(safePreviewGroups)
+                      ? homogeneousOperatorAdmissionOutcome(safePreviewGroups)?.operatorAdmits
+                        ? " Their original provenance remains incomplete; your explicit approval supplies separate retrieval admission authority."
+                        : " Their original provenance remains incomplete and the canonical lifecycle will keep them out of retrieval."
                       : " No detected warning is proof of truth; approval is your explicit trust decision."}
                   </p>
                   <p>
-                    {safePreviewGroups.length > 0 && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction))
-                      ? `Proposed outcome: ${safePreview.memoryCount} canonicalize in quarantine. These records remain excluded from current truth and agent retrieval.`
+                    {homogeneousOperatorAdmissionOutcome(safePreviewGroups)
+                      ? `Proposed outcome: ${safePreview.memoryCount} ${homogeneousOperatorAdmissionOutcome(safePreviewGroups)?.verb}.`
                       : `Proposed outcomes: ${safePreview.resolutionCounts.adopt} adopt, ${safePreview.resolutionCounts.consolidate} consolidate, ${safePreview.resolutionCounts.obsolete} obsolete.`}
                   </p>
                   {safePreviewGroups.map((previewGroup) => (
@@ -473,8 +525,8 @@ export function MemoryReconciliation({
                     </details>
                   ))}
                   <button type="button" disabled={mutating} onClick={() => void approveSafe()}>
-                    {safePreviewGroups.length > 0 && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction))
-                      ? "Approve canonicalization"
+                    {homogeneousOperatorAdmissionOutcome(safePreviewGroups)
+                      ? homogeneousOperatorAdmissionOutcome(safePreviewGroups)?.button
                       : "Approve preview"}
                   </button>
                 </section>

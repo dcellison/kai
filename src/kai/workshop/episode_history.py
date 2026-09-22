@@ -24,7 +24,7 @@ from kai.workshop.domain import (
 from kai.workshop.memory_current_truth import CANONICAL_TEMPORAL_ROLE_KEY
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
-from kai.workshop.temporal_memory import EpisodeFollowupRelationship
+from kai.workshop.temporal_memory import EpisodeFollowupRelationship, resolve_memory_admission
 
 CANONICAL_EPISODE_ID_KEY = "canonical_memory_episode_id"
 _MAX_VECTOR_ATTEMPTS = 3
@@ -84,6 +84,7 @@ class EpisodeInput:
     schema_version: str | None = None
     migration_classification: str = "canonical"
     migration_gaps: tuple[str, ...] = ()
+    admission_authority: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +209,10 @@ def _episode_payload(spec: EpisodeInput) -> dict[str, object]:
         "schema_version": spec.schema_version,
         "migration_classification": spec.migration_classification,
         "migration_gaps": list(spec.migration_gaps),
+        "admission_authority": resolve_memory_admission(
+            spec.migration_classification,
+            spec.admission_authority,
+        ).value,
         "goal": spec.goal.strip(),
         "context": spec.context.strip(),
         "approach": spec.approach.strip(),

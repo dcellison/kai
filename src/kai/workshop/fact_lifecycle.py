@@ -29,6 +29,7 @@ from kai.workshop.memory_current_truth import (
 )
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
+from kai.workshop.temporal_memory import resolve_memory_admission
 
 _ADOPT_MEMORY_ID_KEY = "_canonical_adopt_memory_id"
 
@@ -90,6 +91,7 @@ class FactRevisionInput:
     schema_version: str | None = None
     migration_classification: str = "canonical"
     migration_gaps: tuple[str, ...] = ()
+    admission_authority: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +275,10 @@ def _revision_payload(spec: FactRevisionInput, revision_id: MemoryRevisionId, *,
         "supersedes_revision_id": supersedes,
         "migration_classification": spec.migration_classification,
         "migration_gaps": list(spec.migration_gaps),
+        "admission_authority": resolve_memory_admission(
+            spec.migration_classification,
+            spec.admission_authority,
+        ).value,
         "vector_metadata": metadata,
     }
 
