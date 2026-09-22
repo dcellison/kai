@@ -578,10 +578,16 @@ def _fact_spec(
     metadata = dict(row["metadata"])
     metadata["_canonical_adopt_memory_id"] = row["memory_id"]
     replacement = action.get("replacement", {}) if action is not None else {}
+    corrected = action is not None and action.get("kind") == "adopt_corrected"
+    source_rows = evidence_rows or [row]
+    migration_gaps = (
+        ()
+        if corrected
+        else tuple(sorted({str(value) for item in source_rows for value in item.get("migration_gaps", ())}))
+    )
     scope = replacement.get("scope_kind", row["scope"])
     scope = scope if scope in {"global", "project"} else "global"
     project = replacement.get("scope_key", row["project_id"]) if scope == "project" else None
-    source_rows = evidence_rows or [row]
     return FactRevisionInput(
         content=str(replacement.get("content", row["text"])).strip(),
         scope_kind=scope,
@@ -603,7 +609,8 @@ def _fact_spec(
         model=row["model"],
         prompt_version=row["prompt_version"],
         schema_version=row["schema_version"],
-        migration_classification="legacy_complete",
+        migration_classification=("legacy_incomplete" if migration_gaps else "legacy_complete"),
+        migration_gaps=migration_gaps,
     )
 
 
@@ -611,6 +618,7 @@ def _episode_spec(row: dict[str, Any], *, receipt_id: str) -> EpisodeInput:
     metadata = dict(row["metadata"])
     content = str(row["text"])
     scope = row["scope"] if row["scope"] in {"global", "project"} else "global"
+    migration_gaps = tuple(str(value) for value in row.get("migration_gaps", ()))
     return EpisodeInput(
         goal=str(metadata.get("goal") or content),
         context=str(metadata.get("context") or content),
@@ -636,7 +644,8 @@ def _episode_spec(row: dict[str, Any], *, receipt_id: str) -> EpisodeInput:
         model=row["model"],
         prompt_version=row["prompt_version"],
         schema_version=row["schema_version"],
-        migration_classification="legacy_complete",
+        migration_classification=("legacy_incomplete" if migration_gaps else "legacy_complete"),
+        migration_gaps=migration_gaps,
     )
 
 
@@ -715,12 +724,16 @@ async def apply_review(
             if kind == "keep_first_retract_rest" and keeper not in {row["memory_id"] for row in rows}:
                 raise MemoryReconciliationError("Duplicate action keeper is not part of the candidate")
             for index, row in enumerate(rows):
+                all_duplicate_evidence = (
+                    rows if kind == "keep_first_retract_rest" and row["memory_id"] == keeper else None
+                )
                 adopted = await fact_service.create(
                     fact_authority,
                     _fact_spec(
                         row,
                         receipt_id=receipt_id,
                         reason="Operator-reviewed reconciliation of existing semantic memory.",
+                        evidence_rows=all_duplicate_evidence,
                     ),
                     idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:{index}:adopt",
                     stable_claim_key=f"legacy:{row['memory_id']}",

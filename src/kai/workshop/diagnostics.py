@@ -2139,6 +2139,9 @@ def workshop_memory_reconciliation_status(db_path: Path) -> str:
         "memory_reconciliation_decisions",
         "memory_reconciliation_receipts",
         "memory_reconciliation_operations",
+        "memory_reconciliation_triage_plans",
+        "memory_reconciliation_triage_groups",
+        "memory_reconciliation_triage_recommendations",
     }
     try:
         connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
@@ -2162,12 +2165,52 @@ def workshop_memory_reconciliation_status(db_path: Path) -> str:
             disposition_counts = {str(row[0]): int(row[1]) for row in decisions}
             receipts = _scalar(connection, "SELECT COUNT(*) FROM memory_reconciliation_receipts")
             operations = _scalar(connection, "SELECT COUNT(*) FROM memory_reconciliation_operations")
+            triage_plans = _scalar(connection, "SELECT COUNT(*) FROM memory_reconciliation_triage_plans")
+            triage_groups = _scalar(connection, "SELECT COUNT(*) FROM memory_reconciliation_triage_groups")
+            triage_exceptions = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_triage_groups WHERE deterministic = 0",
+            )
+            triage_pending = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_triage_groups WHERE disposition = 'pending'",
+            )
+            triage_recommended = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_triage_groups WHERE recommendation_json != '{}'",
+            )
             integrity_gaps = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM memory_reconciliation_audits a WHERE a.candidate_count != ("
                 "SELECT COUNT(*) FROM memory_reconciliation_decisions d WHERE d.audit_id = a.audit_id) "
-                "OR (a.status = 'applied') != EXISTS ("
-                "SELECT 1 FROM memory_reconciliation_receipts r WHERE r.audit_id = a.audit_id)",
+                "OR (a.status = 'applied') != (EXISTS ("
+                "SELECT 1 FROM memory_reconciliation_receipts r WHERE r.audit_id = a.audit_id) OR EXISTS ("
+                "SELECT 1 FROM memory_reconciliation_triage_plans p WHERE p.audit_id = a.audit_id "
+                "AND p.status = 'applied' AND p.receipt_json IS NOT NULL))",
+            )
+            integrity_gaps += _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_triage_plans p WHERE p.group_count != ("
+                "SELECT COUNT(*) FROM memory_reconciliation_triage_groups g WHERE g.plan_id = p.plan_id) "
+                "OR (p.status = 'applied') != (p.receipt_json IS NOT NULL)",
+            )
+            integrity_gaps += _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_triage_recommendations r WHERE "
+                "(r.status = 'succeeded' AND r.output_sha256 IS NULL) OR "
+                "(r.status != 'succeeded' AND r.output_sha256 IS NOT NULL) OR "
+                "(r.status = 'succeeded' AND r.group_count != (SELECT COUNT(*) "
+                "FROM memory_reconciliation_triage_groups g WHERE g.plan_id = r.plan_id "
+                "AND json_extract(g.recommendation_json, '$.input_sha256') = r.input_sha256))",
+            )
+            integrity_gaps += _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_reconciliation_triage_groups g "
+                "WHERE g.recommendation_json != '{}' AND NOT EXISTS ("
+                "SELECT 1 FROM memory_reconciliation_triage_recommendations r "
+                "WHERE r.plan_id = g.plan_id AND r.status = 'succeeded' "
+                "AND r.input_sha256 = json_extract(g.recommendation_json, '$.input_sha256') "
+                "AND r.output_sha256 = json_extract(g.recommendation_json, '$.output_sha256'))",
             )
             replay_gaps = _scalar(
                 connection,
@@ -2181,11 +2224,13 @@ def workshop_memory_reconciliation_status(db_path: Path) -> str:
     state = "active" if integrity_gaps == 0 and replay_gaps == 0 else "INCOMPLETE"
     return (
         f"{prefix} {state}; audits={audits} (open={open_audits}, applied={applied_audits}), "
-        f"decisions={sum(disposition_counts.values())} "
+        f"raw audit decisions={sum(disposition_counts.values())} "
         f"(pending={disposition_counts.get('pending', 0)}, approved={disposition_counts.get('approve', 0)}, "
         f"rejected={disposition_counts.get('reject', 0)}, deferred={disposition_counts.get('defer', 0)}), "
         f"receipts={receipts}, operations={operations}; integrity gaps={integrity_gaps}, "
-        f"replay gaps={replay_gaps}; authority=canonical/replay-safe"
+        f"triage=({triage_plans} plans, {triage_groups} groups, {triage_exceptions} exceptions, "
+        f"{triage_pending} pending, {triage_recommended} recommended); replay gaps={replay_gaps}; "
+        f"authority=canonical/replay-safe"
     )
 
 

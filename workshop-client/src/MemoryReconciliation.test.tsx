@@ -1,59 +1,61 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  applyMemoryReconciliation,
-  bulkMemoryReconciliationDecision,
-  loadMemoryReconciliation,
-  loadMemoryReconciliationCandidates,
-  saveMemoryReconciliationDecision,
+  applyMemoryTriage,
+  approveSafeMemoryTriage,
+  loadMemoryTriage,
+  loadMemoryTriageGroups,
+  previewSafeMemoryTriage,
+  recommendMemoryTriage,
+  saveMemoryTriageDecision,
 } from "./api";
 import { ConfirmationProvider } from "./ConfirmationDialog";
 import { MemoryReconciliation } from "./MemoryReconciliation";
-import type {
-  WorkshopMemoryReconciliationCandidate,
-  WorkshopMemoryReconciliationSummary,
-} from "./types";
+import type { WorkshopMemoryTriageGroup, WorkshopMemoryTriageSummary } from "./types";
 
 vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
   return {
     ...original,
-    applyMemoryReconciliation: vi.fn(),
-    bulkMemoryReconciliationDecision: vi.fn(),
-    loadMemoryReconciliation: vi.fn(),
-    loadMemoryReconciliationCandidates: vi.fn(),
-    saveMemoryReconciliationDecision: vi.fn(),
+    applyMemoryTriage: vi.fn(),
+    approveSafeMemoryTriage: vi.fn(),
+    loadMemoryTriage: vi.fn(),
+    loadMemoryTriageGroups: vi.fn(),
+    previewSafeMemoryTriage: vi.fn(),
+    recommendMemoryTriage: vi.fn(),
+    saveMemoryTriageDecision: vi.fn(),
   };
 });
 
-const summary: WorkshopMemoryReconciliationSummary = {
-  actionCounts: { manual_edit_required: 1 },
+const summary: WorkshopMemoryTriageSummary = {
   appliedAt: null,
   auditId: "mra_test",
-  candidateCount: 1,
-  categoryCounts: { malformed_provenance: 1 },
-  corpusCount: 1,
-  dispositionCounts: { approve: 0, defer: 0, pending: 1, reject: 0 },
-  generatedAt: "2026-09-21T18:00:00Z",
-  gapCounts: { "source receipt": 1 },
-  kindCounts: { fact: 1 },
+  deterministicGroups: 2,
+  pendingDeterministicGroups: 2,
+  dispositionCounts: { approve: 0, defer: 0, pending: 3, reject: 0 },
+  exceptionGroups: 1,
+  groupCount: 3,
+  memoryCount: 437,
+  planId: "mtp_test",
+  recommendedGroups: 0,
+  resolutionCounts: { adopt: 312, consolidate: 84, obsolete: 29, needs_review: 12 },
   reviewVersion: 0,
-  runtimeProfileId: "rtp_test",
   status: "open",
-  uncertaintyCounts: { high: 1 },
 };
 
-const candidate: WorkshopMemoryReconciliationCandidate = {
-  candidateId: "mrc_test",
-  category: "malformed_provenance",
+const group: WorkshopMemoryTriageGroup = {
+  bulkEligible: false,
+  classification: "contradiction",
   decision: {
     action: { kind: "manual_edit_required" },
     disposition: "pending",
     operatorNote: "",
+    recommendation: {},
     stateVersion: 0,
   },
+  deterministic: false,
   evidence: [{
     assertedAt: null,
     backend: null,
@@ -78,69 +80,114 @@ const candidate: WorkshopMemoryReconciliationCandidate = {
     validFrom: null,
     validUntil: null,
   }],
+  groupId: "mtg_test",
+  priorReviewEvidence: [],
   proposedAction: { kind: "manual_edit_required" },
-  rationale: "Canonical provenance is missing.",
+  rationale: "The evidence conflicts.",
+  resolution: "needs_review",
   stateSha256: "a".repeat(64),
-  uncertainty: "high",
 };
 
-describe("Memory reconciliation", () => {
+const safeGroups: WorkshopMemoryTriageGroup[] = ["safe-1", "safe-2"].map((groupId, index) => ({
+  ...group,
+  bulkEligible: true,
+  classification: "stable_non_conflicting",
+  decision: {
+    action: { kind: "adopt_as_current" },
+    disposition: "pending",
+    operatorNote: "",
+    recommendation: {},
+    stateVersion: 0,
+  },
+  deterministic: true,
+  evidence: [{ ...group.evidence[0], memoryId: `safe-memory-${index}`, text: `Stable legacy fact ${index + 1}` }],
+  groupId,
+  proposedAction: { kind: "adopt_as_current" },
+  rationale: "No deterministic warning was found; explicit operator approval is still required.",
+  resolution: "adopt",
+}));
+
+describe("Memory reconciliation triage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(loadMemoryReconciliation).mockResolvedValue(summary);
-    vi.mocked(loadMemoryReconciliationCandidates).mockResolvedValue({
-      audit: summary,
-      candidates: [candidate],
+    vi.mocked(loadMemoryTriage).mockResolvedValue(summary);
+    vi.mocked(loadMemoryTriageGroups).mockImplementation(async (_token, _planId, options = {}) => ({
+      triage: summary,
+      groups: options.exceptionsOnly ? [group] : safeGroups,
       nextOffset: null,
+    }));
+    vi.mocked(previewSafeMemoryTriage).mockResolvedValue({
+      groupCount: 2,
+      groupIds: ["safe-1", "safe-2"],
+      memoryCount: 425,
+      planId: summary.planId,
+      previewSha256: "b".repeat(64),
+      resolutionCounts: { adopt: 312, consolidate: 84, obsolete: 29 },
+      reviewVersion: 0,
     });
-    vi.mocked(saveMemoryReconciliationDecision).mockResolvedValue({ reviewVersion: 1, stateVersion: 1 });
   });
 
-  it("explains legacy uncertainty and never offers bulk approval", async () => {
+  it("shows aggregate outcomes and only exceptional groups", async () => {
     render(
       <ConfirmationProvider>
-        <MemoryReconciliation
-          allowedProjects={[]}
-          onAuthenticationFailure={vi.fn()}
-          onBack={vi.fn()}
-          token="session-secret"
-        />
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
       </ConfirmationProvider>,
     );
 
     expect((await screen.findAllByText("An inaccurate legacy fact"))[0]).toBeVisible();
-    expect(screen.getAllByText(/does not (?:establish|mean).*memory is false/i)[0]).toBeVisible();
-    expect(screen.queryByRole("button", { name: /approve selected/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /apply reviewed batch/i })).toBeDisabled();
+    expect(screen.getByText(/partitions 437 legacy memories into 3 non-overlapping groups/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Preview safe groups" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Analyze exceptions" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Apply plan" })).toBeDisabled();
   });
 
-  it("saves corrected replacement fields instead of exposing action JSON", async () => {
+  it("saves one corrected exception instead of exposing hundreds of raw candidates", async () => {
     const user = userEvent.setup();
     render(
       <ConfirmationProvider>
-        <MemoryReconciliation
-          allowedProjects={[]}
-          onAuthenticationFailure={vi.fn()}
-          onBack={vi.fn()}
-          token="session-secret"
-        />
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
       </ConfirmationProvider>,
     );
-    const text = await screen.findByLabelText("Fact text");
+    const text = await screen.findByLabelText("Current fact");
     await user.clear(text);
     await user.type(text, "The corrected current fact");
     await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
-    await waitFor(() => expect(saveMemoryReconciliationDecision).toHaveBeenCalled());
-    expect(vi.mocked(saveMemoryReconciliationDecision).mock.calls[0]?.[3]).toMatchObject({
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({
       disposition: "approve",
-      action: {
-        kind: "adopt_corrected",
-        replacement: { content: "The corrected current fact" },
-      },
+      action: { kind: "adopt_corrected", replacement: { content: "The corrected current fact" } },
     });
-    expect(bulkMemoryReconciliationDecision).not.toHaveBeenCalled();
-    expect(applyMemoryReconciliation).not.toHaveBeenCalled();
+    expect(approveSafeMemoryTriage).not.toHaveBeenCalled();
+    expect(recommendMemoryTriage).not.toHaveBeenCalled();
+    expect(applyMemoryTriage).not.toHaveBeenCalled();
+  });
+
+  it("shows complete deterministic evidence before final bulk confirmation", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Preview safe groups" }));
+    expect(await screen.findByText("Complete deterministic preview")).toBeVisible();
+    expect(previewSafeMemoryTriage).toHaveBeenCalledWith(
+      "secret",
+      summary.planId,
+      0,
+      ["safe-1", "safe-2"],
+    );
+    expect(screen.getByText(/No detected warning is proof of truth/i)).toBeVisible();
+    expect(screen.getAllByText(/Stable non conflicting/)).toHaveLength(2);
+
+    await user.click(screen.getByRole("button", { name: "Approve preview" }));
+    const dialog = screen.getByRole("dialog", { name: "Continue?" });
+    expect(dialog).toHaveTextContent("your approval is the trust decision");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => expect(approveSafeMemoryTriage).toHaveBeenCalledTimes(1));
   });
 });

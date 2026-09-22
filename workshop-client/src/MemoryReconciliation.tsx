@@ -1,40 +1,23 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import {
-  applyMemoryReconciliation,
-  bulkMemoryReconciliationDecision,
-  loadMemoryReconciliation,
-  loadMemoryReconciliationCandidates,
-  saveMemoryReconciliationDecision,
+  applyMemoryTriage,
+  approveSafeMemoryTriage,
+  loadMemoryTriage,
+  loadMemoryTriageGroups,
+  previewSafeMemoryTriage,
+  recommendMemoryTriage,
+  saveMemoryTriageDecision,
 } from "./api";
 import { AuthenticationError } from "./api";
 import { useConfirmation } from "./ConfirmationDialog";
 import { MarkdownMessage } from "./MarkdownMessage";
 import type {
-  WorkshopMemoryReconciliationCandidate,
   WorkshopMemoryReconciliationDisposition,
-  WorkshopMemoryReconciliationSummary,
+  WorkshopMemoryTriageGroup,
+  WorkshopMemoryTriagePreview,
+  WorkshopMemoryTriageSummary,
 } from "./types";
-
-interface ReconciliationFilters {
-  action: string;
-  category: string;
-  disposition: "" | WorkshopMemoryReconciliationDisposition;
-  gap: string;
-  kind: string;
-  scope: string;
-  uncertainty: string;
-}
-
-const EMPTY_FILTERS: ReconciliationFilters = {
-  action: "",
-  category: "",
-  disposition: "",
-  gap: "",
-  kind: "",
-  scope: "",
-  uncertainty: "",
-};
 
 function formatLabel(value: string): string {
   return value.replaceAll("_", " ").replace(/^./, (character) => character.toUpperCase());
@@ -42,18 +25,6 @@ function formatLabel(value: string): string {
 
 function requestError(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
-}
-
-function toDateTimeLocal(value: string | null): string {
-  if (!value) return "";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? "" : date.toISOString().slice(0, 16);
-}
-
-function toIso(value: string): string | null {
-  if (!value) return null;
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? null : date.toISOString();
 }
 
 export function MemoryReviewIcon(): React.JSX.Element {
@@ -65,96 +36,75 @@ export function MemoryReviewIcon(): React.JSX.Element {
   );
 }
 
-function CandidateEditor({
-  auditId,
-  candidate,
+function ExceptionEditor({
+  group,
   onAuthenticationFailure,
   onSaved,
   readOnly,
   token,
-  allowedProjects,
+  planId,
 }: {
-  auditId: string | null;
-  candidate: WorkshopMemoryReconciliationCandidate | null;
+  group: WorkshopMemoryTriageGroup | null;
   onAuthenticationFailure: (message: string) => void;
   onSaved: () => void;
   readOnly: boolean;
   token: string;
-  allowedProjects: Array<{ displayName: string; projectId: string }>;
+  planId: string | null;
 }): React.JSX.Element {
-  const evidence = candidate?.evidence[0] ?? null;
-  const [content, setContent] = useState(evidence?.text ?? "");
-  const [scope, setScope] = useState(evidence?.scope === "project" ? "project" : "global");
-  const [projectId, setProjectId] = useState(evidence?.projectId ?? "");
-  const [confidence, setConfidence] = useState(String(evidence?.confidence ?? 0.5));
-  const [assertedAt, setAssertedAt] = useState(toDateTimeLocal(evidence?.assertedAt ?? null));
-  const [observedAt, setObservedAt] = useState(toDateTimeLocal(evidence?.observedAt ?? null));
-  const [validFrom, setValidFrom] = useState(toDateTimeLocal(evidence?.validFrom ?? null));
-  const [validUntil, setValidUntil] = useState(toDateTimeLocal(evidence?.validUntil ?? null));
+  const first = group?.evidence[0] ?? null;
+  const [content, setContent] = useState(first?.text ?? "");
   const [disposition, setDisposition] = useState<Exclude<WorkshopMemoryReconciliationDisposition, "pending">>(
-    candidate?.decision.disposition === "pending" ? "defer" : candidate?.decision.disposition ?? "defer",
+    group?.decision.disposition === "pending" ? "defer" : group?.decision.disposition ?? "defer",
   );
-  const [note, setNote] = useState(candidate?.decision.operatorNote ?? "");
+  const [note, setNote] = useState(group?.decision.operatorNote ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (!auditId || !candidate || !evidence) {
+  if (!group || !first || !planId) {
     return (
       <div className="memory-detail-empty">
         <span aria-hidden="true">◇</span>
-        <h2>Select a review candidate</h2>
-        <p>Choose a legacy memory to inspect its evidence and record a decision.</p>
+        <h2>No exception selected</h2>
+        <p>Only uncertain or conflicting memory groups require individual review.</p>
       </div>
     );
   }
 
-  const fact = candidate.evidence.every((item) => item.kind === "fact");
-  const corrected = fact && (
-    content.trim() !== evidence.text || scope !== evidence.scope ||
-    (scope === "project" ? projectId !== (evidence.projectId ?? "") : evidence.projectId !== null) ||
-    Number(confidence) !== evidence.confidence || validFrom !== toDateTimeLocal(evidence.validFrom) ||
-    validUntil !== toDateTimeLocal(evidence.validUntil) ||
-    assertedAt !== toDateTimeLocal(evidence.assertedAt) || observedAt !== toDateTimeLocal(evidence.observedAt)
-  );
-  const proposedKind = typeof candidate.proposedAction.kind === "string"
-    ? candidate.proposedAction.kind
-    : "manual_edit_required";
-  const canApprove = fact ? corrected || proposedKind !== "manual_edit_required" : proposedKind === "record_episode_chain";
+  const recommendation = group.decision.recommendation;
+  const corrected = content.trim() !== first.text;
+  const canApprove = group.proposedAction.kind !== "manual_edit_required" || corrected;
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
     setSaving(true);
     setError(null);
     try {
-      let action = candidate.decision.action;
-      if (disposition === "approve") {
-        action = corrected
-          ? {
-              kind: "adopt_corrected",
-              source_memory_id: evidence.memoryId,
-              replacement: {
-                content: content.trim(),
-                scope_kind: scope,
-                scope_key: scope === "project" ? projectId.trim() : "",
-                confidence: Number(confidence),
-                asserted_at: toIso(assertedAt),
-                observed_at: toIso(observedAt),
-                valid_from: toIso(validFrom),
-                valid_until: toIso(validUntil),
-              },
-            }
-          : candidate.proposedAction;
-      }
-      await saveMemoryReconciliationDecision(token, auditId, candidate.candidateId, {
+      const action = disposition === "approve" && corrected
+        ? {
+            kind: "adopt_corrected",
+            source_memory_id: first.memoryId,
+            replacement: {
+              content: content.trim(),
+              scope_kind: first.scope,
+              scope_key: first.projectId ?? "",
+              confidence: typeof first.confidence === "number" ? first.confidence : 0.5,
+              asserted_at: first.assertedAt,
+              observed_at: first.observedAt,
+              valid_from: first.validFrom,
+              valid_until: first.validUntil,
+            },
+          }
+        : group.proposedAction;
+      await saveMemoryTriageDecision(token, planId, group.groupId, {
         disposition,
         action,
         operatorNote: note,
-        expectedStateVersion: candidate.decision.stateVersion,
+        expectedStateVersion: group.decision.stateVersion,
       });
       onSaved();
     } catch (caught) {
       if (caught instanceof AuthenticationError) onAuthenticationFailure(caught.message);
-      setError(requestError(caught, "Could not save this review decision."));
+      setError(requestError(caught, "Could not save this memory decision."));
     } finally {
       setSaving(false);
     }
@@ -164,103 +114,86 @@ function CandidateEditor({
     <form className="memory-reconciliation-detail" onSubmit={(event) => void submit(event)}>
       <header className="memory-detail-header">
         <div>
-          <p className="overline">Legacy review</p>
-          <h2>{formatLabel(candidate.category)}</h2>
+          <p className="overline">Exception review</p>
+          <h2>{formatLabel(group.classification)}</h2>
         </div>
-        <span className={`memory-review-state ${candidate.decision.disposition}`}>
-          {candidate.decision.disposition}
+        <span className={`memory-review-state ${group.decision.disposition}`}>
+          {group.decision.disposition}
         </span>
       </header>
 
       <section className="memory-detail-section">
-        <p className="memory-section-label">Why this needs review</p>
-        <p>{candidate.rationale}</p>
-        <p className="memory-review-explanation">
-          Missing legacy provenance means this memory requires human review. It does not mean the memory is false.
-        </p>
+        <p className="memory-section-label">Why this needs judgment</p>
+        <p>{group.rationale}</p>
       </section>
+
+      {Object.keys(recommendation).length > 0 && (
+        <section className="memory-detail-section">
+          <p className="memory-section-label">Model recommendation</p>
+          <p><strong>{formatLabel(String(recommendation.outcome ?? "needs_review"))}</strong>
+            {typeof recommendation.confidence === "number" && ` · ${Math.round(recommendation.confidence * 100)}% confidence`}
+          </p>
+          <p>{String(recommendation.rationale ?? "No rationale was returned.")}</p>
+          <p className="memory-review-explanation">Advisory only; it has not changed memory.</p>
+        </section>
+      )}
+
+      {group.priorReviewEvidence.length > 0 && (
+        <section className="memory-detail-section">
+          <p className="memory-section-label">Earlier raw review</p>
+          {group.priorReviewEvidence.map((item) => (
+            <p key={item.candidateId}>
+              <strong>{formatLabel(item.disposition)}</strong>
+              {item.operatorNote ? ` · ${item.operatorNote}` : " · No operator note"}
+            </p>
+          ))}
+          <p className="memory-review-explanation">
+            This earlier decision remains evidence. It was not silently converted into a grouped approval.
+          </p>
+        </section>
+      )}
 
       <section className="memory-detail-section">
         <p className="memory-section-label">Evidence</p>
-        {candidate.evidence.map((item) => (
+        {group.evidence.map((item) => (
           <article className="memory-review-evidence" key={item.memoryId}>
             <MarkdownMessage body={item.text} />
-            <dl className="memory-metadata-grid">
-              <div><dt>Kind</dt><dd>{item.kind}</dd></div>
-              <div><dt>Scope</dt><dd>{item.scope}{item.projectId ? ` · ${item.projectId}` : ""}</dd></div>
-              <div><dt>Confidence</dt><dd>{Math.round(item.confidence * 100)}%</dd></div>
-              <div><dt>Uncertainty</dt><dd>{candidate.uncertainty}</dd></div>
-            </dl>
-            <p className="memory-review-gaps">
-              Missing: {item.migrationGaps.length ? item.migrationGaps.map(formatLabel).join(", ") : "none"}
-            </p>
+            <small>{item.kind} · {item.scope}{item.projectId ? ` · ${item.projectId}` : ""}</small>
           </article>
         ))}
       </section>
 
-      {readOnly && <p className="memory-mutation-report" role="status">This reconciliation batch has been applied.</p>}
       <fieldset className="memory-review-controls" disabled={readOnly || saving}>
-        {fact && (
+        {first.kind === "fact" && (
           <section className="memory-detail-section memory-review-correction">
-          <p className="memory-section-label">Correct before adoption</p>
-          <label>Fact text
-            <textarea value={content} maxLength={16384} onChange={(event) => setContent(event.target.value)} />
-          </label>
-          <div className="memory-review-fields">
-            <label>Scope
-              <select value={scope} onChange={(event) => setScope(event.target.value)}>
-                <option value="global">Global</option>
-                <option value="project">Project</option>
-              </select>
+            <p className="memory-section-label">Correct and adopt</p>
+            <label>Current fact
+              <textarea value={content} maxLength={16384} onChange={(event) => setContent(event.target.value)} />
             </label>
-            {scope === "project" && (
-              <label>Project
-                <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-                  <option value="">Choose a permitted project</option>
-                  {allowedProjects.map((project) => (
-                    <option key={project.projectId} value={project.projectId}>{project.displayName}</option>
-                  ))}
-                </select>
-              </label>
-            )}
-            <label>Confidence
-              <input type="number" min="0" max="1" step="0.01" value={confidence} onChange={(event) => setConfidence(event.target.value)} />
-            </label>
-            <label>Valid from
-              <input type="datetime-local" value={validFrom} onChange={(event) => setValidFrom(event.target.value)} />
-            </label>
-            <label>Asserted at
-              <input type="datetime-local" value={assertedAt} onChange={(event) => setAssertedAt(event.target.value)} />
-            </label>
-            <label>Observed at
-              <input type="datetime-local" value={observedAt} onChange={(event) => setObservedAt(event.target.value)} />
-            </label>
-            <label>Valid until
-              <input type="datetime-local" value={validUntil} onChange={(event) => setValidUntil(event.target.value)} />
-            </label>
-          </div>
+            <p className="memory-review-explanation">
+              Editing creates one corrected current claim backed by all evidence in this group.
+            </p>
           </section>
         )}
-
         <section className="memory-detail-section memory-review-decision">
-        <p className="memory-section-label">Decision</p>
-        <label>Disposition
-          <select value={disposition} onChange={(event) => setDisposition(
-            event.target.value as Exclude<WorkshopMemoryReconciliationDisposition, "pending">,
-          )}>
-            <option value="approve" disabled={!canApprove}>Approve</option>
-            <option value="reject">Reject</option>
-            <option value="defer">Defer</option>
-          </select>
-        </label>
-        {!canApprove && <p>Correct this fact before approval, or reject or defer it.</p>}
-        <label>Operator note
-          <textarea value={note} maxLength={4096} onChange={(event) => setNote(event.target.value)} />
-        </label>
-        {error && <p className="memory-editor-error" role="alert">{error}</p>}
-        <button type="submit" disabled={readOnly || saving || (disposition === "approve" && !canApprove)}>
-          {saving ? "Saving…" : "Save decision"}
-        </button>
+          <p className="memory-section-label">Decision</p>
+          <label>Disposition
+            <select value={disposition} onChange={(event) => setDisposition(
+              event.target.value as Exclude<WorkshopMemoryReconciliationDisposition, "pending">,
+            )}>
+              <option value="approve" disabled={!canApprove}>Approve</option>
+              <option value="reject">Reject</option>
+              <option value="defer">Defer</option>
+            </select>
+          </label>
+          {!canApprove && <p>Correct the fact before approval, or reject or defer this group.</p>}
+          <label>Operator note
+            <textarea value={note} maxLength={4096} onChange={(event) => setNote(event.target.value)} />
+          </label>
+          {error && <p className="memory-editor-error" role="alert">{error}</p>}
+          <button type="submit" disabled={readOnly || saving || (disposition === "approve" && !canApprove)}>
+            {saving ? "Saving…" : "Save decision"}
+          </button>
         </section>
       </fieldset>
     </form>
@@ -268,7 +201,6 @@ function CandidateEditor({
 }
 
 export function MemoryReconciliation({
-  allowedProjects,
   detailPanelLayout,
   onAuthenticationFailure,
   onBack,
@@ -288,19 +220,16 @@ export function MemoryReconciliation({
   token: string;
 }): React.JSX.Element {
   const confirm = useConfirmation();
-  const [audit, setAudit] = useState<WorkshopMemoryReconciliationSummary | null>(null);
-  const [candidates, setCandidates] = useState<WorkshopMemoryReconciliationCandidate[]>([]);
+  const [triage, setTriage] = useState<WorkshopMemoryTriageSummary | null>(null);
+  const [groups, setGroups] = useState<WorkshopMemoryTriageGroup[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
-  const [filters, setFilters] = useState<ReconciliationFilters>(EMPTY_FILTERS);
-  const [draftFilters, setDraftFilters] = useState<ReconciliationFilters>(EMPTY_FILTERS);
-  const [nextOffset, setNextOffset] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [mutating, setMutating] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<string | null>(null);
-  const [mutating, setMutating] = useState(false);
+  const [safePreview, setSafePreview] = useState<WorkshopMemoryTriagePreview | null>(null);
+  const [safePreviewGroups, setSafePreviewGroups] = useState<WorkshopMemoryTriageGroup[]>([]);
 
   const handleFailure = (caught: unknown, fallback: string): void => {
     if (caught instanceof AuthenticationError) onAuthenticationFailure(caught.message);
@@ -311,103 +240,138 @@ export function MemoryReconciliation({
     let cancelled = false;
     setLoading(true);
     setError(null);
-    void loadMemoryReconciliation(token)
+    setSafePreview(null);
+    setSafePreviewGroups([]);
+    void loadMemoryTriage(token)
       .then(async (summary) => {
         if (cancelled) return;
-        setAudit(summary);
-        setCandidates([]);
+        setTriage(summary);
+        setGroups([]);
         setSelectedId(null);
-        setSelectedIds(new Set());
         if (!summary) return;
-        const page = await loadMemoryReconciliationCandidates(token, summary.auditId, {
-          category: filters.category || undefined,
-          action: filters.action || undefined,
-          disposition: filters.disposition || undefined,
-          kind: filters.kind || undefined,
-          gap: filters.gap || undefined,
-          scope: filters.scope || undefined,
-          uncertainty: filters.uncertainty || undefined,
-          limit: 25,
-        });
+        const loadedGroups: WorkshopMemoryTriageGroup[] = [];
+        let offset: number | null = 0;
+        let latestSummary = summary;
+        while (offset !== null) {
+          const page = await loadMemoryTriageGroups(token, summary.planId, {
+            exceptionsOnly: true,
+            limit: 100,
+            offset,
+          });
+          loadedGroups.push(...page.groups);
+          latestSummary = page.triage;
+          offset = page.nextOffset;
+        }
         if (cancelled) return;
-        setAudit(page.audit);
-        setCandidates(page.candidates);
-        setNextOffset(page.nextOffset);
-        setSelectedId(page.candidates[0]?.candidateId ?? null);
+        setTriage(latestSummary);
+        setGroups(loadedGroups);
+        setSelectedId(loadedGroups[0]?.groupId ?? null);
       })
-      .catch((caught) => { if (!cancelled) handleFailure(caught, "Could not load memory reconciliation."); })
+      .catch((caught) => { if (!cancelled) handleFailure(caught, "Could not load memory triage."); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [filters, refreshKey, token]);
+  }, [refreshKey, token]);
 
   const selected = useMemo(
-    () => candidates.find((candidate) => candidate.candidateId === selectedId) ?? null,
-    [candidates, selectedId],
+    () => groups.find((group) => group.groupId === selectedId) ?? null,
+    [groups, selectedId],
   );
 
-  const loadMore = async (): Promise<void> => {
-    if (!audit || nextOffset === null) return;
-    setLoadingMore(true);
+  const previewSafe = async (): Promise<void> => {
+    if (!triage) return;
+    setMutating(true);
+    setError(null);
     try {
-      const page = await loadMemoryReconciliationCandidates(token, audit.auditId, {
-        category: filters.category || undefined,
-        action: filters.action || undefined,
-        disposition: filters.disposition || undefined,
-        kind: filters.kind || undefined,
-        gap: filters.gap || undefined,
-        scope: filters.scope || undefined,
-        uncertainty: filters.uncertainty || undefined,
-        offset: nextOffset,
-        limit: 25,
-      });
-      setAudit(page.audit);
-      setCandidates((current) => [...current, ...page.candidates]);
-      setNextOffset(page.nextOffset);
+      const pendingGroups: WorkshopMemoryTriageGroup[] = [];
+      let offset: number | null = 0;
+      while (offset !== null) {
+        const page = await loadMemoryTriageGroups(token, triage.planId, { limit: 100, offset });
+        pendingGroups.push(...page.groups.filter((group) => (
+          group.deterministic && group.bulkEligible && group.decision.disposition === "pending"
+        )));
+        offset = page.nextOffset;
+      }
+      const first = pendingGroups[0];
+      if (!first) throw new Error("No deterministic memory groups are pending.");
+      const actionSignature = JSON.stringify(first.proposedAction);
+      const previewGroups = pendingGroups.filter(
+        (group) => JSON.stringify(group.proposedAction) === actionSignature,
+      );
+      const preview = await previewSafeMemoryTriage(
+        token,
+        triage.planId,
+        triage.reviewVersion,
+        previewGroups.map((group) => group.groupId),
+      );
+      if (previewGroups.length !== preview.groupCount) {
+        throw new Error("Kai returned an incomplete deterministic memory preview.");
+      }
+      setSafePreview(preview);
+      setSafePreviewGroups(previewGroups);
+      setReport("Review the complete grouped evidence below before approving it.");
     } catch (caught) {
-      handleFailure(caught, "Could not load more reconciliation candidates.");
+      handleFailure(caught, "Could not preview deterministic memory groups.");
     } finally {
-      setLoadingMore(false);
+      setMutating(false);
     }
   };
 
-  const bulk = async (disposition: "reject" | "defer"): Promise<void> => {
-    if (!audit || selectedIds.size === 0) return;
+  const approveSafe = async (): Promise<void> => {
+    if (!safePreview) return;
+    const counts = safePreview.resolutionCounts;
     const accepted = await confirm(
-      `${formatLabel(disposition)} ${selectedIds.size} explicitly selected reconciliation candidates?`,
+      `Approve ${safePreview.memoryCount} deterministic memories after reviewing the complete preview: ` +
+      `${counts.adopt} adopt, ${counts.consolidate} consolidate, ${counts.obsolete} obsolete? ` +
+      "No detected warning is not proof that a fact is true; your approval is the trust decision.",
     );
     if (!accepted) return;
     setMutating(true);
     setError(null);
     try {
-      const result = await bulkMemoryReconciliationDecision(token, audit.auditId, {
-        candidateIds: [...selectedIds],
-        disposition,
-        operatorNote: `Bulk ${disposition} from the Workshop reconciliation queue.`,
-        expectedReviewVersion: audit.reviewVersion,
-      });
-      setReport(`${result.changed} candidates marked ${disposition}.`);
+      await approveSafeMemoryTriage(token, safePreview);
+      setReport(`${safePreview.memoryCount} deterministic memories approved in ${safePreview.groupCount} evidence-bound groups.`);
       setRefreshKey((value) => value + 1);
     } catch (caught) {
-      handleFailure(caught, "Could not save the bulk reconciliation decision.");
+      handleFailure(caught, "Could not approve deterministic memory groups.");
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const analyzeExceptions = async (): Promise<void> => {
+    if (!triage) return;
+    setMutating(true);
+    setError(null);
+    try {
+      await recommendMemoryTriage(token, triage.planId);
+      setReport("The configured memory-quality model added advisory recommendations.");
+      setRefreshKey((value) => value + 1);
+    } catch (caught) {
+      handleFailure(caught, "Could not analyze uncertain memory groups.");
     } finally {
       setMutating(false);
     }
   };
 
   const apply = async (): Promise<void> => {
-    if (!audit || audit.dispositionCounts.pending !== 0) return;
+    if (!triage) return;
     const accepted = await confirm(
-      "Apply every approved memory decision through canonical lifecycle events? Rejected and deferred evidence remains unchanged.",
+      "Apply this grouped plan through canonical fact and episode lifecycle events? A final receipt will record every outcome.",
     );
     if (!accepted) return;
     setMutating(true);
     setError(null);
     try {
-      await applyMemoryReconciliation(token, audit.auditId, audit.reviewVersion);
-      setReport("Reviewed memory decisions were applied and receipted.");
+      const summary = await applyMemoryTriage(token, triage.planId, triage.reviewVersion);
+      setReport(
+        `${summary.adopted ?? 0} adopted, ${summary.consolidated ?? 0} consolidated, ` +
+        `${summary.obsolete ?? 0} obsolete, ${summary.deferred ?? 0} deferred, ` +
+        `${summary.rejected ?? 0} rejected, ${summary.failed ?? 0} failed, ` +
+        `${summary.still_unresolved ?? 0} still unresolved.`,
+      );
       setRefreshKey((value) => value + 1);
     } catch (caught) {
-      handleFailure(caught, "Could not apply memory reconciliation.");
+      handleFailure(caught, "Could not apply grouped memory triage.");
     } finally {
       setMutating(false);
     }
@@ -417,121 +381,104 @@ export function MemoryReconciliation({
     <section className="memory-workspace memory-reconciliation-workspace" aria-label="Memory reconciliation">
       <div className="memory-browser-pane">
         <header className="memory-header">
-          <div>
-            <p className="breadcrumbs">Kai Workshop / Memory</p>
-            <h1>Legacy review</h1>
-          </div>
+          <div><p className="breadcrumbs">Kai Workshop / Memory</p><h1>Legacy triage</h1></div>
           <button className="panel-icon-button" type="button" aria-label="Back to memories" title="Back to memories" onClick={onBack}>
             <span aria-hidden="true">←</span>
           </button>
         </header>
-
         <div className="memory-browser-scroll">
           {loading ? (
-            <p className="memory-list-state" role="status">Loading reconciliation review…</p>
+            <p className="memory-list-state" role="status">Building grouped memory triage…</p>
           ) : error ? (
             <div className="memory-list-state error" role="alert"><p>{error}</p><button onClick={() => setRefreshKey((value) => value + 1)}>Retry</button></div>
-          ) : !audit ? (
-            <div className="memory-list-state">
-              <MemoryReviewIcon />
-              <h2>No reconciliation audit</h2>
-              <p>Run a read-only authorized audit before reviewing legacy memory here.</p>
-            </div>
+          ) : !triage ? (
+            <div className="memory-list-state"><MemoryReviewIcon /><h2>No reconciliation audit</h2><p>Run an authorized read-only audit first.</p></div>
           ) : (
             <>
-              <section className="memory-reconciliation-summary" aria-label="Reconciliation progress">
-                <div><strong>{audit.candidateCount}</strong><span>Candidates</span></div>
-                <div><strong>{audit.dispositionCounts.pending}</strong><span>Pending</span></div>
-                <div><strong>{audit.dispositionCounts.approve}</strong><span>Approved</span></div>
-                <div><strong>{audit.dispositionCounts.reject + audit.dispositionCounts.defer}</strong><span>Not adopted</span></div>
+              <section className="memory-reconciliation-summary" aria-label="Triage summary">
+                <div><strong>{triage.resolutionCounts.adopt}</strong><span>Adopt</span></div>
+                <div><strong>{triage.resolutionCounts.consolidate}</strong><span>Consolidate</span></div>
+                <div><strong>{triage.resolutionCounts.obsolete}</strong><span>Obsolete</span></div>
+                <div><strong>{triage.exceptionGroups}</strong><span>Need review</span></div>
               </section>
               <p className="memory-review-explanation">
-                Legacy provenance gaps require review; they do not establish that a memory is false.
+                The plan partitions {triage.memoryCount} legacy memories into {triage.groupCount} non-overlapping groups.
+                Only uncertain or conflicting groups appear below.
               </p>
-              <form className="memory-reconciliation-filters" onSubmit={(event) => {
-                event.preventDefault();
-                setFilters(draftFilters);
-              }}>
-                <label>Reason<select value={draftFilters.category} onChange={(event) => setDraftFilters((value) => ({ ...value, category: event.target.value }))}>
-                  <option value="">Every reason</option>
-                  {Object.keys(audit.categoryCounts).map((value) => <option key={value} value={value}>{formatLabel(value)}</option>)}
-                </select></label>
-                <label>Action<select value={draftFilters.action} onChange={(event) => setDraftFilters((value) => ({ ...value, action: event.target.value }))}>
-                  <option value="">Every action</option>
-                  {Object.keys(audit.actionCounts).map((value) => <option key={value} value={value}>{formatLabel(value)}</option>)}
-                </select></label>
-                <label>Missing provenance<select value={draftFilters.gap} onChange={(event) => setDraftFilters((value) => ({ ...value, gap: event.target.value }))}>
-                  <option value="">Every gap</option>
-                  {Object.keys(audit.gapCounts).map((value) => <option key={value} value={value}>{formatLabel(value)}</option>)}
-                </select></label>
-                <label>State<select value={draftFilters.disposition} onChange={(event) => setDraftFilters((value) => ({ ...value, disposition: event.target.value as ReconciliationFilters["disposition"] }))}>
-                  <option value="">Every state</option><option value="pending">Pending</option><option value="approve">Approved</option><option value="reject">Rejected</option><option value="defer">Deferred</option>
-                </select></label>
-                <label>Kind<select value={draftFilters.kind} onChange={(event) => setDraftFilters((value) => ({ ...value, kind: event.target.value }))}>
-                  <option value="">Facts and episodes</option><option value="fact">Facts</option><option value="episode">Episodes</option>
-                </select></label>
-                <label>Scope<select value={draftFilters.scope} onChange={(event) => setDraftFilters((value) => ({ ...value, scope: event.target.value }))}>
-                  <option value="">Every scope</option><option value="global">Global</option><option value="project">Project</option>
-                </select></label>
-                <label>Uncertainty<select value={draftFilters.uncertainty} onChange={(event) => setDraftFilters((value) => ({ ...value, uncertainty: event.target.value }))}>
-                  <option value="">Every level</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
-                </select></label>
-                <div><button type="submit">Apply filters</button><button type="button" className="quiet-button" onClick={() => { setDraftFilters(EMPTY_FILTERS); setFilters(EMPTY_FILTERS); }}>Clear</button></div>
-              </form>
               {report && <p className="memory-mutation-report" role="status">{report}</p>}
               <div className="memory-review-toolbar">
-                <strong>{selectedIds.size} selected</strong>
-                <button type="button" disabled={!selectedIds.size || mutating} onClick={() => void bulk("defer")}>Defer selected</button>
-                <button type="button" className="danger" disabled={!selectedIds.size || mutating} onClick={() => void bulk("reject")}>Reject selected</button>
-                <button type="button" disabled={audit.dispositionCounts.pending !== 0 || audit.status === "applied" || mutating} onClick={() => void apply()}>
-                  {audit.status === "applied" ? "Applied" : "Apply reviewed batch"}
+                <button type="button" disabled={triage.pendingDeterministicGroups === 0 || mutating || triage.status === "applied"} onClick={() => void previewSafe()}>
+                  {safePreview ? "Refresh safe preview" : "Preview safe groups"}
+                </button>
+                <button type="button" disabled={triage.exceptionGroups === 0 || triage.recommendedGroups >= triage.exceptionGroups || mutating || triage.status === "applied"} onClick={() => void analyzeExceptions()}>
+                  Analyze exceptions
+                </button>
+                <button type="button" disabled={triage.dispositionCounts.pending !== 0 || mutating || triage.status === "applied"} onClick={() => void apply()}>
+                  {triage.status === "applied" ? "Applied" : "Apply plan"}
                 </button>
               </div>
-              <div className="memory-record-list memory-reconciliation-list" role="listbox" aria-label="Reconciliation candidates">
-                {candidates.map((candidate) => (
-                  <div className="memory-record-row selecting" key={candidate.candidateId}>
-                    <input type="checkbox" aria-label={`Select ${candidate.evidence[0]?.text ?? candidate.candidateId}`} checked={selectedIds.has(candidate.candidateId)} onChange={() => setSelectedIds((current) => {
-                      const next = new Set(current); if (next.has(candidate.candidateId)) next.delete(candidate.candidateId); else next.add(candidate.candidateId); return next;
-                    })} />
-                    <button type="button" role="option" aria-selected={selectedId === candidate.candidateId} className={`memory-record ${selectedId === candidate.candidateId ? "selected" : ""}`} onClick={() => setSelectedId(candidate.candidateId)}>
-                      <span className={`memory-review-state ${candidate.decision.disposition}`}>{candidate.decision.disposition}</span>
-                      <span className="memory-record-copy"><strong>{candidate.evidence[0]?.text ?? "Unavailable memory"}</strong><small>{formatLabel(candidate.category)} · {candidate.uncertainty} uncertainty</small></span>
+              {safePreview && (
+                <section className="memory-detail-section memory-safe-preview" aria-label="Deterministic memory preview">
+                  <p className="memory-section-label">Complete deterministic preview</p>
+                  <p>
+                    {safePreview.memoryCount} memories in {safePreview.groupCount} evidence-bound groups.
+                    No detected warning is proof of truth; approval is your explicit trust decision.
+                  </p>
+                  {safePreviewGroups.map((previewGroup) => (
+                    <details key={previewGroup.groupId}>
+                      <summary>
+                        {formatLabel(previewGroup.classification)} · {previewGroup.evidence.length} memories · {formatLabel(previewGroup.resolution)}
+                      </summary>
+                      <p>{previewGroup.rationale}</p>
+                      {previewGroup.evidence.map((item) => (
+                        <article className="memory-review-evidence" key={item.memoryId}>
+                          <MarkdownMessage body={item.text} />
+                          <small>{item.scope}{item.projectId ? ` · ${item.projectId}` : ""}</small>
+                        </article>
+                      ))}
+                    </details>
+                  ))}
+                  <button type="button" disabled={mutating} onClick={() => void approveSafe()}>
+                    Approve preview
+                  </button>
+                </section>
+              )}
+              {groups.length === 0 ? (
+                <div className="memory-list-state"><h2>No exceptional groups</h2><p>The deterministic preview contains everything in this audit.</p></div>
+              ) : (
+                <div className="memory-record-list memory-reconciliation-list" role="listbox" aria-label="Memory triage exceptions">
+                  {groups.map((group) => (
+                    <button type="button" role="option" aria-selected={selectedId === group.groupId} key={group.groupId}
+                      className={`memory-record ${selectedId === group.groupId ? "selected" : ""}`}
+                      onClick={() => setSelectedId(group.groupId)}>
+                      <span className={`memory-review-state ${group.decision.disposition}`}>{group.decision.disposition}</span>
+                      <span className="memory-record-copy">
+                        <strong>{group.evidence[0]?.text ?? "Unavailable memory"}</strong>
+                        <small>{formatLabel(group.classification)} · {group.evidence.length} evidence row{group.evidence.length === 1 ? "" : "s"}</small>
+                      </span>
                     </button>
-                  </div>
-                ))}
-              </div>
-              {nextOffset !== null && <button className="memory-load-more" type="button" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Load more candidates"}</button>}
+                  ))}
+                </div>
+              )}
             </>
           )}
         </div>
       </div>
-      <aside className="context-pane memory-detail-pane" aria-label="Reconciliation candidate detail">
+      <aside className="context-pane memory-detail-pane" aria-label="Memory triage exception detail">
         {detailPanelLayout && (
-          <div
-            className="context-resize-handle"
-            role="separator"
-            aria-label="Resize memory reconciliation detail"
-            aria-orientation="vertical"
-            aria-valuemin={detailPanelLayout.minimumWidth}
-            aria-valuemax={detailPanelLayout.maximumWidth}
-            aria-valuenow={detailPanelLayout.width}
-            tabIndex={0}
-            onKeyDown={detailPanelLayout.onKeyDown}
-            onPointerDown={detailPanelLayout.onPointerDown}
-            onPointerMove={detailPanelLayout.onPointerMove}
-          />
+          <div className="context-resize-handle" role="separator" aria-label="Resize memory triage detail"
+            aria-orientation="vertical" aria-valuemin={detailPanelLayout.minimumWidth}
+            aria-valuemax={detailPanelLayout.maximumWidth} aria-valuenow={detailPanelLayout.width} tabIndex={0}
+            onKeyDown={detailPanelLayout.onKeyDown} onPointerDown={detailPanelLayout.onPointerDown}
+            onPointerMove={detailPanelLayout.onPointerMove} />
         )}
-        <CandidateEditor
-          allowedProjects={allowedProjects}
-          auditId={audit?.auditId ?? null}
-          candidate={selected}
-          key={`${audit?.auditId ?? "none"}:${selected?.candidateId ?? "none"}:${selected?.decision.stateVersion ?? 0}`}
+        <ExceptionEditor
+          group={selected}
+          key={`${triage?.planId ?? "none"}:${selected?.groupId ?? "none"}:${selected?.decision.stateVersion ?? 0}`}
           onAuthenticationFailure={onAuthenticationFailure}
-          readOnly={audit?.status === "applied"}
-          onSaved={() => {
-            setReport("Review decision saved.");
-            setRefreshKey((value) => value + 1);
-          }}
+          onSaved={() => { setReport("Exception decision saved."); setRefreshKey((value) => value + 1); }}
+          planId={triage?.planId ?? null}
+          readOnly={triage?.status === "applied"}
           token={token}
         />
       </aside>

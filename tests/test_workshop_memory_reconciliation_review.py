@@ -27,13 +27,13 @@ NOW = datetime(2026, 9, 21, 18, 0, tzinfo=UTC)
 
 
 @pytest.mark.asyncio
-async def test_schema_90_upgrades_to_canonical_reconciliation_review(tmp_path: Path, monkeypatch) -> None:
+async def test_schema_91_upgrades_to_canonical_reconciliation_triage(tmp_path: Path, monkeypatch) -> None:
     from kai.workshop import schema
 
     path = tmp_path / "upgrade.db"
     with monkeypatch.context() as migration_context:
-        migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 90)
-        migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:90])
+        migration_context.setattr(schema, "WORKSHOP_SCHEMA_VERSION", 91)
+        migration_context.setattr(schema, "_MIGRATIONS", schema._MIGRATIONS[:91])
         old = await WorkshopEventStore.open(path)
         await old.close()
 
@@ -45,6 +45,9 @@ async def test_schema_90_upgrades_to_canonical_reconciliation_review(tmp_path: P
             "memory_reconciliation_decisions",
             "memory_reconciliation_receipts",
             "memory_reconciliation_operations",
+            "memory_reconciliation_triage_plans",
+            "memory_reconciliation_triage_groups",
+            "memory_reconciliation_triage_recommendations",
         }.issubset(await upgraded.schema_tables())
     finally:
         await upgraded.close()
