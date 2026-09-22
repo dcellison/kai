@@ -91,6 +91,53 @@ function requestError(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
 
+type ExceptionActionChoice = "" | "adopt" | "consolidate" | "obsolete" | "retain";
+
+function groupReference(groupId: string): string {
+  return `Group ${groupId.replace(/^mtg_/, "").slice(0, 8)}`;
+}
+
+function initialExceptionAction(group: WorkshopMemoryTriageGroup | null): ExceptionActionChoice {
+  if (!group) return "";
+  const storedKind = group.decision.disposition === "approve" ? group.decision.action.kind : null;
+  const recommended = group.decision.recommendation.outcome;
+  const suggestedKind = storedKind ?? group.proposedAction.kind;
+  const facts = group.evidence.every((item) => item.kind === "fact");
+  const episodes = group.evidence.every((item) => item.kind === "episode");
+  if (episodes && (suggestedKind === "record_episode_chain" || recommended === "adopt")) return "retain";
+  if (!facts) return "";
+  if (suggestedKind === "expire_all" || recommended === "obsolete") return "obsolete";
+  if (suggestedKind === "adopt_corrected") return group.evidence.length > 1 ? "consolidate" : "adopt";
+  if (suggestedKind === "adopt_as_current" || recommended === "adopt") {
+    return group.evidence.length === 1 ? "adopt" : "consolidate";
+  }
+  if (recommended === "consolidate") return group.evidence.length > 1 ? "consolidate" : "adopt";
+  return "";
+}
+
+function initialScope(group: WorkshopMemoryTriageGroup | null): "" | "global" | "project" {
+  const first = group?.evidence[0];
+  if (!first || first.kind !== "fact" || first.migrationGaps.includes("scope")) return "";
+  if (first.scope !== "global" && first.scope !== "project") return "";
+  const consistent = group.evidence.every(
+    (item) => item.scope === first.scope && item.projectId === first.projectId,
+  );
+  return consistent ? first.scope : "";
+}
+
+function relatedRecommendationGroups(
+  group: WorkshopMemoryTriageGroup,
+  availableGroupIds: Set<string>,
+): string[] {
+  const structured = group.decision.recommendation.related_group_ids;
+  const candidates = Array.isArray(structured) && structured.every((value) => typeof value === "string")
+    ? structured
+    : String(group.decision.recommendation.rationale ?? "").match(/mtg_[a-z0-9]+/gi) ?? [];
+  return [...new Set(candidates)].filter(
+    (groupId) => groupId !== group.groupId && availableGroupIds.has(groupId),
+  );
+}
+
 export function MemoryReviewIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
@@ -101,15 +148,21 @@ export function MemoryReviewIcon(): React.JSX.Element {
 }
 
 function ExceptionEditor({
+  allowedProjects,
+  availableGroups,
   group,
   onAuthenticationFailure,
+  onSelectGroup,
   onSaved,
   readOnly,
   token,
   planId,
 }: {
+  allowedProjects: Array<{ displayName: string; projectId: string }>;
+  availableGroups: WorkshopMemoryTriageGroup[];
   group: WorkshopMemoryTriageGroup | null;
   onAuthenticationFailure: (message: string) => void;
+  onSelectGroup: (groupId: string) => void;
   onSaved: () => void;
   readOnly: boolean;
   token: string;
@@ -117,6 +170,9 @@ function ExceptionEditor({
 }): React.JSX.Element {
   const first = group?.evidence[0] ?? null;
   const [content, setContent] = useState(first?.text ?? "");
+  const [actionChoice, setActionChoice] = useState<ExceptionActionChoice>(initialExceptionAction(group));
+  const [scopeKind, setScopeKind] = useState<"" | "global" | "project">(initialScope(group));
+  const [projectId, setProjectId] = useState(first?.projectId ?? "");
   const [disposition, setDisposition] = useState<Exclude<WorkshopMemoryReconciliationDisposition, "pending">>(
     group?.decision.disposition === "pending" ? "defer" : group?.decision.disposition ?? "defer",
   );
@@ -136,32 +192,59 @@ function ExceptionEditor({
 
   const recommendation = group.decision.recommendation;
   const corrected = content.trim() !== first.text;
-  const canApprove = group.proposedAction.kind !== "manual_edit_required" || corrected;
-  const unchangedPriorReviewApproval = group.classification === "prior_review"
-    && group.proposedAction.kind === "adopt_as_current"
-    && !corrected;
+  const factEvidence = group.evidence.every((item) => item.kind === "fact");
+  const episodeEvidence = group.evidence.every((item) => item.kind === "episode");
+  const scopeChanged = scopeKind !== first.scope || (scopeKind === "project" && projectId !== first.projectId);
+  const projectAuthorized = scopeKind !== "project"
+    || allowedProjects.some((project) => project.projectId === projectId);
+  const validityEnd = first.validUntil ? Date.parse(first.validUntil) : null;
+  const expired = validityEnd !== null && !Number.isNaN(validityEnd) && validityEnd <= Date.now();
+  let approvalAction: Record<string, unknown> | null = null;
+  if (actionChoice === "retain" && episodeEvidence) {
+    approvalAction = { kind: "record_episode_chain" };
+  } else if (actionChoice === "obsolete" && factEvidence) {
+    approvalAction = { kind: "expire_all" };
+  } else if (
+    (actionChoice === "adopt" || actionChoice === "consolidate")
+    && factEvidence
+    && content.trim()
+    && scopeKind
+    && projectAuthorized
+    && (scopeKind !== "project" || projectId)
+  ) {
+    const requiresCanonicalReplacement = actionChoice === "consolidate"
+      || group.evidence.length > 1
+      || corrected
+      || scopeChanged
+      || first.migrationGaps.includes("scope")
+      || expired;
+    approvalAction = requiresCanonicalReplacement
+      ? {
+          kind: "adopt_corrected",
+          source_memory_id: first.memoryId,
+          replacement: {
+            content: content.trim(),
+            scope_kind: scopeKind,
+            scope_key: scopeKind === "project" ? projectId : "",
+            confidence: typeof first.confidence === "number" ? first.confidence : 0.5,
+            asserted_at: first.assertedAt,
+            observed_at: first.observedAt,
+            valid_from: expired ? null : first.validFrom,
+            valid_until: expired ? null : first.validUntil,
+          },
+        }
+      : { kind: "adopt_as_current" };
+  }
+  const canApprove = approvalAction !== null;
+  const availableGroupIds = new Set(availableGroups.map((item) => item.groupId));
+  const relatedGroups = relatedRecommendationGroups(group, availableGroupIds);
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
     setSaving(true);
     setError(null);
     try {
-      const action = disposition === "approve" && corrected
-        ? {
-            kind: "adopt_corrected",
-            source_memory_id: first.memoryId,
-            replacement: {
-              content: content.trim(),
-              scope_kind: first.scope,
-              scope_key: first.projectId ?? "",
-              confidence: typeof first.confidence === "number" ? first.confidence : 0.5,
-              asserted_at: first.assertedAt,
-              observed_at: first.observedAt,
-              valid_from: first.validFrom,
-              valid_until: first.validUntil,
-            },
-          }
-        : group.proposedAction;
+      const action = disposition === "approve" && approvalAction ? approvalAction : group.proposedAction;
       await saveMemoryTriageDecision(token, planId, group.groupId, {
         disposition,
         action,
@@ -201,6 +284,19 @@ function ExceptionEditor({
             {typeof recommendation.confidence === "number" && ` · ${Math.round(recommendation.confidence * 100)}% confidence`}
           </p>
           <p>{String(recommendation.rationale ?? "No rationale was returned.")}</p>
+          {relatedGroups.length > 0 && (
+            <div className="memory-related-groups">
+              <p>Related groups</p>
+              {relatedGroups.map((groupId) => (
+                <button type="button" key={groupId} title={groupId} onClick={() => onSelectGroup(groupId)}>
+                  {groupReference(groupId)}
+                </button>
+              ))}
+              <p className="memory-review-explanation">
+                These are separate decisions. Adopt or consolidate one canonical fact, then reject duplicates in the linked groups.
+              </p>
+            </div>
+          )}
           <p className="memory-review-explanation">Advisory only; it has not changed memory.</p>
         </section>
       )}
@@ -233,17 +329,43 @@ function ExceptionEditor({
       <fieldset className="memory-review-controls" disabled={readOnly || saving}>
         {first.kind === "fact" && (
           <section className="memory-detail-section memory-review-correction">
-            <p className="memory-section-label">Correct and adopt</p>
-            <label>Current fact
+            <p className="memory-section-label">Canonical fact</p>
+            <label>Current wording
               <textarea value={content} maxLength={16384} onChange={(event) => setContent(event.target.value)} />
             </label>
+            <label>Scope
+              <select value={scopeKind} onChange={(event) => setScopeKind(event.target.value as "" | "global" | "project")}>
+                <option value="">Choose scope</option>
+                <option value="global">Global</option>
+                <option value="project">Project</option>
+              </select>
+            </label>
+            {scopeKind === "project" && (
+              <label>Project
+                <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+                  <option value="">Choose project</option>
+                  {allowedProjects.map((project) => (
+                    <option value={project.projectId} key={project.projectId}>{project.displayName}</option>
+                  ))}
+                </select>
+              </label>
+            )}
             <p className="memory-review-explanation">
-              Editing creates one corrected current claim backed by all evidence in this group.
+              Adoption creates one current claim backed by every evidence row in this group. You may retain the wording or correct it.
             </p>
           </section>
         )}
         <section className="memory-detail-section memory-review-decision">
           <p className="memory-section-label">Decision</p>
+          <label>Lifecycle action
+            <select value={actionChoice} onChange={(event) => setActionChoice(event.target.value as ExceptionActionChoice)}>
+              <option value="">Choose action</option>
+              {factEvidence && group.evidence.length === 1 && <option value="adopt">Adopt as current truth</option>}
+              {factEvidence && group.evidence.length > 1 && <option value="consolidate">Consolidate into one current fact</option>}
+              {factEvidence && <option value="obsolete">Mark obsolete</option>}
+              {episodeEvidence && <option value="retain">Retain as immutable history</option>}
+            </select>
+          </label>
           <label>Disposition
             <select value={disposition} onChange={(event) => setDisposition(
               event.target.value as Exclude<WorkshopMemoryReconciliationDisposition, "pending">,
@@ -253,9 +375,12 @@ function ExceptionEditor({
               <option value="defer">Defer</option>
             </select>
           </label>
-          {!canApprove && <p>Correct the fact before approval, or reject or defer this group.</p>}
-          {unchangedPriorReviewApproval && (
-            <p>Approve adopts this fact unchanged as current truth. The earlier decision remains audit evidence.</p>
+          {!canApprove && <p>Choose a complete lifecycle action before approval, or reject or defer this group.</p>}
+          {canApprove && actionChoice === "adopt" && !corrected && (
+            <p>
+              Approve adopts this fact unchanged as current truth.
+              {group.priorReviewEvidence.length > 0 && " The earlier decision remains audit evidence."}
+            </p>
           )}
           <label>Operator note
             <textarea value={note} maxLength={4096} onChange={(event) => setNote(event.target.value)} />
@@ -271,6 +396,7 @@ function ExceptionEditor({
 }
 
 export function MemoryReconciliation({
+  allowedProjects,
   detailPanelLayout,
   onAuthenticationFailure,
   onBack,
@@ -548,7 +674,7 @@ export function MemoryReconciliation({
                       <span className={`memory-review-state ${group.decision.disposition}`}>{group.decision.disposition}</span>
                       <span className="memory-record-copy">
                         <strong>{group.evidence[0]?.text ?? "Unavailable memory"}</strong>
-                        <small>{formatLabel(group.classification)} · {group.evidence.length} evidence row{group.evidence.length === 1 ? "" : "s"}</small>
+                        <small>{groupReference(group.groupId)} · {formatLabel(group.classification)} · {group.evidence.length} evidence row{group.evidence.length === 1 ? "" : "s"}</small>
                       </span>
                     </button>
                   ))}
@@ -567,9 +693,12 @@ export function MemoryReconciliation({
             onPointerMove={detailPanelLayout.onPointerMove} />
         )}
         <ExceptionEditor
+          allowedProjects={allowedProjects}
+          availableGroups={groups}
           group={selected}
           key={`${triage?.planId ?? "none"}:${selected?.groupId ?? "none"}:${selected?.decision.stateVersion ?? 0}`}
           onAuthenticationFailure={onAuthenticationFailure}
+          onSelectGroup={setSelectedId}
           onSaved={() => { setReport("Exception decision saved."); setRefreshKey((value) => value + 1); }}
           planId={triage?.planId ?? null}
           readOnly={triage?.status === "applied"}
