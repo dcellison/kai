@@ -16,7 +16,10 @@ from kai.memory_reconciliation_triage import build_triage_plan, validate_triage_
 from kai.oneshot import OneShotResult
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
 from kai.workshop.domain import PrincipalId
-from kai.workshop.memory_reconciliation_review import record_reconciliation_audit
+from kai.workshop.memory_reconciliation_review import (
+    MemoryReconciliationReviewValidationError,
+    record_reconciliation_audit,
+)
 from kai.workshop.memory_reconciliation_triage import WorkshopMemoryReconciliationTriageService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
@@ -165,6 +168,7 @@ async def test_safe_group_approval_is_preview_bound_replay_safe_and_preserves_ra
     assert summary.pending_deterministic_groups == 1
     exception_page = await service.groups(principal, summary.plan_id, exceptions_only=True)
     assert exception_page.groups[0]["classification"] == "prior_review"
+    assert exception_page.groups[0]["proposed_action"] == {"kind": "adopt_as_current"}
     assert exception_page.groups[0]["prior_review_evidence"] == [
         {
             "candidate_id": raw_candidate["candidate_id"],
@@ -201,12 +205,75 @@ async def test_safe_group_approval_is_preview_bound_replay_safe_and_preserves_ra
 
     assert approved["replayed"] is False
     assert replay["replayed"] is True
+    grouped = await service.decide_group(
+        principal,
+        summary.plan_id,
+        exception_page.groups[0]["group_id"],
+        disposition="approve",
+        action={"kind": "adopt_as_current"},
+        operator_note="The unchanged fact remains current.",
+        expected_state_version=0,
+        allowed_project_ids=frozenset(),
+        client_operation_id="reverse-raw-defer-1",
+    )
+    assert grouped["disposition"] == "approve"
+    grouped_page = await service.groups(principal, summary.plan_id, exceptions_only=True)
+    assert grouped_page.groups[0]["decision"]["action"] == {"kind": "adopt_as_current"}
+    assert grouped_page.groups[0]["decision"]["disposition"] == "approve"
     async with store.connection.execute(
         "SELECT disposition FROM memory_reconciliation_decisions WHERE audit_id = ? AND candidate_id = ?",
         (audit["audit_id"], raw_candidate["candidate_id"]),
     ) as cursor:
         raw_state = await cursor.fetchone()
     assert raw_state is not None and raw_state[0] == "defer"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_group_decision_rejects_unchanged_adoption_for_ambiguous_facts(tmp_path: Path) -> None:
+    db_path = tmp_path / "kai.db"
+    store = await WorkshopEventStore.open(db_path)
+    await bootstrap_default_workshop(
+        store,
+        (BootstrapHuman("Alice", "admin", "telegram", "101", "101", profile_id(101)),),
+    )
+    async with store.connection.execute(
+        "SELECT principal_id FROM external_identities WHERE provider = 'telegram' AND external_subject = '101'"
+    ) as cursor:
+        principal_row = await cursor.fetchone()
+    assert principal_row is not None
+    principal = PrincipalId(str(principal_row[0]))
+    audit = memory_reconciliation.build_audit(
+        principal_id=str(principal),
+        runtime_profile_id=str(profile_id(101)),
+        rows=[
+            _row("positive", "Alice does use Telegram alerts"),
+            _row("negative", "Alice does not use Telegram alerts"),
+        ],
+        now=NOW,
+    )
+    record_reconciliation_audit(db_path, audit)
+    service = WorkshopMemoryReconciliationTriageService(
+        store,
+        db_path=db_path,
+        runtime_pool=cast(WorkshopRuntimePool, object()),
+    )
+    summary = await service.latest(principal)
+    assert summary is not None
+    page = await service.groups(principal, summary.plan_id, exceptions_only=True)
+
+    with pytest.raises(MemoryReconciliationReviewValidationError, match="authorized action"):
+        await service.decide_group(
+            principal,
+            summary.plan_id,
+            page.groups[0]["group_id"],
+            disposition="approve",
+            action={"kind": "adopt_as_current"},
+            operator_note="",
+            expected_state_version=0,
+            allowed_project_ids=frozenset(),
+            client_operation_id="unsafe-unchanged-adoption",
+        )
     await store.close()
 
 

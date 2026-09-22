@@ -101,6 +101,46 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _unchanged_prior_review_action(
+    group: dict[str, Any],
+    *,
+    audit_boundary: object,
+) -> dict[str, str] | None:
+    """Recover the safe unchanged action without rewriting an immutable plan."""
+    if group.get("classification") != "prior_review" or group.get("action") != {"kind": "manual_edit_required"}:
+        return None
+    evidence = group.get("evidence")
+    if not isinstance(evidence, list) or len(evidence) != 1:
+        return None
+    row = evidence[0]
+    if not isinstance(row, dict) or row.get("kind") != "fact" or row.get("scope") not in {"global", "project"}:
+        return None
+    if row.get("scope") == "project" and not row.get("project_id"):
+        return None
+    gaps = row.get("migration_gaps")
+    if not isinstance(gaps, list) or "scope" in gaps:
+        return None
+    valid_until = row.get("valid_until")
+    if valid_until is not None:
+        boundary = _timestamp(audit_boundary)
+        validity_end = _timestamp(valid_until)
+        if boundary is None or validity_end is None or validity_end <= boundary:
+            return None
+    return {"kind": "adopt_as_current"}
+
+
 def _load_json(value: object, *, label: str) -> dict[str, Any]:
     try:
         parsed = json.loads(str(value))
@@ -409,6 +449,10 @@ class WorkshopMemoryReconciliationTriageService:
             state = states.get(str(group["group_id"]))
             if state is None:
                 continue
+            unchanged_prior_review_action = _unchanged_prior_review_action(
+                group,
+                audit_boundary=plan["generated_at"],
+            )
             visible.append(
                 {
                     **{
@@ -423,7 +467,7 @@ class WorkshopMemoryReconciliationTriageService:
                             "bulk_eligible",
                         )
                     },
-                    "proposed_action": group["action"],
+                    "proposed_action": unchanged_prior_review_action or group["action"],
                     "prior_review_evidence": group["prior_review_evidence"],
                     "evidence": [self._client_evidence(item) for item in group["evidence"]],
                     "decision": state,
@@ -591,6 +635,19 @@ class WorkshopMemoryReconciliationTriageService:
         if group is None:
             raise MemoryReconciliationReviewNotFound("Memory triage group not found")
         if disposition == "approve":
+            unchanged_prior_review_action = _unchanged_prior_review_action(
+                group,
+                audit_boundary=plan["generated_at"],
+            )
+            selected_kind = action.get("kind") if isinstance(action, dict) else None
+            if (
+                action != group["action"]
+                and action != unchanged_prior_review_action
+                and selected_kind != "adopt_corrected"
+            ):
+                raise MemoryReconciliationReviewValidationError(
+                    "Memory triage approval does not match an authorized action"
+                )
             synthetic = {"evidence": group["evidence"]}
             try:
                 memory_reconciliation.validate_candidate_action(synthetic, action)
