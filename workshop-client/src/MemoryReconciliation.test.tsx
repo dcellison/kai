@@ -171,8 +171,7 @@ describe("Memory reconciliation triage", () => {
     const text = await screen.findByLabelText("Current wording");
     await user.clear(text);
     await user.type(text, "The corrected current fact");
-    await user.selectOptions(screen.getByLabelText("Lifecycle action"), "adopt");
-    await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
+    await user.selectOptions(screen.getByLabelText("Decision"), "approve");
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
     await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
@@ -202,10 +201,9 @@ describe("Memory reconciliation triage", () => {
       </ConfirmationProvider>,
     );
 
-    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("adopt");
-    const disposition = screen.getByLabelText("Disposition");
-    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeEnabled();
-    await user.selectOptions(disposition, "approve");
+    const decision = await screen.findByLabelText("Decision");
+    expect(decision).toHaveValue("approve");
+    expect(within(decision).getByRole("option", { name: "Approve as current truth" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
     await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
@@ -235,8 +233,7 @@ describe("Memory reconciliation triage", () => {
       </ConfirmationProvider>,
     );
 
-    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("consolidate");
-    await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
+    expect(await screen.findByLabelText("Decision")).toHaveValue("approve");
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
     await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
@@ -246,7 +243,7 @@ describe("Memory reconciliation triage", () => {
     });
   });
 
-  it("requires an explicit scope before adopting an uncertain-scope fact", async () => {
+  it("keeps a valid displayed scope selected while explicitly confirming incomplete provenance", async () => {
     const user = userEvent.setup();
     const uncertain = {
       ...group,
@@ -263,11 +260,10 @@ describe("Memory reconciliation triage", () => {
       </ConfirmationProvider>,
     );
 
-    const disposition = await screen.findByLabelText("Disposition");
-    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeDisabled();
-    await user.selectOptions(screen.getByLabelText("Scope"), "global");
-    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeEnabled();
-    await user.selectOptions(disposition, "approve");
+    const decision = await screen.findByLabelText("Decision");
+    expect(decision).toHaveValue("approve");
+    expect(screen.getByLabelText("Scope")).toHaveValue("global");
+    expect(screen.getByRole("button", { name: "Save decision" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
     await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
@@ -275,6 +271,104 @@ describe("Memory reconciliation triage", () => {
       disposition: "approve",
       action: { kind: "adopt_corrected", replacement: { scope_kind: "global" } },
     });
+  });
+
+  it("explains genuinely missing scope without disabling the approval decision", async () => {
+    const missing = {
+      ...group,
+      decision: {
+        ...group.decision,
+        recommendation: { outcome: "adopt", confidence: 0.76, rationale: "Keep after choosing scope." },
+      },
+      evidence: [{ ...group.evidence[0], migrationGaps: ["scope"], scope: "" }],
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [missing], nextOffset: null });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const decision = await screen.findByLabelText("Decision");
+    expect(within(decision).getByRole("option", { name: "Approve as current truth" })).toBeEnabled();
+    expect(screen.getByText("Choose a scope before approval.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save decision" })).toBeDisabled();
+  });
+
+  it("keeps an unauthorized project visible and explains why it cannot be approved", async () => {
+    const projectScoped = {
+      ...group,
+      decision: {
+        ...group.decision,
+        recommendation: { outcome: "adopt", confidence: 0.8, rationale: "The project fact still applies." },
+      },
+      evidence: [{ ...group.evidence[0], projectId: "project-private", scope: "project" }],
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({
+      triage: summary,
+      groups: [projectScoped],
+      nextOffset: null,
+    });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    expect(await screen.findByLabelText("Scope")).toHaveValue("project");
+    expect(screen.getByLabelText("Project")).toHaveValue("project-private");
+    expect(screen.getByText("The selected project is not currently authorized for this runtime.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Save decision" })).toBeDisabled();
+  });
+
+  it("restores a saved corrected approval without reverting to the legacy evidence", async () => {
+    const saved = {
+      ...group,
+      decision: {
+        ...group.decision,
+        action: {
+          kind: "adopt_corrected",
+          replacement: {
+            content: "The operator-confirmed current fact",
+            scope_kind: "project",
+            scope_key: "project-kai",
+          },
+        },
+        disposition: "approve" as const,
+      },
+    };
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [saved], nextOffset: null });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation
+          allowedProjects={[{ displayName: "Kai", projectId: "project-kai" }]}
+          onAuthenticationFailure={vi.fn()}
+          onBack={vi.fn()}
+          token="secret"
+        />
+      </ConfirmationProvider>,
+    );
+
+    expect(await screen.findByLabelText("Decision")).toHaveValue("approve");
+    expect(screen.getByLabelText("Current wording")).toHaveValue("The operator-confirmed current fact");
+    expect(screen.getByLabelText("Scope")).toHaveValue("project");
+    expect(screen.getByLabelText("Project")).toHaveValue("project-kai");
+    expect(screen.getByRole("button", { name: "Save decision" })).toBeEnabled();
+  });
+
+  it.each(["reject", "defer"] as const)("maps %s directly without a lifecycle prerequisite", async (choice) => {
+    const user = userEvent.setup();
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    await user.selectOptions(await screen.findByLabelText("Decision"), choice);
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({ disposition: choice });
   });
 
   it("turns an obsolete recommendation into an explicit retirement action", async () => {
@@ -293,8 +387,7 @@ describe("Memory reconciliation triage", () => {
       </ConfirmationProvider>,
     );
 
-    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("obsolete");
-    await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
+    expect(await screen.findByLabelText("Decision")).toHaveValue("obsolete");
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
     await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
@@ -321,8 +414,7 @@ describe("Memory reconciliation triage", () => {
       </ConfirmationProvider>,
     );
 
-    expect(await screen.findByLabelText("Lifecycle action")).toHaveValue("retain");
-    await user.selectOptions(screen.getByLabelText("Disposition"), "approve");
+    expect(await screen.findByLabelText("Decision")).toHaveValue("approve");
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
     await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
@@ -365,8 +457,8 @@ describe("Memory reconciliation triage", () => {
 
     const linked = await screen.findByRole("button", { name: "Group a37a7728" });
     expect(screen.getByText(/Group 97555862/)).toBeVisible();
-    expect(screen.getByLabelText("Lifecycle action")).toHaveValue("adopt");
-    expect(within(screen.getByLabelText("Disposition")).getByRole("option", { name: "Approve" })).toBeEnabled();
+    expect(screen.getByLabelText("Decision")).toHaveValue("approve");
+    expect(within(screen.getByLabelText("Decision")).getByRole("option", { name: "Approve as current truth" })).toBeEnabled();
     await user.click(linked);
     expect(await screen.findByLabelText("Current wording")).toHaveValue("The related canonical fact");
   });
@@ -384,10 +476,10 @@ describe("Memory reconciliation triage", () => {
       </ConfirmationProvider>,
     );
 
-    const disposition = await screen.findByLabelText("Disposition");
-    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeEnabled();
+    const decision = await screen.findByLabelText("Decision");
+    expect(decision).toHaveValue("approve");
+    expect(within(decision).getByRole("option", { name: "Approve as current truth" })).toBeEnabled();
     expect(screen.getByText(/earlier decision remains audit evidence/i)).toBeVisible();
-    await user.selectOptions(disposition, "approve");
     await user.click(screen.getByRole("button", { name: "Save decision" }));
 
     await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
