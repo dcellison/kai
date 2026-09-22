@@ -107,6 +107,25 @@ const safeGroups: WorkshopMemoryTriageGroup[] = ["safe-1", "safe-2"].map((groupI
   resolution: "adopt",
 }));
 
+const priorDeferredGroup: WorkshopMemoryTriageGroup = {
+  ...group,
+  classification: "prior_review",
+  evidence: [{
+    ...group.evidence[0],
+    text: "Workshop and Telegram should preserve workflow continuity",
+  }],
+  groupId: "prior-deferred",
+  priorReviewEvidence: [{
+    candidateId: "raw-candidate",
+    disposition: "defer",
+    memoryIds: ["mem_test"],
+    operatorNote: "Qualification probe",
+    stateVersion: 1,
+  }],
+  proposedAction: { kind: "adopt_as_current" },
+  rationale: "An earlier raw-audit decision remains evidence.",
+};
+
 describe("Memory reconciliation triage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -163,6 +182,32 @@ describe("Memory reconciliation triage", () => {
     expect(approveSafeMemoryTriage).not.toHaveBeenCalled();
     expect(recommendMemoryTriage).not.toHaveBeenCalled();
     expect(applyMemoryTriage).not.toHaveBeenCalled();
+  });
+
+  it("allows an eligible previously deferred fact to be approved unchanged", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({
+      triage: summary,
+      groups: [priorDeferredGroup],
+      nextOffset: null,
+    });
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const disposition = await screen.findByLabelText("Disposition");
+    expect(within(disposition).getByRole("option", { name: "Approve" })).toBeEnabled();
+    expect(screen.getByText(/earlier decision remains audit evidence/i)).toBeVisible();
+    await user.selectOptions(disposition, "approve");
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({
+      disposition: "approve",
+      action: { kind: "adopt_as_current" },
+    });
   });
 
   it("shows complete deterministic evidence before final bulk confirmation", async () => {

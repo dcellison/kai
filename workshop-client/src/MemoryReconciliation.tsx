@@ -137,6 +137,9 @@ function ExceptionEditor({
   const recommendation = group.decision.recommendation;
   const corrected = content.trim() !== first.text;
   const canApprove = group.proposedAction.kind !== "manual_edit_required" || corrected;
+  const unchangedPriorReviewApproval = group.classification === "prior_review"
+    && group.proposedAction.kind === "adopt_as_current"
+    && !corrected;
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
@@ -251,6 +254,9 @@ function ExceptionEditor({
             </select>
           </label>
           {!canApprove && <p>Correct the fact before approval, or reject or defer this group.</p>}
+          {unchangedPriorReviewApproval && (
+            <p>Approve adopts this fact unchanged as current truth. The earlier decision remains audit evidence.</p>
+          )}
           <label>Operator note
             <textarea value={note} maxLength={4096} onChange={(event) => setNote(event.target.value)} />
           </label>
