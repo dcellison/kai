@@ -12,7 +12,6 @@ from typing import Any, Literal
 
 from kai import memory, memory_reconciliation
 from kai.config import ModelRole
-from kai.memory_extraction import build_memory_reasoner
 from kai.memory_reconciliation_triage import build_triage_plan, validate_triage_plan
 from kai.oneshot import OneShotError
 from kai.workshop.domain import PrincipalId, RuntimeProfileId
@@ -30,6 +29,14 @@ from kai.workshop.store import WorkshopEventStore
 
 PROMPT_VERSION = "memory_reconciliation_triage_v1"
 MAX_GROUPS = 100
+
+
+def build_memory_reasoner(*args: Any, **kwargs: Any) -> Any:
+    """Resolve the shared reasoner factory without creating an import cycle."""
+    from kai.memory_extraction import build_memory_reasoner as factory
+
+    return factory(*args, **kwargs)
+
 
 _RECOMMENDATION_SCHEMA: dict[str, Any] = {
     "type": "object",
