@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 92
+WORKSHOP_SCHEMA_VERSION = 93
 
 
 @dataclass(frozen=True, slots=True)
@@ -4497,6 +4497,27 @@ _MEMORY_RECONCILIATION_TRIAGE_SCHEMA = SchemaMigration(
     ),
 )
 
+
+_MEMORY_ADMISSION_AUTHORITY_SCHEMA = SchemaMigration(
+    version=93,
+    name="canonical_memory_admission_authority",
+    statements=(
+        "ALTER TABLE memory_fact_revisions ADD COLUMN admission_authority TEXT NOT NULL "
+        "DEFAULT 'provenance_verified' CHECK ("
+        "admission_authority IN ('provenance_verified', 'operator_review', 'quarantined'))",
+        "UPDATE memory_fact_revisions SET admission_authority = 'quarantined' "
+        "WHERE migration_classification IN ('legacy_incomplete', 'legacy_quarantined')",
+        "ALTER TABLE memory_episodes ADD COLUMN admission_authority TEXT NOT NULL "
+        "DEFAULT 'provenance_verified' CHECK ("
+        "admission_authority IN ('provenance_verified', 'operator_review', 'quarantined'))",
+        "UPDATE memory_episodes SET admission_authority = 'quarantined' "
+        "WHERE migration_classification IN ('legacy_incomplete', 'legacy_quarantined')",
+        "CREATE INDEX memory_fact_revision_admission_idx "
+        "ON memory_fact_revisions (admission_authority, migration_classification)",
+        "CREATE INDEX memory_episode_admission_idx ON memory_episodes (admission_authority, migration_classification)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4590,6 +4611,7 @@ _MIGRATIONS = (
     _IMMUTABLE_EPISODE_HISTORY_SCHEMA,
     _MEMORY_RECONCILIATION_REVIEW_SCHEMA,
     _MEMORY_RECONCILIATION_TRIAGE_SCHEMA,
+    _MEMORY_ADMISSION_AUTHORITY_SCHEMA,
 )
 
 

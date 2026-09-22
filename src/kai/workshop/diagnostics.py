@@ -2062,7 +2062,10 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
                 "SELECT COUNT(*) FROM memory_fact_revisions r "
                 "JOIN memory_fact_revision_states s ON s.revision_id = r.revision_id "
                 "WHERE s.state = 'active' "
-                "AND r.migration_classification IN ('canonical', 'legacy_complete') "
+                "AND ((r.migration_classification IN ('canonical', 'legacy_complete') "
+                "AND r.admission_authority = 'provenance_verified') "
+                "OR (r.migration_classification != 'legacy_quarantined' "
+                "AND r.admission_authority = 'operator_review')) "
                 "AND (r.valid_from IS NULL OR julianday(r.valid_from) <= julianday('now')) "
                 "AND (r.valid_until IS NULL OR julianday(r.valid_until) > julianday('now'))",
             )
@@ -2072,9 +2075,21 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
             )
             quarantined = _scalar(
                 connection,
-                "SELECT COUNT(*) FROM memory_fact_revisions "
-                "WHERE migration_classification IN ('legacy_incomplete', 'legacy_quarantined')",
+                "SELECT COUNT(*) FROM memory_fact_revisions WHERE admission_authority = 'quarantined'",
             )
+            operator_admitted = _scalar(
+                connection,
+                "SELECT COUNT(*) FROM memory_fact_revisions WHERE admission_authority = 'operator_review'",
+            )
+            if "memory_episodes" in tables:
+                quarantined += _scalar(
+                    connection,
+                    "SELECT COUNT(*) FROM memory_episodes WHERE admission_authority = 'quarantined'",
+                )
+                operator_admitted += _scalar(
+                    connection,
+                    "SELECT COUNT(*) FROM memory_episodes WHERE admission_authority = 'operator_review'",
+                )
             validity_excluded = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM memory_fact_revisions r "
@@ -2087,7 +2102,11 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
                 connection,
                 "SELECT COUNT(*) FROM memory_fact_revisions r "
                 "JOIN memory_fact_revision_states s ON s.revision_id = r.revision_id "
-                "WHERE s.state = 'active' AND r.migration_classification IN ('canonical', 'legacy_complete') "
+                "WHERE s.state = 'active' AND (("
+                "r.migration_classification IN ('canonical', 'legacy_complete') "
+                "AND r.admission_authority = 'provenance_verified') OR ("
+                "r.migration_classification != 'legacy_quarantined' "
+                "AND r.admission_authority = 'operator_review')) "
                 "AND (r.valid_from IS NULL OR julianday(r.valid_from) <= julianday('now')) "
                 "AND (r.valid_until IS NULL OR julianday(r.valid_until) > julianday('now')) "
                 "AND NOT EXISTS (SELECT 1 FROM memory_fact_vector_operations v "
@@ -2124,6 +2143,7 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
     return (
         f"{prefix} {state}; claims={claims}, revisions={revisions}, current={active}, "
         f"inactive={inactive}, validity excluded={validity_excluded}, quarantined={quarantined}, "
+        f"operator admitted={operator_admitted}, "
         f"legacy unclassified={legacy_unclassified}, projection gaps={projection_gaps}, "
         f"integrity gaps={malformed}; authority=canonical/current-only"
     )

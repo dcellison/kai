@@ -20,6 +20,7 @@ CANONICAL_REVISION_ID_KEY = "canonical_memory_revision_id"
 CANONICAL_LIFECYCLE_STATE_KEY = "canonical_memory_lifecycle_state"
 CANONICAL_TEMPORAL_ROLE_KEY = "canonical_memory_temporal_role"
 CANONICAL_EPISODE_ID_KEY = "canonical_memory_episode_id"
+CANONICAL_ADMISSION_AUTHORITY_KEY = "canonical_memory_admission_authority"
 
 _FACT_TABLES = {
     "memory_fact_claims",
@@ -34,6 +35,12 @@ _EPISODE_TABLES = {
     "memory_episode_vector_operations",
 }
 _ADMITTED_MIGRATION_CLASSES = {"canonical", "legacy_complete"}
+
+
+def _is_admitted(migration_classification: str, admission_authority: str) -> bool:
+    return (
+        migration_classification in _ADMITTED_MIGRATION_CLASSES and admission_authority == "provenance_verified"
+    ) or (migration_classification != "legacy_quarantined" and admission_authority == "operator_review")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +62,7 @@ class _CanonicalRevision:
     valid_from: str | None
     valid_until: str | None
     migration_classification: str
+    admission_authority: str
     vector_metadata: dict[str, Any]
     source_receipt_id: str | None
     source_run_id: str | None
@@ -79,6 +87,7 @@ class _CanonicalEpisode:
     scope_key: str
     stored_at: str
     migration_classification: str
+    admission_authority: str
     vector_metadata: dict[str, Any]
     structured: dict[str, Any]
     provenance: dict[str, str | None]
@@ -117,7 +126,8 @@ def _load_revision(
 ) -> _CanonicalRevision | None:
     row = connection.execute(
         "SELECT r.claim_id, r.revision_id, r.content, c.scope_kind, c.scope_key, s.state, "
-        "r.valid_from, r.valid_until, r.migration_classification, r.vector_metadata_json, "
+        "r.valid_from, r.valid_until, r.migration_classification, r.admission_authority, "
+        "r.vector_metadata_json, "
         "r.source_receipt_id, r.source_run_id, r.source_message_id, r.result_message_id, "
         "r.backend, r.provider, r.model, r.prompt_version, r.schema_version, "
         "v.revision_id AS operation_revision_id, v.status AS operation_status, "
@@ -135,7 +145,7 @@ def _load_revision(
     ).fetchone()
     if row is None:
         return None
-    metadata = json.loads(str(row[9]))
+    metadata = json.loads(str(row[10]))
     if not isinstance(metadata, dict):
         raise ValueError("canonical vector metadata is not an object")
     return _CanonicalRevision(
@@ -148,20 +158,21 @@ def _load_revision(
         valid_from=str(row[6]) if row[6] is not None else None,
         valid_until=str(row[7]) if row[7] is not None else None,
         migration_classification=str(row[8]),
+        admission_authority=str(row[9]),
         vector_metadata=metadata,
-        source_receipt_id=str(row[10]) if row[10] is not None else None,
-        source_run_id=str(row[11]) if row[11] is not None else None,
-        source_message_id=str(row[12]) if row[12] is not None else None,
-        result_message_id=str(row[13]) if row[13] is not None else None,
-        backend=str(row[14]) if row[14] is not None else None,
-        provider=str(row[15]) if row[15] is not None else None,
-        model=str(row[16]) if row[16] is not None else None,
-        prompt_version=str(row[17]) if row[17] is not None else None,
-        schema_version=str(row[18]) if row[18] is not None else None,
-        operation_revision_id=str(row[19]) if row[19] is not None else None,
-        operation_status=str(row[20]) if row[20] is not None else None,
-        operation=str(row[21]) if row[21] is not None else None,
-        memory_id=str(row[22]) if row[22] is not None else None,
+        source_receipt_id=str(row[11]) if row[11] is not None else None,
+        source_run_id=str(row[12]) if row[12] is not None else None,
+        source_message_id=str(row[13]) if row[13] is not None else None,
+        result_message_id=str(row[14]) if row[14] is not None else None,
+        backend=str(row[15]) if row[15] is not None else None,
+        provider=str(row[16]) if row[16] is not None else None,
+        model=str(row[17]) if row[17] is not None else None,
+        prompt_version=str(row[18]) if row[18] is not None else None,
+        schema_version=str(row[19]) if row[19] is not None else None,
+        operation_revision_id=str(row[20]) if row[20] is not None else None,
+        operation_status=str(row[21]) if row[21] is not None else None,
+        operation=str(row[22]) if row[22] is not None else None,
+        memory_id=str(row[23]) if row[23] is not None else None,
     )
 
 
@@ -178,7 +189,7 @@ def _project_row(
             "expired",
             "unresolved_conflict",
         } else "invalid_state"
-    if revision.migration_classification not in _ADMITTED_MIGRATION_CLASSES:
+    if not _is_admitted(revision.migration_classification, revision.admission_authority):
         return None, "quarantined"
     try:
         valid_from = _parse_timestamp(revision.valid_from)
@@ -209,6 +220,7 @@ def _project_row(
             "valid_from": revision.valid_from,
             "valid_until": revision.valid_until,
             "migration_classification": revision.migration_classification,
+            CANONICAL_ADMISSION_AUTHORITY_KEY: revision.admission_authority,
             "source_receipt_id": revision.source_receipt_id,
             "source_run_id": revision.source_run_id,
             "source_message_id": revision.source_message_id,
@@ -232,7 +244,8 @@ def _load_episode(
 ) -> _CanonicalEpisode | None:
     row = connection.execute(
         "SELECT e.episode_id, e.content, e.scope_kind, e.scope_key, e.stored_at, "
-        "e.migration_classification, e.vector_metadata_json, e.goal, e.context, e.approach, "
+        "e.migration_classification, e.admission_authority, e.vector_metadata_json, "
+        "e.goal, e.context, e.approach, "
         "e.outcome, e.outcome_quality, e.lessons, e.tags_json, e.actors_json, "
         "e.occurred_from, e.occurred_until, e.observed_at, e.reason, e.evidence_json, "
         "e.source_receipt_id, e.source_run_id, e.source_message_id, e.result_message_id, "
@@ -244,10 +257,10 @@ def _load_episode(
     ).fetchone()
     if row is None:
         return None
-    vector_metadata = json.loads(str(row[6]))
-    tags = json.loads(str(row[13]))
-    actors = json.loads(str(row[14]))
-    evidence = json.loads(str(row[19]))
+    vector_metadata = json.loads(str(row[7]))
+    tags = json.loads(str(row[14]))
+    actors = json.loads(str(row[15]))
+    evidence = json.loads(str(row[20]))
     if not isinstance(vector_metadata, dict) or not isinstance(tags, list) or not isinstance(actors, list):
         raise ValueError("canonical episode metadata is malformed")
     if not isinstance(evidence, list):
@@ -273,35 +286,36 @@ def _load_episode(
         scope_key=str(row[3]),
         stored_at=str(row[4]),
         migration_classification=str(row[5]),
+        admission_authority=str(row[6]),
         vector_metadata=vector_metadata,
         structured={
-            "goal": str(row[7]),
-            "context": str(row[8]),
-            "approach": str(row[9]),
-            "outcome": str(row[10]),
-            "outcome_quality": str(row[11]),
-            "lessons": str(row[12]) if row[12] is not None else None,
+            "goal": str(row[8]),
+            "context": str(row[9]),
+            "approach": str(row[10]),
+            "outcome": str(row[11]),
+            "outcome_quality": str(row[12]),
+            "lessons": str(row[13]) if row[13] is not None else None,
             "tags": tags,
             "actors": actors,
-            "occurred_from": str(row[15]) if row[15] is not None else None,
-            "occurred_until": str(row[16]) if row[16] is not None else None,
-            "observed_at": str(row[17]) if row[17] is not None else None,
-            "reason": str(row[18]),
+            "occurred_from": str(row[16]) if row[16] is not None else None,
+            "occurred_until": str(row[17]) if row[17] is not None else None,
+            "observed_at": str(row[18]) if row[18] is not None else None,
+            "reason": str(row[19]),
             "evidence": evidence,
         },
         provenance={
-            "source_receipt_id": str(row[20]) if row[20] is not None else None,
-            "source_run_id": str(row[21]) if row[21] is not None else None,
-            "source_message_id": str(row[22]) if row[22] is not None else None,
-            "result_message_id": str(row[23]) if row[23] is not None else None,
-            "backend": str(row[24]) if row[24] is not None else None,
-            "provider": str(row[25]) if row[25] is not None else None,
-            "model": str(row[26]) if row[26] is not None else None,
-            "prompt_version": str(row[27]) if row[27] is not None else None,
-            "schema_version": str(row[28]) if row[28] is not None else None,
+            "source_receipt_id": str(row[21]) if row[21] is not None else None,
+            "source_run_id": str(row[22]) if row[22] is not None else None,
+            "source_message_id": str(row[23]) if row[23] is not None else None,
+            "result_message_id": str(row[24]) if row[24] is not None else None,
+            "backend": str(row[25]) if row[25] is not None else None,
+            "provider": str(row[26]) if row[26] is not None else None,
+            "model": str(row[27]) if row[27] is not None else None,
+            "prompt_version": str(row[28]) if row[28] is not None else None,
+            "schema_version": str(row[29]) if row[29] is not None else None,
         },
-        operation_status=str(row[29]) if row[29] is not None else None,
-        memory_id=str(row[30]) if row[30] is not None else None,
+        operation_status=str(row[30]) if row[30] is not None else None,
+        memory_id=str(row[31]) if row[31] is not None else None,
         relationships=relationships,
     )
 
@@ -310,7 +324,7 @@ def _project_episode(
     row: MemoryResult,
     episode: _CanonicalEpisode,
 ) -> tuple[MemoryResult | None, str | None]:
-    if episode.migration_classification not in _ADMITTED_MIGRATION_CLASSES:
+    if not _is_admitted(episode.migration_classification, episode.admission_authority):
         return None, "quarantined"
     if episode.operation_status != "succeeded" or episode.memory_id != row.id:
         return None, "projection_not_current"
@@ -326,6 +340,7 @@ def _project_episode(
             "project_id": episode.scope_key if episode.scope_kind == "project" else None,
             "stored_at": episode.stored_at,
             "migration_classification": episode.migration_classification,
+            CANONICAL_ADMISSION_AUTHORITY_KEY: episode.admission_authority,
             "episode_followups": list(episode.relationships),
         }
     )
@@ -484,7 +499,7 @@ def current_truth_revision(db_path: Path, *, principal_id: str, runtime_profile_
                 return "unavailable"
             rows = connection.execute(
                 "SELECT r.claim_id, r.revision_id, s.state, s.state_event_position, "
-                "r.valid_from, r.valid_until, r.migration_classification, "
+                "r.valid_from, r.valid_until, r.migration_classification, r.admission_authority, "
                 "v.revision_id, v.status, v.operation, v.memory_id "
                 "FROM memory_fact_revisions r "
                 "JOIN memory_fact_claims c ON c.claim_id = r.claim_id "
@@ -498,7 +513,7 @@ def current_truth_revision(db_path: Path, *, principal_id: str, runtime_profile_
             ).fetchall()
             episode_rows = (
                 connection.execute(
-                    "SELECT e.episode_id, e.stored_at, e.migration_classification, "
+                    "SELECT e.episode_id, e.stored_at, e.migration_classification, e.admission_authority, "
                     "v.status, v.memory_id, f.source_episode_id, f.target_episode_id, f.relationship, "
                     "f.created_event_position FROM memory_episodes e "
                     "LEFT JOIN memory_episode_vector_operations v ON v.episode_id = e.episode_id "

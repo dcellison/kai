@@ -925,10 +925,16 @@ class WorkshopMemoryReconciliationTriageService:
             raise MemoryReconciliationReviewConflict("Memory changed after this triage plan")
         receipt = await memory_reconciliation.apply_review(db_path=self._db_path, audit=synthetic, review=sealed)
         approved_group_ids = {str(item[0]) for item in decision_rows if str(item[1]) == "approve"}
-        canonicalized_in_quarantine = sum(
-            len(group["evidence"])
+        operator_admitted = sum(
+            (
+                1
+                if group["action"].get("kind") == "keep_first_retract_rest"
+                else 0
+                if group["action"].get("kind") == "expire_all"
+                else len(group["evidence"])
+            )
             for group_id, group in groups.items()
-            if group_id in approved_group_ids and group["action"].get("migration_classification") == "legacy_incomplete"
+            if group_id in approved_group_ids
         )
         summary = {
             "adopted": sum(
@@ -955,7 +961,8 @@ class WorkshopMemoryReconciliationTriageService:
             "not_adopted": sum(
                 len(groups[str(item[0])]["evidence"]) for item in decision_rows if str(item[1]) in {"reject", "defer"}
             ),
-            "canonicalized_in_quarantine": canonicalized_in_quarantine,
+            "operator_admitted": operator_admitted,
+            "canonicalized_in_quarantine": 0,
         }
         response = {
             "audit_id": plan["audit_id"],

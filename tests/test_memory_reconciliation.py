@@ -154,6 +154,7 @@ def test_legacy_fact_adoption_preserves_incomplete_provenance() -> None:
     assert evidence["migration_gaps"]
     assert spec.migration_classification == "legacy_incomplete"
     assert set(spec.migration_gaps) == set(evidence["migration_gaps"])
+    assert spec.admission_authority == "operator_review"
 
     corrected = reconciliation._fact_spec(
         evidence,
@@ -166,6 +167,7 @@ def test_legacy_fact_adoption_preserves_incomplete_provenance() -> None:
     )
     assert corrected.migration_classification == "legacy_complete"
     assert corrected.migration_gaps == ()
+    assert corrected.admission_authority == "operator_review"
 
 
 def test_rejected_and_deferred_candidates_are_suppressed_until_evidence_changes(tmp_path: Path):

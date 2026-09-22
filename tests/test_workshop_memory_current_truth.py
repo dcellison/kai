@@ -11,6 +11,7 @@ import pytest
 
 from kai.memory import MemoryResult
 from kai.workshop.memory_current_truth import (
+    CANONICAL_ADMISSION_AUTHORITY_KEY,
     CANONICAL_CLAIM_ID_KEY,
     CANONICAL_LIFECYCLE_STATE_KEY,
     CANONICAL_REVISION_ID_KEY,
@@ -43,6 +44,7 @@ def _database(path: Path) -> sqlite3.Connection:
             valid_from TEXT,
             valid_until TEXT,
             migration_classification TEXT NOT NULL,
+            admission_authority TEXT NOT NULL,
             vector_metadata_json TEXT NOT NULL,
             source_receipt_id TEXT,
             source_run_id TEXT,
@@ -82,6 +84,7 @@ def _insert_revision(
     state: str = "active",
     status: str = "succeeded",
     classification: str = "canonical",
+    admission_authority: str | None = None,
     valid_from: datetime | None = None,
     valid_until: datetime | None = None,
 ) -> None:
@@ -90,7 +93,7 @@ def _insert_revision(
         (CLAIM, PRINCIPAL, RUNTIME),
     )
     connection.execute(
-        "INSERT INTO memory_fact_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO memory_fact_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             REVISION,
             CLAIM,
@@ -98,6 +101,8 @@ def _insert_revision(
             valid_from.isoformat() if valid_from is not None else None,
             valid_until.isoformat() if valid_until is not None else None,
             classification,
+            admission_authority
+            or ("provenance_verified" if classification in {"canonical", "legacy_complete"} else "quarantined"),
             '{"confidence":0.95,"scope":"global","scope_source":"operator","source":"explicit"}',
             "receipt-1",
             "run-1",
@@ -218,6 +223,38 @@ def test_projection_excludes_quarantine_and_invalid_time_windows(
         now=NOW,
     )
     assert result.rows == ()
+
+
+def test_operator_review_admits_incomplete_fact_without_rewriting_provenance(tmp_path: Path) -> None:
+    from kai.workshop.diagnostics import workshop_memory_current_truth_status
+
+    database = tmp_path / "kai.db"
+    connection = _database(database)
+    _insert_revision(
+        connection,
+        classification="legacy_incomplete",
+        admission_authority="operator_review",
+    )
+    connection.close()
+
+    result = project_current_truth(
+        (_row(),),
+        db_path=database,
+        principal_id=PRINCIPAL,
+        runtime_profile_id=RUNTIME,
+        now=NOW,
+    )
+
+    assert result.excluded == {}
+    assert len(result.rows) == 1
+    admitted = result.rows[0]
+    assert admitted.metadata["migration_classification"] == "legacy_incomplete"
+    assert admitted.metadata[CANONICAL_ADMISSION_AUTHORITY_KEY] == "operator_review"
+    status = workshop_memory_current_truth_status(database, memory_enabled=True)
+    assert status.startswith("Workshop memory current truth: active;")
+    assert "current=1" in status
+    assert "quarantined=0" in status
+    assert "operator admitted=1" in status
 
 
 def test_projection_fails_closed_for_legacy_malformed_and_unavailable_authority(tmp_path: Path) -> None:
@@ -374,7 +411,10 @@ def test_status_surfaces_quarantine_projection_and_legacy_gaps(tmp_path: Path) -
     assert "legacy unclassified=0" in active
 
     connection = sqlite3.connect(database)
-    connection.execute("UPDATE memory_fact_revisions SET migration_classification = 'legacy_quarantined'")
+    connection.execute(
+        "UPDATE memory_fact_revisions SET migration_classification = 'legacy_quarantined', "
+        "admission_authority = 'quarantined'"
+    )
     connection.execute("UPDATE workshop_memory_authority_migrations SET total_count = 2")
     connection.commit()
     connection.close()

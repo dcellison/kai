@@ -181,22 +181,22 @@ describe("Memory reconciliation triage", () => {
       0,
       ["safe-1", "safe-2"],
     );
-    expect(screen.getByText(/does not declare them current truth/i)).toBeVisible();
-    expect(screen.getByText(/425 canonicalize in quarantine/i)).toBeVisible();
-    expect(screen.getByText(/remain excluded from current truth and agent retrieval/i)).toBeVisible();
-    expect(screen.getByText("Stable non conflicting · Stable legacy fact 1 · 1 memory · Canonicalize in quarantine")).toBeVisible();
-    expect(screen.getByText("Stable non conflicting · Stable legacy fact 2 · 1 memory · Canonicalize in quarantine")).toBeVisible();
+    expect(screen.getByText(/explicit approval supplies separate retrieval admission authority/i)).toBeVisible();
+    expect(screen.getByText(/425 adopt as current truth/i)).toBeVisible();
+    expect(screen.getByText("Stable non conflicting · Stable legacy fact 1 · 1 memory · Adopt as current truth")).toBeVisible();
+    expect(screen.getByText("Stable non conflicting · Stable legacy fact 2 · 1 memory · Adopt as current truth")).toBeVisible();
     expect(screen.getAllByText(/Stable non conflicting/)).toHaveLength(2);
 
-    await user.click(screen.getByRole("button", { name: "Approve canonicalization" }));
+    await user.click(screen.getByRole("button", { name: "Approve current-truth adoption" }));
     const dialog = screen.getByRole("dialog", { name: "Continue?" });
-    expect(dialog).toHaveTextContent("excluded from current truth and agent retrieval");
+    expect(dialog).toHaveTextContent("original provenance will remain incomplete");
+    expect(dialog).toHaveTextContent("separate retrieval admission authority");
     await user.click(within(dialog).getByRole("button", { name: "Continue" }));
 
     await waitFor(() => expect(approveSafeMemoryTriage).toHaveBeenCalledTimes(1));
   });
 
-  it("reports quarantined canonicalization separately from lifecycle outcomes", async () => {
+  it("reports operator admission separately from lifecycle outcomes", async () => {
     const user = userEvent.setup();
     const readySummary = {
       ...summary,
@@ -211,11 +211,11 @@ describe("Memory reconciliation triage", () => {
     });
     vi.mocked(applyMemoryTriage).mockResolvedValue({
       adopted: 312,
-      canonicalized_in_quarantine: 425,
       consolidated: 84,
       deferred: 0,
       failed: 0,
       obsolete: 29,
+      operator_admitted: 425,
       rejected: 0,
       still_unresolved: 0,
     });
@@ -229,7 +229,7 @@ describe("Memory reconciliation triage", () => {
     await user.click(await screen.findByRole("button", { name: "Apply plan" }));
     await user.click(within(screen.getByRole("dialog", { name: "Continue?" })).getByRole("button", { name: "Continue" }));
 
-    expect(await screen.findByText(/425 canonicalized in quarantine/i)).toBeVisible();
+    expect(await screen.findByText(/425 operator admitted/i)).toBeVisible();
     expect(screen.getByText(/312 adopted by lifecycle outcome/i)).toBeVisible();
   });
 
