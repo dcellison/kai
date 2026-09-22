@@ -402,6 +402,7 @@ class ModelRole(StrEnum):
     # are runtime-only (no env-var override surface, no Config field).
     MEMORY_EXTRACTION = "memory_extraction"
     MEMORY_EPISODE = "memory_episode"
+    MEMORY_RECONCILIATION = "memory_reconciliation"
 
 
 # Per-role tier assignment. Roles that need reasoning depth (PR
@@ -417,6 +418,7 @@ _TIER_BY_ROLE: dict[ModelRole, str] = {
     ModelRole.ISSUE_TRIAGE: "balanced",
     ModelRole.MEMORY_EXTRACTION: "cheap",
     ModelRole.MEMORY_EPISODE: "cheap",
+    ModelRole.MEMORY_RECONCILIATION: "balanced",
     ModelRole.BEHAVIORAL_JUDGE: "cheap",
     ModelRole.BEHAVIORAL_GEN: "balanced",
 }

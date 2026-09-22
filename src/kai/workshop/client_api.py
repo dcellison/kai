@@ -255,6 +255,7 @@ from kai.workshop.memory_reconciliation_review import (
     MemoryReconciliationReviewValidationError,
     ReconciliationAuditSummary,
 )
+from kai.workshop.memory_reconciliation_triage import TriageSummary
 from kai.workshop.message_reactions import (
     MessageReactionAccessDeniedError,
     MessageReactionValidationError,
@@ -543,6 +544,12 @@ _MEMORY_RECONCILIATION_CANDIDATES_PATH = "/v1/memory/reconciliation/{audit_id}/c
 _MEMORY_RECONCILIATION_DECISION_PATH = "/v1/memory/reconciliation/{audit_id}/candidates/{candidate_id}/decision"
 _MEMORY_RECONCILIATION_BULK_PATH = "/v1/memory/reconciliation/{audit_id}/actions/bulk"
 _MEMORY_RECONCILIATION_APPLY_PATH = "/v1/memory/reconciliation/{audit_id}/apply"
+_MEMORY_TRIAGE_GROUPS_PATH = "/v1/memory/reconciliation/triage/{plan_id}/groups"
+_MEMORY_TRIAGE_GROUP_DECISION_PATH = "/v1/memory/reconciliation/triage/{plan_id}/groups/{group_id}/decision"
+_MEMORY_TRIAGE_SAFE_PREVIEW_PATH = "/v1/memory/reconciliation/triage/{plan_id}/safe/preview"
+_MEMORY_TRIAGE_SAFE_APPROVE_PATH = "/v1/memory/reconciliation/triage/{plan_id}/safe/approve"
+_MEMORY_TRIAGE_RECOMMEND_PATH = "/v1/memory/reconciliation/triage/{plan_id}/recommend"
+_MEMORY_TRIAGE_APPLY_PATH = "/v1/memory/reconciliation/triage/{plan_id}/apply"
 _ALLOWED_MEMORY_RECONCILIATION_FILTERS = frozenset(
     {"category", "kind", "scope", "uncertainty", "disposition", "action", "gap", "offset", "limit"}
 )
@@ -1966,6 +1973,24 @@ def _serialize_reconciliation_summary(summary: ReconciliationAuditSummary) -> di
     }
 
 
+def _serialize_triage_summary(summary: TriageSummary) -> dict[str, object]:
+    return {
+        "plan_id": summary.plan_id,
+        "audit_id": summary.audit_id,
+        "status": summary.status,
+        "review_version": summary.review_version,
+        "memory_count": summary.memory_count,
+        "group_count": summary.group_count,
+        "resolution_counts": summary.resolution_counts,
+        "disposition_counts": summary.disposition_counts,
+        "deterministic_groups": summary.deterministic_groups,
+        "pending_deterministic_groups": summary.pending_deterministic_groups,
+        "exception_groups": summary.exception_groups,
+        "recommended_groups": summary.recommended_groups,
+        "applied_at": summary.applied_at,
+    }
+
+
 def _reconciliation_error_response(exc: Exception) -> web.Response:
     if isinstance(exc, MemoryReconciliationReviewNotFound):
         return _error_response(status=404, code="reconciliation_not_found", message=str(exc))
@@ -2002,15 +2027,254 @@ async def _handle_memory_reconciliation_latest(
     assert authority is not None
     try:
         summary = await service.reconciliation.latest(authority.principal_id)
+        triage_service = getattr(service, "reconciliation_triage", None)
+        allowed = frozenset(project.project_id for project in await service.allowed_projects(authority))
+        triage = (
+            None
+            if triage_service is None
+            else await triage_service.latest(authority.principal_id, allowed_project_ids=allowed)
+        )
     except MemoryReconciliationReviewError as exc:
         return _reconciliation_error_response(exc)
     return _json_response(
         {
             "version": 1,
             "audit": None if summary is None else _serialize_reconciliation_summary(summary),
+            "triage": None if triage is None else _serialize_triage_summary(triage),
         },
         status=200,
     )
+
+
+async def _handle_memory_triage_groups(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if not set(request.query).issubset({"disposition", "resolution", "exceptions_only", "offset", "limit"}):
+        return _error_response(status=400, code="invalid_request", message="Invalid memory triage request")
+    assert authority is not None
+    try:
+        raw_offset = _single_query_value(request, "offset") or "0"
+        raw_limit = _single_query_value(request, "limit") or "50"
+        if not _DECIMAL_INTEGER.fullmatch(raw_offset) or not _DECIMAL_INTEGER.fullmatch(raw_limit):
+            raise MemoryReconciliationReviewValidationError("Invalid memory triage page")
+        exceptions = _single_query_value(request, "exceptions_only")
+        if exceptions not in {None, "0", "1"}:
+            raise MemoryReconciliationReviewValidationError("Invalid memory triage filter")
+        page = await service.reconciliation_triage.groups(
+            authority.principal_id,
+            request.match_info["plan_id"],
+            disposition=_single_query_value(request, "disposition"),
+            resolution=_single_query_value(request, "resolution"),
+            exceptions_only=exceptions == "1",
+            offset=int(raw_offset),
+            limit=int(raw_limit),
+        )
+    except (KeyError, ValueError, MemoryReconciliationReviewError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "triage": _serialize_triage_summary(page.triage),
+            "groups": list(page.groups),
+            "next_offset": page.next_offset,
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_triage_safe_preview(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if set(payload) != {"group_ids", "expected_review_version"}:
+            raise MemoryReconciliationReviewValidationError("Invalid safe-memory preview")
+        group_ids = payload["group_ids"]
+        if group_ids is not None and (
+            not isinstance(group_ids, list) or not all(isinstance(value, str) for value in group_ids)
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid safe-memory preview")
+        expected = payload["expected_review_version"]
+        if not isinstance(expected, int) or isinstance(expected, bool):
+            raise MemoryReconciliationReviewValidationError("Invalid safe-memory preview")
+        result = await service.reconciliation_triage.preview_safe_approval(
+            authority.principal_id,
+            request.match_info["plan_id"],
+            group_ids=group_ids,
+            expected_review_version=expected,
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_triage_safe_approve(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if (
+            set(payload)
+            != {
+                "group_ids",
+                "expected_review_version",
+                "preview_sha256",
+                "operator_note",
+                "confirmation",
+                "client_operation_id",
+            }
+            or payload["confirmation"] != "approve deterministic memory groups"
+        ):
+            raise MemoryReconciliationReviewValidationError("Explicit safe-memory approval is required")
+        group_ids = payload["group_ids"]
+        if group_ids is not None and (
+            not isinstance(group_ids, list) or not all(isinstance(value, str) for value in group_ids)
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid safe-memory approval")
+        if (
+            not isinstance(payload["expected_review_version"], int)
+            or isinstance(payload["expected_review_version"], bool)
+            or not isinstance(payload["preview_sha256"], str)
+            or not isinstance(payload["operator_note"], str)
+            or not isinstance(payload["client_operation_id"], str)
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid safe-memory approval")
+        result = await service.reconciliation_triage.approve_safe(
+            authority.principal_id,
+            request.match_info["plan_id"],
+            group_ids=group_ids,
+            expected_review_version=payload["expected_review_version"],
+            preview_sha256=payload["preview_sha256"],
+            operator_note=payload["operator_note"],
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_triage_group_decision(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if set(payload) != {"disposition", "action", "operator_note", "expected_state_version", "client_operation_id"}:
+            raise MemoryReconciliationReviewValidationError("Invalid memory triage decision")
+        raw_disposition = payload["disposition"]
+        disposition: Literal["approve", "reject", "defer"]
+        if raw_disposition == "approve":
+            disposition = "approve"
+        elif raw_disposition == "reject":
+            disposition = "reject"
+        elif raw_disposition == "defer":
+            disposition = "defer"
+        else:
+            raise MemoryReconciliationReviewValidationError("Invalid memory triage decision")
+        if (
+            not isinstance(payload["action"], dict)
+            or not isinstance(payload["operator_note"], str)
+            or not isinstance(payload["expected_state_version"], int)
+            or isinstance(payload["expected_state_version"], bool)
+            or not isinstance(payload["client_operation_id"], str)
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid memory triage decision")
+        allowed = frozenset(project.project_id for project in await service.allowed_projects(authority))
+        result = await service.reconciliation_triage.decide_group(
+            authority.principal_id,
+            request.match_info["plan_id"],
+            request.match_info["group_id"],
+            disposition=disposition,
+            action=payload["action"],
+            operator_note=payload["operator_note"],
+            expected_state_version=payload["expected_state_version"],
+            allowed_project_ids=allowed,
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_triage_recommend(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory triage request")
+    assert authority is not None
+    try:
+        result = await service.reconciliation_triage.recommend(
+            authority.principal_id,
+            request.match_info["plan_id"],
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_triage_apply(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if (
+            set(payload) != {"expected_review_version", "confirmation", "client_operation_id"}
+            or payload["confirmation"] != "apply grouped memory triage"
+            or not isinstance(payload["expected_review_version"], int)
+            or isinstance(payload["expected_review_version"], bool)
+            or not isinstance(payload["client_operation_id"], str)
+        ):
+            raise MemoryReconciliationReviewValidationError("Explicit memory triage confirmation is required")
+        allowed = frozenset(project.project_id for project in await service.allowed_projects(authority))
+        result = await service.reconciliation_triage.apply(
+            authority.principal_id,
+            request.match_info["plan_id"],
+            expected_review_version=payload["expected_review_version"],
+            allowed_project_ids=allowed,
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
 
 
 async def _handle_memory_reconciliation_candidates(
@@ -11666,6 +11930,54 @@ def register_workshop_read_routes(
                     service=memory_queries,
                 )
 
+        async def handle_memory_triage_groups(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_groups(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_triage_safe_preview(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_safe_preview(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_triage_safe_approve(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_safe_approve(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_triage_group_decision(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_group_decision(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_triage_recommend(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_recommend(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_triage_apply(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_apply(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
         app.router.add_get(_MEMORY_STATS_PATH, handle_memory_stats)
         app.router.add_get(_MEMORY_RECORDS_PATH, handle_memory_records)
         _register_workshop_capability_route(
@@ -11689,6 +12001,7 @@ def register_workshop_read_routes(
         app.router.add_get(_MEMORY_SOURCE_PATH, handle_memory_source)
         app.router.add_get(_MEMORY_RECONCILIATION_PATH, handle_memory_reconciliation_latest)
         app.router.add_get(_MEMORY_RECONCILIATION_CANDIDATES_PATH, handle_memory_reconciliation_candidates)
+        app.router.add_get(_MEMORY_TRIAGE_GROUPS_PATH, handle_memory_triage_groups)
         for method, path, handler, entrypoint in (
             (
                 "PATCH",
@@ -11707,6 +12020,36 @@ def register_workshop_read_routes(
                 _MEMORY_RECONCILIATION_APPLY_PATH,
                 handle_memory_reconciliation_apply,
                 "memory_reconciliation_apply",
+            ),
+            (
+                "PATCH",
+                _MEMORY_TRIAGE_GROUP_DECISION_PATH,
+                handle_memory_triage_group_decision,
+                "memory_triage_group_decision",
+            ),
+            (
+                "POST",
+                _MEMORY_TRIAGE_SAFE_PREVIEW_PATH,
+                handle_memory_triage_safe_preview,
+                "memory_triage_safe_preview",
+            ),
+            (
+                "POST",
+                _MEMORY_TRIAGE_SAFE_APPROVE_PATH,
+                handle_memory_triage_safe_approve,
+                "memory_triage_safe_approve",
+            ),
+            (
+                "POST",
+                _MEMORY_TRIAGE_RECOMMEND_PATH,
+                handle_memory_triage_recommend,
+                "memory_triage_recommend",
+            ),
+            (
+                "POST",
+                _MEMORY_TRIAGE_APPLY_PATH,
+                handle_memory_triage_apply,
+                "memory_triage_apply",
             ),
         ):
             _register_workshop_capability_route(

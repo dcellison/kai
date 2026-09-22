@@ -69,6 +69,11 @@ import type {
   WorkshopMemoryReconciliationDisposition,
   WorkshopMemoryReconciliationPage,
   WorkshopMemoryReconciliationSummary,
+  WorkshopMemoryTriageGroup,
+  WorkshopMemoryTriagePage,
+  WorkshopMemoryTriagePreview,
+  WorkshopMemoryTriageResolution,
+  WorkshopMemoryTriageSummary,
   WorkshopArtifactKind,
   WorkshopArtifactSummary,
   WorkshopMessageReaction,
@@ -4156,6 +4161,96 @@ function parseReconciliationCandidate(value: unknown): WorkshopMemoryReconciliat
   };
 }
 
+function parseMemoryTriageSummary(value: unknown): WorkshopMemoryTriageSummary | null {
+  if (!isRecord(value)) return null;
+  const resolutions = parseCountMap(value.resolution_counts);
+  const dispositions = parseCountMap(value.disposition_counts);
+  if (
+    typeof value.plan_id !== "string" || typeof value.audit_id !== "string" ||
+    !["open", "applied"].includes(String(value.status)) ||
+    !Number.isSafeInteger(value.review_version) || !Number.isSafeInteger(value.memory_count) ||
+    !Number.isSafeInteger(value.group_count) || !Number.isSafeInteger(value.deterministic_groups) ||
+    !Number.isSafeInteger(value.pending_deterministic_groups) ||
+    !Number.isSafeInteger(value.exception_groups) || !Number.isSafeInteger(value.recommended_groups) ||
+    (value.applied_at !== null && typeof value.applied_at !== "string") || !resolutions || !dispositions
+  ) return null;
+  for (const key of ["adopt", "consolidate", "obsolete", "needs_review"]) {
+    if (!Number.isSafeInteger(resolutions[key])) return null;
+  }
+  for (const key of ["pending", "approve", "reject", "defer"]) {
+    if (!Number.isSafeInteger(dispositions[key])) return null;
+  }
+  return {
+    appliedAt: value.applied_at,
+    auditId: value.audit_id,
+    deterministicGroups: value.deterministic_groups as number,
+    pendingDeterministicGroups: value.pending_deterministic_groups as number,
+    dispositionCounts: dispositions as Record<WorkshopMemoryReconciliationDisposition, number>,
+    exceptionGroups: value.exception_groups as number,
+    groupCount: value.group_count as number,
+    memoryCount: value.memory_count as number,
+    planId: value.plan_id,
+    recommendedGroups: value.recommended_groups as number,
+    resolutionCounts: resolutions as Record<WorkshopMemoryTriageResolution, number>,
+    reviewVersion: value.review_version as number,
+    status: value.status as "open" | "applied",
+  };
+}
+
+function parseMemoryTriageGroup(value: unknown): WorkshopMemoryTriageGroup | null {
+  if (
+    !isRecord(value) || typeof value.group_id !== "string" ||
+    typeof value.classification !== "string" ||
+    !["adopt", "consolidate", "obsolete", "needs_review"].includes(String(value.resolution)) ||
+    typeof value.deterministic !== "boolean" || typeof value.bulk_eligible !== "boolean" ||
+    !isRecord(value.decision) || !isRecord(value.decision.recommendation) ||
+    !Array.isArray(value.prior_review_evidence)
+  ) return null;
+  const priorReviewEvidence = value.prior_review_evidence.map((item) => {
+    if (
+      !isRecord(item) || typeof item.candidate_id !== "string" ||
+      !["approve", "reject", "defer"].includes(String(item.disposition)) ||
+      typeof item.operator_note !== "string" || !Number.isSafeInteger(item.state_version) ||
+      !Array.isArray(item.memory_ids) || !item.memory_ids.every((memoryId) => typeof memoryId === "string")
+    ) return null;
+    return {
+      candidateId: item.candidate_id,
+      disposition: item.disposition as Exclude<WorkshopMemoryReconciliationDisposition, "pending">,
+      memoryIds: item.memory_ids as string[],
+      operatorNote: item.operator_note,
+      stateVersion: item.state_version as number,
+    };
+  });
+  if (priorReviewEvidence.some((item) => item === null)) return null;
+  const candidate = parseReconciliationCandidate({
+    candidate_id: value.group_id,
+    state_sha256: value.state_sha256,
+    category: value.classification,
+    uncertainty: value.deterministic ? "low" : "high",
+    rationale: value.rationale,
+    proposed_action: value.proposed_action,
+    evidence: value.evidence,
+    decision: value.decision,
+  });
+  if (!candidate) return null;
+  return {
+    bulkEligible: value.bulk_eligible,
+    classification: value.classification,
+    decision: {
+      ...candidate.decision,
+      recommendation: value.decision.recommendation,
+    },
+    deterministic: value.deterministic,
+    evidence: candidate.evidence,
+    groupId: value.group_id,
+    priorReviewEvidence: priorReviewEvidence as WorkshopMemoryTriageGroup["priorReviewEvidence"],
+    proposedAction: candidate.proposedAction,
+    rationale: candidate.rationale,
+    resolution: value.resolution as WorkshopMemoryTriageResolution,
+    stateSha256: candidate.stateSha256,
+  };
+}
+
 export async function loadMemoryReconciliation(
   token: string,
 ): Promise<WorkshopMemoryReconciliationSummary | null> {
@@ -4169,6 +4264,184 @@ export async function loadMemoryReconciliation(
   const parsed = parseReconciliationSummary(payload.audit);
   if (!parsed) throw new Error("Kai returned an unsupported memory reconciliation summary.");
   return parsed;
+}
+
+export async function loadMemoryTriage(token: string): Promise<WorkshopMemoryTriageSummary | null> {
+  const response = await authorizedFetch({ channelId: "", token }, "/v1/memory/reconciliation");
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load memory triage."));
+  if (!isRecord(payload) || payload.version !== 1 || !("triage" in payload)) {
+    throw new Error("Kai returned an unsupported memory triage summary.");
+  }
+  if (payload.triage === null) return null;
+  const parsed = parseMemoryTriageSummary(payload.triage);
+  if (!parsed) throw new Error("Kai returned an unsupported memory triage summary.");
+  return parsed;
+}
+
+export async function loadMemoryTriageGroups(
+  token: string,
+  planId: string,
+  options: {
+    disposition?: WorkshopMemoryReconciliationDisposition;
+    resolution?: WorkshopMemoryTriageResolution;
+    exceptionsOnly?: boolean;
+    offset?: number;
+    limit?: number;
+  } = {},
+): Promise<WorkshopMemoryTriagePage> {
+  const query = new URLSearchParams();
+  if (options.disposition) query.set("disposition", options.disposition);
+  if (options.resolution) query.set("resolution", options.resolution);
+  if (options.exceptionsOnly) query.set("exceptions_only", "1");
+  if (options.offset !== undefined) query.set("offset", String(options.offset));
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/groups?${query}`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load memory triage groups."));
+  const triage = isRecord(payload) ? parseMemoryTriageSummary(payload.triage) : null;
+  if (
+    !isRecord(payload) || payload.version !== 1 || !triage || !Array.isArray(payload.groups) ||
+    (payload.next_offset !== null && !Number.isSafeInteger(payload.next_offset))
+  ) throw new Error("Kai returned an unsupported memory triage page.");
+  const groups = payload.groups.map(parseMemoryTriageGroup);
+  if (groups.some((group) => group === null)) {
+    throw new Error("Kai returned an unsupported memory triage group.");
+  }
+  return {
+    triage,
+    groups: groups as WorkshopMemoryTriageGroup[],
+    nextOffset: payload.next_offset as number | null,
+  };
+}
+
+export async function previewSafeMemoryTriage(
+  token: string,
+  planId: string,
+  expectedReviewVersion: number,
+  groupIds: string[] | null = null,
+): Promise<WorkshopMemoryTriagePreview> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/safe/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group_ids: groupIds, expected_review_version: expectedReviewVersion }),
+    },
+  );
+  const payload = await responsePayload(response);
+  const counts = isRecord(payload) ? parseCountMap(payload.resolution_counts) : null;
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not preview safe memory groups."));
+  if (
+    !isRecord(payload) || payload.version !== 1 || typeof payload.plan_id !== "string" ||
+    typeof payload.preview_sha256 !== "string" || !Array.isArray(payload.group_ids) ||
+    !payload.group_ids.every((value) => typeof value === "string") ||
+    !Number.isSafeInteger(payload.group_count) || !Number.isSafeInteger(payload.memory_count) ||
+    !Number.isSafeInteger(payload.review_version) || !counts
+  ) throw new Error("Kai returned an unsupported safe-memory preview.");
+  return {
+    groupCount: payload.group_count as number,
+    groupIds: payload.group_ids as string[],
+    memoryCount: payload.memory_count as number,
+    planId: payload.plan_id,
+    previewSha256: payload.preview_sha256,
+    resolutionCounts: counts as Record<"adopt" | "consolidate" | "obsolete", number>,
+    reviewVersion: payload.review_version as number,
+  };
+}
+
+export async function approveSafeMemoryTriage(
+  token: string,
+  preview: WorkshopMemoryTriagePreview,
+): Promise<void> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(preview.planId)}/safe/approve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        group_ids: preview.groupIds,
+        expected_review_version: preview.reviewVersion,
+        preview_sha256: preview.previewSha256,
+        operator_note: "Approved deterministic legacy-memory triage after preview.",
+        confirmation: "approve deterministic memory groups",
+        client_operation_id: mutationRequestId(),
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not approve safe memory groups."));
+}
+
+export async function saveMemoryTriageDecision(
+  token: string,
+  planId: string,
+  groupId: string,
+  input: {
+    disposition: Exclude<WorkshopMemoryReconciliationDisposition, "pending">;
+    action: Record<string, unknown>;
+    operatorNote: string;
+    expectedStateVersion: number;
+  },
+): Promise<void> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/groups/${encodeURIComponent(groupId)}/decision`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        disposition: input.disposition,
+        action: input.action,
+        operator_note: input.operatorNote,
+        expected_state_version: input.expectedStateVersion,
+        client_operation_id: mutationRequestId(),
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not save memory triage decision."));
+}
+
+export async function recommendMemoryTriage(token: string, planId: string): Promise<void> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/recommend`,
+    { method: "POST" },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not analyze uncertain memory groups."));
+}
+
+export async function applyMemoryTriage(
+  token: string,
+  planId: string,
+  expectedReviewVersion: number,
+): Promise<Record<string, number>> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/apply`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_review_version: expectedReviewVersion,
+        confirmation: "apply grouped memory triage",
+        client_operation_id: mutationRequestId(),
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not apply grouped memory triage."));
+  if (!isRecord(payload) || payload.version !== 1 || !isRecord(payload.summary)) {
+    throw new Error("Kai returned an unsupported memory triage receipt.");
+  }
+  return parseCountMap(payload.summary) ?? {};
 }
 
 export async function loadMemoryReconciliationCandidates(

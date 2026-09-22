@@ -140,6 +140,34 @@ def test_corrected_fact_rejects_invalid_scope_and_validity():
         reconciliation.validate_candidate_action(candidate, action)
 
 
+def test_legacy_fact_adoption_preserves_incomplete_provenance() -> None:
+    audit = reconciliation.build_audit(
+        principal_id=PRINCIPAL,
+        runtime_profile_id=RUNTIME,
+        rows=[_row("mem_1", "A legacy fact without complete extraction provenance")],
+        now=NOW,
+    )
+    evidence = audit["candidates"][0]["evidence"][0]
+
+    spec = reconciliation._fact_spec(evidence, receipt_id="mrr_test", reason="Legacy adoption")
+
+    assert evidence["migration_gaps"]
+    assert spec.migration_classification == "legacy_incomplete"
+    assert set(spec.migration_gaps) == set(evidence["migration_gaps"])
+
+    corrected = reconciliation._fact_spec(
+        evidence,
+        receipt_id="mrr_test",
+        reason="Operator correction",
+        action={
+            "kind": "adopt_corrected",
+            "replacement": {"content": "A corrected current fact"},
+        },
+    )
+    assert corrected.migration_classification == "legacy_complete"
+    assert corrected.migration_gaps == ()
+
+
 def test_rejected_and_deferred_candidates_are_suppressed_until_evidence_changes(tmp_path: Path):
     rows = [_row("mem_1", "A legacy fact")]
     audit = reconciliation.build_audit(principal_id=PRINCIPAL, runtime_profile_id=RUNTIME, rows=rows, now=NOW)

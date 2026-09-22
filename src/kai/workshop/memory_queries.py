@@ -39,6 +39,7 @@ from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptSnapshot,
 )
 from kai.workshop.memory_reconciliation_review import WorkshopMemoryReconciliationReviewService
+from kai.workshop.memory_reconciliation_triage import WorkshopMemoryReconciliationTriageService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 from kai.workspace_utils import is_workspace_allowed
@@ -449,6 +450,11 @@ class WorkshopMemoryQueryService:
         self.reconciliation = WorkshopMemoryReconciliationReviewService(
             store,
             db_path=Path(config.session_db_path),
+        )
+        self.reconciliation_triage = WorkshopMemoryReconciliationTriageService(
+            store,
+            db_path=Path(config.session_db_path),
+            runtime_pool=runtime_pool,
         )
 
     async def recover_fact_projections(self) -> int:

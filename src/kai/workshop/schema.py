@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 91
+WORKSHOP_SCHEMA_VERSION = 92
 
 
 @dataclass(frozen=True, slots=True)
@@ -4428,6 +4428,75 @@ _MEMORY_RECONCILIATION_REVIEW_SCHEMA = SchemaMigration(
     ),
 )
 
+_MEMORY_RECONCILIATION_TRIAGE_SCHEMA = SchemaMigration(
+    version=92,
+    name="canonical_memory_reconciliation_triage",
+    statements=(
+        """
+        CREATE TABLE memory_reconciliation_triage_plans (
+            plan_id TEXT PRIMARY KEY CHECK (length(plan_id) BETWEEN 1 AND 128),
+            audit_id TEXT NOT NULL UNIQUE REFERENCES memory_reconciliation_audits(audit_id) ON DELETE CASCADE,
+            plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+            policy_version TEXT NOT NULL CHECK (length(policy_version) BETWEEN 1 AND 128),
+            group_count INTEGER NOT NULL CHECK (group_count >= 0),
+            memory_count INTEGER NOT NULL CHECK (memory_count >= 0),
+            plan_json TEXT NOT NULL CHECK (json_valid(plan_json) AND json_type(plan_json) = 'object'),
+            status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'applied')),
+            review_version INTEGER NOT NULL DEFAULT 0 CHECK (review_version >= 0),
+            created_at TEXT NOT NULL,
+            applied_at TEXT,
+            receipt_json TEXT CHECK (
+                receipt_json IS NULL OR (json_valid(receipt_json) AND json_type(receipt_json) = 'object')
+            )
+        )
+        """,
+        """
+        CREATE TABLE memory_reconciliation_triage_groups (
+            plan_id TEXT NOT NULL REFERENCES memory_reconciliation_triage_plans(plan_id) ON DELETE CASCADE,
+            group_id TEXT NOT NULL CHECK (length(group_id) BETWEEN 1 AND 128),
+            state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64),
+            classification TEXT NOT NULL CHECK (length(classification) BETWEEN 1 AND 128),
+            resolution TEXT NOT NULL CHECK (resolution IN ('adopt', 'consolidate', 'obsolete', 'needs_review')),
+            deterministic INTEGER NOT NULL CHECK (deterministic IN (0, 1)),
+            bulk_eligible INTEGER NOT NULL CHECK (bulk_eligible IN (0, 1)),
+            memory_count INTEGER NOT NULL CHECK (memory_count >= 1),
+            disposition TEXT NOT NULL DEFAULT 'pending' CHECK (
+                disposition IN ('pending', 'approve', 'reject', 'defer')
+            ),
+            action_json TEXT NOT NULL CHECK (json_valid(action_json) AND json_type(action_json) = 'object'),
+            recommendation_json TEXT NOT NULL DEFAULT '{}' CHECK (
+                json_valid(recommendation_json) AND json_type(recommendation_json) = 'object'
+            ),
+            operator_note TEXT NOT NULL DEFAULT '' CHECK (length(operator_note) <= 4096),
+            state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (plan_id, group_id)
+        )
+        """,
+        "CREATE INDEX memory_reconciliation_triage_group_state_idx "
+        "ON memory_reconciliation_triage_groups (plan_id, disposition, deterministic, resolution, group_id)",
+        """
+        CREATE TABLE memory_reconciliation_triage_recommendations (
+            recommendation_id TEXT PRIMARY KEY CHECK (length(recommendation_id) BETWEEN 1 AND 128),
+            plan_id TEXT NOT NULL REFERENCES memory_reconciliation_triage_plans(plan_id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+            backend TEXT NOT NULL CHECK (length(backend) BETWEEN 1 AND 64),
+            provider TEXT NOT NULL CHECK (length(provider) BETWEEN 1 AND 64),
+            model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 256),
+            prompt_version TEXT NOT NULL CHECK (length(prompt_version) BETWEEN 1 AND 64),
+            input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+            output_sha256 TEXT CHECK (output_sha256 IS NULL OR length(output_sha256) = 64),
+            group_count INTEGER NOT NULL CHECK (group_count >= 0),
+            error_code TEXT CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 128),
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """,
+        "CREATE INDEX memory_reconciliation_triage_recommendation_idx "
+        "ON memory_reconciliation_triage_recommendations (plan_id, created_at DESC)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4520,6 +4589,7 @@ _MIGRATIONS = (
     _ATOMIC_MEMORY_FACT_MUTATION_SCHEMA,
     _IMMUTABLE_EPISODE_HISTORY_SCHEMA,
     _MEMORY_RECONCILIATION_REVIEW_SCHEMA,
+    _MEMORY_RECONCILIATION_TRIAGE_SCHEMA,
 )
 
 

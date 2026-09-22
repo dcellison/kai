@@ -1413,6 +1413,66 @@ export interface WorkshopMemoryReconciliationPage {
   nextOffset: number | null;
 }
 
+export type WorkshopMemoryTriageResolution = "adopt" | "consolidate" | "obsolete" | "needs_review";
+
+export interface WorkshopMemoryTriageSummary {
+  appliedAt: string | null;
+  auditId: string;
+  deterministicGroups: number;
+  pendingDeterministicGroups: number;
+  dispositionCounts: Record<WorkshopMemoryReconciliationDisposition, number>;
+  exceptionGroups: number;
+  groupCount: number;
+  memoryCount: number;
+  planId: string;
+  recommendedGroups: number;
+  resolutionCounts: Record<WorkshopMemoryTriageResolution, number>;
+  reviewVersion: number;
+  status: "open" | "applied";
+}
+
+export interface WorkshopMemoryTriageGroup {
+  bulkEligible: boolean;
+  classification: string;
+  decision: {
+    action: Record<string, unknown>;
+    disposition: WorkshopMemoryReconciliationDisposition;
+    operatorNote: string;
+    recommendation: Record<string, unknown>;
+    stateVersion: number;
+  };
+  deterministic: boolean;
+  evidence: WorkshopMemoryReconciliationEvidence[];
+  groupId: string;
+  priorReviewEvidence: {
+    candidateId: string;
+    disposition: Exclude<WorkshopMemoryReconciliationDisposition, "pending">;
+    memoryIds: string[];
+    operatorNote: string;
+    stateVersion: number;
+  }[];
+  proposedAction: Record<string, unknown>;
+  rationale: string;
+  resolution: WorkshopMemoryTriageResolution;
+  stateSha256: string;
+}
+
+export interface WorkshopMemoryTriagePage {
+  groups: WorkshopMemoryTriageGroup[];
+  nextOffset: number | null;
+  triage: WorkshopMemoryTriageSummary;
+}
+
+export interface WorkshopMemoryTriagePreview {
+  groupCount: number;
+  groupIds: string[];
+  memoryCount: number;
+  planId: string;
+  previewSha256: string;
+  resolutionCounts: Record<"adopt" | "consolidate" | "obsolete", number>;
+  reviewVersion: number;
+}
+
 export interface TimelineMessage {
   artifacts: WorkshopArtifactSummary[];
   authorDisplayName: string;

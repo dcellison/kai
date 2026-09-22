@@ -2147,6 +2147,12 @@ def _build_memory_reasoner(
     raise RuntimeError(f"extraction reached _build_memory_reasoner for non-extraction backend: {effective_backend!r}")
 
 
+# Shared product-code entry point for policy-bounded memory reasoning outside
+# extraction itself.  Keep the private name above for compatibility with the
+# existing extraction tests and call sites.
+build_memory_reasoner = _build_memory_reasoner
+
+
 # ── Subprocess wiring ───────────────────────────────────────────────
 
 

@@ -134,6 +134,7 @@ from kai.workshop.memory_reconciliation_review import (
     ReconciliationAuditSummary,
     ReconciliationCandidatePage,
 )
+from kai.workshop.memory_reconciliation_triage import TriageGroupPage, TriageSummary
 from kai.workshop.model_catalogue import (
     ModelCatalogueEntry,
     ModelCatalogueEntryStatus,
@@ -833,15 +834,110 @@ class _ReconciliationQueries:
         return {"audit_id": audit_id, "receipt": {"receipt_id": "mrr_test"}, "replayed": False}
 
 
+class _TriageQueries:
+    def __init__(self, principal_id: PrincipalId) -> None:
+        self.principal_id = principal_id
+        self.calls: list[tuple[str, object]] = []
+
+    @staticmethod
+    def summary() -> TriageSummary:
+        return TriageSummary(
+            plan_id="mtp_test",
+            audit_id="mra_test",
+            status="open",
+            review_version=0,
+            memory_count=437,
+            group_count=3,
+            resolution_counts={"adopt": 312, "consolidate": 84, "obsolete": 29, "needs_review": 12},
+            disposition_counts={"pending": 3, "approve": 0, "reject": 0, "defer": 0},
+            deterministic_groups=2,
+            pending_deterministic_groups=2,
+            exception_groups=1,
+            recommended_groups=0,
+            applied_at=None,
+        )
+
+    async def latest(self, principal_id, **kwargs):
+        assert principal_id == self.principal_id
+        assert isinstance(kwargs["allowed_project_ids"], frozenset)
+        return self.summary()
+
+    async def groups(self, principal_id, plan_id, **kwargs):
+        assert principal_id == self.principal_id and plan_id == "mtp_test"
+        self.calls.append(("groups", kwargs))
+        return TriageGroupPage(
+            triage=self.summary(),
+            groups=(
+                {
+                    "group_id": "mtg_exception",
+                    "state_sha256": "b" * 64,
+                    "classification": "contradiction",
+                    "resolution": "needs_review",
+                    "rationale": "Conflicting evidence.",
+                    "deterministic": False,
+                    "bulk_eligible": False,
+                    "proposed_action": {"kind": "manual_edit_required"},
+                    "prior_review_evidence": [],
+                    "evidence": [],
+                    "decision": {
+                        "disposition": "pending",
+                        "action": {"kind": "manual_edit_required"},
+                        "recommendation": {},
+                        "operator_note": "",
+                        "state_version": 0,
+                    },
+                },
+            ),
+            next_offset=None,
+        )
+
+    async def preview_safe_approval(self, principal_id, plan_id, **kwargs):
+        assert principal_id == self.principal_id
+        return {
+            "plan_id": plan_id,
+            "preview_sha256": "c" * 64,
+            "group_ids": ["mtg_safe"],
+            "group_count": 1,
+            "memory_count": 425,
+            "resolution_counts": {"adopt": 312, "consolidate": 84, "obsolete": 29},
+            "review_version": kwargs["expected_review_version"],
+        }
+
+    async def approve_safe(self, principal_id, plan_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("approve_safe", kwargs))
+        return {"plan_id": plan_id, "review_version": 1, "replayed": False}
+
+    async def decide_group(self, principal_id, plan_id, group_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("decide_group", kwargs))
+        return {"plan_id": plan_id, "group_id": group_id, "disposition": kwargs["disposition"]}
+
+    async def recommend(self, principal_id, plan_id):
+        assert principal_id == self.principal_id
+        return {"plan_id": plan_id, "recommended": 1, "remaining": 0}
+
+    async def apply(self, principal_id, plan_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("apply", kwargs))
+        return {
+            "plan_id": plan_id,
+            "receipt": {"receipt_id": "mrr_triage"},
+            "summary": {"adopted": 312, "consolidated": 84, "obsolete": 29, "not_adopted": 12},
+        }
+
+
 @dataclass
 class _MemoryQueries:
     principal_id: PrincipalId
     mutations: list[tuple[str, tuple[str, ...], str | None, str | None]] = field(default_factory=list)
     content_mutations: list[tuple[str, object]] = field(default_factory=list)
     reconciliation: _ReconciliationQueries = field(init=False)
+    reconciliation_triage: _TriageQueries = field(init=False)
 
     def __post_init__(self) -> None:
         self.reconciliation = _ReconciliationQueries(self.principal_id)
+        self.reconciliation_triage = _TriageQueries(self.principal_id)
 
     def authority_for_principal(self, principal_id):
         if principal_id != self.principal_id:
@@ -1683,7 +1779,38 @@ async def test_memory_reconciliation_api_is_principal_authorized_typed_and_confi
     try:
         latest = await client.get("/v1/memory/reconciliation", headers=headers)
         assert latest.status == 200
-        assert (await latest.json())["audit"]["audit_id"] == "mra_test"
+        latest_payload = await latest.json()
+        assert latest_payload["audit"]["audit_id"] == "mra_test"
+        assert latest_payload["triage"]["memory_count"] == 437
+
+        triage_groups = await client.get(
+            "/v1/memory/reconciliation/triage/mtp_test/groups?exceptions_only=1",
+            headers=headers,
+        )
+        assert triage_groups.status == 200
+        assert (await triage_groups.json())["groups"][0]["group_id"] == "mtg_exception"
+
+        preview = await client.post(
+            "/v1/memory/reconciliation/triage/mtp_test/safe/preview",
+            headers=headers,
+            json={"group_ids": None, "expected_review_version": 0},
+        )
+        assert preview.status == 200
+        preview_payload = await preview.json()
+        assert preview_payload["memory_count"] == 425
+        safe_approval = await client.post(
+            "/v1/memory/reconciliation/triage/mtp_test/safe/approve",
+            headers=headers,
+            json={
+                "group_ids": preview_payload["group_ids"],
+                "expected_review_version": 0,
+                "preview_sha256": preview_payload["preview_sha256"],
+                "operator_note": "Reviewed grouped evidence.",
+                "confirmation": "approve deterministic memory groups",
+                "client_operation_id": "triage-safe-1",
+            },
+        )
+        assert safe_approval.status == 200
 
         page = await client.get(
             "/v1/memory/reconciliation/mra_test/candidates?disposition=pending&limit=25",
