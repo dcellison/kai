@@ -125,6 +125,7 @@ describe("Memory reconciliation triage", () => {
       resolutionCounts: { adopt: 312, consolidate: 84, obsolete: 29 },
       reviewVersion: 0,
     });
+    vi.mocked(recommendMemoryTriage).mockResolvedValue({ recommended: 1, remaining: 0 });
   });
 
   it("shows aggregate outcomes and only exceptional groups", async () => {
@@ -181,6 +182,9 @@ describe("Memory reconciliation triage", () => {
       ["safe-1", "safe-2"],
     );
     expect(screen.getByText(/No detected warning is proof of truth/i)).toBeVisible();
+    expect(screen.getByText("Proposed outcomes: 312 adopt, 84 consolidate, 29 obsolete.")).toBeVisible();
+    expect(screen.getByText("Stable non conflicting · Stable legacy fact 1 · 1 memory · Adopt")).toBeVisible();
+    expect(screen.getByText("Stable non conflicting · Stable legacy fact 2 · 1 memory · Adopt")).toBeVisible();
     expect(screen.getAllByText(/Stable non conflicting/)).toHaveLength(2);
 
     await user.click(screen.getByRole("button", { name: "Approve preview" }));
@@ -189,5 +193,23 @@ describe("Memory reconciliation triage", () => {
     await user.click(within(dialog).getByRole("button", { name: "Continue" }));
 
     await waitFor(() => expect(approveSafeMemoryTriage).toHaveBeenCalledTimes(1));
+  });
+
+  it("makes completed exception analysis explicit", async () => {
+    const analyzedSummary = { ...summary, recommendedGroups: 1 };
+    vi.mocked(loadMemoryTriage).mockResolvedValue(analyzedSummary);
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({
+      triage: analyzedSummary,
+      groups: [group],
+      nextOffset: null,
+    });
+
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    expect(await screen.findByRole("button", { name: "Exceptions analyzed (1)" })).toBeDisabled();
   });
 });

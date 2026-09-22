@@ -23,6 +23,11 @@ function formatLabel(value: string): string {
   return value.replaceAll("_", " ").replace(/^./, (character) => character.toUpperCase());
 }
 
+function summarizeEvidence(value: string): string {
+  const condensed = value.replace(/\s+/g, " ").trim();
+  return condensed.length > 88 ? `${condensed.slice(0, 87)}…` : condensed;
+}
+
 function requestError(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
@@ -343,8 +348,12 @@ export function MemoryReconciliation({
     setMutating(true);
     setError(null);
     try {
-      await recommendMemoryTriage(token, triage.planId);
-      setReport("The configured memory-quality model added advisory recommendations.");
+      const result = await recommendMemoryTriage(token, triage.planId);
+      setReport(
+        result.remaining === 0
+          ? `The configured memory-quality model analyzed all ${triage.exceptionGroups} exception groups. Recommendations are advisory only.`
+          : `The configured memory-quality model analyzed ${result.recommended} exception groups; ${result.remaining} remain. Recommendations are advisory only.`,
+      );
       setRefreshKey((value) => value + 1);
     } catch (caught) {
       handleFailure(caught, "Could not analyze uncertain memory groups.");
@@ -411,7 +420,9 @@ export function MemoryReconciliation({
                   {safePreview ? "Refresh safe preview" : "Preview safe groups"}
                 </button>
                 <button type="button" disabled={triage.exceptionGroups === 0 || triage.recommendedGroups >= triage.exceptionGroups || mutating || triage.status === "applied"} onClick={() => void analyzeExceptions()}>
-                  Analyze exceptions
+                  {triage.exceptionGroups > 0 && triage.recommendedGroups >= triage.exceptionGroups
+                    ? `Exceptions analyzed (${triage.recommendedGroups})`
+                    : "Analyze exceptions"}
                 </button>
                 <button type="button" disabled={triage.dispositionCounts.pending !== 0 || mutating || triage.status === "applied"} onClick={() => void apply()}>
                   {triage.status === "applied" ? "Applied" : "Apply plan"}
@@ -424,10 +435,13 @@ export function MemoryReconciliation({
                     {safePreview.memoryCount} memories in {safePreview.groupCount} evidence-bound groups.
                     No detected warning is proof of truth; approval is your explicit trust decision.
                   </p>
+                  <p>
+                    Proposed outcomes: {safePreview.resolutionCounts.adopt} adopt, {safePreview.resolutionCounts.consolidate} consolidate, {safePreview.resolutionCounts.obsolete} obsolete.
+                  </p>
                   {safePreviewGroups.map((previewGroup) => (
                     <details key={previewGroup.groupId}>
                       <summary>
-                        {formatLabel(previewGroup.classification)} · {previewGroup.evidence.length} memories · {formatLabel(previewGroup.resolution)}
+                        {formatLabel(previewGroup.classification)} · {summarizeEvidence(previewGroup.evidence[0]?.text ?? "Unavailable memory")} · {previewGroup.evidence.length} {previewGroup.evidence.length === 1 ? "memory" : "memories"} · {formatLabel(previewGroup.resolution)}
                       </summary>
                       <p>{previewGroup.rationale}</p>
                       {previewGroup.evidence.map((item) => (
