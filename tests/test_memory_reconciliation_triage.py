@@ -439,6 +439,7 @@ async def test_grouped_apply_emits_aggregate_summary_and_is_replay_safe(
         "failed": 0,
         "still_unresolved": 0,
         "not_adopted": 0,
+        "canonicalized_in_quarantine": 2,
     }
     assert replay["replayed"] is True
     applied_replay = await service.apply(

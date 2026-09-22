@@ -102,7 +102,7 @@ const safeGroups: WorkshopMemoryTriageGroup[] = ["safe-1", "safe-2"].map((groupI
   deterministic: true,
   evidence: [{ ...group.evidence[0], memoryId: `safe-memory-${index}`, text: `Stable legacy fact ${index + 1}` }],
   groupId,
-  proposedAction: { kind: "adopt_as_current" },
+  proposedAction: { kind: "adopt_as_current", migration_classification: "legacy_incomplete" },
   rationale: "No deterministic warning was found; explicit operator approval is still required.",
   resolution: "adopt",
 }));
@@ -181,18 +181,56 @@ describe("Memory reconciliation triage", () => {
       0,
       ["safe-1", "safe-2"],
     );
-    expect(screen.getByText(/No detected warning is proof of truth/i)).toBeVisible();
-    expect(screen.getByText("Proposed outcomes: 312 adopt, 84 consolidate, 29 obsolete.")).toBeVisible();
-    expect(screen.getByText("Stable non conflicting · Stable legacy fact 1 · 1 memory · Adopt")).toBeVisible();
-    expect(screen.getByText("Stable non conflicting · Stable legacy fact 2 · 1 memory · Adopt")).toBeVisible();
+    expect(screen.getByText(/does not declare them current truth/i)).toBeVisible();
+    expect(screen.getByText(/425 canonicalize in quarantine/i)).toBeVisible();
+    expect(screen.getByText(/remain excluded from current truth and agent retrieval/i)).toBeVisible();
+    expect(screen.getByText("Stable non conflicting · Stable legacy fact 1 · 1 memory · Canonicalize in quarantine")).toBeVisible();
+    expect(screen.getByText("Stable non conflicting · Stable legacy fact 2 · 1 memory · Canonicalize in quarantine")).toBeVisible();
     expect(screen.getAllByText(/Stable non conflicting/)).toHaveLength(2);
 
-    await user.click(screen.getByRole("button", { name: "Approve preview" }));
+    await user.click(screen.getByRole("button", { name: "Approve canonicalization" }));
     const dialog = screen.getByRole("dialog", { name: "Continue?" });
-    expect(dialog).toHaveTextContent("your approval is the trust decision");
+    expect(dialog).toHaveTextContent("excluded from current truth and agent retrieval");
     await user.click(within(dialog).getByRole("button", { name: "Continue" }));
 
     await waitFor(() => expect(approveSafeMemoryTriage).toHaveBeenCalledTimes(1));
+  });
+
+  it("reports quarantined canonicalization separately from lifecycle outcomes", async () => {
+    const user = userEvent.setup();
+    const readySummary = {
+      ...summary,
+      dispositionCounts: { approve: 3, defer: 0, pending: 0, reject: 0 },
+      pendingDeterministicGroups: 0,
+    };
+    vi.mocked(loadMemoryTriage).mockResolvedValue(readySummary);
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({
+      triage: readySummary,
+      groups: [],
+      nextOffset: null,
+    });
+    vi.mocked(applyMemoryTriage).mockResolvedValue({
+      adopted: 312,
+      canonicalized_in_quarantine: 425,
+      consolidated: 84,
+      deferred: 0,
+      failed: 0,
+      obsolete: 29,
+      rejected: 0,
+      still_unresolved: 0,
+    });
+
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Apply plan" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Continue?" })).getByRole("button", { name: "Continue" }));
+
+    expect(await screen.findByText(/425 canonicalized in quarantine/i)).toBeVisible();
+    expect(screen.getByText(/312 adopted by lifecycle outcome/i)).toBeVisible();
   });
 
   it("makes completed exception analysis explicit", async () => {

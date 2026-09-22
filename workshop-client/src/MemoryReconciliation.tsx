@@ -28,6 +28,16 @@ function summarizeEvidence(value: string): string {
   return condensed.length > 88 ? `${condensed.slice(0, 87)}…` : condensed;
 }
 
+function canonicalizesInQuarantine(action: Record<string, unknown>): boolean {
+  return action.migration_classification === "legacy_incomplete";
+}
+
+function resolutionLabel(group: WorkshopMemoryTriageGroup): string {
+  return canonicalizesInQuarantine(group.proposedAction)
+    ? "Canonicalize in quarantine"
+    : formatLabel(group.resolution);
+}
+
 function requestError(caught: unknown, fallback: string): string {
   return caught instanceof Error ? caught.message : fallback;
 }
@@ -324,17 +334,22 @@ export function MemoryReconciliation({
   const approveSafe = async (): Promise<void> => {
     if (!safePreview) return;
     const counts = safePreview.resolutionCounts;
-    const accepted = await confirm(
-      `Approve ${safePreview.memoryCount} deterministic memories after reviewing the complete preview: ` +
-      `${counts.adopt} adopt, ${counts.consolidate} consolidate, ${counts.obsolete} obsolete? ` +
-      "No detected warning is not proof that a fact is true; your approval is the trust decision.",
-    );
+    const quarantine = safePreviewGroups.length > 0
+      && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction));
+    const accepted = await confirm(quarantine
+      ? `Canonicalize ${safePreview.memoryCount} deterministic legacy memories into quarantine? ` +
+        "They will remain excluded from current truth and agent retrieval."
+      : `Approve ${safePreview.memoryCount} deterministic memories after reviewing the complete preview: ` +
+        `${counts.adopt} adopt, ${counts.consolidate} consolidate, ${counts.obsolete} obsolete? ` +
+        "No detected warning is not proof that a fact is true; your approval is the trust decision.");
     if (!accepted) return;
     setMutating(true);
     setError(null);
     try {
       await approveSafeMemoryTriage(token, safePreview);
-      setReport(`${safePreview.memoryCount} deterministic memories approved in ${safePreview.groupCount} evidence-bound groups.`);
+      setReport(quarantine
+        ? `${safePreview.memoryCount} deterministic legacy memories approved for canonical quarantine in ${safePreview.groupCount} evidence-bound groups.`
+        : `${safePreview.memoryCount} deterministic memories approved in ${safePreview.groupCount} evidence-bound groups.`);
       setRefreshKey((value) => value + 1);
     } catch (caught) {
       handleFailure(caught, "Could not approve deterministic memory groups.");
@@ -373,7 +388,8 @@ export function MemoryReconciliation({
     try {
       const summary = await applyMemoryTriage(token, triage.planId, triage.reviewVersion);
       setReport(
-        `${summary.adopted ?? 0} adopted, ${summary.consolidated ?? 0} consolidated, ` +
+        `${summary.canonicalized_in_quarantine ?? 0} canonicalized in quarantine, ` +
+        `${summary.adopted ?? 0} adopted by lifecycle outcome, ${summary.consolidated ?? 0} consolidated, ` +
         `${summary.obsolete ?? 0} obsolete, ${summary.deferred ?? 0} deferred, ` +
         `${summary.rejected ?? 0} rejected, ${summary.failed ?? 0} failed, ` +
         `${summary.still_unresolved ?? 0} still unresolved.`,
@@ -405,7 +421,7 @@ export function MemoryReconciliation({
           ) : (
             <>
               <section className="memory-reconciliation-summary" aria-label="Triage summary">
-                <div><strong>{triage.resolutionCounts.adopt}</strong><span>Adopt</span></div>
+                <div><strong>{triage.resolutionCounts.adopt}</strong><span>Retain</span></div>
                 <div><strong>{triage.resolutionCounts.consolidate}</strong><span>Consolidate</span></div>
                 <div><strong>{triage.resolutionCounts.obsolete}</strong><span>Obsolete</span></div>
                 <div><strong>{triage.exceptionGroups}</strong><span>Need review</span></div>
@@ -433,15 +449,19 @@ export function MemoryReconciliation({
                   <p className="memory-section-label">Complete deterministic preview</p>
                   <p>
                     {safePreview.memoryCount} memories in {safePreview.groupCount} evidence-bound groups.
-                    No detected warning is proof of truth; approval is your explicit trust decision.
+                    {safePreviewGroups.length > 0 && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction))
+                      ? " Canonicalization preserves these records for future review; it does not declare them current truth."
+                      : " No detected warning is proof of truth; approval is your explicit trust decision."}
                   </p>
                   <p>
-                    Proposed outcomes: {safePreview.resolutionCounts.adopt} adopt, {safePreview.resolutionCounts.consolidate} consolidate, {safePreview.resolutionCounts.obsolete} obsolete.
+                    {safePreviewGroups.length > 0 && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction))
+                      ? `Proposed outcome: ${safePreview.memoryCount} canonicalize in quarantine. These records remain excluded from current truth and agent retrieval.`
+                      : `Proposed outcomes: ${safePreview.resolutionCounts.adopt} adopt, ${safePreview.resolutionCounts.consolidate} consolidate, ${safePreview.resolutionCounts.obsolete} obsolete.`}
                   </p>
                   {safePreviewGroups.map((previewGroup) => (
                     <details key={previewGroup.groupId}>
                       <summary>
-                        {formatLabel(previewGroup.classification)} · {summarizeEvidence(previewGroup.evidence[0]?.text ?? "Unavailable memory")} · {previewGroup.evidence.length} {previewGroup.evidence.length === 1 ? "memory" : "memories"} · {formatLabel(previewGroup.resolution)}
+                        {formatLabel(previewGroup.classification)} · {summarizeEvidence(previewGroup.evidence[0]?.text ?? "Unavailable memory")} · {previewGroup.evidence.length} {previewGroup.evidence.length === 1 ? "memory" : "memories"} · {resolutionLabel(previewGroup)}
                       </summary>
                       <p>{previewGroup.rationale}</p>
                       {previewGroup.evidence.map((item) => (
@@ -453,7 +473,9 @@ export function MemoryReconciliation({
                     </details>
                   ))}
                   <button type="button" disabled={mutating} onClick={() => void approveSafe()}>
-                    Approve preview
+                    {safePreviewGroups.length > 0 && safePreviewGroups.every((group) => canonicalizesInQuarantine(group.proposedAction))
+                      ? "Approve canonicalization"
+                      : "Approve preview"}
                   </button>
                 </section>
               )}
