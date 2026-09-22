@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -199,7 +200,7 @@ def _operator_action_is_authorized(
 
 def _approved_outcome_summary(
     groups: dict[str, dict[str, Any]],
-    decision_rows: list[Any],
+    decision_rows: Iterable[Any],
 ) -> dict[str, int]:
     """Summarize the operator's saved actions, not the plan's earlier proposals."""
     counts = {
