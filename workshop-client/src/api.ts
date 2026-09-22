@@ -4408,7 +4408,10 @@ export async function saveMemoryTriageDecision(
   if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not save memory triage decision."));
 }
 
-export async function recommendMemoryTriage(token: string, planId: string): Promise<void> {
+export async function recommendMemoryTriage(
+  token: string,
+  planId: string,
+): Promise<{ recommended: number; remaining: number }> {
   const response = await authorizedFetch(
     { channelId: "", token },
     `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/recommend`,
@@ -4416,6 +4419,16 @@ export async function recommendMemoryTriage(token: string, planId: string): Prom
   );
   const payload = await responsePayload(response);
   if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not analyze uncertain memory groups."));
+  if (
+    !isRecord(payload)
+    || typeof payload.recommended !== "number"
+    || !Number.isFinite(payload.recommended)
+    || typeof payload.remaining !== "number"
+    || !Number.isFinite(payload.remaining)
+  ) {
+    throw new Error("Kai returned an unsupported memory triage analysis result.");
+  }
+  return { recommended: payload.recommended, remaining: payload.remaining };
 }
 
 export async function applyMemoryTriage(
