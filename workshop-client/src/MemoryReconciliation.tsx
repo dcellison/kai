@@ -719,8 +719,18 @@ export function MemoryReconciliation({
                 <div><strong>{triage.resolutionCounts.adopt}</strong><span>Retain</span></div>
                 <div><strong>{triage.resolutionCounts.consolidate}</strong><span>Consolidate</span></div>
                 <div><strong>{triage.resolutionCounts.obsolete}</strong><span>Obsolete</span></div>
-                <div><strong>{triage.exceptionGroups}</strong><span>Need review</span></div>
+                {/* Counts exception groups still awaiting a decision, so the
+                    card reaches zero as the owner works through them. The
+                    total the plan sorted into review stays in
+                    `exceptionGroups`; showing it here would read as work left
+                    even after every group is decided or the plan is applied. */}
+                <div><strong>{Math.max(triage.dispositionCounts.pending - triage.pendingDeterministicGroups, 0)}</strong><span>Need review</span></div>
               </section>
+              {triage.status === "applied" && (
+                <p className="memory-review-explanation" role="status">
+                  Applied: every group was decided and the plan has changed memory. This view is a record of it.
+                </p>
+              )}
               <p className="memory-review-explanation">
                 The plan partitions {triage.memoryCount} legacy memories into {triage.groupCount} non-overlapping groups.
                 Only uncertain or conflicting groups appear below.
