@@ -1,13 +1,35 @@
-"""Read-only current-truth projection for canonical semantic memory."""
+"""
+Read-only current-truth projection for canonical semantic memory.
+
+Provides functionality to:
+1. Admit only exact, active, successfully projected canonical fact
+   revisions and canonical episodes into protected-install retrieval.
+2. Temporarily admit unreconciled legacy rows on read-only surfaces
+   (semantic search and full listings) until the owner's legacy
+   reconciliation has been applied, so recall keeps working while the
+   reconciliation plan is still open.
+3. Report privacy-safe admission and exclusion counts; no function in
+   this module ever returns memory content in diagnostics.
+
+Legacy admission is a bounded stopgap, not a second authority. A legacy
+row (one without canonical lifecycle keys) is admitted only when the
+caller opts in, the owner has no applied reconciliation audit, the row
+has a user-visible source, no canonical fact revision or episode already
+cites it as legacy evidence, the operator has not rejected it in the
+owner's open reconciliation, and its own validity window has not ended.
+Exact-id reads stay strict, because they gate mutations; see
+`project_current_truth`.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
+import threading
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,6 +58,57 @@ _EPISODE_TABLES = {
 }
 _ADMITTED_MIGRATION_CLASSES = {"canonical", "legacy_complete"}
 
+# Temporal role stamped on an admitted legacy row. The recall renderer
+# turns it into an explicit `current_truth: false` marker so an agent can
+# tell an unreconciled legacy memory apart from a reconciled current fact.
+LEGACY_UNRECONCILED_ROLE = "legacy_unreconciled"
+
+# Reconciliation tables consulted for legacy admission. When the audit
+# table is missing the install predates reconciliation entirely, every
+# stored memory is legacy, and nothing can have been rejected yet.
+_RECONCILIATION_AUDIT_TABLE = "memory_reconciliation_audits"
+_RECONCILIATION_DECISION_TABLE = "memory_reconciliation_decisions"
+_TRIAGE_PLAN_TABLE = "memory_reconciliation_triage_plans"
+_TRIAGE_GROUP_TABLE = "memory_reconciliation_triage_groups"
+
+# Rejected legacy memory ids per owner, keyed by every open audit and
+# plan identity plus its review version. Each operator decision bumps the
+# review version of the audit or plan it touches, so a changed key is the
+# only invalidation this cache needs. Reads happen on worker threads
+# (memory searches run through asyncio.to_thread), hence the lock. The
+# bound keeps a long-lived process from accumulating stale owner keys.
+_REJECTED_CACHE_LIMIT = 64
+_rejected_cache: dict[tuple[object, ...], frozenset[str]] = {}
+_rejected_cache_lock = threading.Lock()
+
+
+class _MalformedReconciliationState(ValueError):
+    """Reconciliation JSON could not be read, so rejections are unknown."""
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyAdmission:
+    """
+    Per-call legacy admission authority for one owner.
+
+    Attributes:
+        active: True while the owner has no applied reconciliation audit
+            and the reconciliation state was readable.
+        absorbed: Legacy memory ids already cited as `legacy` evidence by
+            a canonical fact revision or episode of this owner, in any
+            lifecycle state. Admitting them would duplicate or resurrect
+            memory that reconciliation already handled.
+        rejected: Legacy memory ids the operator rejected in the owner's
+            open audit or open triage plan.
+    """
+
+    active: bool
+    absorbed: frozenset[str]
+    rejected: frozenset[str]
+
+
+_INACTIVE_LEGACY_ADMISSION = _LegacyAdmission(False, frozenset(), frozenset())
+
 
 def _is_admitted(migration_classification: str, admission_authority: str) -> bool:
     return (
@@ -49,6 +122,10 @@ class CurrentTruthProjection:
 
     rows: tuple[MemoryResult, ...]
     excluded: dict[str, int]
+    # Admission counts by reason. Only legacy admission is counted here;
+    # canonical admissions are implied by `rows`. Kept separate from
+    # `excluded` so exclusion accounting means the same thing it always has.
+    admitted: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +468,323 @@ def _order_episode_chains(rows: list[MemoryResult]) -> list[MemoryResult]:
     return ordered
 
 
+# ── Legacy admission authority ───────────────────────────────────────
+
+
+def _legacy_admission(
+    connection: sqlite3.Connection,
+    tables: set[str],
+    *,
+    database: str,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> _LegacyAdmission:
+    """
+    Resolve whether, and which, legacy rows this owner may see right now.
+
+    Admission is active until any reconciliation audit for the owner is
+    applied. Both Workshop apply paths (triage apply and the item-by-item
+    review) mark the audit row applied, so the audit row is the one signal
+    they share. The file-based CLI apply writes no audit row, so an owner
+    reconciled only through the CLI keeps legacy admission active; that
+    limitation is accepted because the installed plan is applied through
+    Workshop triage.
+
+    The switch is permanent per owner: a later audit does not re-enable
+    admission, because after the first applied reconciliation the
+    fail-closed current-truth semantics are the intended behavior.
+
+    Any failure to read legacy authority (unreadable reconciliation JSON,
+    or a SQLite error such as a missing evidence column) makes admission
+    inactive for this call rather than risk re-admitting rows that were
+    absorbed or rejected. The failure is contained here on purpose:
+    legacy admission is optional, and canonical admission must behave
+    exactly as it does without it.
+    """
+    try:
+        return _read_legacy_admission(
+            connection,
+            tables,
+            database=database,
+            principal_id=principal_id,
+            runtime_profile_id=runtime_profile_id,
+        )
+    except (sqlite3.Error, _MalformedReconciliationState):
+        return _INACTIVE_LEGACY_ADMISSION
+
+
+def _read_legacy_admission(
+    connection: sqlite3.Connection,
+    tables: set[str],
+    *,
+    database: str,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> _LegacyAdmission:
+    """Read legacy admission authority; errors are handled by the caller."""
+    if _RECONCILIATION_AUDIT_TABLE in tables:
+        applied = connection.execute(
+            f"SELECT 1 FROM {_RECONCILIATION_AUDIT_TABLE} "
+            "WHERE principal_id = ? AND runtime_profile_id = ? AND status = 'applied' LIMIT 1",
+            (principal_id, runtime_profile_id),
+        ).fetchone()
+        if applied is not None:
+            return _INACTIVE_LEGACY_ADMISSION
+    absorbed = _absorbed_legacy_ids(
+        connection,
+        tables,
+        principal_id=principal_id,
+        runtime_profile_id=runtime_profile_id,
+    )
+    rejected = _rejected_legacy_ids(
+        connection,
+        tables,
+        database=database,
+        principal_id=principal_id,
+        runtime_profile_id=runtime_profile_id,
+    )
+    return _LegacyAdmission(True, absorbed, rejected)
+
+
+def _absorbed_legacy_ids(
+    connection: sqlite3.Connection,
+    tables: set[str],
+    *,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> frozenset[str]:
+    """
+    Return legacy memory ids already cited by this owner's canonical memory.
+
+    Reconciliation adopts a fact in place, but records episodes as new
+    vector rows and leaves consolidation siblings and retired duplicates
+    as untouched legacy rows. Each of those canonical results cites its
+    source rows as `{"kind": "legacy", "reference_id": <memory id>}`
+    evidence. Any cited row, regardless of the citing revision's lifecycle
+    state, is already represented (or deliberately retired) canonically
+    and must not also surface as legacy.
+    """
+    absorbed = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT json_extract(evidence.value, '$.reference_id') "
+            "FROM memory_fact_revisions r "
+            "JOIN memory_fact_claims c ON c.claim_id = r.claim_id, "
+            "json_each(r.evidence_json) AS evidence "
+            "WHERE c.owner_principal_id = ? AND c.runtime_profile_id = ? "
+            "AND json_extract(evidence.value, '$.kind') = 'legacy'",
+            (principal_id, runtime_profile_id),
+        ).fetchall()
+        if row[0] is not None
+    }
+    if "memory_episodes" in tables:
+        absorbed.update(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT json_extract(evidence.value, '$.reference_id') "
+                "FROM memory_episodes e, json_each(e.evidence_json) AS evidence "
+                "WHERE e.owner_principal_id = ? AND e.runtime_profile_id = ? "
+                "AND json_extract(evidence.value, '$.kind') = 'legacy'",
+                (principal_id, runtime_profile_id),
+            ).fetchall()
+            if row[0] is not None
+        )
+    return frozenset(absorbed)
+
+
+def _rejected_legacy_ids(
+    connection: sqlite3.Connection,
+    tables: set[str],
+    *,
+    database: str,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> frozenset[str]:
+    """
+    Return legacy memory ids rejected in the owner's open reconciliation.
+
+    A rejection declines the proposed lifecycle action, which does not by
+    itself prove the memory false. Admission still treats it as "do not
+    show", the conservative reading of an explicit operator decision.
+
+    Rejections are recorded per audit candidate or per triage group, while
+    the member memory ids live in the immutable audit and plan JSON. The
+    JSON is parsed only when at least one rejection exists, and the result
+    is cached by the review versions that every decision increments.
+
+    Raises:
+        _MalformedReconciliationState: A rejection references a candidate
+            or group whose member ids cannot be read.
+    """
+    if _RECONCILIATION_AUDIT_TABLE not in tables:
+        return frozenset()
+    audits = tuple(
+        (str(row[0]), int(row[1]))
+        for row in connection.execute(
+            f"SELECT audit_id, review_version FROM {_RECONCILIATION_AUDIT_TABLE} "
+            "WHERE principal_id = ? AND runtime_profile_id = ? AND status = 'open' ORDER BY audit_id",
+            (principal_id, runtime_profile_id),
+        ).fetchall()
+    )
+    if not audits:
+        return frozenset()
+    plans: tuple[tuple[str, str, int], ...] = ()
+    if _TRIAGE_PLAN_TABLE in tables:
+        plans = tuple(
+            (str(row[0]), str(row[1]), int(row[2]))
+            for row in connection.execute(
+                f"SELECT p.plan_id, p.audit_id, p.review_version FROM {_TRIAGE_PLAN_TABLE} p "
+                f"JOIN {_RECONCILIATION_AUDIT_TABLE} a ON a.audit_id = p.audit_id "
+                "WHERE a.principal_id = ? AND a.runtime_profile_id = ? AND a.status = 'open' "
+                "AND p.status = 'open' ORDER BY p.plan_id",
+                (principal_id, runtime_profile_id),
+            ).fetchall()
+        )
+    key: tuple[object, ...] = (database, principal_id, runtime_profile_id, audits, plans)
+    with _rejected_cache_lock:
+        cached = _rejected_cache.get(key)
+    if cached is not None:
+        return cached
+
+    rejected: set[str] = set()
+    if _RECONCILIATION_DECISION_TABLE in tables:
+        for audit_id, _review_version in audits:
+            candidates = {
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT candidate_id FROM {_RECONCILIATION_DECISION_TABLE} "
+                    "WHERE audit_id = ? AND disposition = 'reject'",
+                    (audit_id,),
+                ).fetchall()
+            }
+            if candidates:
+                document = connection.execute(
+                    f"SELECT audit_json FROM {_RECONCILIATION_AUDIT_TABLE} WHERE audit_id = ?",
+                    (audit_id,),
+                ).fetchone()
+                rejected.update(
+                    _member_memory_ids(document, collection="candidates", id_key="candidate_id", wanted=candidates)
+                )
+    if _TRIAGE_GROUP_TABLE in tables:
+        for plan_id, _audit_id, _review_version in plans:
+            groups = {
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT group_id FROM {_TRIAGE_GROUP_TABLE} WHERE plan_id = ? AND disposition = 'reject'",
+                    (plan_id,),
+                ).fetchall()
+            }
+            if groups:
+                document = connection.execute(
+                    f"SELECT plan_json FROM {_TRIAGE_PLAN_TABLE} WHERE plan_id = ?",
+                    (plan_id,),
+                ).fetchone()
+                rejected.update(_member_memory_ids(document, collection="groups", id_key="group_id", wanted=groups))
+
+    result = frozenset(rejected)
+    with _rejected_cache_lock:
+        if len(_rejected_cache) >= _REJECTED_CACHE_LIMIT:
+            _rejected_cache.clear()
+        _rejected_cache[key] = result
+    return result
+
+
+def _member_memory_ids(
+    document: sqlite3.Row | tuple[object, ...] | None,
+    *,
+    collection: str,
+    id_key: str,
+    wanted: set[str],
+) -> set[str]:
+    """
+    Collect evidence memory ids for the wanted candidates or groups.
+
+    Args:
+        document: The one-column row holding the audit or plan JSON.
+        collection: Top-level list key (`candidates` or `groups`).
+        id_key: Identity key inside each entry (`candidate_id` or `group_id`).
+        wanted: Identities whose members are required.
+
+    Raises:
+        _MalformedReconciliationState: The JSON is unreadable, or a wanted
+            identity or one of its member ids is missing.
+    """
+    try:
+        parsed = json.loads(str(document[0])) if document is not None else None
+    except (TypeError, ValueError) as exc:
+        raise _MalformedReconciliationState("reconciliation document is unreadable") from exc
+    entries = parsed.get(collection) if isinstance(parsed, dict) else None
+    if not isinstance(entries, list):
+        raise _MalformedReconciliationState("reconciliation document has no member list")
+    found: set[str] = set()
+    members: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get(id_key) not in wanted:
+            continue
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise _MalformedReconciliationState("rejected entry has no evidence")
+        for item in evidence:
+            memory_id = item.get("memory_id") if isinstance(item, dict) else None
+            if not isinstance(memory_id, str) or not memory_id:
+                raise _MalformedReconciliationState("rejected entry has an unreadable member")
+            members.add(memory_id)
+        found.add(str(entry[id_key]))
+    if found != wanted:
+        raise _MalformedReconciliationState("rejected entry is missing from its document")
+    return members
+
+
+def _legacy_validity_ended(metadata: dict[str, Any], now: datetime) -> bool:
+    """
+    Return True only when a legacy row states a validity end already passed.
+
+    Legacy metadata is not canonical, so only an explicit, timezone-aware
+    `valid_until` counts. A naive or unparseable value excludes nothing:
+    the absence of a trustworthy expiry is not evidence of expiry.
+    """
+    value = metadata.get("valid_until")
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return False
+    return parsed.astimezone(UTC) <= now
+
+
+def _legacy_decision(
+    row: MemoryResult,
+    authority: _LegacyAdmission,
+    *,
+    user_visible_sources: frozenset[str],
+    now: datetime,
+) -> tuple[MemoryResult | None, str]:
+    """
+    Decide one legacy row against the owner's admission authority.
+
+    Returns:
+        The labeled row and `legacy_admitted`, or None and the exclusion
+        reason. Rules are checked in a fixed order so each excluded row is
+        counted under exactly one reason.
+    """
+    if not authority.active:
+        return None, "legacy_unclassified"
+    if row.metadata.get("source") not in user_visible_sources:
+        return None, "legacy_invalid_source"
+    if row.id in authority.absorbed:
+        return None, "legacy_absorbed"
+    if row.id in authority.rejected:
+        return None, "legacy_rejected"
+    if _legacy_validity_ended(row.metadata, now):
+        return None, "legacy_expired"
+    labeled = dict(row.metadata)
+    labeled[CANONICAL_TEMPORAL_ROLE_KEY] = LEGACY_UNRECONCILED_ROLE
+    return replace(row, metadata=labeled), "legacy_admitted"
+
+
 def project_current_truth(
     rows: Iterable[MemoryResult],
     *,
@@ -398,15 +792,40 @@ def project_current_truth(
     principal_id: str,
     runtime_profile_id: str,
     now: datetime | None = None,
+    admit_legacy: bool = False,
 ) -> CurrentTruthProjection:
-    """Admit only exact, active, successfully projected canonical revisions.
+    """
+    Admit exact, active, successfully projected canonical revisions.
 
-    Any unavailable or malformed canonical authority fails closed. The caller
-    may expose the returned reason counts, but this function never includes
-    memory content in diagnostics.
+    Any unavailable or malformed canonical authority fails closed. The
+    caller may expose the returned reason counts, but this function never
+    includes memory content in diagnostics.
+
+    Rows without canonical lifecycle keys are legacy. By default they are
+    excluded as `legacy_unclassified`. Read-only surfaces (semantic search
+    and full listings) pass `admit_legacy=True` to admit them temporarily
+    under the owner's legacy admission authority, labeled with the
+    `legacy_unreconciled` temporal role. Exact-id reads must keep the
+    default: they are the precondition for memory mutations, and admitting
+    a legacy row there would let edits and extraction updates adopt legacy
+    memory outside reconciliation.
+
+    Legacy admission ends for an owner once any reconciliation audit for
+    that owner is applied. The file-based CLI apply records no audit row,
+    so an owner reconciled only through the CLI keeps legacy admission
+    active.
+
+    Args:
+        rows: Candidate rows already filtered to the owning principal.
+        db_path: Canonical Workshop database, opened read-only.
+        principal_id: Owning principal of the candidate rows.
+        runtime_profile_id: Owning runtime profile of the candidate rows.
+        now: Evaluation time for validity windows; defaults to now.
+        admit_legacy: Opt in to temporary legacy admission.
     """
     candidates = tuple(rows)
     excluded: Counter[str] = Counter()
+    admitted_counts: Counter[str] = Counter()
     admitted: list[MemoryResult] = []
     effective_now = (now or datetime.now(UTC)).astimezone(UTC)
     try:
@@ -416,6 +835,22 @@ def project_current_truth(
             if not _FACT_TABLES.issubset(available_tables):
                 return CurrentTruthProjection((), {"authority_unavailable": len(candidates)})
             connection.execute("BEGIN")
+            # Legacy authority is resolved once per call, inside the same
+            # read transaction as the canonical lookups, so every row in the
+            # call is judged against one consistent snapshot.
+            legacy_authority = _INACTIVE_LEGACY_ADMISSION
+            user_visible_sources: frozenset[str] = frozenset()
+            if admit_legacy:
+                from kai.memory import USER_VISIBLE_SOURCES
+
+                user_visible_sources = USER_VISIBLE_SOURCES
+                legacy_authority = _legacy_admission(
+                    connection,
+                    available_tables,
+                    database=str(db_path.resolve()),
+                    principal_id=principal_id,
+                    runtime_profile_id=runtime_profile_id,
+                )
             for row in candidates:
                 episode_id = row.metadata.get(CANONICAL_EPISODE_ID_KEY)
                 if episode_id is not None:
@@ -448,7 +883,17 @@ def project_current_truth(
                 revision_id = row.metadata.get(CANONICAL_REVISION_ID_KEY)
                 lifecycle_state = row.metadata.get(CANONICAL_LIFECYCLE_STATE_KEY)
                 if claim_id is None and revision_id is None and lifecycle_state is None:
-                    excluded["legacy_unclassified"] += 1
+                    legacy_row, reason = _legacy_decision(
+                        row,
+                        legacy_authority,
+                        user_visible_sources=user_visible_sources,
+                        now=effective_now,
+                    )
+                    if legacy_row is None:
+                        excluded[reason] += 1
+                    else:
+                        admitted_counts[reason] += 1
+                        admitted.append(legacy_row)
                     continue
                 if (
                     not isinstance(claim_id, str)
@@ -486,7 +931,11 @@ def project_current_truth(
             connection.close()
     except (OSError, sqlite3.Error):
         return CurrentTruthProjection((), {"authority_unavailable": len(candidates)})
-    return CurrentTruthProjection(tuple(_order_episode_chains(admitted)), dict(sorted(excluded.items())))
+    return CurrentTruthProjection(
+        tuple(_order_episode_chains(admitted)),
+        dict(sorted(excluded.items())),
+        dict(sorted(admitted_counts.items())),
+    )
 
 
 def current_truth_revision(db_path: Path, *, principal_id: str, runtime_profile_id: str) -> str:
