@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -205,6 +206,91 @@ def _operator_action_is_authorized(
     if action_kind == "record_episode_chain":
         return kinds == {"episode"}
     return False
+
+
+# Consolidations always come from at least two facts; the upper bound keeps
+# one decision reviewable and one apply step bounded.
+MIN_CONSOLIDATION_FACTS = 2
+MAX_CONSOLIDATION_FACTS = 50
+_GROUP_ID_PATTERN = re.compile(r"mtg_[0-9a-f]{32}")
+
+
+def related_group_ids(
+    group: dict[str, Any], recommendation: dict[str, Any], plan_groups: dict[str, dict[str, Any]]
+) -> list[str]:
+    """
+    Return the other fact groups a recommendation says belong with this one.
+
+    Current recommendations list them in `related_group_ids`. Earlier ones
+    named them only in their rationale, so full group ids found there are
+    read too. Either way, only ids of other groups in this plan whose
+    evidence is all facts are returned, so a recommendation can never lead
+    to a consolidation of something that is not there or not a fact.
+    """
+    structured = recommendation.get("related_group_ids")
+    candidates = (
+        [str(item) for item in structured if isinstance(item, str)]
+        if isinstance(structured, list)
+        else _GROUP_ID_PATTERN.findall(str(recommendation.get("rationale", "")))
+    )
+    related: list[str] = []
+    for group_id in candidates:
+        other = plan_groups.get(group_id)
+        if (
+            other is None
+            or group_id == group["group_id"]
+            or group_id in related
+            or any(item.get("kind") != "fact" for item in other["evidence"])
+        ):
+            continue
+        related.append(group_id)
+    return related
+
+
+def _consolidation_action(canonical: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Build the corrected adoption a consolidation applies as.
+
+    One canonical fact, adopted from the chosen source row with the
+    operator's final wording and scope, citing every selected row as
+    evidence. The other rows are then absorbed: kept as evidence, never
+    recalled.
+    """
+    if not isinstance(canonical, dict):
+        raise MemoryReconciliationReviewValidationError("Invalid consolidated fact")
+    content = canonical.get("content")
+    source = canonical.get("source_memory_id")
+    scope_kind = canonical.get("scope_kind")
+    scope_key = canonical.get("scope_key") or ""
+    if not isinstance(content, str) or not content.strip():
+        raise MemoryReconciliationReviewValidationError("Enter the consolidated fact's wording")
+    if source not in {str(item["memory_id"]) for item in rows}:
+        raise MemoryReconciliationReviewValidationError("The wording source must be one of the selected facts")
+    if scope_kind not in {"global", "project"} or not isinstance(scope_key, str):
+        raise MemoryReconciliationReviewValidationError("Choose the consolidated fact's scope")
+    return {
+        "kind": "adopt_corrected",
+        "source_memory_id": source,
+        "replacement": {"content": content.strip(), "scope_kind": scope_kind, "scope_key": scope_key},
+    }
+
+
+def _public_consolidation(item: dict[str, Any]) -> dict[str, Any]:
+    """Client-safe view of a staged consolidation, with the preview counts."""
+    replacement = item["canonical"]["replacement"]
+    return {
+        "consolidation_id": item["consolidation_id"],
+        "revision": item["revision"],
+        "group_ids": list(item["group_ids"]),
+        "content": replacement["content"],
+        "scope_kind": replacement["scope_kind"],
+        "scope_key": replacement.get("scope_key") or None,
+        "source_memory_id": item["canonical"]["source_memory_id"],
+        "operator_note": item["operator_note"],
+        "updated_at": item["updated_at"],
+        "selected_facts": len(item["group_ids"]),
+        "duplicates_excluded": len(item["group_ids"]) - 1,
+    }
 
 
 def _approved_outcome_summary(
@@ -418,8 +504,10 @@ class WorkshopMemoryReconciliationTriageService:
             ) as cursor:
                 existing = await cursor.fetchone()
             if existing is not None and str(existing[2]) != str(plan["policy_version"]):
-                if str(existing[3]) != "open" or await memory_reconciliation.apply_in_progress(
-                    self._store.connection, str(existing[0])
+                if (
+                    str(existing[3]) != "open"
+                    or await memory_reconciliation.apply_in_progress(self._store.connection, str(existing[0]))
+                    or await self._has_consolidations(str(existing[0]))
                 ):
                     # An applied plan is history: show it exactly as it was
                     # applied, under the policy that produced it. A plan
@@ -730,6 +818,13 @@ class WorkshopMemoryReconciliationTriageService:
                 }
                 for item in await cursor.fetchall()
             }
+        async with self._store.connection.execute(
+            "SELECT group_id, consolidation_id FROM memory_reconciliation_triage_consolidation_members "
+            "WHERE plan_id = ?",
+            (plan_id,),
+        ) as cursor:
+            membership = {str(item[0]): str(item[1]) for item in await cursor.fetchall()}
+        plan_groups = {str(item["group_id"]): item for item in plan["groups"]}
         visible = []
         for group in plan["groups"]:
             state = states.get(str(group["group_id"]))
@@ -758,6 +853,10 @@ class WorkshopMemoryReconciliationTriageService:
                     # Names of the schema fields an incomplete episode lacks;
                     # empty for every other group.
                     "missing_fields": list(group.get("missing_fields", [])),
+                    # Other fact groups the recommendation links to this one,
+                    # checked against the plan, for "Consolidate with...".
+                    "related_group_ids": related_group_ids(group, state["recommendation"], plan_groups),
+                    "consolidation_id": membership.get(str(group["group_id"])),
                     "evidence": [self._client_evidence(item) for item in group["evidence"]],
                     "decision": state,
                 }
@@ -927,6 +1026,14 @@ class WorkshopMemoryReconciliationTriageService:
         group = next((item for item in plan["groups"] if item["group_id"] == group_id), None)
         if group is None:
             raise MemoryReconciliationReviewNotFound("Memory triage group not found")
+        async with self._store.connection.execute(
+            "SELECT 1 FROM memory_reconciliation_triage_consolidation_members WHERE plan_id = ? AND group_id = ?",
+            (plan_id, group_id),
+        ) as cursor:
+            if await cursor.fetchone() is not None:
+                raise MemoryReconciliationReviewConflict(
+                    "This fact is part of a consolidation; revise or cancel the consolidation instead"
+                )
         if disposition == "approve":
             if not _operator_action_is_authorized(group, action, audit_boundary=plan["generated_at"]):
                 raise MemoryReconciliationReviewValidationError(
@@ -999,6 +1106,411 @@ class WorkshopMemoryReconciliationTriageService:
             await connection.rollback()
             raise
         return response
+
+    async def _consolidations(self, plan_id: str) -> list[dict[str, Any]]:
+        """Return the plan's staged consolidations with their members in selection order."""
+        async with self._store.connection.execute(
+            "SELECT consolidation_id, revision, canonical_json, selection_sha256, operator_note, updated_at "
+            "FROM memory_reconciliation_triage_consolidations WHERE plan_id = ? ORDER BY created_at, consolidation_id",
+            (plan_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        async with self._store.connection.execute(
+            "SELECT consolidation_id, group_id, prior_decision_json FROM "
+            "memory_reconciliation_triage_consolidation_members WHERE plan_id = ? ORDER BY consolidation_id, position",
+            (plan_id,),
+        ) as cursor:
+            members = await cursor.fetchall()
+        by_id: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for item in members:
+            by_id.setdefault(str(item[0]), []).append(
+                (str(item[1]), _load_json(item[2], label="memory consolidation member"))
+            )
+        return [
+            {
+                "consolidation_id": str(row[0]),
+                "revision": int(row[1]),
+                "canonical": _load_json(row[2], label="memory consolidation"),
+                "selection_sha256": str(row[3]),
+                "operator_note": str(row[4]),
+                "updated_at": str(row[5]),
+                "group_ids": [group_id for group_id, _prior in by_id.get(str(row[0]), [])],
+                "prior_decisions": dict(by_id.get(str(row[0]), [])),
+            }
+            for row in rows
+        ]
+
+    async def consolidations(self, principal_id: PrincipalId, plan_id: str) -> list[dict[str, Any]]:
+        """List the plan's staged consolidations for the signed-in owner."""
+        await self._plan_row(principal_id, plan_id)
+        return [_public_consolidation(item) for item in await self._consolidations(plan_id)]
+
+    async def stage_consolidation(
+        self,
+        principal_id: PrincipalId,
+        plan_id: str,
+        *,
+        group_ids: list[str],
+        expected_state_versions: dict[str, int],
+        canonical: dict[str, Any],
+        operator_note: str,
+        consolidation_id: str | None,
+        expected_revision: int | None,
+        allowed_project_ids: frozenset[str],
+        client_operation_id: str,
+    ) -> dict[str, Any]:
+        """
+        Stage (or revise) one consolidation of several facts into one canonical fact.
+
+        Every selected group must be a fact group of this open plan, at the
+        state version the owner saw, and not part of another consolidation.
+        The final wording and scope are checked exactly as an approved
+        corrected adoption would be, including the schema and project
+        authority. In one transaction each member's current decision is
+        kept for restoring later, and every member is marked as belonging
+        to the consolidation, so none of them can be decided on its own.
+        Revising replaces the selection and canonical fact; facts dropped
+        from it get their earlier decision back. Any failure changes nothing.
+        """
+        operation_id = self._operation_id(client_operation_id)
+        request_sha256 = _digest(
+            {
+                "kind": "triage_consolidation",
+                "plan_id": plan_id,
+                "group_ids": group_ids,
+                "expected_state_versions": expected_state_versions,
+                "canonical": canonical,
+                "operator_note": operator_note,
+                "consolidation_id": consolidation_id,
+                "expected_revision": expected_revision,
+            }
+        )
+        async with self._lock:
+            replay = await self._operation_replay(principal_id, operation_id, request_sha256)
+            if replay is not None:
+                return replay
+            row, plan = await self._plan_row(principal_id, plan_id)
+            if str(row[3]) != "open":
+                raise MemoryReconciliationReviewConflict("Memory triage plan has already been applied")
+            if await memory_reconciliation.apply_in_progress(self._store.connection, plan_id):
+                raise MemoryReconciliationReviewConflict(_APPLY_IN_PROGRESS)
+            if not isinstance(operator_note, str) or len(operator_note) > MAX_OPERATOR_NOTE:
+                raise MemoryReconciliationReviewValidationError("Invalid memory triage operator note")
+            if (
+                not isinstance(group_ids, list)
+                or not all(isinstance(group_id, str) for group_id in group_ids)
+                or not MIN_CONSOLIDATION_FACTS <= len(group_ids) <= MAX_CONSOLIDATION_FACTS
+                or len(set(group_ids)) != len(group_ids)
+                or not isinstance(expected_state_versions, dict)
+                or set(expected_state_versions) != set(group_ids)
+            ):
+                raise MemoryReconciliationReviewValidationError(
+                    f"Select between {MIN_CONSOLIDATION_FACTS} and {MAX_CONSOLIDATION_FACTS} different facts"
+                )
+            plan_groups = {str(item["group_id"]): item for item in plan["groups"]}
+            if any(group_id not in plan_groups for group_id in group_ids):
+                raise MemoryReconciliationReviewNotFound("A selected fact is not part of this plan")
+            rows = [item for group_id in group_ids for item in plan_groups[group_id]["evidence"]]
+            if any(item.get("kind") != "fact" for item in rows):
+                raise MemoryReconciliationReviewValidationError("Only facts can be consolidated; episodes stay history")
+            action = _consolidation_action(canonical, rows)
+            try:
+                memory_reconciliation.validate_candidate_action({"evidence": rows}, action)
+            except memory_reconciliation.MemoryReconciliationError as exc:
+                raise MemoryReconciliationReviewValidationError(str(exc)) from exc
+            project_ids = {
+                str(item["project_id"]) for item in rows if item.get("scope") == "project" and item.get("project_id")
+            }
+            if action["replacement"]["scope_kind"] == "project":
+                project_ids.add(str(action["replacement"]["scope_key"]))
+            if project_ids - allowed_project_ids:
+                raise MemoryReconciliationReviewAccessDenied(
+                    "The consolidation references a project outside current authority"
+                )
+
+            existing = None
+            if consolidation_id is not None:
+                existing = next(
+                    (
+                        item
+                        for item in await self._consolidations(plan_id)
+                        if item["consolidation_id"] == consolidation_id
+                    ),
+                    None,
+                )
+                if existing is None:
+                    raise MemoryReconciliationReviewNotFound("Memory consolidation not found")
+                if existing["revision"] != expected_revision:
+                    raise MemoryReconciliationReviewConflict("This consolidation changed after it was loaded")
+            placeholders = ", ".join("?" for _ in group_ids)
+            async with self._store.connection.execute(
+                "SELECT g.group_id, g.disposition, g.action_json, g.operator_note, g.state_version, m.consolidation_id "
+                "FROM memory_reconciliation_triage_groups g "
+                "LEFT JOIN memory_reconciliation_triage_consolidation_members m "
+                "ON m.plan_id = g.plan_id AND m.group_id = g.group_id "
+                f"WHERE g.plan_id = ? AND g.group_id IN ({placeholders})",
+                (plan_id, *group_ids),
+            ) as cursor:
+                states = {str(item[0]): item for item in await cursor.fetchall()}
+            for group_id in group_ids:
+                state = states[group_id]
+                if int(state[4]) != int(expected_state_versions[group_id]):
+                    raise MemoryReconciliationReviewConflict("A selected fact changed after it was loaded")
+                if state[5] is not None and str(state[5]) != consolidation_id:
+                    raise MemoryReconciliationReviewConflict("A selected fact already belongs to another consolidation")
+
+            new_id = consolidation_id or f"mcn_{_digest({'plan': plan_id, 'operation': operation_id})[:32]}"
+            revision = 1 if existing is None else int(existing["revision"]) + 1
+            earlier: dict[str, dict[str, Any]] = existing["prior_decisions"] if existing is not None else {}
+            dropped = [
+                group_id for group_id in (existing["group_ids"] if existing else []) if group_id not in group_ids
+            ]
+            selection_sha256 = _digest(
+                {
+                    "plan_id": plan_id,
+                    "members": [
+                        {"group_id": group_id, "state_sha256": plan_groups[group_id]["state_sha256"]}
+                        for group_id in group_ids
+                    ],
+                    "action": action,
+                }
+            )
+            now = _now()
+            marker = _canonical({"kind": "consolidate", "consolidation_id": new_id})
+            connection = self._store.connection
+            try:
+                await connection.execute("BEGIN IMMEDIATE")
+                for group_id in dropped:
+                    await self._restore_decision(plan_id, group_id, earlier[group_id], now)
+                await connection.execute(
+                    "DELETE FROM memory_reconciliation_triage_consolidation_members WHERE consolidation_id = ?",
+                    (new_id,),
+                )
+                await connection.execute(
+                    "INSERT INTO memory_reconciliation_triage_consolidations ("
+                    "consolidation_id, plan_id, revision, canonical_json, selection_sha256, operator_note, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (consolidation_id) DO UPDATE SET revision = excluded.revision, "
+                    "canonical_json = excluded.canonical_json, selection_sha256 = excluded.selection_sha256, "
+                    "operator_note = excluded.operator_note, updated_at = excluded.updated_at",
+                    (new_id, plan_id, revision, _canonical(action), selection_sha256, operator_note, now, now),
+                )
+                for position, group_id in enumerate(group_ids):
+                    state = states[group_id]
+                    prior = earlier.get(group_id) or {
+                        "disposition": str(state[1]),
+                        "action_json": str(state[2]),
+                        "operator_note": str(state[3]),
+                    }
+                    await connection.execute(
+                        "INSERT INTO memory_reconciliation_triage_consolidation_members ("
+                        "plan_id, group_id, consolidation_id, position, prior_decision_json) VALUES (?, ?, ?, ?, ?)",
+                        (plan_id, group_id, new_id, position, _canonical(prior)),
+                    )
+                    await connection.execute(
+                        "UPDATE memory_reconciliation_triage_groups SET disposition = 'approve', action_json = ?, "
+                        "operator_note = ?, state_version = state_version + 1, updated_at = ? "
+                        "WHERE plan_id = ? AND group_id = ?",
+                        (marker, operator_note, now, plan_id, group_id),
+                    )
+                await connection.execute(
+                    "UPDATE memory_reconciliation_triage_plans SET review_version = review_version + 1 "
+                    "WHERE plan_id = ?",
+                    (plan_id,),
+                )
+                response = {
+                    "plan_id": plan_id,
+                    "consolidation": _public_consolidation(
+                        {
+                            "consolidation_id": new_id,
+                            "revision": revision,
+                            "canonical": action,
+                            "operator_note": operator_note,
+                            "group_ids": list(group_ids),
+                            "updated_at": now,
+                        }
+                    ),
+                    "replayed": False,
+                }
+                await connection.execute(
+                    "INSERT INTO memory_reconciliation_operations ("
+                    "principal_id, client_operation_id, request_sha256, response_json, created_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (str(principal_id), operation_id, request_sha256, _canonical(response), now),
+                )
+                await connection.commit()
+            except Exception:
+                await connection.rollback()
+                raise
+            return response
+
+    async def cancel_consolidation(
+        self,
+        principal_id: PrincipalId,
+        plan_id: str,
+        consolidation_id: str,
+        *,
+        expected_revision: int,
+        client_operation_id: str,
+    ) -> dict[str, Any]:
+        """Remove a staged consolidation and give every member its earlier decision back."""
+        operation_id = self._operation_id(client_operation_id)
+        request_sha256 = _digest(
+            {
+                "kind": "triage_consolidation_cancel",
+                "plan_id": plan_id,
+                "consolidation_id": consolidation_id,
+                "expected_revision": expected_revision,
+            }
+        )
+        async with self._lock:
+            replay = await self._operation_replay(principal_id, operation_id, request_sha256)
+            if replay is not None:
+                return replay
+            row, _plan = await self._plan_row(principal_id, plan_id)
+            if str(row[3]) != "open":
+                raise MemoryReconciliationReviewConflict("Memory triage plan has already been applied")
+            if await memory_reconciliation.apply_in_progress(self._store.connection, plan_id):
+                raise MemoryReconciliationReviewConflict(_APPLY_IN_PROGRESS)
+            existing = next(
+                (item for item in await self._consolidations(plan_id) if item["consolidation_id"] == consolidation_id),
+                None,
+            )
+            if existing is None:
+                raise MemoryReconciliationReviewNotFound("Memory consolidation not found")
+            if existing["revision"] != expected_revision:
+                raise MemoryReconciliationReviewConflict("This consolidation changed after it was loaded")
+            now = _now()
+            connection = self._store.connection
+            try:
+                await connection.execute("BEGIN IMMEDIATE")
+                for group_id, prior in existing["prior_decisions"].items():
+                    await self._restore_decision(plan_id, group_id, prior, now)
+                await connection.execute(
+                    "DELETE FROM memory_reconciliation_triage_consolidations WHERE consolidation_id = ?",
+                    (consolidation_id,),
+                )
+                await connection.execute(
+                    "UPDATE memory_reconciliation_triage_plans SET review_version = review_version + 1 "
+                    "WHERE plan_id = ?",
+                    (plan_id,),
+                )
+                response = {
+                    "plan_id": plan_id,
+                    "consolidation_id": consolidation_id,
+                    "cancelled": True,
+                    "replayed": False,
+                }
+                await connection.execute(
+                    "INSERT INTO memory_reconciliation_operations ("
+                    "principal_id, client_operation_id, request_sha256, response_json, created_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (str(principal_id), operation_id, request_sha256, _canonical(response), now),
+                )
+                await connection.commit()
+            except Exception:
+                await connection.rollback()
+                raise
+            return response
+
+    async def _with_consolidations(
+        self,
+        plan_id: str,
+        plan: dict[str, Any],
+        decision_rows: list[Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[Any]]:
+        """
+        Replace each consolidation's member groups with one combined candidate for apply.
+
+        The combined candidate holds every member's evidence and carries the
+        consolidation's corrected adoption as its approved decision, so apply
+        records one canonical fact citing all of them. Its id is the
+        consolidation id and its state digest is the selection digest, so a
+        resumed apply keys its progress to exactly what was staged. Before
+        that, every member must still carry this consolidation's marker and
+        the selection must hash to what was staged; otherwise apply refuses.
+        """
+        plan_groups = {str(item["group_id"]): item for item in plan["groups"]}
+        consolidations = await self._consolidations(plan_id)
+        if not consolidations:
+            return list(plan["groups"]), plan_groups, decision_rows
+        stored = {str(item[0]): item for item in decision_rows}
+        members: set[str] = set()
+        combined_groups: list[dict[str, Any]] = []
+        combined_rows: list[Any] = []
+        for consolidation in consolidations:
+            consolidation_id = consolidation["consolidation_id"]
+            marker = {"kind": "consolidate", "consolidation_id": consolidation_id}
+            for group_id in consolidation["group_ids"]:
+                if _load_json(stored[group_id][2], label="memory triage action") != marker:
+                    raise MemoryReconciliationReviewConflict("A consolidated fact's decision changed; reopen it")
+            selection_sha256 = _digest(
+                {
+                    "plan_id": plan_id,
+                    "members": [
+                        {"group_id": group_id, "state_sha256": plan_groups[group_id]["state_sha256"]}
+                        for group_id in consolidation["group_ids"]
+                    ],
+                    "action": consolidation["canonical"],
+                }
+            )
+            if selection_sha256 != consolidation["selection_sha256"]:
+                raise MemoryReconciliationReviewConflict("A consolidation no longer matches its facts; reopen it")
+            members.update(consolidation["group_ids"])
+            combined_groups.append(
+                {
+                    "group_id": consolidation_id,
+                    "state_sha256": selection_sha256,
+                    "classification": "consolidation",
+                    "resolution": "consolidate",
+                    "deterministic": False,
+                    "bulk_eligible": False,
+                    "rationale": f"Operator consolidation of {len(consolidation['group_ids'])} facts into one.",
+                    "action": {"kind": "manual_edit_required"},
+                    "prior_review_evidence": [],
+                    "evidence": [
+                        item for group_id in consolidation["group_ids"] for item in plan_groups[group_id]["evidence"]
+                    ],
+                }
+            )
+            combined_rows.append(
+                (consolidation_id, "approve", _canonical(consolidation["canonical"]), consolidation["operator_note"])
+            )
+        apply_groups = [group for group in plan["groups"] if str(group["group_id"]) not in members] + combined_groups
+        return (
+            apply_groups,
+            {str(group["group_id"]): group for group in apply_groups},
+            [item for item in decision_rows if str(item[0]) not in members] + combined_rows,
+        )
+
+    async def _has_consolidations(self, plan_id: str) -> bool:
+        """
+        Return True when the plan has staged consolidations.
+
+        A policy replan rebuilds groups and could change or drop members, so
+        a plan with consolidations keeps its current policy until they are
+        applied or cancelled.
+        """
+        async with self._store.connection.execute(
+            "SELECT 1 FROM memory_reconciliation_triage_consolidations WHERE plan_id = ? LIMIT 1",
+            (plan_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _restore_decision(self, plan_id: str, group_id: str, prior: dict[str, Any], now: str) -> None:
+        """Put back the decision a group had before it joined a consolidation. Caller holds a transaction."""
+        await self._store.connection.execute(
+            "UPDATE memory_reconciliation_triage_groups SET disposition = ?, action_json = ?, operator_note = ?, "
+            "state_version = state_version + 1, updated_at = ? WHERE plan_id = ? AND group_id = ?",
+            (
+                str(prior["disposition"]),
+                str(prior["action_json"]),
+                str(prior["operator_note"]),
+                now,
+                plan_id,
+                group_id,
+            ),
+        )
 
     async def recommend(self, principal_id: PrincipalId, plan_id: str) -> dict[str, Any]:
         row, plan = await self._plan_row(principal_id, plan_id)
@@ -1203,7 +1715,7 @@ class WorkshopMemoryReconciliationTriageService:
             decision_rows = await cursor.fetchall()
         if any(str(item[1]) == "pending" for item in decision_rows):
             raise MemoryReconciliationReviewValidationError("Resolve every memory triage group before applying")
-        groups = {str(item["group_id"]): item for item in plan["groups"]}
+        apply_groups, groups, decision_rows = await self._with_consolidations(plan_id, plan, list(decision_rows))
         async with self._store.connection.execute(
             "SELECT recommendation_id, status, backend, provider, model, prompt_version, input_sha256, "
             "output_sha256, group_count, error_code FROM memory_reconciliation_triage_recommendations "
@@ -1236,7 +1748,7 @@ class WorkshopMemoryReconciliationTriageService:
                 "proposed_action": group["action"],
                 "evidence": group["evidence"],
             }
-            for group in plan["groups"]
+            for group in apply_groups
         ]
         synthetic: dict[str, Any] = {
             "kind": memory_reconciliation.AUDIT_KIND,

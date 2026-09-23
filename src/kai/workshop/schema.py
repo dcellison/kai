@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 94
+WORKSHOP_SCHEMA_VERSION = 95
 
 
 @dataclass(frozen=True, slots=True)
@@ -4566,6 +4566,47 @@ _MEMORY_RECONCILIATION_RESUME_SCHEMA = SchemaMigration(
     ),
 )
 
+# An operator consolidation merges several single-fact triage groups of one
+# open plan into one canonical fact. The member table's primary key makes
+# a group belong to at most one consolidation, so two consolidations can
+# never claim the same fact; each member's decision before it joined is
+# kept so cancelling or revising restores it exactly.
+_MEMORY_TRIAGE_CONSOLIDATION_SCHEMA = SchemaMigration(
+    version=95,
+    name="memory_triage_consolidations",
+    statements=(
+        """
+        CREATE TABLE memory_reconciliation_triage_consolidations (
+            consolidation_id TEXT PRIMARY KEY CHECK (length(consolidation_id) BETWEEN 1 AND 128),
+            plan_id TEXT NOT NULL REFERENCES memory_reconciliation_triage_plans(plan_id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            canonical_json TEXT NOT NULL CHECK (json_valid(canonical_json) AND json_type(canonical_json) = 'object'),
+            selection_sha256 TEXT NOT NULL CHECK (length(selection_sha256) = 64),
+            operator_note TEXT NOT NULL DEFAULT '' CHECK (length(operator_note) <= 4096),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE memory_reconciliation_triage_consolidation_members (
+            plan_id TEXT NOT NULL,
+            group_id TEXT NOT NULL,
+            consolidation_id TEXT NOT NULL
+                REFERENCES memory_reconciliation_triage_consolidations(consolidation_id) ON DELETE CASCADE,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            prior_decision_json TEXT NOT NULL CHECK (
+                json_valid(prior_decision_json) AND json_type(prior_decision_json) = 'object'
+            ),
+            PRIMARY KEY (plan_id, group_id),
+            FOREIGN KEY (plan_id, group_id)
+                REFERENCES memory_reconciliation_triage_groups(plan_id, group_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX memory_triage_consolidation_member_idx "
+        "ON memory_reconciliation_triage_consolidation_members (consolidation_id, position)",
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4661,6 +4702,7 @@ _MIGRATIONS = (
     _MEMORY_RECONCILIATION_TRIAGE_SCHEMA,
     _MEMORY_ADMISSION_AUTHORITY_SCHEMA,
     _MEMORY_RECONCILIATION_RESUME_SCHEMA,
+    _MEMORY_TRIAGE_CONSOLIDATION_SCHEMA,
 )
 
 

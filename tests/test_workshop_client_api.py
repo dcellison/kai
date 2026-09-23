@@ -851,6 +851,20 @@ class _TriageQueries:
         self.principal_id = principal_id
         self.calls: list[tuple[str, object]] = []
 
+    async def consolidations(self, principal_id, plan_id):
+        assert principal_id == self.principal_id
+        return [{"consolidation_id": "mcn_test", "revision": 1, "group_ids": ["mtg_a", "mtg_b"]}]
+
+    async def stage_consolidation(self, principal_id, plan_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("stage_consolidation", kwargs))
+        return {"plan_id": plan_id, "consolidation": {"consolidation_id": "mcn_test", "revision": 1}, "replayed": False}
+
+    async def cancel_consolidation(self, principal_id, plan_id, consolidation_id, **kwargs):
+        assert principal_id == self.principal_id
+        self.calls.append(("cancel_consolidation", {"consolidation_id": consolidation_id, **kwargs}))
+        return {"plan_id": plan_id, "consolidation_id": consolidation_id, "cancelled": True, "replayed": False}
+
     @staticmethod
     def summary() -> TriageSummary:
         return TriageSummary(
@@ -1941,6 +1955,48 @@ async def test_projection_routes_serialize_review_audit_and_retry(tmp_path: Path
         wrong = await client.post("/v1/memory/projections/retry", headers=headers, json={"episode_ids": "e"})
         assert (unknown.status, wrong.status) == (400, 400)
         assert len(queries.retries) == 2
+    finally:
+        await client.close()
+        await store.close()
+
+
+async def test_consolidation_routes_validate_bodies_and_reach_the_triage_service(tmp_path: Path) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    queries = _MemoryQueries(alice_id)
+    client = await _open_client(store, _Authenticator({"alice-token": alice_id}), memory_queries=queries)
+    headers = {"Authorization": "Bearer alice-token"}
+    base = "/v1/memory/reconciliation/triage/mtp_test/consolidations"
+    body = {
+        "group_ids": ["mtg_a", "mtg_b"],
+        "expected_state_versions": {"mtg_a": 0, "mtg_b": 1},
+        "canonical": {"content": "One fact", "source_memory_id": "mem_a", "scope_kind": "global"},
+        "operator_note": "",
+        "client_operation_id": "stage-1",
+    }
+    try:
+        assert (await client.get(base)).status == 401
+        listed = await client.get(base, headers=headers)
+        assert (await listed.json())["consolidations"][0]["consolidation_id"] == "mcn_test"
+
+        staged = await client.post(base, headers=headers, json=body)
+        revised = await client.post(
+            base, headers=headers, json={**body, "consolidation_id": "mcn_test", "expected_revision": 1}
+        )
+        half_revision = await client.post(base, headers=headers, json={**body, "consolidation_id": "mcn_test"})
+        extra = await client.post(base, headers=headers, json={**body, "force": True})
+        cancelled = await client.post(
+            f"{base}/mcn_test/cancel", headers=headers, json={"expected_revision": 1, "client_operation_id": "c-1"}
+        )
+
+        assert (staged.status, revised.status, cancelled.status) == (200, 200, 200)
+        assert (half_revision.status, extra.status) == (400, 400)
+        stages = [kwargs for name, kwargs in queries.reconciliation_triage.calls if name == "stage_consolidation"]
+        assert [item["consolidation_id"] for item in stages] == [None, "mcn_test"]
+        assert stages[0]["group_ids"] == ["mtg_a", "mtg_b"]
+        assert (
+            "cancel_consolidation",
+            {"consolidation_id": "mcn_test", "expected_revision": 1, "client_operation_id": "c-1"},
+        ) in queries.reconciliation_triage.calls
     finally:
         await client.close()
         await store.close()

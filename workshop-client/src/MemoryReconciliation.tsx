@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import {
   applyMemoryTriage,
+  loadMemoryConsolidations,
   approveSafeMemoryTriage,
   loadMemoryTriage,
   loadMemoryTriageGroups,
@@ -12,7 +13,9 @@ import {
 import { AuthenticationError } from "./api";
 import { useConfirmation } from "./ConfirmationDialog";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { ConsolidationEditor } from "./MemoryConsolidation";
 import type {
+  WorkshopMemoryConsolidation,
   WorkshopMemoryReconciliationDisposition,
   WorkshopMemoryTriageGroup,
   WorkshopMemoryTriagePreview,
@@ -104,6 +107,8 @@ function decisionBadge(decision: WorkshopMemoryTriageGroup["decision"]): { class
   switch (decision.action.kind) {
     case "expire_all":
       return { className: "obsolete", label: "obsolete" };
+    case "consolidate":
+      return { className: "approve", label: "consolidated" };
     case "keep_first_retract_rest":
       return { className: "approve", label: "consolidated" };
     case "record_episode_chain":
@@ -202,6 +207,7 @@ function ExceptionEditor({
   availableGroups,
   group,
   onAuthenticationFailure,
+  onConsolidate,
   onSelectGroup,
   onSaved,
   readOnly,
@@ -212,6 +218,8 @@ function ExceptionEditor({
   availableGroups: WorkshopMemoryTriageGroup[];
   group: WorkshopMemoryTriageGroup | null;
   onAuthenticationFailure: (message: string) => void;
+  // Opens the consolidation view with this fact (and its related facts) selected.
+  onConsolidate: () => void;
   onSelectGroup: (groupId: string) => void;
   onSaved: () => void;
   readOnly: boolean;
@@ -308,7 +316,9 @@ function ExceptionEditor({
     } else unavailableReason = "This decision is not available for the supplied evidence.";
   }
   const availableGroupIds = new Set(availableGroups.map((item) => item.groupId));
-  const relatedGroups = relatedRecommendationGroups(group, availableGroupIds);
+  const relatedGroups = group.relatedGroupIds.length > 0
+    ? group.relatedGroupIds.filter((groupId) => availableGroupIds.has(groupId))
+    : relatedRecommendationGroups(group, availableGroupIds);
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
@@ -365,15 +375,17 @@ function ExceptionEditor({
           <p>{String(recommendation.rationale ?? "No rationale was returned.")}</p>
           {relatedGroups.length > 0 && (
             <div className="memory-related-groups">
-              <p>Related groups</p>
+              <p>Related facts</p>
               {relatedGroups.map((groupId) => (
-                <button type="button" key={groupId} title={groupId} onClick={() => onSelectGroup(groupId)}>
-                  {groupReference(groupId)}
+                <button type="button" key={groupId} title="Open this fact" onClick={() => onSelectGroup(groupId)}>
+                  {summarizeEvidence(availableGroups.find((item) => item.groupId === groupId)?.evidence[0]?.text ?? "Unavailable fact")}
                 </button>
               ))}
-              <p className="memory-review-explanation">
-                These are separate decisions. Adopt or consolidate one canonical fact, then reject duplicates in the linked groups.
-              </p>
+              {factEvidence && !readOnly && (
+                <button type="button" className="memory-consolidate-button" onClick={onConsolidate}>
+                  Consolidate related facts…
+                </button>
+              )}
             </div>
           )}
           <p className="memory-review-explanation">Advisory only; it has not changed memory.</p>
@@ -463,6 +475,14 @@ function ExceptionEditor({
           <button type="submit" disabled={readOnly || saving || !canSave}>
             {saving ? "Saving…" : "Save decision"}
           </button>
+          {factEvidence && !isIncompleteEpisode(group) && (
+            <p className="memory-review-explanation">
+              Same fact saved several times?{" "}
+              <button type="button" className="fact-review-link" disabled={readOnly} onClick={onConsolidate}>
+                Consolidate with other facts…
+              </button>
+            </p>
+          )}
         </section>
       </fieldset>
     </form>
@@ -500,6 +520,10 @@ export function MemoryReconciliation({
   const [report, setReport] = useState<string | null>(null);
   const [safePreview, setSafePreview] = useState<WorkshopMemoryTriagePreview | null>(null);
   const [safePreviewGroups, setSafePreviewGroups] = useState<WorkshopMemoryTriageGroup[]>([]);
+  const [consolidations, setConsolidations] = useState<WorkshopMemoryConsolidation[]>([]);
+  // True while the detail pane shows the consolidation view for a fact that
+  // is not yet part of one; members always open their consolidation.
+  const [consolidating, setConsolidating] = useState(false);
 
   const handleFailure = (caught: unknown, fallback: string): void => {
     if (caught instanceof AuthenticationError) onAuthenticationFailure(caught.message);
@@ -517,8 +541,11 @@ export function MemoryReconciliation({
         if (cancelled) return;
         setTriage(summary);
         setGroups([]);
-        setSelectedId(null);
-        if (!summary) return;
+        setConsolidating(false);
+        if (!summary) {
+          setSelectedId(null);
+          return;
+        }
         const loadedGroups: WorkshopMemoryTriageGroup[] = [];
         let offset: number | null = 0;
         let latestSummary = summary;
@@ -532,10 +559,17 @@ export function MemoryReconciliation({
           latestSummary = page.triage;
           offset = page.nextOffset;
         }
+        const loadedConsolidations = await loadMemoryConsolidations(token, summary.planId);
         if (cancelled) return;
         setTriage(latestSummary);
         setGroups(loadedGroups);
-        setSelectedId(loadedGroups[0]?.groupId ?? null);
+        setConsolidations(loadedConsolidations);
+        // Keep the owner's place after a save; fall back to the first fact.
+        setSelectedId((current) =>
+          current !== null && loadedGroups.some((group) => group.groupId === current)
+            ? current
+            : loadedGroups[0]?.groupId ?? null,
+        );
       })
       .catch((caught) => { if (!cancelled) handleFailure(caught, "Could not load memory triage."); })
       .finally(() => { if (!cancelled) setLoading(false); });
@@ -749,13 +783,19 @@ export function MemoryReconciliation({
                   {groups.map((group) => (
                     <button type="button" role="option" aria-selected={selectedId === group.groupId} key={group.groupId}
                       className={`memory-record ${selectedId === group.groupId ? "selected" : ""}`}
-                      onClick={() => setSelectedId(group.groupId)}>
+                      onClick={() => { setConsolidating(false); setSelectedId(group.groupId); }}>
                       <span className={`memory-review-state ${decisionBadge(group.decision).className}`}>
                         {decisionBadge(group.decision).label}
                       </span>
                       <span className="memory-record-copy">
                         <strong>{group.evidence[0]?.text ?? "Unavailable memory"}</strong>
-                        <small>{groupReference(group.groupId)} · {formatLabel(group.classification)} · {group.evidence.length} evidence row{group.evidence.length === 1 ? "" : "s"}</small>
+                        <small>
+                          {/* One fact is simply a fact; only a real group of several memories gets a group label. */}
+                          {group.evidence.length === 1
+                            ? formatLabel(group.classification)
+                            : `${groupReference(group.groupId)} · ${formatLabel(group.classification)} · ${group.evidence.length} memories`}
+                          {group.consolidationId && " · part of a consolidation"}
+                        </small>
                       </span>
                     </button>
                   ))}
@@ -773,18 +813,34 @@ export function MemoryReconciliation({
             onKeyDown={detailPanelLayout.onKeyDown} onPointerDown={detailPanelLayout.onPointerDown}
             onPointerMove={detailPanelLayout.onPointerMove} />
         )}
-        <ExceptionEditor
-          allowedProjects={allowedProjects}
-          availableGroups={groups}
-          group={selected}
-          key={`${triage?.planId ?? "none"}:${selected?.groupId ?? "none"}:${selected?.decision.stateVersion ?? 0}`}
-          onAuthenticationFailure={onAuthenticationFailure}
-          onSelectGroup={setSelectedId}
-          onSaved={() => { setReport("Exception decision saved."); setRefreshKey((value) => value + 1); }}
-          planId={triage?.planId ?? null}
-          readOnly={triage?.status === "applied"}
-          token={token}
-        />
+        {selected && triage && triage.status !== "applied" && (consolidating || selected.consolidationId) ? (
+          <ConsolidationEditor
+            allowedProjects={allowedProjects}
+            anchor={selected}
+            availableGroups={groups}
+            consolidation={consolidations.find((item) => item.consolidationId === selected.consolidationId) ?? null}
+            key={`${selected.groupId}:${selected.consolidationId ?? "new"}:${selected.decision.stateVersion}`}
+            onAuthenticationFailure={onAuthenticationFailure}
+            onClose={() => setConsolidating(false)}
+            onSaved={(message) => { setReport(message); setConsolidating(false); setRefreshKey((value) => value + 1); }}
+            planId={triage.planId}
+            token={token}
+          />
+        ) : (
+          <ExceptionEditor
+            allowedProjects={allowedProjects}
+            availableGroups={groups}
+            group={selected}
+            key={`${triage?.planId ?? "none"}:${selected?.groupId ?? "none"}:${selected?.decision.stateVersion ?? 0}`}
+            onAuthenticationFailure={onAuthenticationFailure}
+            onConsolidate={() => setConsolidating(true)}
+            onSelectGroup={(groupId) => { setConsolidating(false); setSelectedId(groupId); }}
+            onSaved={() => { setReport("Exception decision saved."); setRefreshKey((value) => value + 1); }}
+            planId={triage?.planId ?? null}
+            readOnly={triage?.status === "applied"}
+            token={token}
+          />
+        )}
       </aside>
     </section>
   );

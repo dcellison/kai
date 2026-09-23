@@ -66,6 +66,7 @@ import type {
   WorkshopMemorySourceMessage,
   WorkshopMemoryStats,
   WorkshopMemoryConflictSummary,
+  WorkshopMemoryConsolidation,
   WorkshopMemoryForgottenFact,
   WorkshopMemoryLifecycle,
   WorkshopMemoryLifecycleOutcome,
@@ -4249,13 +4250,22 @@ function parseMemoryTriageGroup(value: unknown): WorkshopMemoryTriageGroup | nul
     decision: value.decision,
   });
   if (!candidate) return null;
-  // Older servers omit the field; treat that as "nothing missing".
+  // Older servers omit these fields; treat that as "nothing missing",
+  // "no related facts", and "not consolidated".
   const missingFields = value.missing_fields === undefined ? [] : value.missing_fields;
-  if (!Array.isArray(missingFields) || !missingFields.every((field) => typeof field === "string")) return null;
+  const relatedGroupIds = value.related_group_ids === undefined ? [] : value.related_group_ids;
+  const consolidationId = value.consolidation_id === undefined ? null : value.consolidation_id;
+  if (
+    !Array.isArray(missingFields) || !missingFields.every((field) => typeof field === "string") ||
+    !Array.isArray(relatedGroupIds) || !relatedGroupIds.every((id) => typeof id === "string") ||
+    (consolidationId !== null && typeof consolidationId !== "string")
+  ) return null;
   return {
     bulkEligible: value.bulk_eligible,
     classification: value.classification,
+    consolidationId: consolidationId as string | null,
     missingFields: missingFields as string[],
+    relatedGroupIds: relatedGroupIds as string[],
     decision: {
       ...candidate.decision,
       recommendation: value.decision.recommendation,
@@ -4426,6 +4436,111 @@ export async function saveMemoryTriageDecision(
   );
   const payload = await responsePayload(response);
   if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not save memory triage decision."));
+}
+
+// Consolidations: several legacy facts staged to become one canonical fact.
+
+function parseConsolidation(value: unknown): WorkshopMemoryConsolidation | null {
+  if (
+    !isRecord(value) || typeof value.consolidation_id !== "string" || !Number.isSafeInteger(value.revision) ||
+    !Array.isArray(value.group_ids) || !value.group_ids.every((id) => typeof id === "string") ||
+    typeof value.content !== "string" || (value.scope_kind !== "global" && value.scope_kind !== "project") ||
+    (value.scope_key !== null && typeof value.scope_key !== "string") ||
+    typeof value.source_memory_id !== "string" || typeof value.operator_note !== "string" ||
+    !Number.isSafeInteger(value.selected_facts) || !Number.isSafeInteger(value.duplicates_excluded)
+  ) return null;
+  return {
+    consolidationId: value.consolidation_id,
+    content: value.content,
+    duplicatesExcluded: value.duplicates_excluded as number,
+    groupIds: value.group_ids as string[],
+    operatorNote: value.operator_note,
+    revision: value.revision as number,
+    scopeKey: value.scope_key as string | null,
+    scopeKind: value.scope_kind,
+    selectedFacts: value.selected_facts as number,
+    sourceMemoryId: value.source_memory_id,
+  };
+}
+
+export async function loadMemoryConsolidations(token: string, planId: string): Promise<WorkshopMemoryConsolidation[]> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/consolidations`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load consolidations."));
+  const items = isRecord(payload) && payload.version === 1 && Array.isArray(payload.consolidations)
+    ? payload.consolidations.map(parseConsolidation)
+    : null;
+  if (!items || items.some((item) => item === null)) {
+    throw new Error("Kai returned unsupported consolidations.");
+  }
+  return items as WorkshopMemoryConsolidation[];
+}
+
+// Saves a new consolidation, or revises one when `consolidationId` and
+// `expectedRevision` are given. The server checks every selected fact's
+// version, so a stale screen is refused rather than overwriting.
+export async function stageMemoryConsolidation(
+  token: string,
+  planId: string,
+  input: {
+    canonical: { content: string; scopeKey: string | null; scopeKind: "global" | "project"; sourceMemoryId: string };
+    consolidationId?: string;
+    expectedRevision?: number;
+    expectedStateVersions: Record<string, number>;
+    groupIds: string[];
+    operatorNote: string;
+  },
+): Promise<WorkshopMemoryConsolidation> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/consolidations`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        group_ids: input.groupIds,
+        expected_state_versions: input.expectedStateVersions,
+        canonical: {
+          content: input.canonical.content,
+          source_memory_id: input.canonical.sourceMemoryId,
+          scope_kind: input.canonical.scopeKind,
+          ...(input.canonical.scopeKind === "project" ? { scope_key: input.canonical.scopeKey } : {}),
+        },
+        operator_note: input.operatorNote,
+        ...(input.consolidationId !== undefined
+          ? { consolidation_id: input.consolidationId, expected_revision: input.expectedRevision }
+          : {}),
+        client_operation_id: mutationRequestId(),
+      }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not save the consolidation."));
+  const consolidation = isRecord(payload) && payload.version === 1 ? parseConsolidation(payload.consolidation) : null;
+  if (!consolidation) throw new Error("Kai returned an unsupported consolidation.");
+  return consolidation;
+}
+
+export async function cancelMemoryConsolidation(
+  token: string,
+  planId: string,
+  consolidationId: string,
+  expectedRevision: number,
+): Promise<void> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/reconciliation/triage/${encodeURIComponent(planId)}/consolidations/${encodeURIComponent(consolidationId)}/cancel`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_revision: expectedRevision, client_operation_id: mutationRequestId() }),
+    },
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not cancel the consolidation."));
 }
 
 export async function recommendMemoryTriage(

@@ -5,6 +5,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyMemoryTriage,
   approveSafeMemoryTriage,
+  cancelMemoryConsolidation,
+  loadMemoryConsolidations,
+  stageMemoryConsolidation,
   loadMemoryTriage,
   loadMemoryTriageGroups,
   previewSafeMemoryTriage,
@@ -21,6 +24,9 @@ vi.mock("./api", async (importOriginal) => {
     ...original,
     applyMemoryTriage: vi.fn(),
     approveSafeMemoryTriage: vi.fn(),
+    cancelMemoryConsolidation: vi.fn(),
+    loadMemoryConsolidations: vi.fn(),
+    stageMemoryConsolidation: vi.fn(),
     loadMemoryTriage: vi.fn(),
     loadMemoryTriageGroups: vi.fn(),
     previewSafeMemoryTriage: vi.fn(),
@@ -80,8 +86,10 @@ const group: WorkshopMemoryTriageGroup = {
     validFrom: null,
     validUntil: null,
   }],
+  consolidationId: null,
   groupId: "mtg_test",
   missingFields: [],
+  relatedGroupIds: [],
   priorReviewEvidence: [],
   proposedAction: { kind: "manual_edit_required" },
   rationale: "The evidence conflicts.",
@@ -146,6 +154,7 @@ describe("Memory reconciliation triage", () => {
       reviewVersion: 0,
     });
     vi.mocked(recommendMemoryTriage).mockResolvedValue({ recommended: 1, remaining: 0 });
+    vi.mocked(loadMemoryConsolidations).mockResolvedValue([]);
   });
 
   it("shows aggregate outcomes and only exceptional groups", async () => {
@@ -160,6 +169,132 @@ describe("Memory reconciliation triage", () => {
     expect(screen.getByRole("button", { name: "Preview safe groups" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Analyze exceptions" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Apply plan" })).toBeDisabled();
+  });
+
+  describe("consolidating facts", () => {
+    const fact = (groupId: string, text: string, extra: Partial<WorkshopMemoryTriageGroup> = {}) => ({
+      ...group,
+      classification: "uncertain_scope",
+      evidence: [{ ...group.evidence[0], memoryId: `${groupId}-memory`, text, migrationGaps: ["scope"] }],
+      groupId,
+      ...extra,
+    });
+    const dark = fact("dark", "Alice prefers the dark theme", {
+      decision: { ...group.decision, recommendation: { outcome: "consolidate", rationale: "Duplicates." } },
+      relatedGroupIds: ["mode", "scheme"],
+    });
+    const mode = fact("mode", "Alice likes dark mode in every app");
+    const scheme = fact("scheme", "Alice uses a dark color scheme");
+    const standup = fact("standup", "Alice's standup is at nine");
+
+    function renderWith(groups: WorkshopMemoryTriageGroup[]) {
+      vi.mocked(loadMemoryTriageGroups).mockImplementation(async (_token, _planId, options = {}) => ({
+        triage: summary,
+        groups: options.exceptionsOnly ? groups : safeGroups,
+        nextOffset: null,
+      }));
+      return render(
+        <ConfirmationProvider>
+          <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+        </ConfirmationProvider>,
+      );
+    }
+
+    it("stages related facts as one consolidation from the recommendation", async () => {
+      vi.mocked(stageMemoryConsolidation).mockResolvedValue({
+        consolidationId: "mcn_1", content: "", duplicatesExcluded: 1, groupIds: [], operatorNote: "", revision: 1,
+        scopeKey: null, scopeKind: "global", selectedFacts: 2, sourceMemoryId: "",
+      });
+      const user = userEvent.setup();
+      renderWith([dark, mode, scheme, standup]);
+
+      await user.click(await screen.findByRole("button", { name: "Consolidate related facts…" }));
+      const view = screen.getByRole("region", { name: "Consolidate facts" });
+      expect(within(view).getByText("Alice likes dark mode in every app")).toBeInTheDocument();
+      expect(within(view).getByRole("status")).toHaveTextContent("3 selected facts → 1 current fact; 2 duplicates excluded");
+      expect(within(view).queryByText(/mtg_|Group /)).not.toBeInTheDocument();
+
+      // Removing a wrong match updates the preview before anything is saved.
+      await user.click(within(view).getByRole("checkbox", { name: "Alice uses a dark color scheme" }));
+      expect(within(view).getByRole("status")).toHaveTextContent("2 selected facts → 1 current fact; 1 duplicates excluded");
+      await user.click(within(view).getAllByRole("button", { name: "Use this wording" })[0]);
+      expect(within(view).getByLabelText("Wording")).toHaveValue("Alice likes dark mode in every app");
+      expect(within(view).getByRole("button", { name: "Save consolidation" })).toBeDisabled();
+      await user.selectOptions(within(view).getByLabelText("Scope"), "global");
+      await user.click(within(view).getByRole("button", { name: "Save consolidation" }));
+      await user.click(within(screen.getByRole("dialog", { name: "Continue?" })).getByRole("button", { name: "Continue" }));
+
+      await waitFor(() => expect(stageMemoryConsolidation).toHaveBeenCalled());
+      expect(vi.mocked(stageMemoryConsolidation).mock.calls[0]?.[2]).toEqual({
+        canonical: {
+          content: "Alice likes dark mode in every app",
+          scopeKey: null,
+          scopeKind: "global",
+          sourceMemoryId: "mode-memory",
+        },
+        expectedStateVersions: { dark: 0, mode: 0 },
+        groupIds: ["dark", "mode"],
+        operatorNote: "",
+      });
+    });
+
+    it("adds any pending fact by search", async () => {
+      const user = userEvent.setup();
+      renderWith([standup, dark, mode, scheme]);
+
+      await user.click(await screen.findByRole("button", { name: "Consolidate with other facts…" }));
+      const view = screen.getByRole("region", { name: "Consolidate facts" });
+      expect(within(view).getByRole("status")).toHaveTextContent("1 selected facts");
+      await user.type(within(view).getByLabelText("Add another fact"), "standup");
+      expect(within(view).queryByRole("list", { name: "Matching facts" })).not.toBeInTheDocument();
+      await user.clear(within(view).getByLabelText("Add another fact"));
+      await user.type(within(view).getByLabelText("Add another fact"), "dark mode");
+      await user.click(within(within(view).getByRole("list", { name: "Matching facts" })).getByRole("checkbox"));
+
+      expect(within(view).getByRole("status")).toHaveTextContent("2 selected facts → 1 current fact");
+    });
+
+    it("reopens a saved consolidation from a member and cancels it", async () => {
+      const saved = {
+        consolidationId: "mcn_1", content: "Alice prefers dark themes", duplicatesExcluded: 1,
+        groupIds: ["dark", "mode"], operatorNote: "Same thing.", revision: 2, scopeKey: null,
+        scopeKind: "global" as const, selectedFacts: 2, sourceMemoryId: "dark-memory",
+      };
+      vi.mocked(loadMemoryConsolidations).mockResolvedValue([saved]);
+      const approved = { ...group.decision, action: { kind: "consolidate", consolidation_id: "mcn_1" }, disposition: "approve" as const };
+      const user = userEvent.setup();
+      renderWith([
+        { ...mode, consolidationId: "mcn_1", decision: approved },
+        { ...dark, consolidationId: "mcn_1", decision: approved },
+        scheme,
+      ]);
+
+      const list = await screen.findByRole("listbox", { name: "Memory triage exceptions" });
+      expect(within(list).getByRole("option", { name: /dark mode/ })).toHaveTextContent("consolidated");
+      const view = await screen.findByRole("region", { name: "Consolidate facts" });
+      expect(within(view).getByLabelText("Wording")).toHaveValue("Alice prefers dark themes");
+      await user.click(within(view).getByRole("button", { name: "Cancel consolidation" }));
+      await user.click(within(screen.getByRole("dialog", { name: "Continue?" })).getByRole("button", { name: "Continue" }));
+
+      await waitFor(() => expect(cancelMemoryConsolidation).toHaveBeenCalledWith("secret", summary.planId, "mcn_1", 2));
+    });
+
+    it("keeps the draft when saving fails", async () => {
+      vi.mocked(stageMemoryConsolidation).mockRejectedValue(new Error("A selected fact changed after it was loaded"));
+      const user = userEvent.setup();
+      renderWith([dark, mode, scheme]);
+
+      await user.click(await screen.findByRole("button", { name: "Consolidate related facts…" }));
+      const view = screen.getByRole("region", { name: "Consolidate facts" });
+      await user.clear(within(view).getByLabelText("Wording"));
+      await user.type(within(view).getByLabelText("Wording"), "Alice prefers dark themes");
+      await user.selectOptions(within(view).getByLabelText("Scope"), "global");
+      await user.click(within(view).getByRole("button", { name: "Save consolidation" }));
+      await user.click(within(screen.getByRole("dialog", { name: "Continue?" })).getByRole("button", { name: "Continue" }));
+
+      expect(await within(view).findByRole("alert")).toHaveTextContent("changed after it was loaded");
+      expect(within(view).getByLabelText("Wording")).toHaveValue("Alice prefers dark themes");
+    });
   });
 
   it("labels a saved decision by its outcome, so obsolete is not shown as approved", async () => {
@@ -487,7 +622,7 @@ describe("Memory reconciliation triage", () => {
     });
   });
 
-  it("shows stable references and navigates legacy cross-group recommendations", async () => {
+  it("shows related facts by their text and navigates legacy cross-group recommendations", async () => {
     const relatedId = "mtg_a37a772857d24bb5556da8997ff2381e";
     const source = {
       ...group,
@@ -518,8 +653,11 @@ describe("Memory reconciliation triage", () => {
       </ConfirmationProvider>,
     );
 
-    const linked = await screen.findByRole("button", { name: "Group a37a7728" });
-    expect(screen.getByText(/Group 97555862/)).toBeVisible();
+    // Related facts are shown by what they say, and a one-fact group is
+    // labelled as a fact, never by an internal group id.
+    const linked = await screen.findByRole("button", { name: "The related canonical fact" });
+    expect(screen.queryByText(/Group 97555862/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Consolidate related facts…" })).toBeEnabled();
     expect(screen.getByLabelText("Decision")).toHaveValue("approve");
     expect(within(screen.getByLabelText("Decision")).getByRole("option", { name: "Approve as current truth" })).toBeEnabled();
     await user.click(linked);
