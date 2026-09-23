@@ -418,6 +418,7 @@ function MemoryDetailPane({
       </div>
     );
   }
+  const legacy = detail.lifecycle.authority === "legacy";
 
   return (
     <div className="memory-detail-scroll">
@@ -524,9 +525,16 @@ function MemoryDetailPane({
 
       <section className="memory-detail-section memory-management">
         <p className="memory-section-label">Manage memory</p>
+        {/* Legacy rows are read-only until legacy reconciliation adopts them;
+            the server refuses edits, moves, and forgets for them. */}
+        {legacy && (
+          <p className="memory-review-gaps">
+            This memory is waiting for legacy reconciliation and can't be changed yet.
+          </p>
+        )}
         <label>
           Move to
-          <select value={target} onChange={(event) => setTarget(event.target.value)}>
+          <select disabled={legacy} value={target} onChange={(event) => setTarget(event.target.value)}>
             <option value="global">Global scope</option>
             {allowedProjects.map((project) => (
               <option key={project.projectId} value={`project:${project.projectId}`}>
@@ -536,16 +544,16 @@ function MemoryDetailPane({
           </select>
         </label>
         <div>
-          <button type="button" disabled={busy} onClick={() => onEdit(detail)}>
+          <button type="button" disabled={busy || legacy} onClick={() => onEdit(detail)}>
             Edit memory…
           </button>
-          <button type="button" disabled={busy} onClick={() => onMove(detail.memoryId, target)}>
+          <button type="button" disabled={busy || legacy} onClick={() => onMove(detail.memoryId, target)}>
             Move memory…
           </button>
           <button
             className="danger"
             type="button"
-            disabled={busy}
+            disabled={busy || legacy}
             onClick={() => onDelete(detail.memoryId)}
           >
             Forget memory…
@@ -817,12 +825,15 @@ function MemoryExplorerContent({
   };
 
   const mutationSummary = (batch: WorkshopMemoryMutationBatch): string => {
-    const counts = { succeeded: 0, not_found: 0, stale: 0, failed: 0 };
+    const counts = { succeeded: 0, not_found: 0, stale: 0, failed: 0, awaiting_reconciliation: 0 };
     for (const result of batch.results) counts[result.outcome] += 1;
     const parts = [`${counts.succeeded} succeeded`];
     if (counts.stale) parts.push(`${counts.stale} became stale`);
     if (counts.not_found) parts.push(`${counts.not_found} no longer existed`);
     if (counts.failed) parts.push(`${counts.failed} failed`);
+    if (counts.awaiting_reconciliation) {
+      parts.push(`${counts.awaiting_reconciliation} ${counts.awaiting_reconciliation === 1 ? "is" : "are"} waiting for legacy reconciliation`);
+    }
     return `${batch.operation === "delete" ? "Forget" : "Scope change"}: ${parts.join(", ")}.`;
   };
 

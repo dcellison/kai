@@ -93,10 +93,10 @@ function detail(item: WorkshopMemoryRecord): WorkshopMemoryDetail {
         }
       : null,
     lifecycle: {
-      authority: "legacy",
+      authority: "canonical",
       createdAt: item.createdAt,
       currentRevisionId: null,
-      currentState: "requires_review",
+      currentState: "active",
       events: [],
       followups: [],
       identity: item.memoryId,
@@ -108,6 +108,22 @@ function detail(item: WorkshopMemoryRecord): WorkshopMemoryDetail {
       scope: { key: item.scope.projectId, kind: item.scope.scope },
     },
     promptVersion: "v1",
+  };
+}
+
+// An unreconciled legacy memory: readable, but not editable until legacy
+// reconciliation adopts it.
+function legacyDetail(item: WorkshopMemoryRecord): WorkshopMemoryDetail {
+  const base = detail(item);
+  return {
+    ...base,
+    lifecycle: {
+      ...base.lifecycle,
+      authority: "legacy",
+      currentState: "requires_review",
+      migrationClassification: "unclassified",
+      migrationGaps: ["canonical provenance"],
+    },
   };
 }
 
@@ -339,6 +355,62 @@ describe("Workshop Memory explorer", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Memory service unavailable");
     await user.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(onAuthenticationFailure).toHaveBeenCalledWith("Session expired"));
+  });
+
+  it("shows legacy memories read-only while they wait for reconciliation", async () => {
+    vi.mocked(loadMemoryDetail).mockImplementation(async (_token, memoryId) =>
+      legacyDetail(memoryId === episode.memoryId ? episode : fact)
+    );
+    render(
+      <MemoryExplorer
+        initialMemoryId={null}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    expect(await screen.findByText("Legacy evidence")).toBeVisible();
+    expect(
+      screen.getByText("This memory is waiting for legacy reconciliation and can't be changed yet."),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Edit memory…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Move memory…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Forget memory…" })).toBeDisabled();
+    expect(screen.getByLabelText("Move to")).toBeDisabled();
+  });
+
+  it("reports bulk items that are waiting for legacy reconciliation", async () => {
+    const user = userEvent.setup();
+    vi.mocked(moveMemoriesScope).mockResolvedValue({
+      operation: "move_scope",
+      results: [
+        { memoryId: "memory-1", outcome: "succeeded", priorScope: null, newScope: null },
+        { memoryId: "memory-2", outcome: "awaiting_reconciliation", priorScope: null, newScope: null },
+      ],
+    });
+    render(
+      <MemoryExplorer
+        initialMemoryId={null}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    await screen.findByText("Kai deployment episode");
+    await user.click(screen.getByRole("button", { name: "Select memories" }));
+    await user.click(screen.getByRole("checkbox", { name: /Select Kai deployment episode/ }));
+    await user.click(screen.getByRole("checkbox", { name: /Select Daniel prefers concise output/ }));
+    await user.selectOptions(screen.getByLabelText("Move selected memories to"), "project:kai");
+    await user.click(screen.getByRole("button", { name: "Move selected…" }));
+    await user.click(screen.getByRole("button", { name: "Confirm move" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "1 succeeded, 1 is waiting for legacy reconciliation",
+    );
   });
 
   it("requires confirmation, supports cancellation, and reports partial bulk outcomes", async () => {

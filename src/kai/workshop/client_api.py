@@ -239,6 +239,7 @@ from kai.workshop.memory_queries import (
     MemorySourceContext,
     MemorySourceMessage,
     WorkshopMemoryAccessDenied,
+    WorkshopMemoryAwaitingReconciliation,
     WorkshopMemoryConflict,
     WorkshopMemoryMutationFailed,
     WorkshopMemoryNotFound,
@@ -1943,6 +1944,8 @@ def _memory_error_response(exc: Exception) -> web.Response:
             },
             status=409,
         )
+    if isinstance(exc, WorkshopMemoryAwaitingReconciliation):
+        return _error_response(status=409, code="memory_awaiting_reconciliation", message=str(exc))
     if isinstance(exc, WorkshopMemoryMutationFailed):
         return _error_response(status=503, code="memory_mutation_failed", message=str(exc))
     if isinstance(exc, WorkshopMemoryValidationError):

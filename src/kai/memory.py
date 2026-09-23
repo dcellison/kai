@@ -3934,8 +3934,16 @@ def get_by_id(
     user_id: str,
     memory_id: str,
     runtime_profile_id: str | None = None,
+    admit_legacy: bool = False,
 ) -> MemoryResult | None:
     """Fetch a single user-visible memory by id, scoped to user.
+
+    `admit_legacy` opts this read into the temporary legacy admission
+    that protected search and listings use. Only read-only callers (the
+    Workshop memory detail and source views) may pass it: every mutation
+    path looks its target up here first, and a legacy row must not be
+    edited, moved, or forgotten outside legacy reconciliation. The
+    default keeps exact-id reads strict.
 
     Used by the /memory fact view and forget-fact confirmation
     (spec 310 §6.3, §6.4). Replaces the old pattern of pulling
@@ -4011,6 +4019,7 @@ def get_by_id(
             db_path=Path(_config.session_db_path),
             principal_id=str(namespace.principal_id),
             runtime_profile_id=str(namespace.runtime_profile_id),
+            admit_legacy=admit_legacy,
         ).rows
         return projected[0] if projected else None
     return result

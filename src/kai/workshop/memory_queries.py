@@ -32,6 +32,8 @@ from kai.workshop.memory_current_truth import (
     CANONICAL_CLAIM_ID_KEY,
     CANONICAL_EPISODE_ID_KEY,
     CANONICAL_REVISION_ID_KEY,
+    CANONICAL_TEMPORAL_ROLE_KEY,
+    LEGACY_UNRECONCILED_ROLE,
 )
 from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptAccessDenied,
@@ -106,6 +108,19 @@ class WorkshopMemoryConflict(WorkshopMemoryQueryError):
 
 class WorkshopMemoryMutationFailed(WorkshopMemoryQueryError):
     """A provider mutation failed without producing a verified result."""
+
+
+class WorkshopMemoryAwaitingReconciliation(WorkshopMemoryQueryError):
+    """
+    The memory is an unreconciled legacy row and cannot be changed yet.
+
+    Legacy rows are readable while temporary legacy admission is active,
+    but editing, moving, or forgetting one outside legacy reconciliation
+    would bypass the reconciliation plan that is responsible for it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("This memory is waiting for legacy reconciliation and can't be changed yet")
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +274,7 @@ class MemoryStatsSnapshot:
 @dataclass(frozen=True, slots=True)
 class MemoryMutationResult:
     memory_id: str
-    outcome: Literal["succeeded", "not_found", "stale", "failed"]
+    outcome: Literal["succeeded", "not_found", "stale", "failed", "awaiting_reconciliation"]
     prior_scope: MemoryScopeSnapshot | None
     new_scope: MemoryScopeSnapshot | None
 
@@ -1121,6 +1136,8 @@ class WorkshopMemoryQueryService:
                 runtime_profile_id=str(namespace.runtime_profile_id),
             )
             if existing is None:
+                if await self._awaiting_reconciliation(authority, memory_id):
+                    raise WorkshopMemoryAwaitingReconciliation()
                 raise WorkshopMemoryNotFound("Memory not found")
             if existing.metadata.get("canonical_memory_episode_id"):
                 raise WorkshopMemoryValidationError(
@@ -1377,7 +1394,12 @@ class WorkshopMemoryQueryService:
                     memory_id=memory_id,
                 )
                 if record is None:
-                    result = MemoryMutationResult(memory_id, "not_found", None, None)
+                    outcome: Literal["not_found", "awaiting_reconciliation"] = (
+                        "awaiting_reconciliation"
+                        if await self._awaiting_reconciliation(authority, memory_id)
+                        else "not_found"
+                    )
+                    result = MemoryMutationResult(memory_id, outcome, None, None)
                 else:
                     prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
                     if record.metadata.get("canonical_memory_episode_id"):
@@ -1514,7 +1536,12 @@ class WorkshopMemoryQueryService:
                     memory_id=memory_id,
                 )
                 if record is None:
-                    result = MemoryMutationResult(memory_id, "not_found", None, None)
+                    outcome: Literal["not_found", "awaiting_reconciliation"] = (
+                        "awaiting_reconciliation"
+                        if await self._awaiting_reconciliation(authority, memory_id)
+                        else "not_found"
+                    )
+                    result = MemoryMutationResult(memory_id, outcome, None, None)
                 else:
                     prior = self._scope_snapshot(record, allowed_project_id=allowed_project_id)
                     if record.metadata.get("canonical_memory_episode_id"):
@@ -1779,6 +1806,24 @@ class WorkshopMemoryQueryService:
             ),
         }
 
+    async def _awaiting_reconciliation(self, authority: MemoryQueryAuthority, memory_id: str) -> bool:
+        """
+        Return True when a strict lookup missed only because the row is legacy.
+
+        Mutation paths read their target strictly, so an unreconciled
+        legacy row looks absent to them. Re-reading with legacy admission
+        tells that case apart from a truly missing row, so the caller can
+        say the memory is waiting for reconciliation instead of reporting
+        it as not found.
+        """
+        admitted = await asyncio.to_thread(
+            memory.get_by_id,
+            user_id=str(authority.principal_id),
+            memory_id=memory_id,
+            admit_legacy=True,
+        )
+        return admitted is not None and admitted.metadata.get(CANONICAL_TEMPORAL_ROLE_KEY) == LEGACY_UNRECONCILED_ROLE
+
     async def detail(
         self,
         authority: MemoryQueryAuthority,
@@ -1786,10 +1831,13 @@ class WorkshopMemoryQueryService:
     ) -> MemoryRecordDetail:
         if not memory_id or len(memory_id) > 256:
             raise WorkshopMemoryValidationError("Invalid memory identifier")
+        # Read-only view: admit legacy rows the list already shows, so a
+        # listed memory never opens as "not found".
         result = await asyncio.to_thread(
             memory.get_by_id,
             user_id=str(authority.principal_id),
             memory_id=memory_id,
+            admit_legacy=True,
         )
         if result is None:
             raise WorkshopMemoryNotFound("Memory not found")
@@ -1961,10 +2009,13 @@ class WorkshopMemoryQueryService:
     ) -> MemorySourceContext:
         if not memory_id or len(memory_id) > 256:
             raise WorkshopMemoryValidationError("Invalid memory identifier")
+        # Read-only view: admit legacy rows the list already shows, so a
+        # listed memory never opens as "not found".
         result = await asyncio.to_thread(
             memory.get_by_id,
             user_id=str(authority.principal_id),
             memory_id=memory_id,
+            admit_legacy=True,
         )
         if result is None:
             raise WorkshopMemoryNotFound("Memory not found")

@@ -510,7 +510,9 @@ async def test_stats_and_detail_expose_only_bounded_stable_fields(
     monkeypatch.setattr(
         memory,
         "get_by_id",
-        lambda *, user_id, memory_id: episode if user_id == str(principal_id) and memory_id == episode.id else None,
+        lambda *, user_id, memory_id, admit_legacy=False: (
+            episode if user_id == str(principal_id) and memory_id == episode.id else None
+        ),
     )
 
     stats = await service.stats(authority)
@@ -619,7 +621,7 @@ async def test_scope_management_is_bounded_authorized_partial_and_audited(
     async def active_project(_authority):
         return "kai"
 
-    def get_by_id(*, user_id: str, memory_id: str):
+    def get_by_id(*, user_id: str, memory_id: str, admit_legacy: bool = False):
         assert user_id == str(principal_id)
         return rows.get(memory_id)
 
@@ -685,7 +687,7 @@ async def test_delete_management_restricts_sources_and_reports_stale_targets(
         "stale": _result("stale", "already deleting"),
     }
 
-    def get_by_id(*, user_id: str, memory_id: str):
+    def get_by_id(*, user_id: str, memory_id: str, admit_legacy: bool = False):
         assert user_id == str(principal_id)
         return rows.get(memory_id)
 
@@ -1238,3 +1240,119 @@ async def test_source_context_requires_canonical_lineage_and_channel_membership(
         assert (legacy.status, legacy.reason) == ("unavailable", "legacy_source")
     finally:
         await store.close()
+
+
+# ── Unreconciled legacy memories ─────────────────────────────────────
+
+
+def _legacy_rows(principal_id: PrincipalId):
+    """
+    Build a get_by_id stub that mirrors temporary legacy admission.
+
+    The "legacy" row is visible only when the caller opts in with
+    `admit_legacy=True`, and then carries the legacy temporal role, which
+    is how the real current-truth gate presents unreconciled rows.
+    """
+    from kai.workshop.memory_current_truth import CANONICAL_TEMPORAL_ROLE_KEY, LEGACY_UNRECONCILED_ROLE
+
+    legacy = _result("legacy", "An unreconciled legacy fact")
+    labeled = replace(legacy, metadata={**legacy.metadata, CANONICAL_TEMPORAL_ROLE_KEY: LEGACY_UNRECONCILED_ROLE})
+    calls: list[tuple[str, bool]] = []
+
+    def get_by_id(*, user_id: str, memory_id: str, runtime_profile_id=None, admit_legacy: bool = False):
+        assert user_id == str(principal_id)
+        calls.append((memory_id, admit_legacy))
+        return labeled if memory_id == "legacy" and admit_legacy else None
+
+    return get_by_id, calls
+
+
+async def test_legacy_memory_detail_and_source_open_through_read_only_admission(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, principal_id = _service(tmp_path)
+    get_by_id, calls = _legacy_rows(principal_id)
+    monkeypatch.setattr(memory, "get_by_id", get_by_id)
+
+    detail = await service.detail(authority, "legacy")
+    source = await service.source_context(authority, "legacy")
+
+    assert detail.record.memory_id == "legacy"
+    assert detail.lifecycle["authority"] == "legacy"
+    assert source is not None
+    assert calls[:2] == [("legacy", True), ("legacy", True)]
+
+
+def _legacy_revision() -> str:
+    """A well-formed revision token; the strict lookup fails before it is compared."""
+    from kai.workshop.memory_queries import _REVISION_VERSION
+
+    return f"mr{_REVISION_VERSION}_" + "0" * 64
+
+
+async def test_legacy_memory_edits_are_refused_as_awaiting_reconciliation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from kai.workshop.memory_queries import WorkshopMemoryAwaitingReconciliation
+
+    service, authority, principal_id = _service(tmp_path)
+    get_by_id, _calls = _legacy_rows(principal_id)
+    monkeypatch.setattr(memory, "get_by_id", get_by_id)
+    monkeypatch.setattr(
+        memory,
+        "update_metadata",
+        lambda **_kwargs: pytest.fail("a legacy row must not be edited outside reconciliation"),
+    )
+
+    with pytest.raises(WorkshopMemoryAwaitingReconciliation):
+        await service.edit(
+            authority,
+            "legacy",
+            revision=_legacy_revision(),
+            request_id="legacy-edit",
+            edit=MemoryFactEdit("Changed", ("preference",)),
+        )
+    with pytest.raises(WorkshopMemoryNotFound):
+        await service.edit(
+            authority,
+            "missing",
+            revision=_legacy_revision(),
+            request_id="missing-edit",
+            edit=MemoryFactEdit("Changed", ("preference",)),
+        )
+
+
+async def test_legacy_memory_moves_and_forgets_report_awaiting_reconciliation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, authority, principal_id = _service(tmp_path)
+    get_by_id, _calls = _legacy_rows(principal_id)
+    monkeypatch.setattr(memory, "get_by_id", get_by_id)
+    monkeypatch.setattr(
+        memory,
+        "delete_by_id",
+        lambda **_kwargs: pytest.fail("a legacy row must not be forgotten outside reconciliation"),
+    )
+
+    moved = await service.move_scope(authority, ["legacy", "missing"], scope="global")
+    deleted = await service.delete(authority, ["legacy", "missing"])
+
+    assert [result.outcome for result in moved.results] == ["awaiting_reconciliation", "not_found"]
+    assert [result.outcome for result in deleted.results] == ["awaiting_reconciliation", "not_found"]
+
+
+def test_awaiting_reconciliation_maps_to_a_distinct_conflict_response() -> None:
+    import json as _json
+
+    from kai.workshop.client_api import _memory_error_response
+    from kai.workshop.memory_queries import WorkshopMemoryAwaitingReconciliation
+
+    response = _memory_error_response(WorkshopMemoryAwaitingReconciliation())
+    body = _json.loads(response.text or "{}")
+
+    assert response.status == 409
+    assert body["error"]["code"] == "memory_awaiting_reconciliation"
+    assert "waiting for legacy reconciliation" in body["error"]["message"]

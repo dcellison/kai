@@ -541,7 +541,7 @@ def _configured_memory(monkeypatch, database: Path, raw: dict[str, object]):
 
 
 @pytest.mark.asyncio
-async def test_search_and_listing_admit_legacy_while_exact_reads_stay_strict(tmp_path: Path, monkeypatch) -> None:
+async def test_read_surfaces_admit_legacy_while_exact_reads_stay_strict_by_default(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "kai.db"
     store = await _store(path)
     await store.close()
@@ -558,6 +558,12 @@ async def test_search_and_listing_admit_legacy_while_exact_reads_stay_strict(tmp
         searched = memory.search("preference", user_id=str(PRINCIPAL_ID), runtime_profile_id=str(RUNTIME_ID))
         listed = memory.get_all(user_id=str(PRINCIPAL_ID), runtime_profile_id=str(RUNTIME_ID))
         exact = memory.get_by_id(user_id=str(PRINCIPAL_ID), memory_id="legacy-1", runtime_profile_id=str(RUNTIME_ID))
+        read_only = memory.get_by_id(
+            user_id=str(PRINCIPAL_ID),
+            memory_id="legacy-1",
+            runtime_profile_id=str(RUNTIME_ID),
+            admit_legacy=True,
+        )
         updated = memory.update_metadata(
             user_id=str(PRINCIPAL_ID),
             memory_id="legacy-1",
@@ -570,6 +576,8 @@ async def test_search_and_listing_admit_legacy_while_exact_reads_stay_strict(tmp
         assert [row.id for row in listed] == ["legacy-1"]
         assert searched[0].metadata[CANONICAL_TEMPORAL_ROLE_KEY] == LEGACY_UNRECONCILED_ROLE
         assert exact is None
+        assert read_only is not None
+        assert read_only.metadata[CANONICAL_TEMPORAL_ROLE_KEY] == LEGACY_UNRECONCILED_ROLE
         assert updated is False
     finally:
         memory.configure_memory_authority(None)
