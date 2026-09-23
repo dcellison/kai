@@ -93,6 +93,26 @@ function requestError(caught: unknown, fallback: string): string {
 
 type ExceptionDecisionChoice = "approve" | "obsolete" | "reject" | "defer";
 
+// What a saved decision means, for its badge. Triage stores "mark obsolete"
+// as an approval of the expire action (approving it is how a fact is
+// retired), so the raw disposition alone would show an obsolete decision
+// as "approve". The class keys the badge color; the label is the outcome.
+function decisionBadge(decision: WorkshopMemoryTriageGroup["decision"]): { className: string; label: string } {
+  if (decision.disposition !== "approve") {
+    return { className: decision.disposition, label: decision.disposition };
+  }
+  switch (decision.action.kind) {
+    case "expire_all":
+      return { className: "obsolete", label: "obsolete" };
+    case "keep_first_retract_rest":
+      return { className: "approve", label: "consolidated" };
+    case "record_episode_chain":
+      return { className: "approve", label: "retained" };
+    default:
+      return { className: "approve", label: "approved" };
+  }
+}
+
 function groupReference(groupId: string): string {
   return `Group ${groupId.replace(/^mtg_/, "").slice(0, 8)}`;
 }
@@ -318,8 +338,8 @@ function ExceptionEditor({
           <p className="overline">Exception review</p>
           <h2>{formatLabel(group.classification)}</h2>
         </div>
-        <span className={`memory-review-state ${group.decision.disposition}`}>
-          {group.decision.disposition}
+        <span className={`memory-review-state ${decisionBadge(group.decision).className}`}>
+          {decisionBadge(group.decision).label}
         </span>
       </header>
 
@@ -730,7 +750,9 @@ export function MemoryReconciliation({
                     <button type="button" role="option" aria-selected={selectedId === group.groupId} key={group.groupId}
                       className={`memory-record ${selectedId === group.groupId ? "selected" : ""}`}
                       onClick={() => setSelectedId(group.groupId)}>
-                      <span className={`memory-review-state ${group.decision.disposition}`}>{group.decision.disposition}</span>
+                      <span className={`memory-review-state ${decisionBadge(group.decision).className}`}>
+                        {decisionBadge(group.decision).label}
+                      </span>
                       <span className="memory-record-copy">
                         <strong>{group.evidence[0]?.text ?? "Unavailable memory"}</strong>
                         <small>{groupReference(group.groupId)} · {formatLabel(group.classification)} · {group.evidence.length} evidence row{group.evidence.length === 1 ? "" : "s"}</small>
