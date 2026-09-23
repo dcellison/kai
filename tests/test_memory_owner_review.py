@@ -18,59 +18,21 @@ from pathlib import Path
 import pytest
 
 from kai import memory
-from kai.config import Config
-from kai.workshop.domain import AgentId, ChannelId
-from kai.workshop.execution_state import WorkshopExecutionStateNamespace, WorkshopExecutionStateRegistry
 from kai.workshop.memory_queries import (
     WorkshopMemoryConflictChanged,
     WorkshopMemoryMutationFailed,
     WorkshopMemoryNotFound,
-    WorkshopMemoryQueryService,
     WorkshopMemoryValidationError,
 )
-from tests.test_memory_canonical_write_path import (  # noqa: F401 - pytest fixture import
+from tests.memory_fixtures import (  # noqa: F401 - pytest fixture import
     PRINCIPAL_ID,
     RUNTIME_ID,
     _new,
+    _query_service,
     _recall,
     _store_fact,
     protected,
 )
-
-
-class _RuntimePool:
-    """Runtime pool stand-in: the owner review paths only need a workspace."""
-
-    def __init__(self, workspace: Path) -> None:
-        self.workspace = workspace
-
-    async def get_effective_workspace(self, _profile_id) -> Path:
-        return self.workspace
-
-
-def _query_service(store, tmp_path: Path) -> tuple[WorkshopMemoryQueryService, object]:
-    namespace = WorkshopExecutionStateNamespace(
-        principal_id=PRINCIPAL_ID,
-        channel_id=ChannelId("chn_23000000000000000000000000000001"),
-        agent_id=AgentId("agt_23000000000000000000000000000001"),
-        runtime_profile_id=RUNTIME_ID,
-        legacy_runtime_key=1,
-    )
-    service = WorkshopMemoryQueryService(
-        # The service writes stored audits through `session_db_path`, which
-        # in production is the store's own database; the fixture's store
-        # lives at tmp_path / "kai.db".
-        Config(
-            telegram_bot_token="token",
-            allowed_user_ids={1},
-            memory_enabled=True,
-            session_db_path=tmp_path / "kai.db",
-        ),
-        store,
-        _RuntimePool(tmp_path),  # type: ignore[arg-type]
-        WorkshopExecutionStateRegistry((namespace,)),
-    )
-    return service, service.authority_for_principal(PRINCIPAL_ID)
 
 
 async def _conflict(store, provider) -> str:

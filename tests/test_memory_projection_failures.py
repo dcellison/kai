@@ -28,15 +28,15 @@ from kai.workshop.episode_history import Mem0EpisodeVectorAdapter, MemoryEpisode
 from kai.workshop.memory_current_truth import CANONICAL_CLAIM_ID_KEY
 from kai.workshop.memory_projection_status import projection_status_async
 from kai.workshop.memory_queries import WorkshopMemoryMutationFailed
-from tests.test_memory_canonical_write_path import (  # noqa: F401 - pytest fixture import
+from tests.memory_fixtures import (  # noqa: F401 - pytest fixture import
     PRINCIPAL_ID,
     RUNTIME_ID,
     _new,
+    _query_service,
     _recall,
     _store_fact,
     protected,
 )
-from tests.test_memory_owner_review import _query_service
 from tests.test_workshop_episode_history import _spec as _episode_spec
 
 OWNER = (str(PRINCIPAL_ID), str(RUNTIME_ID))

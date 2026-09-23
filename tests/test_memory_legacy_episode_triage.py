@@ -32,7 +32,7 @@ from kai.workshop.memory_reconciliation_review import (
 from kai.workshop.memory_reconciliation_triage import WorkshopMemoryReconciliationTriageService
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
-from tests.test_memory_canonical_write_path import FakeMem0
+from tests.memory_fixtures import FakeMem0
 from tests.test_memory_reconciliation_triage import NOW, _row
 from tests.workshop_profiles import profile_id
 
