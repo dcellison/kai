@@ -483,6 +483,11 @@ class KaiApplicationHost:
                     "Recovered %d canonical memory vector projection(s)",
                     recovered_memory_projections,
                 )
+            # Install status reads this per-owner count because it cannot
+            # open the vector store the service now holds.
+            census_owners = await memory_queries.refresh_legacy_census()
+            if census_owners:
+                log.info("Counted legacy memory for %d owner(s)", census_owners)
             preference_documents = WorkshopPreferenceService(
                 Path(self._config.session_db_path).parent,
                 self._principal_storage,

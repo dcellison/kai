@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -2121,17 +2121,7 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
                 "SELECT 1 FROM memory_fact_revision_states s WHERE s.revision_id = r.revision_id "
                 "AND s.claim_id = r.claim_id)",
             )
-            baseline = _scalar(
-                connection,
-                "SELECT COALESCE(SUM(total_count), 0) FROM workshop_memory_authority_migrations",
-            )
-            adopted = _scalar(
-                connection,
-                "SELECT COUNT(DISTINCT json_extract(vector_metadata_json, '$._canonical_adopt_memory_id')) "
-                "FROM memory_fact_revisions "
-                "WHERE json_extract(vector_metadata_json, '$._canonical_adopt_memory_id') IS NOT NULL",
-            )
-            legacy_unclassified = max(baseline - adopted, 0)
+            legacy_unclassified, census_age = _legacy_census_summary(connection, tables)
             legacy_active, legacy_inactive = _legacy_admission_owner_counts(connection, tables)
             conflicts, oldest_conflict_days = _unresolved_conflict_summary(connection)
             failed_facts, failed_episodes, blocked, oldest_failure_days = _projection_failure_summary(
@@ -2144,7 +2134,9 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
     failed_projections = failed_facts + failed_episodes
     # Failed and blocked vector operations are faults, not a state waiting
     # on an owner, so unlike open conflicts they make the status INCOMPLETE.
-    gaps = malformed + quarantined + projection_gaps + legacy_unclassified + failed_projections + blocked
+    # No census yet means the count is unknown, which is not "complete".
+    gaps = malformed + quarantined + projection_gaps + (legacy_unclassified if legacy_unclassified is not None else 1)
+    gaps += failed_projections + blocked
     state = "active" if memory_enabled is True and gaps == 0 else "INCOMPLETE"
     if memory_enabled is None:
         state = "NOT VERIFIED"
@@ -2152,7 +2144,7 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
         f"{prefix} {state}; claims={claims}, revisions={revisions}, current={active}, "
         f"inactive={inactive}, validity excluded={validity_excluded}, quarantined={quarantined}, "
         f"operator admitted={operator_admitted}, "
-        f"legacy unclassified={legacy_unclassified}, projection gaps={projection_gaps}, "
+        f"legacy unclassified={_census_label(legacy_unclassified, census_age)}, projection gaps={projection_gaps}, "
         f"integrity gaps={malformed}; "
         f"unresolved conflicts={conflicts}"
         f"{f' (oldest={oldest_conflict_days}d)' if conflicts else ''}; "
@@ -2194,6 +2186,41 @@ def _unresolved_conflict_summary(connection: sqlite3.Connection) -> tuple[int, i
     if opened.tzinfo is None:
         opened = opened.replace(tzinfo=UTC)
     return count, max((datetime.now(UTC) - opened).days, 0)
+
+
+def _legacy_census_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int | None, str | None]:
+    """
+    Sum unclassified legacy rows across owners from the stored census.
+
+    The service counts legacy rows at startup and after every
+    reconciliation apply, because only it can read the vector store; this
+    reads the stored counts. Returns (None, None) before any census, and
+    otherwise the sum with the age of the oldest owner's count, so a stale
+    number is visible as stale.
+    """
+    if "memory_legacy_census" not in tables:
+        return None, None
+    row = connection.execute("SELECT COUNT(*), SUM(unclassified), MIN(counted_at) FROM memory_legacy_census").fetchone()
+    if row is None or not row[0]:
+        return None, None
+    counted = datetime.fromisoformat(str(row[2]).replace("Z", "+00:00"))
+    if counted.tzinfo is None:
+        counted = counted.replace(tzinfo=UTC)
+    return int(row[1] or 0), _age_label(datetime.now(UTC) - counted)
+
+
+def _age_label(age: timedelta) -> str:
+    """Render an age compactly: minutes under an hour, hours under a day, then days."""
+    minutes = max(int(age.total_seconds() // 60), 0)
+    if minutes < 60:
+        return f"{minutes}m"
+    if minutes < 24 * 60:
+        return f"{minutes // 60}h"
+    return f"{minutes // (24 * 60)}d"
+
+
+def _census_label(unclassified: int | None, age: str | None) -> str:
+    return "not counted" if unclassified is None else f"{unclassified} (counted {age} ago)"
 
 
 def _projection_failure_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int, int, int, int]:

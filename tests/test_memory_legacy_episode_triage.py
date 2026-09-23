@@ -12,6 +12,7 @@ policy forward without losing the operator's other decisions.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,7 +23,8 @@ from kai import memory_reconciliation_triage as triage_policy
 from kai.memory import MemoryResult
 from kai.memory_reconciliation_triage import build_triage_plan
 from kai.workshop.bootstrap import BootstrapHuman, bootstrap_default_workshop
-from kai.workshop.domain import PrincipalId
+from kai.workshop.domain import AgentId, ChannelId, PrincipalId
+from kai.workshop.execution_state import WorkshopExecutionStateNamespace, WorkshopExecutionStateRegistry
 from kai.workshop.memory_reconciliation_review import (
     MemoryReconciliationReviewValidationError,
     record_reconciliation_audit,
@@ -136,7 +138,7 @@ def test_every_deterministic_group_passes_the_schema() -> None:
 # ── Service: decisions, apply preflight, and moving a plan forward ───
 
 
-async def _service(tmp_path: Path, rows: list[MemoryResult]):
+async def _service(tmp_path: Path, rows: list[MemoryResult], *, stamp_owner: bool = False):
     db_path = tmp_path / "kai.db"
     store = await WorkshopEventStore.open(db_path)
     await bootstrap_default_workshop(
@@ -149,6 +151,12 @@ async def _service(tmp_path: Path, rows: list[MemoryResult]):
         row = await cursor.fetchone()
     assert row is not None
     principal = PrincipalId(str(row[0]))
+    if stamp_owner:
+        # Production legacy rows carry their owner's principal stamp, which
+        # the owner-verified reads require; the audit sees the same rows.
+        rows[:] = [
+            replace(item, metadata={**item.metadata, memory.WORKSHOP_PRINCIPAL_ID_KEY: str(principal)}) for item in rows
+        ]
     audit = memory_reconciliation.build_audit(
         principal_id=str(principal),
         runtime_profile_id=str(profile_id(101)),
@@ -334,9 +342,38 @@ async def test_apply_refuses_a_stored_approval_that_would_fail_the_schema(tmp_pa
         await store.close()
 
 
+def _stored(principal: PrincipalId, rows: list[MemoryResult]) -> FakeMem0:
+    """A vector store holding the legacy rows exactly as the audit saw them."""
+    provider = FakeMem0()
+    for row in rows:
+        provider.rows[row.id] = {
+            "id": row.id,
+            "memory": row.text,
+            "metadata": dict(row.metadata),
+            "user_id": str(principal),
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+    return provider
+
+
 async def test_rejecting_incomplete_episodes_lets_every_approved_episode_apply(tmp_path: Path, monkeypatch) -> None:
-    store, service, principal = await _service(tmp_path, _ROWS)
-    monkeypatch.setattr(memory, "_memory", FakeMem0())
+    rows = list(_ROWS)
+    store, service, principal = await _service(tmp_path, rows, stamp_owner=True)
+    monkeypatch.setattr(memory, "_memory", _stored(principal, rows))
+    memory.configure_memory_authority(
+        WorkshopExecutionStateRegistry(
+            (
+                WorkshopExecutionStateNamespace(
+                    principal_id=principal,
+                    channel_id=ChannelId("chn_" + "1" * 32),
+                    agent_id=AgentId("agt_" + "1" * 32),
+                    runtime_profile_id=profile_id(101),
+                    legacy_runtime_key=101,
+                ),
+            )
+        )
+    )
     try:
         summary = await service.latest(principal)
         assert summary is not None
@@ -354,8 +391,6 @@ async def test_rejecting_incomplete_episodes_lets_every_approved_episode_apply(t
             client_operation_id="decide-reject-before-apply",
         )
         review_version = await _approve_safe_groups(service, principal, summary.plan_id, 1)
-        monkeypatch.setattr(memory, "get_all_for_lifecycle_projection", lambda **_kwargs: _ROWS)
-
         applied = await service.apply(
             principal,
             summary.plan_id,
@@ -368,4 +403,5 @@ async def test_rejecting_incomplete_episodes_lets_every_approved_episode_apply(t
         async with store.connection.execute("SELECT COUNT(*) FROM memory_episodes") as cursor:
             assert (await cursor.fetchone())[0] == 1  # the complete episode; the rejected one is not recorded
     finally:
+        memory.configure_memory_authority(None)
         await store.close()

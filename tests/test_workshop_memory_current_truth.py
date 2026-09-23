@@ -73,6 +73,18 @@ def _database(path: Path) -> sqlite3.Connection:
         );
         CREATE TABLE workshop_memory_authority_migrations (total_count INTEGER NOT NULL);
         INSERT INTO workshop_memory_authority_migrations VALUES (0);
+        CREATE TABLE memory_legacy_census (
+            principal_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL,
+            legacy_rows INTEGER NOT NULL,
+            absorbed INTEGER NOT NULL,
+            rejected INTEGER NOT NULL,
+            unclassified INTEGER NOT NULL,
+            counted_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, runtime_profile_id)
+        );
+        -- The service counts legacy rows at startup; here nothing is unclassified.
+        INSERT INTO memory_legacy_census VALUES ('prn_x', 'rtp_x', 0, 0, 0, 0, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
         """
     )
     return connection
@@ -408,17 +420,25 @@ def test_status_surfaces_quarantine_projection_and_legacy_gaps(tmp_path: Path) -
     active = workshop_memory_current_truth_status(database, memory_enabled=True)
     assert active.startswith("Workshop memory current truth: active;")
     assert "current=1" in active
-    assert "legacy unclassified=0" in active
+    assert "legacy unclassified=0 (counted 0m ago)" in active
 
     connection = sqlite3.connect(database)
     connection.execute(
         "UPDATE memory_fact_revisions SET migration_classification = 'legacy_quarantined', "
         "admission_authority = 'quarantined'"
     )
-    connection.execute("UPDATE workshop_memory_authority_migrations SET total_count = 2")
+    # The latest census found two legacy rows nothing has settled.
+    connection.execute("UPDATE memory_legacy_census SET legacy_rows = 2, unclassified = 2")
     connection.commit()
     connection.close()
     incomplete = workshop_memory_current_truth_status(database, memory_enabled=True)
     assert incomplete.startswith("Workshop memory current truth: INCOMPLETE;")
     assert "quarantined=1" in incomplete
-    assert "legacy unclassified=2" in incomplete
+    assert "legacy unclassified=2 (counted 0m ago)" in incomplete
+
+    connection = sqlite3.connect(database)
+    connection.execute("DELETE FROM memory_legacy_census")
+    connection.commit()
+    connection.close()
+    uncounted = workshop_memory_current_truth_status(database, memory_enabled=True)
+    assert "legacy unclassified=not counted" in uncounted and "INCOMPLETE" in uncounted
