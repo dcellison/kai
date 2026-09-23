@@ -2133,6 +2133,7 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
             )
             legacy_unclassified = max(baseline - adopted, 0)
             legacy_active, legacy_inactive = _legacy_admission_owner_counts(connection, tables)
+            conflicts, oldest_conflict_days = _unresolved_conflict_summary(connection)
         finally:
             connection.close()
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
@@ -2147,9 +2148,43 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
         f"operator admitted={operator_admitted}, "
         f"legacy unclassified={legacy_unclassified}, projection gaps={projection_gaps}, "
         f"integrity gaps={malformed}; "
+        f"unresolved conflicts={conflicts}"
+        f"{f' (oldest={oldest_conflict_days}d)' if conflicts else ''}; "
         f"legacy admission active={legacy_active} (no applied audit), inactive={legacy_inactive} (audit applied); "
         "authority=canonical/current-only"
     )
+
+
+def _unresolved_conflict_summary(connection: sqlite3.Connection) -> tuple[int, int]:
+    """
+    Count claims waiting on their owner to settle a conflict, and the age of the oldest.
+
+    Conflicts are a normal state that only the owner can end, so they are
+    reported for visibility and never counted as integrity gaps. The age
+    is whole days since the oldest still-open conflict was opened; it is
+    reported as 0 when the lifecycle history cannot say when that was.
+    """
+    row = connection.execute(
+        "SELECT COUNT(DISTINCT claim_id) FROM memory_fact_revision_states WHERE state = 'unresolved_conflict'"
+    ).fetchone()
+    count = int(row[0]) if row is not None and row[0] is not None else 0
+    history_columns = {
+        str(column[1]) for column in connection.execute("PRAGMA table_info(memory_fact_lifecycle_events)")
+    }
+    if not count or not {"claim_id", "transition", "occurred_at"}.issubset(history_columns):
+        return count, 0
+    oldest = connection.execute(
+        "SELECT MIN(opened) FROM (SELECT MAX(e.occurred_at) AS opened FROM memory_fact_lifecycle_events e "
+        "WHERE e.transition = 'conflict_opened' AND e.claim_id IN ("
+        "SELECT claim_id FROM memory_fact_revision_states WHERE state = 'unresolved_conflict') "
+        "GROUP BY e.claim_id)"
+    ).fetchone()
+    if oldest is None or oldest[0] is None:
+        return count, 0
+    opened = datetime.fromisoformat(str(oldest[0]).replace("Z", "+00:00"))
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=UTC)
+    return count, max((datetime.now(UTC) - opened).days, 0)
 
 
 def _legacy_admission_owner_counts(connection: sqlite3.Connection, tables: set[str]) -> tuple[int, int]:

@@ -6724,6 +6724,118 @@ button:disabled {
   color: var(--color-success);
 }
 
+/* Fact review: owner decisions on conflicted and forgotten facts. */
+
+.memory-review-state.retracted,
+.memory-review-state.expired {
+  border-color: color-mix(in srgb, var(--color-danger) 45%, transparent);
+  color: var(--color-danger);
+}
+
+.fact-review-button {
+  position: relative;
+}
+
+.fact-review-button svg {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+/* Count of open conflicts, pinned to the button corner like an unread count. */
+.fact-review-badge {
+  position: absolute;
+  top: -0.3rem;
+  right: -0.3rem;
+  min-width: 1rem;
+  border-radius: 999px;
+  padding: 0.08rem 0.28rem;
+  background: var(--color-warning);
+  color: var(--color-canvas);
+  font: 700 0.58rem/1.2 var(--sans);
+  text-align: center;
+}
+
+.fact-review-tabs {
+  display: flex;
+  gap: 0.4rem;
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 0.65rem;
+}
+
+.fact-review-tabs button {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.35rem 0.65rem;
+  background: transparent;
+  color: var(--color-text-muted);
+  font: 600 0.72rem/1.3 var(--sans);
+  cursor: pointer;
+}
+
+.fact-review-tabs button[aria-selected="true"] {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.fact-review-tabs span {
+  margin-left: 0.3rem;
+  opacity: 0.75;
+}
+
+/* Competing versions sit side by side, stacking when the pane is narrow. */
+.fact-review-sides {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.65rem;
+  margin: 0.8rem 0;
+}
+
+.fact-review-sides .memory-review-evidence + .memory-review-evidence {
+  margin-top: 0;
+}
+
+.fact-review-sides .memory-review-evidence {
+  display: grid;
+  align-content: start;
+  gap: 0.55rem;
+}
+
+.fact-review-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.25rem 0.6rem;
+  margin: 0;
+  font-size: 0.7rem;
+}
+
+.fact-review-facts dt {
+  color: var(--color-text-muted);
+  font-weight: 680;
+}
+
+.fact-review-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.fact-review-warning {
+  border: 1px solid color-mix(in srgb, var(--color-warning) 50%, transparent);
+  border-radius: 0.35rem;
+  padding: 0.5rem 0.65rem;
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  color: var(--color-warning);
+}
+
+.fact-review-link {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--color-accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .memory-reconciliation-detail {
   height: 100%;
   padding: 0 1.2rem 3rem;

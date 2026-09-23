@@ -1096,6 +1096,7 @@ describe("Workshop React client", () => {
       episodes: 0,
       facts: 1,
       total: 1,
+      unresolvedConflicts: 0,
     });
     vi.mocked(loadMemoryRecords).mockResolvedValue({
       nextCursor: null,

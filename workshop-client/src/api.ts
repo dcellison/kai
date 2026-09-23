@@ -65,6 +65,11 @@ import type {
   WorkshopMemorySourceContext,
   WorkshopMemorySourceMessage,
   WorkshopMemoryStats,
+  WorkshopMemoryConflictSummary,
+  WorkshopMemoryForgottenFact,
+  WorkshopMemoryLifecycle,
+  WorkshopMemoryLifecycleOutcome,
+  WorkshopMemoryReviewList,
   WorkshopMemoryReconciliationCandidate,
   WorkshopMemoryReconciliationDisposition,
   WorkshopMemoryReconciliationPage,
@@ -157,6 +162,9 @@ export class PrincipalPolicyRevisionConflictError extends Error {
   }
 }
 export class SettingsRevisionConflictError extends Error {}
+// The conflict's unresolved revisions no longer match what the owner saw,
+// so the client must reload before letting them choose again.
+export class MemoryConflictChangedError extends Error {}
 export class MemoryRevisionConflictError extends Error {
   constructor(
     message: string,
@@ -4036,6 +4044,7 @@ export async function loadMemoryStats(token: string): Promise<WorkshopMemoryStat
     !Number.isSafeInteger(stats.total) ||
     !Number.isSafeInteger(stats.facts) ||
     !Number.isSafeInteger(stats.episodes) ||
+    !Number.isSafeInteger(stats.unresolved_conflicts) ||
     !byScope || !bySource || !byType || !allowedProjects ||
     allowedProjects.some((project) => project === null)
   ) {
@@ -4049,6 +4058,7 @@ export async function loadMemoryStats(token: string): Promise<WorkshopMemoryStat
     episodes: stats.episodes as number,
     facts: stats.facts as number,
     total: stats.total as number,
+    unresolvedConflicts: stats.unresolved_conflicts as number,
   };
 }
 
@@ -4901,6 +4911,180 @@ export async function loadMemoryDetail(
     : null;
   if (!record) throw new Error("Kai returned an unsupported memory detail.");
   return record;
+}
+
+// Owner fact review: unresolved conflicts and forgotten facts.
+//
+// These claims have no vector row, so the server reads them from the
+// canonical tables. Every parser rejects the whole payload on one bad
+// item, like the other memory readers, so a server drift shows as an
+// error instead of a half-rendered list.
+
+function parseReviewScope(value: unknown): { kind: string; key: string | null } | null {
+  return isRecord(value) && typeof value.kind === "string" &&
+    (value.key === null || typeof value.key === "string")
+    ? { kind: value.kind, key: value.key as string | null }
+    : null;
+}
+
+function parseConflictSummary(value: unknown): WorkshopMemoryConflictSummary | null {
+  if (
+    !isRecord(value) || typeof value.claim_id !== "string" || typeof value.opened_at !== "string" ||
+    !Array.isArray(value.revisions)
+  ) return null;
+  const scope = parseReviewScope(value.scope);
+  const revisions = value.revisions.map((revision) => (
+    isRecord(revision) && typeof revision.revision_id === "string" &&
+    typeof revision.preview === "string" && typeof revision.stored_at === "string"
+      ? { preview: revision.preview, revisionId: revision.revision_id, storedAt: revision.stored_at }
+      : null
+  ));
+  if (!scope || revisions.some((revision) => revision === null)) return null;
+  return {
+    claimId: value.claim_id,
+    openedAt: value.opened_at,
+    revisions: revisions as WorkshopMemoryConflictSummary["revisions"],
+    scope,
+  };
+}
+
+function parseForgottenFact(value: unknown): WorkshopMemoryForgottenFact | null {
+  if (
+    !isRecord(value) || typeof value.claim_id !== "string" || typeof value.revision_id !== "string" ||
+    typeof value.changed_at !== "string" || typeof value.reason !== "string" ||
+    typeof value.preview !== "string" || (value.state !== "retracted" && value.state !== "expired")
+  ) return null;
+  const scope = parseReviewScope(value.scope);
+  if (!scope) return null;
+  return {
+    changedAt: value.changed_at,
+    claimId: value.claim_id,
+    preview: value.preview,
+    reason: value.reason,
+    revisionId: value.revision_id,
+    scope,
+    state: value.state,
+  };
+}
+
+async function loadReviewList<T>(
+  token: string,
+  path: string,
+  field: string,
+  parse: (value: unknown) => T | null,
+  fallback: string,
+): Promise<WorkshopMemoryReviewList<T>> {
+  const response = await authorizedFetch({ channelId: "", token }, path);
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, fallback));
+  const items = isRecord(payload) && payload.version === 1 && Array.isArray(payload[field])
+    ? (payload[field] as unknown[]).map(parse)
+    : null;
+  if (
+    !items || items.some((item) => item === null) || !isRecord(payload) ||
+    !Number.isSafeInteger(payload.total)
+  ) {
+    throw new Error("Kai returned an unsupported memory review list.");
+  }
+  return { items: items as T[], total: payload.total as number };
+}
+
+export async function loadMemoryConflicts(
+  token: string,
+): Promise<WorkshopMemoryReviewList<WorkshopMemoryConflictSummary>> {
+  return loadReviewList(token, "/v1/memory/conflicts", "conflicts", parseConflictSummary,
+    "Could not load memory conflicts.");
+}
+
+export async function loadForgottenMemories(
+  token: string,
+): Promise<WorkshopMemoryReviewList<WorkshopMemoryForgottenFact>> {
+  return loadReviewList(token, "/v1/memory/forgotten", "facts", parseForgottenFact,
+    "Could not load forgotten facts.");
+}
+
+export async function loadMemoryConflict(
+  token: string,
+  claimId: string,
+): Promise<WorkshopMemoryLifecycle> {
+  const response = await authorizedFetch(
+    { channelId: "", token },
+    `/v1/memory/conflicts/${encodeURIComponent(claimId)}`,
+  );
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load this conflict."));
+  const lifecycle = isRecord(payload) && payload.version === 1
+    ? parseMemoryLifecycle(payload.lifecycle)
+    : null;
+  if (!lifecycle) throw new Error("Kai returned an unsupported memory conflict.");
+  return lifecycle;
+}
+
+async function memoryLifecycleMutation(
+  token: string,
+  path: string,
+  body: Record<string, unknown>,
+  fallback: string,
+): Promise<WorkshopMemoryLifecycleOutcome> {
+  const response = await authorizedFetch({ channelId: "", token }, path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, client_operation_id: mutationRequestId() }),
+  });
+  const payload = await responsePayload(response);
+  // A stale conflict has its own error so the view can reload the detail
+  // rather than show a dead end.
+  if (response.status === 409 && isRecord(payload) && isRecord(payload.error) &&
+    payload.error.code === "memory_conflict_changed"
+  ) {
+    throw new MemoryConflictChangedError(
+      safeErrorMessage(payload, "This conflict changed since you opened it."),
+    );
+  }
+  if (!response.ok) throw new Error(safeErrorMessage(payload, fallback));
+  if (
+    !isRecord(payload) || payload.version !== 1 || typeof payload.claim_id !== "string" ||
+    typeof payload.active_revision_id !== "string" || typeof payload.replayed !== "boolean" ||
+    (payload.memory_id !== null && typeof payload.memory_id !== "string")
+  ) {
+    throw new Error("Kai returned an unsupported memory review result.");
+  }
+  return {
+    activeRevisionId: payload.active_revision_id,
+    claimId: payload.claim_id,
+    memoryId: payload.memory_id as string | null,
+    replayed: payload.replayed,
+  };
+}
+
+export async function resolveMemoryConflict(
+  token: string,
+  claimId: string,
+  input: { expectedRevisionIds: string[]; keepRevisionId: string; note: string },
+): Promise<WorkshopMemoryLifecycleOutcome> {
+  return memoryLifecycleMutation(
+    token,
+    `/v1/memory/conflicts/${encodeURIComponent(claimId)}/resolve`,
+    {
+      keep_revision_id: input.keepRevisionId,
+      expected_revision_ids: input.expectedRevisionIds,
+      note: input.note,
+    },
+    "Could not resolve this conflict.",
+  );
+}
+
+export async function restoreForgottenMemory(
+  token: string,
+  claimId: string,
+  input: { note: string; revisionId: string },
+): Promise<WorkshopMemoryLifecycleOutcome> {
+  return memoryLifecycleMutation(
+    token,
+    `/v1/memory/forgotten/${encodeURIComponent(claimId)}/restore`,
+    { revision_id: input.revisionId, note: input.note },
+    "Could not restore this fact.",
+  );
 }
 
 function mutationRequestId(): string {

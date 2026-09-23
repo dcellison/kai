@@ -112,8 +112,11 @@ from kai.workshop.inbound import (
     record_inbound_message,
 )
 from kai.workshop.memory_queries import (
+    MemoryConflictSummary,
     MemoryCreationSnapshot,
     MemoryEditSnapshot,
+    MemoryForgottenSummary,
+    MemoryLifecycleOutcome,
     MemoryMutationBatch,
     MemoryMutationResult,
     MemoryProjectOption,
@@ -121,6 +124,8 @@ from kai.workshop.memory_queries import (
     MemoryRecordDetail,
     MemoryRecordPage,
     MemoryRecordSummary,
+    MemoryReviewList,
+    MemoryRevisionPreview,
     MemoryScopeSnapshot,
     MemorySearchHit,
     MemorySearchSnapshot,
@@ -128,6 +133,7 @@ from kai.workshop.memory_queries import (
     MemoryStatsSnapshot,
     WorkshopMemoryAccessDenied,
     WorkshopMemoryConflict,
+    WorkshopMemoryConflictChanged,
     WorkshopMemoryNotFound,
 )
 from kai.workshop.memory_reconciliation_review import (
@@ -1687,6 +1693,170 @@ async def test_standing_participation_api_is_principal_scoped_versioned_and_repl
 
 
 @pytest.mark.asyncio
+@dataclass
+class _FactReviewQueries(_MemoryQueries):
+    """Memory query stub with owner fact review; records every decision it receives."""
+
+    decisions: list[tuple[str, str, dict[str, object]]] = field(default_factory=list)
+
+    async def list_conflicts(self, _authority):
+        return MemoryReviewList(
+            items=(
+                MemoryConflictSummary(
+                    claim_id="mcl_1",
+                    scope_kind="global",
+                    scope_key=None,
+                    opened_at="2026-09-23T10:00:00+00:00",
+                    revisions=(
+                        MemoryRevisionPreview("mfr_old", "Dark themes.", "2026-09-22T10:00:00+00:00"),
+                        MemoryRevisionPreview("mfr_new", "Light themes.", "2026-09-23T10:00:00+00:00"),
+                    ),
+                ),
+            ),
+            total=1,
+        )
+
+    async def conflict_detail(self, _authority, claim_id):
+        if claim_id != "mcl_1":
+            raise WorkshopMemoryNotFound("Memory not found")
+        return {"identity": claim_id, "revisions": []}
+
+    async def resolve_conflict(self, _authority, claim_id, **kwargs):
+        self.decisions.append(("resolve", claim_id, kwargs))
+        if kwargs["expected_revision_ids"] != ["mfr_old", "mfr_new"]:
+            raise WorkshopMemoryConflictChanged()
+        return MemoryLifecycleOutcome(claim_id, str(kwargs["keep_revision_id"]), False, "memory-9")
+
+    async def list_forgotten(self, _authority):
+        return MemoryReviewList(
+            items=(
+                MemoryForgottenSummary(
+                    claim_id="mcl_2",
+                    scope_kind="project",
+                    scope_key="kai",
+                    state="expired",
+                    revision_id="mfr_gone",
+                    changed_at="2026-09-21T10:00:00+00:00",
+                    reason="Validity ended.",
+                    preview="Deploys run on Fridays.",
+                ),
+            ),
+            total=1,
+        )
+
+    async def restore_fact(self, _authority, claim_id, **kwargs):
+        self.decisions.append(("restore", claim_id, kwargs))
+        return MemoryLifecycleOutcome(claim_id, "mfr_back", True, None)
+
+
+async def test_fact_review_routes_serialize_lists_and_decisions(tmp_path: Path) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    queries = _FactReviewQueries(alice_id)
+    client = await _open_client(store, _Authenticator({"alice-token": alice_id}), memory_queries=queries)
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        assert (await client.get("/v1/memory/conflicts")).status == 401
+
+        conflicts = await client.get("/v1/memory/conflicts", headers=headers)
+        assert await conflicts.json() == {
+            "version": 1,
+            "total": 1,
+            "conflicts": [
+                {
+                    "claim_id": "mcl_1",
+                    "scope": {"kind": "global", "key": None},
+                    "opened_at": "2026-09-23T10:00:00+00:00",
+                    "revisions": [
+                        {"revision_id": "mfr_old", "preview": "Dark themes.", "stored_at": "2026-09-22T10:00:00+00:00"},
+                        {
+                            "revision_id": "mfr_new",
+                            "preview": "Light themes.",
+                            "stored_at": "2026-09-23T10:00:00+00:00",
+                        },
+                    ],
+                }
+            ],
+        }
+        detail = await client.get("/v1/memory/conflicts/mcl_1", headers=headers)
+        assert await detail.json() == {"version": 1, "lifecycle": {"identity": "mcl_1", "revisions": []}}
+        assert (await client.get("/v1/memory/conflicts/mcl_x", headers=headers)).status == 404
+
+        forgotten = await client.get("/v1/memory/forgotten", headers=headers)
+        forgotten_payload = await forgotten.json()
+        assert forgotten_payload["total"] == 1
+        assert forgotten_payload["facts"][0] == {
+            "claim_id": "mcl_2",
+            "scope": {"kind": "project", "key": "kai"},
+            "state": "expired",
+            "revision_id": "mfr_gone",
+            "changed_at": "2026-09-21T10:00:00+00:00",
+            "reason": "Validity ended.",
+            "preview": "Deploys run on Fridays.",
+        }
+
+        resolve_body = {
+            "keep_revision_id": "mfr_new",
+            "expected_revision_ids": ["mfr_old", "mfr_new"],
+            "note": "Newer is right.",
+            "client_operation_id": "op-1",
+        }
+        resolved = await client.post("/v1/memory/conflicts/mcl_1/resolve", headers=headers, json=resolve_body)
+        assert resolved.status == 200
+        assert await resolved.json() == {
+            "version": 1,
+            "claim_id": "mcl_1",
+            "active_revision_id": "mfr_new",
+            "replayed": False,
+            "memory_id": "memory-9",
+        }
+
+        stale = await client.post(
+            "/v1/memory/conflicts/mcl_1/resolve",
+            headers=headers,
+            json={**resolve_body, "expected_revision_ids": ["mfr_new"]},
+        )
+        assert stale.status == 409
+        assert (await stale.json())["error"]["code"] == "memory_conflict_changed"
+
+        # Unknown fields and wrong types never reach the service.
+        decisions_before = len(queries.decisions)
+        extra = await client.post(
+            "/v1/memory/conflicts/mcl_1/resolve", headers=headers, json={**resolve_body, "force": True}
+        )
+        wrong_type = await client.post(
+            "/v1/memory/conflicts/mcl_1/resolve", headers=headers, json={**resolve_body, "expected_revision_ids": "x"}
+        )
+        missing_note = await client.post(
+            "/v1/memory/forgotten/mcl_2/restore",
+            headers=headers,
+            json={"revision_id": "mfr_gone", "client_operation_id": "op-2"},
+        )
+        assert (extra.status, wrong_type.status, missing_note.status) == (400, 400, 400)
+        assert len(queries.decisions) == decisions_before
+
+        restored = await client.post(
+            "/v1/memory/forgotten/mcl_2/restore",
+            headers=headers,
+            json={"revision_id": "mfr_gone", "note": "", "client_operation_id": "op-2"},
+        )
+        assert restored.status == 200
+        assert await restored.json() == {
+            "version": 1,
+            "claim_id": "mcl_2",
+            "active_revision_id": "mfr_back",
+            "replayed": True,
+            "memory_id": None,
+        }
+        assert queries.decisions[-1] == (
+            "restore",
+            "mcl_2",
+            {"revision_id": "mfr_gone", "note": "", "client_operation_id": "op-2"},
+        )
+    finally:
+        await client.close()
+        await store.close()
+
+
 async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
     tmp_path: Path,
 ) -> None:
@@ -1717,6 +1887,7 @@ async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
                 "allowed_projects": [
                     {"project_id": "kai", "display_name": "Kai"},
                 ],
+                "unresolved_conflicts": 0,
             },
         }
 

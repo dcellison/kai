@@ -174,6 +174,13 @@ def _service(tmp_path: Path):
         WorkshopExecutionStateRegistry((namespace,)),
     )
     service._fact_lifecycle = _FactLifecycleStub()  # type: ignore[assignment]
+
+    # This fixture has no canonical store; the conflict count it would read
+    # is covered by the real-schema owner review tests.
+    async def no_conflicts(_authority) -> int:
+        return 0
+
+    service.unresolved_conflict_count = no_conflicts  # type: ignore[method-assign]
     return service, service.authority_for_principal(principal_id), principal_id
 
 

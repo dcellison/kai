@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   EventStreamDecoder,
+  MemoryConflictChangedError,
   MemoryRevisionConflictError,
   PreferenceRevisionConflictError,
   SettingsRevisionConflictError,
@@ -41,6 +42,11 @@ import {
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
+  loadMemoryConflict,
+  loadMemoryConflicts,
+  loadForgottenMemories,
+  resolveMemoryConflict,
+  restoreForgottenMemory,
   loadModelCatalogue,
   loadMessageReactors,
   loadNavigation,
@@ -1128,6 +1134,104 @@ describe("Workshop client API", () => {
     expect(path).not.toContain("tail=");
   });
 
+  it("reads the owner fact review lists and conflict detail", async () => {
+    const responses = [
+      Response.json({
+        version: 1,
+        total: 1,
+        conflicts: [{
+          claim_id: "mcl_1",
+          scope: { kind: "global", key: null },
+          opened_at: "2026-09-23T10:00:00Z",
+          revisions: [
+            { revision_id: "mfr_old", preview: "Dark themes.", stored_at: "2026-09-22T10:00:00Z" },
+            { revision_id: "mfr_new", preview: "Light themes.", stored_at: "2026-09-23T10:00:00Z" },
+          ],
+        }],
+      }),
+      Response.json({
+        version: 1,
+        total: 1,
+        facts: [{
+          claim_id: "mcl_2",
+          scope: { kind: "project", key: "kai" },
+          state: "expired",
+          revision_id: "mfr_gone",
+          changed_at: "2026-09-21T10:00:00Z",
+          reason: "Validity ended.",
+          preview: "Deploys run on Fridays.",
+        }],
+      }),
+      Response.json({ version: 1, lifecycle: { ...memoryLifecycle(), authority: "canonical" } }),
+      Response.json({ version: 1, total: 1, facts: [{ claim_id: "mcl_3", state: "active" }] }),
+    ];
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => responses.shift()));
+
+    await expect(loadMemoryConflicts("session-secret")).resolves.toEqual({
+      total: 1,
+      items: [{
+        claimId: "mcl_1",
+        openedAt: "2026-09-23T10:00:00Z",
+        scope: { kind: "global", key: null },
+        revisions: [
+          { revisionId: "mfr_old", preview: "Dark themes.", storedAt: "2026-09-22T10:00:00Z" },
+          { revisionId: "mfr_new", preview: "Light themes.", storedAt: "2026-09-23T10:00:00Z" },
+        ],
+      }],
+    });
+    await expect(loadForgottenMemories("session-secret")).resolves.toMatchObject({
+      total: 1,
+      items: [{ claimId: "mcl_2", state: "expired", reason: "Validity ended.", scope: { key: "kai" } }],
+    });
+    await expect(loadMemoryConflict("session-secret", "mcl_1")).resolves.toMatchObject({
+      authority: "canonical",
+    });
+    // One malformed item rejects the whole list rather than rendering part of it.
+    await expect(loadForgottenMemories("session-secret")).rejects.toThrow("unsupported memory review list");
+  });
+
+  it("sends owner review decisions and surfaces a changed conflict", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({
+        version: 1, claim_id: "mcl_1", active_revision_id: "mfr_new", replayed: false, memory_id: "memory-9",
+      }))
+      .mockResolvedValueOnce(Response.json(
+        { error: { code: "memory_conflict_changed", message: "This conflict changed since you opened it" } },
+        { status: 409 },
+      ))
+      .mockResolvedValueOnce(Response.json({
+        version: 1, claim_id: "mcl_2", active_revision_id: "mfr_back", replayed: false, memory_id: null,
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(resolveMemoryConflict("session-secret", "mcl_1", {
+      keepRevisionId: "mfr_new",
+      expectedRevisionIds: ["mfr_old", "mfr_new"],
+      note: "Newer is right.",
+    })).resolves.toEqual({ claimId: "mcl_1", activeRevisionId: "mfr_new", replayed: false, memoryId: "memory-9" });
+    const [resolvePath, resolveInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(resolvePath).toContain("/v1/memory/conflicts/mcl_1/resolve");
+    const resolveBody = JSON.parse(String(resolveInit.body)) as Record<string, unknown>;
+    expect(resolveBody).toMatchObject({
+      keep_revision_id: "mfr_new",
+      expected_revision_ids: ["mfr_old", "mfr_new"],
+      note: "Newer is right.",
+    });
+    expect(typeof resolveBody.client_operation_id).toBe("string");
+
+    await expect(resolveMemoryConflict("session-secret", "mcl_1", {
+      keepRevisionId: "mfr_new",
+      expectedRevisionIds: ["mfr_new"],
+      note: "",
+    })).rejects.toBeInstanceOf(MemoryConflictChangedError);
+
+    await expect(restoreForgottenMemory("session-secret", "mcl_2", { revisionId: "mfr_gone", note: "" }))
+      .resolves.toMatchObject({ activeRevisionId: "mfr_back", memoryId: null });
+    const [restorePath, restoreInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(restorePath).toContain("/v1/memory/forgotten/mcl_2/restore");
+    expect(JSON.parse(String(restoreInit.body))).toMatchObject({ revision_id: "mfr_gone", note: "" });
+  });
+
   it("parses the stable Workshop memory read contracts", async () => {
     const responses = [
       Response.json({
@@ -1140,6 +1244,7 @@ describe("Workshop client API", () => {
           by_type: { fact: 1 },
           by_scope: { global: 1 },
           allowed_projects: [{ project_id: "kai", display_name: "Kai" }],
+          unresolved_conflicts: 2,
         },
       }),
       Response.json({ version: 1, records: [memoryRecord()], next_cursor: null }),
@@ -1186,6 +1291,7 @@ describe("Workshop client API", () => {
       total: 1,
       facts: 1,
       bySource: { extracted: 1 },
+      unresolvedConflicts: 2,
     });
     await expect(
       loadMemoryRecords("session-secret", {
