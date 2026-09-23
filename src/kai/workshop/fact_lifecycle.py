@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -27,9 +28,12 @@ from kai.workshop.memory_current_truth import (
     CANONICAL_LIFECYCLE_STATE_KEY,
     CANONICAL_REVISION_ID_KEY,
 )
+from kai.workshop.memory_projection_status import ProjectionRetryResult
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.temporal_memory import resolve_memory_admission
+
+log = logging.getLogger(__name__)
 
 _ADOPT_MEMORY_ID_KEY = "_canonical_adopt_memory_id"
 
@@ -148,15 +152,18 @@ class Mem0FactVectorAdapter:
         authority: FactLifecycleAuthority,
         revision_id: MemoryRevisionId,
     ) -> memory.MemoryResult | None:
+        # Filtered in the vector store rather than by loading the owner's
+        # whole corpus on every outbox step. Duplicates (more than one
+        # row for a revision) are reported by the projection audit; the
+        # worker reuses the first so it never adds yet another.
         rows = await asyncio.to_thread(
-            memory.get_all_for_lifecycle_projection,
+            memory.find_for_lifecycle_projection,
             user_id=str(authority.principal_id),
             runtime_profile_id=str(authority.runtime_profile_id),
+            key=CANONICAL_REVISION_ID_KEY,
+            value=str(revision_id),
         )
-        return next(
-            (row for row in rows if row.metadata.get(CANONICAL_REVISION_ID_KEY) == str(revision_id)),
-            None,
-        )
+        return rows[0] if rows else None
 
     async def add(
         self,
@@ -581,6 +588,66 @@ class MemoryFactLifecycleService:
                 completed += 1
         return completed
 
+    async def retry_failed(
+        self,
+        *,
+        principal_id: PrincipalId | None = None,
+        runtime_profile_id: RuntimeProfileId | None = None,
+        claim_ids: tuple[MemoryClaimId, ...] | None = None,
+    ) -> ProjectionRetryResult:
+        """
+        Re-run failed vector operations, then drain the outbox.
+
+        A failed operation blocks every later operation on its claim, and
+        nothing else resets it. Retrying reuses the original operation
+        rows, so each keeps its event position and identity, and draining
+        afterwards also runs the operations that were queued behind it.
+
+        With no filters this covers every owner (operator CLI and service
+        startup). The Workshop passes the owner pair, and optionally the
+        claims the owner picked; an empty `claim_ids` retries nothing.
+        """
+        if claim_ids is not None and not claim_ids:
+            return ProjectionRetryResult(0, 0, 0)
+        conditions = ["v.status = 'failed'"]
+        parameters: list[str] = []
+        if principal_id is not None:
+            conditions.append("c.owner_principal_id = ?")
+            parameters.append(str(principal_id))
+        if runtime_profile_id is not None:
+            conditions.append("c.runtime_profile_id = ?")
+            parameters.append(str(runtime_profile_id))
+        if claim_ids is not None:
+            conditions.append(f"v.claim_id IN ({', '.join('?' for _ in claim_ids)})")
+            parameters.extend(str(claim_id) for claim_id in claim_ids)
+        async with self._lock:
+            connection = self._store.connection
+            async with connection.execute(
+                "SELECT v.event_position FROM memory_fact_vector_operations v "
+                "JOIN memory_fact_claims c ON c.claim_id = v.claim_id WHERE " + " AND ".join(conditions),
+                parameters,
+            ) as cursor:
+                positions = [int(row[0]) for row in await cursor.fetchall()]
+            if not positions:
+                return ProjectionRetryResult(0, 0, 0)
+            marks = ", ".join("?" for _ in positions)
+            await connection.execute(
+                "UPDATE memory_fact_vector_operations SET status = 'pending', attempt_count = 0, "
+                "last_error_code = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+                f"WHERE status = 'failed' AND event_position IN ({marks})",
+                positions,
+            )
+            await connection.commit()
+            while await self._project_next():
+                pass
+            async with connection.execute(
+                "SELECT status, COUNT(*) FROM memory_fact_vector_operations "
+                f"WHERE event_position IN ({marks}) GROUP BY status",
+                positions,
+            ) as cursor:
+                outcomes = {str(row[0]): int(row[1]) for row in await cursor.fetchall()}
+        return ProjectionRetryResult(len(positions), outcomes.get("succeeded", 0), outcomes.get("failed", 0))
+
     async def _mutate(
         self,
         authority: FactLifecycleAuthority,
@@ -739,12 +806,25 @@ class MemoryFactLifecycleService:
             )
             await connection.commit()
         except Exception as exc:
+            exhausted = attempt >= _MAX_VECTOR_ATTEMPTS
             await connection.execute(
                 "UPDATE memory_fact_vector_operations SET status = ?, last_error_code = ?, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE event_position = ?",
-                ("failed" if attempt >= _MAX_VECTOR_ATTEMPTS else "pending", type(exc).__name__[:128], event_position),
+                ("failed" if exhausted else "pending", type(exc).__name__[:128], event_position),
             )
             await connection.commit()
+            if exhausted:
+                # The fact now stays out of recall, and later changes to
+                # the claim queue behind it, until someone retries. Only
+                # identifiers and the error class are logged, never content.
+                log.warning(
+                    "Fact vector %s failed for claim %s revision %s after %s attempts: %s",
+                    operation,
+                    claim_id,
+                    revision_id,
+                    attempt,
+                    type(exc).__name__,
+                )
         return True
 
     async def _memory_id_for_revision(self, revision_id: MemoryRevisionId) -> str | None:

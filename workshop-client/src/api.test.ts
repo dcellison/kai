@@ -45,8 +45,11 @@ import {
   loadMemoryConflict,
   loadMemoryConflicts,
   loadForgottenMemories,
+  loadMemoryProjectionAudit,
+  loadMemoryProjections,
   resolveMemoryConflict,
   restoreForgottenMemory,
+  retryMemoryProjections,
   loadModelCatalogue,
   loadMessageReactors,
   loadNavigation,
@@ -1232,6 +1235,56 @@ describe("Workshop client API", () => {
     expect(JSON.parse(String(restoreInit.body))).toMatchObject({ revision_id: "mfr_gone", note: "" });
   });
 
+  it("reads search sync status, the index check, and retry results", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({
+        version: 1,
+        failed_total: 1,
+        failed_facts: 1,
+        failed_episodes: 0,
+        blocked: 2,
+        failed: [{
+          kind: "fact",
+          id: "mcl_1",
+          operation: "upsert",
+          revision_id: "mrv_1",
+          attempts: 3,
+          error_code: null,
+          updated_at: "2026-09-23T10:00:00Z",
+          preview: "Dark themes.",
+        }],
+      }))
+      .mockResolvedValueOnce(Response.json({ version: 1, orphan: ["vec-2"], unknown: [], duplicate: 1 }))
+      .mockResolvedValueOnce(Response.json({ version: 1, retried: 1, succeeded: 1, failed: 0 }))
+      .mockResolvedValueOnce(Response.json({ version: 1, failed_total: 1, blocked: 0, failed: [{ kind: "row" }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loadMemoryProjections("session-secret")).resolves.toEqual({
+      blocked: 2,
+      failedTotal: 1,
+      failed: [{
+        attempts: 3,
+        errorCode: null,
+        id: "mcl_1",
+        kind: "fact",
+        operation: "upsert",
+        preview: "Dark themes.",
+        revisionId: "mrv_1",
+        updatedAt: "2026-09-23T10:00:00Z",
+      }],
+    });
+    await expect(loadMemoryProjectionAudit("session-secret")).resolves.toEqual({
+      duplicate: 1, orphan: ["vec-2"], unknown: [],
+    });
+    await expect(retryMemoryProjections("session-secret", { episodeIds: ["mep_1"] })).resolves.toEqual({
+      failed: 0, retried: 1, succeeded: 1,
+    });
+    const [retryPath, retryInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(retryPath).toContain("/v1/memory/projections/retry");
+    expect(JSON.parse(String(retryInit.body))).toEqual({ episode_ids: ["mep_1"] });
+    await expect(loadMemoryProjections("session-secret")).rejects.toThrow("unsupported search sync status");
+  });
+
   it("parses the stable Workshop memory read contracts", async () => {
     const responses = [
       Response.json({
@@ -1245,6 +1298,7 @@ describe("Workshop client API", () => {
           by_scope: { global: 1 },
           allowed_projects: [{ project_id: "kai", display_name: "Kai" }],
           unresolved_conflicts: 2,
+          projection_failures: 1,
         },
       }),
       Response.json({ version: 1, records: [memoryRecord()], next_cursor: null }),
@@ -1292,6 +1346,7 @@ describe("Workshop client API", () => {
       facts: 1,
       bySource: { extracted: 1 },
       unresolvedConflicts: 2,
+      projectionFailures: 1,
     });
     await expect(
       loadMemoryRecords("session-secret", {

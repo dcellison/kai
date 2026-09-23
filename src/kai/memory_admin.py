@@ -495,6 +495,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--yes", action="store_true", help="Authorize the reviewed mutation batch; absent means no changes"
     )
 
+    projections = sub.add_parser(
+        "projections",
+        help="Report and retry failed canonical memory vector projections",
+        description=(
+            "Canonical facts and episodes reach search through a vector outbox. An operation that fails "
+            "three times stays failed and, for facts, blocks later changes to the same fact. `status` lists "
+            "failures and audits vector rows; `retry` runs failed operations again. Both need the service "
+            "stopped, because the embedded vector store is single-process."
+        ),
+    )
+    projections_sub = projections.add_subparsers(dest="projections_command", required=True)
+    projections_status = projections_sub.add_parser("status", help="List failed and blocked projections")
+    projections_retry = projections_sub.add_parser("retry", help="Retry failed projections")
+    for command in (projections_status, projections_retry):
+        command.add_argument(
+            "--principal",
+            default=None,
+            help="Limit to one canonical human principal or external identity subject (default: every owner)",
+        )
+
     quality = sub.add_parser(
         "quality-corpus",
         help="Build, review, seal, and score a private production memory-quality corpus",
@@ -1611,12 +1631,131 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                 f"memory reconciliation: batch complete; approved={approvals}, "
                 f"unchanged={len(review['decisions']) - approvals}"
             )
+            failures = len(receipt.get("projection_failures", ()))
+            if failures:
+                # Canonical state is committed either way; these items are
+                # missing from recall until their projection is retried.
+                print(
+                    f"memory reconciliation: {failures} item(s) did not reach search; "
+                    "retry them with `python -m kai memory projections retry` (service stopped) "
+                    "or from Fact review in Workshop"
+                )
             print(f"memory reconciliation: durable receipt: {receipt_path}")
             return 0
     except (reconciliation.MemoryReconciliationError, OSError, sqlite3.Error, RuntimeError) as exc:
         print(f"memory reconciliation: {exc}", file=sys.stderr)
         return 1
     return 2
+
+
+def _cmd_projections(args: argparse.Namespace) -> int:
+    """
+    Report or retry failed canonical memory vector projections.
+
+    `status` prints the outbox failures from the database, then audits
+    each owner's vector rows against canonical state. The audit needs the
+    vector store, so when the store cannot open (usually because the
+    service holds it) the outbox report still prints and the audit is
+    reported as skipped.
+
+    `retry` needs the store to project anything, so it refuses to run
+    without it rather than turning every retried operation into a fresh
+    failure.
+    """
+    from kai.config import load_config
+    from kai.memory_quality_corpus import MemoryQualityCorpusError, resolve_human_principal
+    from kai.workshop.memory_projection_status import audit_vector_rows, expected_rows, projection_status
+
+    config = load_config()
+    db_path = Path(config.session_db_path)
+    if db_path.is_symlink() or not db_path.is_file():
+        print("memory projections: canonical Workshop database is unavailable", file=sys.stderr)
+        return 1
+    connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        try:
+            principal_id = resolve_human_principal(connection, args.principal) if args.principal else None
+        except MemoryQualityCorpusError as exc:
+            print(f"memory projections: {exc}", file=sys.stderr)
+            return 1
+        # Every owner pair that has canonical memory, optionally narrowed to
+        # one principal; status and the audit report per pair.
+        owners = [
+            (str(row[0]), str(row[1]))
+            for row in connection.execute(
+                "SELECT owner_principal_id, runtime_profile_id FROM memory_fact_claims UNION "
+                "SELECT owner_principal_id, runtime_profile_id FROM memory_episodes ORDER BY 1, 2"
+            ).fetchall()
+            if principal_id is None or str(row[0]) == principal_id
+        ]
+        before = [projection_status(connection, owner) for owner in owners]
+        expected = {owner: expected_rows(connection, owner) for owner in owners}
+    finally:
+        connection.close()
+
+    def report(label: str, statuses: list) -> None:
+        failed = sum(status.failed_total for status in statuses)
+        blocked = sum(status.blocked for status in statuses)
+        print(f"memory projections: {label}; failed={failed}, blocked={blocked}")
+
+    if args.projections_command == "status":
+        report("outbox", before)
+        for owner, status in zip(owners, before, strict=True):
+            for item in status.failed:
+                print(
+                    f"  {owner[0]}/{owner[1]} {item.kind} {item.item_id}: {item.operation} failed "
+                    f"after {item.attempts} attempt(s) ({item.error_code or 'unknown error'}) at {item.updated_at}"
+                )
+        from kai import memory
+
+        if _initialize_memory(config) is None:
+            print("memory projections: vector audit skipped; the vector store is unavailable (stop the service)")
+            return 0
+        try:
+            for owner in owners:
+                rows = memory.get_all_for_lifecycle_projection(user_id=owner[0], runtime_profile_id=owner[1])
+                facts, episodes = expected[owner]
+                audit = audit_vector_rows(rows, current_facts=facts, current_episodes=episodes)
+                print(
+                    f"memory projections: vector audit {owner[0]}/{owner[1]}; orphan={len(audit.orphan)}, "
+                    f"unknown={len(audit.unknown)}, duplicate={audit.duplicate}"
+                )
+                for memory_id in (*audit.orphan, *audit.unknown):
+                    print(f"  {memory_id}")
+        finally:
+            memory.close_memory()
+        return 0
+
+    from kai import memory
+    from kai.workshop.domain import PrincipalId
+    from kai.workshop.episode_history import MemoryEpisodeHistoryService
+    from kai.workshop.fact_lifecycle import MemoryFactLifecycleService
+    from kai.workshop.store import WorkshopEventStore
+
+    if _initialize_memory(config) is None:
+        return 1
+    report("before retry", before)
+
+    async def retry() -> tuple[int, int, int]:
+        store = await WorkshopEventStore.open(db_path)
+        try:
+            owner = PrincipalId(principal_id) if principal_id is not None else None
+            facts = await MemoryFactLifecycleService(store).retry_failed(principal_id=owner)
+            episodes = await MemoryEpisodeHistoryService(store).retry_failed(principal_id=owner)
+        finally:
+            await store.close()
+        return (
+            facts.retried + episodes.retried,
+            facts.succeeded + episodes.succeeded,
+            facts.failed + episodes.failed,
+        )
+
+    try:
+        retried, succeeded, failed = asyncio.run(retry())
+    finally:
+        memory.close_memory()
+    print(f"memory projections: retried={retried}, succeeded={succeeded}, failed={failed}")
+    return 0 if failed == 0 else 1
 
 
 def cli(argv: list[str]) -> None:
@@ -1644,6 +1783,8 @@ def cli(argv: list[str]) -> None:
         sys.exit(_cmd_reconciliation(args))
     if args.command == "quality-corpus":
         sys.exit(_cmd_quality_corpus(args))
+    if args.command == "projections":
+        sys.exit(_cmd_projections(args))
     # argparse's required=True on the subparsers guarantees a known
     # command reaches this point, so the else branch is unreachable
     # under normal invocation. Guarded anyway in case a future

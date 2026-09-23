@@ -903,6 +903,18 @@ class CanonicalMemoryAuthorityError(RuntimeError):
     """Semantic memory cannot be attributed to one canonical owner."""
 
 
+class LifecycleProjectionReadError(RuntimeError):
+    """
+    A lifecycle projection read could not tell whether a vector row exists.
+
+    The projection worker decides whether to create, rewrite, or delete a
+    row from what it reads. Treating an unanswered read as "absent" would
+    mark a deletion done while the row survives, or add a second row for
+    a revision that already has one. Raising instead fails the outbox
+    operation, which the owner or operator can then retry.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalMemoryMigrationResult:
     """Result of re-keying one protected semantic-memory namespace."""
@@ -3552,8 +3564,11 @@ def get_all_for_lifecycle_projection(
     the worker must find and repair stale vectors that the current-truth gate
     correctly withholds from users and models.
     """
+    # A store that is not initialized is not an empty corpus; saying so
+    # would let reconciliation hash an empty list and the projection
+    # worker conclude that nothing exists.
     if _memory is None:
-        return []
+        raise LifecycleProjectionReadError("Semantic memory is not initialized")
     storage_user_id, namespace = _canonical_memory_owner(
         user_id,
         runtime_profile_id=runtime_profile_id,
@@ -3562,6 +3577,52 @@ def get_all_for_lifecycle_projection(
     raw_results = result.get("results", []) if isinstance(result, dict) else result
     return [
         wrapped for raw in raw_results if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
+    ]
+
+
+def find_for_lifecycle_projection(
+    *,
+    user_id: str,
+    runtime_profile_id: str,
+    key: str,
+    value: str,
+) -> list[MemoryResult]:
+    """
+    Return the owner's rows whose payload carries `key == value`.
+
+    The projection worker looks up the row for one canonical revision or
+    episode on every outbox step. Mem0 flattens metadata into the vector
+    payload and passes extra filter keys through to the vector store, so
+    the lookup filters in the store instead of materializing the owner's
+    whole corpus. The owner-namespace check still runs on each result,
+    exactly as in `get_all_for_lifecycle_projection`.
+
+    Args:
+        user_id: Canonical owning principal.
+        runtime_profile_id: Owning runtime profile.
+        key: Canonical payload key, such as the revision or episode id key.
+        value: Identifier to match.
+
+    Returns:
+        Every matching owner row; more than one means duplicates exist.
+
+    Raises:
+        LifecycleProjectionReadError: Memory is not initialized. Provider
+            errors propagate unchanged so the caller fails its operation.
+    """
+    if _memory is None:
+        raise LifecycleProjectionReadError("Semantic memory is not initialized")
+    storage_user_id, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
+    result = _memory.get_all(filters={"user_id": storage_user_id, key: value}, top_k=100)
+    raw_results = result.get("results", []) if isinstance(result, dict) else result
+    return [
+        wrapped
+        for raw in raw_results
+        if _memory_result_belongs_to_principal((wrapped := _wrap_result(raw)), namespace)
+        and wrapped.metadata.get(key) == value
     ]
 
 
@@ -4014,14 +4075,17 @@ def get_by_id(
     if namespace is not None and bool(getattr(_config, "protected_install", False)):
         from kai.workshop.memory_current_truth import project_current_truth
 
-        projected = project_current_truth(
+        projection = project_current_truth(
             (result,),
             db_path=Path(_config.session_db_path),
             principal_id=str(namespace.principal_id),
             runtime_profile_id=str(namespace.runtime_profile_id),
             admit_legacy=admit_legacy,
-        ).rows
-        return projected[0] if projected else None
+        )
+        # Single-row reads exclude for the same reasons as search, so they
+        # log through the same rate-limited, content-free counter.
+        _log_current_truth_counts("get_by_id", namespace, projection)
+        return projection.rows[0] if projection.rows else None
     return result
 
 
@@ -4031,24 +4095,40 @@ def get_by_id_for_lifecycle_projection(
     memory_id: str,
     runtime_profile_id: str,
 ) -> MemoryResult | None:
-    """Read one exact vector for the trusted lifecycle projection worker."""
+    """
+    Read one exact vector for the trusted lifecycle projection worker.
+
+    Only a provider answer of "no such row" returns None. Every other
+    outcome that leaves existence unknown raises, so the worker fails the
+    operation instead of deleting nothing or adding a duplicate:
+
+    - the provider raising (store unavailable, locked, corrupt);
+    - memory not being initialized;
+    - the row belonging to a different owner. Memory ids reach this
+      function from the owner's own outbox records, so a foreign owner
+      means the record or the row is wrong, and neither overwriting nor
+      treating the row as gone is safe.
+
+    Raises:
+        LifecycleProjectionReadError: Existence could not be determined.
+    """
     if _memory is None:
-        return None
+        raise LifecycleProjectionReadError("Semantic memory is not initialized")
     try:
         row = _memory.get(memory_id=memory_id)
-    except Exception:
+    except Exception as exc:
         log.warning("Lifecycle projection get failed for %s", memory_id, exc_info=True)
-        return None
+        raise LifecycleProjectionReadError(f"Vector read failed for {memory_id}") from exc
     if row is None:
         return None
     storage_user_id, namespace = _canonical_memory_owner(
         user_id,
         runtime_profile_id=runtime_profile_id,
     )
-    if row.get("user_id") != storage_user_id:
-        return None
     result = _wrap_result(row)
-    return result if _memory_result_belongs_to_principal(result, namespace) else None
+    if row.get("user_id") != storage_user_id or not _memory_result_belongs_to_principal(result, namespace):
+        raise LifecycleProjectionReadError(f"Vector {memory_id} belongs to a different owner")
+    return result
 
 
 def update_for_lifecycle_projection(
@@ -4083,11 +4163,13 @@ def update_for_lifecycle_projection(
         runtime_profile_id: Owning runtime profile.
 
     Returns:
-        True when the rewrite was issued; False when ownership cannot be
-        verified (including a failed read) or the provider update fails.
+        True when the rewrite was issued; False when the row is absent or
+        the provider update fails.
+
+    Raises:
+        LifecycleProjectionReadError: The ownership read could not answer
+            or found a foreign owner.
     """
-    if _memory is None:
-        return False
     if (
         get_by_id_for_lifecycle_projection(
             user_id=user_id,
@@ -4097,6 +4179,8 @@ def update_for_lifecycle_projection(
         is None
     ):
         return False
+    # The read above raises when memory is not initialized.
+    assert _memory is not None
     _, namespace = _canonical_memory_owner(
         user_id,
         runtime_profile_id=runtime_profile_id,
@@ -4119,7 +4203,21 @@ def delete_by_id_for_lifecycle_projection(
     memory_id: str,
     runtime_profile_id: str,
 ) -> bool:
-    """Delete one owner-verified vector on behalf of canonical lifecycle."""
+    """
+    Delete one owner-verified vector on behalf of canonical lifecycle.
+
+    An absent row is already in the desired state, so it returns True.
+    A read that cannot answer raises rather than being mistaken for
+    absence. Mem0 raises ValueError when the row vanished between the
+    ownership read and the delete; that race also ends with the row gone.
+
+    Returns:
+        True when the row is gone; False when the provider delete fails.
+
+    Raises:
+        LifecycleProjectionReadError: The ownership read could not answer
+            or found a foreign owner.
+    """
     if (
         get_by_id_for_lifecycle_projection(
             user_id=user_id,
@@ -4129,10 +4227,11 @@ def delete_by_id_for_lifecycle_projection(
         is None
     ):
         return True
-    if _memory is None:
-        return False
+    assert _memory is not None
     try:
         _memory.delete(memory_id=memory_id)
+    except ValueError:
+        return True
     except Exception:
         log.warning("Lifecycle projection delete failed for %s", memory_id, exc_info=True)
         return False

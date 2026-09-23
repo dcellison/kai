@@ -105,7 +105,15 @@ class FakeMem0:
         self.rows.pop(memory_id, None)
 
     def get_all(self, *, filters: dict, top_k: int) -> dict:
-        owned = [dict(row) for row in self.rows.values() if row["user_id"] == filters["user_id"]]
+        # Mem0 flattens metadata into the vector payload, so any filter key
+        # other than the owner matches a metadata field.
+        payload_filters = {key: value for key, value in filters.items() if key != "user_id"}
+        owned = [
+            dict(row)
+            for row in self.rows.values()
+            if row["user_id"] == filters["user_id"]
+            and all(row["metadata"].get(key) == value for key, value in payload_filters.items())
+        ]
         return {"results": owned[:top_k]}
 
     def search(self, query: str, *, filters: dict, top_k: int) -> dict:
@@ -504,15 +512,17 @@ async def test_projection_update_refuses_rows_owned_by_someone_else(protected) -
     provider.add("Foreign row", user_id="someone-else", infer=False, metadata={"source": "extracted"})
     (foreign_id,) = provider.rows
 
-    updated = memory.update_for_lifecycle_projection(
-        user_id=str(PRINCIPAL_ID),
-        memory_id=foreign_id,
-        data="Overwritten",
-        metadata={"source": "extracted"},
-        runtime_profile_id=str(RUNTIME_ID),
-    )
+    # A foreign owner under a recorded memory id means something is wrong,
+    # so the projection read refuses instead of overwriting the row.
+    with pytest.raises(memory.LifecycleProjectionReadError):
+        memory.update_for_lifecycle_projection(
+            user_id=str(PRINCIPAL_ID),
+            memory_id=foreign_id,
+            data="Overwritten",
+            metadata={"source": "extracted"},
+            runtime_profile_id=str(RUNTIME_ID),
+        )
 
-    assert updated is False
     assert provider.rows[foreign_id]["memory"] == "Foreign row"
 
 

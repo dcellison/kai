@@ -2134,11 +2134,17 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
             legacy_unclassified = max(baseline - adopted, 0)
             legacy_active, legacy_inactive = _legacy_admission_owner_counts(connection, tables)
             conflicts, oldest_conflict_days = _unresolved_conflict_summary(connection)
+            failed_facts, failed_episodes, blocked, oldest_failure_days = _projection_failure_summary(
+                connection, tables
+            )
         finally:
             connection.close()
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         return f"{prefix} NOT VERIFIED ({type(exc).__name__})"
-    gaps = malformed + quarantined + projection_gaps + legacy_unclassified
+    failed_projections = failed_facts + failed_episodes
+    # Failed and blocked vector operations are faults, not a state waiting
+    # on an owner, so unlike open conflicts they make the status INCOMPLETE.
+    gaps = malformed + quarantined + projection_gaps + legacy_unclassified + failed_projections + blocked
     state = "active" if memory_enabled is True and gaps == 0 else "INCOMPLETE"
     if memory_enabled is None:
         state = "NOT VERIFIED"
@@ -2150,6 +2156,9 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
         f"integrity gaps={malformed}; "
         f"unresolved conflicts={conflicts}"
         f"{f' (oldest={oldest_conflict_days}d)' if conflicts else ''}; "
+        f"projection failed={failed_projections} (facts={failed_facts}, episodes={failed_episodes}), "
+        f"blocked={blocked}"
+        f"{f' (oldest failure={oldest_failure_days}d)' if failed_projections else ''}; "
         f"legacy admission active={legacy_active} (no applied audit), inactive={legacy_inactive} (audit applied); "
         "authority=canonical/current-only"
     )
@@ -2185,6 +2194,53 @@ def _unresolved_conflict_summary(connection: sqlite3.Connection) -> tuple[int, i
     if opened.tzinfo is None:
         opened = opened.replace(tzinfo=UTC)
     return count, max((datetime.now(UTC) - opened).days, 0)
+
+
+def _projection_failure_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int, int, int, int]:
+    """
+    Count failed and blocked vector outbox operations, and the oldest failure's age.
+
+    Returns (fact claims with a failed operation, episodes with a failed
+    operation, fact operations blocked behind a failure, whole days since
+    the oldest failure). These are plain counts rather than the full
+    listing in `memory_projection_status`, so they need only the outbox
+    columns every schema version has; the age is 0 when the table has no
+    `updated_at` column, and episodes count as 0 before their outbox exists.
+    """
+    row = connection.execute(
+        "SELECT COUNT(DISTINCT claim_id) FROM memory_fact_vector_operations WHERE status = 'failed'"
+    ).fetchone()
+    failed_facts = int(row[0]) if row is not None and row[0] is not None else 0
+    row = connection.execute(
+        "SELECT COUNT(*) FROM memory_fact_vector_operations v WHERE v.status = 'pending' AND EXISTS ("
+        "SELECT 1 FROM memory_fact_vector_operations prior WHERE prior.claim_id = v.claim_id "
+        "AND prior.event_position < v.event_position AND prior.status = 'failed')"
+    ).fetchone()
+    blocked = int(row[0]) if row is not None and row[0] is not None else 0
+    failed_episodes = 0
+    if "memory_episode_vector_operations" in tables:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM memory_episode_vector_operations WHERE status = 'failed'"
+        ).fetchone()
+        failed_episodes = int(row[0]) if row is not None and row[0] is not None else 0
+    if not failed_facts and not failed_episodes:
+        return failed_facts, failed_episodes, blocked, 0
+    oldest: list[str] = []
+    for table, present in (
+        ("memory_fact_vector_operations", True),
+        ("memory_episode_vector_operations", "memory_episode_vector_operations" in tables),
+    ):
+        columns = {str(column[1]) for column in connection.execute(f"PRAGMA table_info({table})")} if present else set()
+        if "updated_at" in columns:
+            row = connection.execute(f"SELECT MIN(updated_at) FROM {table} WHERE status = 'failed'").fetchone()
+            if row is not None and row[0] is not None:
+                oldest.append(str(row[0]))
+    if not oldest:
+        return failed_facts, failed_episodes, blocked, 0
+    failed_at = datetime.fromisoformat(min(oldest).replace("Z", "+00:00"))
+    if failed_at.tzinfo is None:
+        failed_at = failed_at.replace(tzinfo=UTC)
+    return failed_facts, failed_episodes, blocked, max((datetime.now(UTC) - failed_at).days, 0)
 
 
 def _legacy_admission_owner_counts(connection: sqlite3.Connection, tables: set[str]) -> tuple[int, int]:

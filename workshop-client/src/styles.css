@@ -6727,7 +6727,8 @@ button:disabled {
 /* Fact review: owner decisions on conflicted and forgotten facts. */
 
 .memory-review-state.retracted,
-.memory-review-state.expired {
+.memory-review-state.expired,
+.memory-review-state.failed {
   border-color: color-mix(in srgb, var(--color-danger) 45%, transparent);
   color: var(--color-danger);
 }
@@ -6824,6 +6825,11 @@ button:disabled {
   padding: 0.5rem 0.65rem;
   background: color-mix(in srgb, var(--color-warning) 8%, transparent);
   color: var(--color-warning);
+}
+
+.fact-review-sync-summary {
+  border-bottom: 1px solid var(--color-border);
+  padding-top: 0.65rem;
 }
 
 .fact-review-link {

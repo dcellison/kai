@@ -111,6 +111,12 @@ from kai.workshop.inbound import (
     record_client_inbound_message_in_transaction,
     record_inbound_message,
 )
+from kai.workshop.memory_projection_status import (
+    FailedProjection,
+    ProjectionRetryResult,
+    ProjectionStatus,
+    VectorAudit,
+)
 from kai.workshop.memory_queries import (
     MemoryConflictSummary,
     MemoryCreationSnapshot,
@@ -1857,6 +1863,89 @@ async def test_fact_review_routes_serialize_lists_and_decisions(tmp_path: Path) 
         await store.close()
 
 
+@dataclass
+class _ProjectionQueries(_MemoryQueries):
+    """Memory query stub with search sync review; records every retry request."""
+
+    retries: list[tuple[tuple[str, ...] | None, tuple[str, ...] | None]] = field(default_factory=list)
+
+    async def projection_review(self, _authority):
+        return ProjectionStatus(
+            failed=(
+                FailedProjection(
+                    kind="fact",
+                    item_id="mcl_1",
+                    principal_id="prn_x",
+                    runtime_profile_id="rtp_x",
+                    operation="upsert",
+                    revision_id="mrv_1",
+                    attempts=3,
+                    error_code="FactLifecycleProjectionFailed",
+                    updated_at="2026-09-23T10:00:00Z",
+                    preview="Dark themes.",
+                ),
+            ),
+            failed_facts=1,
+            failed_episodes=0,
+            blocked=2,
+            oldest_failure_at="2026-09-23T10:00:00Z",
+        )
+
+    async def audit_projections(self, _authority):
+        return VectorAudit(orphan=("vec-2",), unknown=(), duplicate=1)
+
+    async def retry_projections(self, _authority, *, claim_ids, episode_ids):
+        self.retries.append((claim_ids, episode_ids))
+        return ProjectionRetryResult(retried=1, succeeded=1, failed=0)
+
+
+async def test_projection_routes_serialize_review_audit_and_retry(tmp_path: Path) -> None:
+    store, alice_id, _, _, _ = await _open_store(tmp_path / "kai.db")
+    queries = _ProjectionQueries(alice_id)
+    client = await _open_client(store, _Authenticator({"alice-token": alice_id}), memory_queries=queries)
+    headers = {"Authorization": "Bearer alice-token"}
+    try:
+        assert (await client.get("/v1/memory/projections")).status == 401
+
+        review = await client.get("/v1/memory/projections", headers=headers)
+        assert await review.json() == {
+            "version": 1,
+            "failed_total": 1,
+            "failed_facts": 1,
+            "failed_episodes": 0,
+            "blocked": 2,
+            "failed": [
+                {
+                    "kind": "fact",
+                    "id": "mcl_1",
+                    "operation": "upsert",
+                    "revision_id": "mrv_1",
+                    "attempts": 3,
+                    "error_code": "FactLifecycleProjectionFailed",
+                    "updated_at": "2026-09-23T10:00:00Z",
+                    "preview": "Dark themes.",
+                }
+            ],
+        }
+        audit = await client.get("/v1/memory/projections/audit", headers=headers)
+        assert await audit.json() == {"version": 1, "orphan": ["vec-2"], "unknown": [], "duplicate": 1}
+
+        everything = await client.post("/v1/memory/projections/retry", headers=headers, json={})
+        named = await client.post("/v1/memory/projections/retry", headers=headers, json={"claim_ids": ["mcl_1"]})
+        assert await everything.json() == {"version": 1, "retried": 1, "succeeded": 1, "failed": 0}
+        assert named.status == 200
+        assert queries.retries == [(None, None), (("mcl_1",), None)]
+
+        # Unknown fields and wrong shapes never reach the service.
+        unknown = await client.post("/v1/memory/projections/retry", headers=headers, json={"all": True})
+        wrong = await client.post("/v1/memory/projections/retry", headers=headers, json={"episode_ids": "e"})
+        assert (unknown.status, wrong.status) == (400, 400)
+        assert len(queries.retries) == 2
+    finally:
+        await client.close()
+        await store.close()
+
+
 async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
     tmp_path: Path,
 ) -> None:
@@ -1888,6 +1977,7 @@ async def test_memory_api_uses_bearer_principal_and_stable_read_schema(
                     {"project_id": "kai", "display_name": "Kai"},
                 ],
                 "unresolved_conflicts": 0,
+                "projection_failures": 0,
             },
         }
 

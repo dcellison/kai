@@ -232,10 +232,13 @@ async def test_apply_routes_approval_through_fact_lifecycle_and_returns_receipt(
 
         async def create(self, authority, spec, *, idempotency_key, stable_claim_key):
             calls.append(("create", idempotency_key))
-            return SimpleNamespace(claim_id="mcl_test", revision_id="mrv_test")
+            return SimpleNamespace(claim_id="mcl_test", revision_id="mrv_test", projection_status="succeeded")
 
         async def retract(self, authority, claim_id, revision_id, *, reason, idempotency_key, expired):
             calls.append(("expire", idempotency_key))
+            # The expiry's vector delete failed: canonical state committed,
+            # but the receipt must say the item did not reach search.
+            return SimpleNamespace(claim_id=claim_id, revision_id="mrv_expired", projection_status="failed")
 
     class FakeEpisodeService:
         def __init__(self, store):
@@ -255,6 +258,15 @@ async def test_apply_routes_approval_through_fact_lifecycle_and_returns_receipt(
     assert [call[0] for call in calls] == ["create", "expire", "store"]
     assert receipt["kind"] == reconciliation.RECEIPT_KIND
     assert receipt["applied"][0]["candidate_id"] == audit["candidates"][0]["candidate_id"]
+    assert receipt["applied"][0]["projection"] == ["failed"]
+    assert receipt["projection_failures"] == [
+        {
+            "candidate_id": audit["candidates"][0]["candidate_id"],
+            "kind": "fact",
+            "id": "mrv_expired",
+            "status": "failed",
+        }
+    ]
 
 
 def test_cli_exposes_complete_reconciliation_workflow():

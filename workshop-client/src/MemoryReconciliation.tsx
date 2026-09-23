@@ -604,7 +604,12 @@ export function MemoryReconciliation({
         `${summary.adopted ?? 0} adopted by lifecycle outcome, ${summary.consolidated ?? 0} consolidated, ` +
         `${summary.obsolete ?? 0} obsolete, ${summary.deferred ?? 0} deferred, ` +
         `${summary.rejected ?? 0} rejected, ${summary.failed ?? 0} failed, ` +
-        `${summary.still_unresolved ?? 0} still unresolved.`,
+        `${summary.still_unresolved ?? 0} still unresolved.` +
+        // Failed items are applied but did not reach search, so they are
+        // missing from recall until retried.
+        ((summary.failed ?? 0) > 0
+          ? ` ${summary.failed} did not reach search; retry them under Search sync in Fact review.`
+          : ""),
       );
       setRefreshKey((value) => value + 1);
     } catch (caught) {
