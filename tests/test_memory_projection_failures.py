@@ -333,7 +333,10 @@ def test_payload_filter_matches_one_revision_in_local_qdrant(tmp_path: Path) -> 
     the rows whose payload carries one canonical revision id, rather than
     listing the owner's whole corpus.
     """
-    from mem0.vector_stores.qdrant import Qdrant
+    # Mem0 is the optional `memory` extra; like the other real-store tests,
+    # this runs only where it is installed.
+    qdrant = pytest.importorskip("mem0.vector_stores.qdrant", reason="mem0ai not installed")
+    Qdrant = qdrant.Qdrant
 
     store = Qdrant(collection_name="lookup", embedding_model_dims=4, path=str(tmp_path / "qdrant"), on_disk=True)
     store.insert(
