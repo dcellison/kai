@@ -55,6 +55,7 @@ from kai.workshop.domain import (
     RunId,
 )
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
+from kai.workshop.memory_queries import WorkshopMemoryMutationFailed
 from kai.workshop.proactive_publication import ProactivePublicationResult
 from kai.workshop.scheduler import WorkshopScheduledJobRegistrationError
 from kai.workshop.storage_namespaces import (
@@ -3704,6 +3705,85 @@ class TestMemoryStats:
         assert resp.status == 500
         body = json.loads(resp.body.decode())
         assert body == {"error": "Memory stats failed"}
+
+
+def _protect(mock_request, service) -> None:
+    """Make the mock request a protected install with `service` as its memory query service."""
+    mock_request.app[CONFIG_KEY] = SimpleNamespace(memory_projects={}, protected_install=True)
+    mock_request.app[CORE_HOST_KEY].services.memory_queries = service
+
+
+class TestProtectedMemoryWrites:
+    """On a protected install, explicit saves and forget-all go through the fact lifecycle."""
+
+    async def test_save_is_recorded_as_a_canonical_claim(self, mock_request):
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "User likes Earl Grey", "tags": ["tea"]})
+        service = SimpleNamespace(record_agent_fact=AsyncMock(return_value="vec-1"))
+        _protect(mock_request, service)
+
+        with (
+            patch("kai.memory.is_enabled", return_value=True),
+            patch("kai.memory.add_structured") as direct_write,
+        ):
+            resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 200
+        assert json.loads(resp.body.decode()) == {"id": "vec-1"}
+        # The direct vector write would create a row recall never admits.
+        direct_write.assert_not_called()
+        call = service.record_agent_fact.await_args.kwargs
+        assert call["content"] == "User likes Earl Grey"
+        assert call["tags"] == ["tea"]
+        assert call["vector_metadata"]["source"] == "explicit"
+        assert call["vector_metadata"]["scope"] == "global"
+
+    async def test_save_reports_a_pending_projection_as_unavailable(self, mock_request):
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "User likes Earl Grey"})
+        service = SimpleNamespace(
+            record_agent_fact=AsyncMock(side_effect=WorkshopMemoryMutationFailed("projection pending"))
+        )
+        _protect(mock_request, service)
+
+        with patch("kai.memory.is_enabled", return_value=True):
+            resp = await _handle_memory_add(mock_request)
+
+        # The agent must not report the save as done while recall lacks it.
+        assert resp.status == 503
+
+    async def test_save_refuses_non_fact_types(self, mock_request):
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"content": "Deployed", "memory_type": "episode"})
+        service = SimpleNamespace(record_agent_fact=AsyncMock())
+        _protect(mock_request, service)
+
+        with patch("kai.memory.is_enabled", return_value=True):
+            resp = await _handle_memory_add(mock_request)
+
+        assert resp.status == 400
+        service.record_agent_fact.assert_not_awaited()
+
+    async def test_forget_all_retracts_instead_of_deleting_rows(self, mock_request):
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.json = AsyncMock(return_value={"confirm": "delete-all-memories"})
+        result = SimpleNamespace(retracted=3, projection_failed=0, legacy_deleted=2, kept_conflicts=1, kept_episodes=4)
+        service = SimpleNamespace(forget_all_for_agent=AsyncMock(return_value=result))
+        _protect(mock_request, service)
+
+        with patch("kai.memory.is_enabled", return_value=True), patch("kai.memory.delete_all") as wipe:
+            resp = await _call_memory_delete_all_as_authorized(mock_request)
+
+        assert resp.status == 200
+        assert json.loads(resp.body.decode()) == {
+            "status": "deleted",
+            "retracted": 3,
+            "projection_failed": 0,
+            "legacy_deleted": 2,
+            "kept_conflicts": 1,
+            "kept_episodes": 4,
+        }
+        wipe.assert_not_called()
 
 
 class TestMemoryDeleteAll:

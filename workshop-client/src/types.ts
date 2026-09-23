@@ -1371,9 +1371,12 @@ export interface WorkshopMemoryProjectionReview {
 }
 
 // Search rows that no longer match canonical state. Recall never uses
-// them; they are reported so the owner knows the index has leftovers.
+// orphan, unknown, or duplicate rows; they are reported so the owner
+// knows the index has leftovers. Missing rows are the opposite: current
+// facts whose row is gone, which recall cannot return.
 export interface WorkshopMemoryProjectionAudit {
   duplicate: number;
+  missing: string[];
   orphan: string[];
   unknown: string[];
 }

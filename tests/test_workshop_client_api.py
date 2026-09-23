@@ -1942,7 +1942,7 @@ async def test_projection_routes_serialize_review_audit_and_retry(tmp_path: Path
             ],
         }
         audit = await client.get("/v1/memory/projections/audit", headers=headers)
-        assert await audit.json() == {"version": 1, "orphan": ["vec-2"], "unknown": [], "duplicate": 1}
+        assert await audit.json() == {"version": 1, "orphan": ["vec-2"], "unknown": [], "duplicate": 1, "missing": []}
 
         everything = await client.post("/v1/memory/projections/retry", headers=headers, json={})
         named = await client.post("/v1/memory/projections/retry", headers=headers, json={"claim_ids": ["mcl_1"]})

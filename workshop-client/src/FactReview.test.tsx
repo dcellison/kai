@@ -271,7 +271,7 @@ describe("Workshop fact review", () => {
   it("retries everything and checks the search index on request", async () => {
     vi.mocked(loadMemoryProjections).mockResolvedValue(syncStatus);
     vi.mocked(retryMemoryProjections).mockResolvedValue({ failed: 1, retried: 2, succeeded: 1 });
-    vi.mocked(loadMemoryProjectionAudit).mockResolvedValue({ duplicate: 1, orphan: ["vec-2"], unknown: [] });
+    vi.mocked(loadMemoryProjectionAudit).mockResolvedValue({ duplicate: 1, missing: [], orphan: ["vec-2"], unknown: [] });
     const user = userEvent.setup();
     renderReview();
 
@@ -284,5 +284,19 @@ describe("Workshop fact review", () => {
 
     expect(retryMemoryProjections).toHaveBeenCalledWith("session-secret", {});
     expect(await screen.findByRole("status")).toHaveTextContent("Retried 2: 1 back in search. 1 still failing.");
+  });
+
+  it("leads the index check with current facts recall cannot return", async () => {
+    vi.mocked(loadMemoryProjections).mockResolvedValue(syncStatus);
+    vi.mocked(loadMemoryProjectionAudit).mockResolvedValue({ duplicate: 0, missing: ["vec-7"], orphan: [], unknown: [] });
+    const user = userEvent.setup();
+    renderReview();
+
+    await user.click(await screen.findByRole("tab", { name: /Search sync/ }));
+    await user.click(screen.getByRole("button", { name: "Check search index" }));
+
+    const note = await screen.findByRole("note");
+    expect(note).toHaveTextContent("1 current fact(s) have no search row, so Kai cannot recall them.");
+    expect(note).not.toHaveTextContent("leftover");
   });
 });

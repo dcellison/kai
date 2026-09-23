@@ -488,6 +488,11 @@ class KaiApplicationHost:
             census_owners = await memory_queries.refresh_legacy_census()
             if census_owners:
                 log.info("Counted legacy memory for %d owner(s)", census_owners)
+            # The same reason applies to vector drift: install status reads
+            # the stored audit rather than opening the vector store.
+            audited_owners = await memory_queries.refresh_vector_audits()
+            if audited_owners:
+                log.info("Audited memory vector rows for %d owner(s)", audited_owners)
             preference_documents = WorkshopPreferenceService(
                 Path(self._config.session_db_path).parent,
                 self._principal_storage,

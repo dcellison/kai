@@ -5262,11 +5262,16 @@ export async function loadMemoryProjectionAudit(token: string): Promise<Workshop
     Array.isArray(value) && value.every((item) => typeof item === "string");
   if (
     !isRecord(payload) || payload.version !== 1 || !isIdList(payload.orphan) ||
-    !isIdList(payload.unknown) || !Number.isSafeInteger(payload.duplicate)
+    !isIdList(payload.unknown) || !Number.isSafeInteger(payload.duplicate) || !isIdList(payload.missing)
   ) {
     throw new Error("Kai returned an unsupported search index check.");
   }
-  return { duplicate: payload.duplicate as number, orphan: payload.orphan, unknown: payload.unknown };
+  return {
+    duplicate: payload.duplicate as number,
+    missing: payload.missing,
+    orphan: payload.orphan,
+    unknown: payload.unknown,
+  };
 }
 
 // Retrying only resets items that are already failed, so a repeated

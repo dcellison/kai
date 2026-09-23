@@ -123,7 +123,12 @@ from kai.workshop.integration_notifications import (
     WorkshopIntegrationNotificationService,
 )
 from kai.workshop.internal_api_contexts import WorkshopInternalAPIExecutionContext
-from kai.workshop.memory_queries import WorkshopMemoryQueryService
+from kai.workshop.memory_queries import (
+    WorkshopMemoryAccessDenied,
+    WorkshopMemoryMutationFailed,
+    WorkshopMemoryQueryService,
+    WorkshopMemoryValidationError,
+)
 from kai.workshop.notification_preferences import WorkshopNotificationPreferenceService
 from kai.workshop.preferences import WorkshopPreferenceService
 from kai.workshop.principal_policies import WorkshopPrincipalPolicyService
@@ -1738,12 +1743,14 @@ def _memory_disabled_response() -> web.Response:
 @_require_internal_api(InternalAPIOperation.MEMORY_ADD)
 async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
-    Store a structured memory via memory.add_structured().
+    Store one fact the agent saves deliberately.
 
-    Wraps the existing add_structured() primitive used by the extraction
-    path. Lets authorized agent runtimes deliberately store facts without waiting for the extractor to pass
-    over a conversation. The primitive itself is unchanged; this handler
-    only adds the HTTP surface.
+    Lets authorized agent runtimes store facts without waiting for the
+    extractor to pass over a conversation. On a protected install the
+    fact is recorded as a canonical claim through the fact lifecycle, so
+    it is current truth and recalled like any other fact; only
+    `memory_type` "fact" is accepted there. Elsewhere it is written with
+    the add_structured() primitive the extraction path uses.
 
     Request body (JSON):
         content: str, required, non-empty after strip
@@ -1763,7 +1770,10 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
         200 {"id": "<mem0-uuid>"} on success
         400 on bad input or a retired caller identity selector
         401 on bad/missing internal API credential (handled by the decorator)
-        503 when memory is disabled (precheck; do not retry, escalate)
+        403 on a protected install when the runtime is not the principal's
+        503 when memory is disabled (precheck; do not retry, escalate), or
+            on a protected install when the fact was recorded but its
+            search projection has not succeeded yet (it is retried)
         500 when add_structured() returns None despite memory being enabled
             (the underlying store call failed; may be transient)
     """
@@ -1887,6 +1897,43 @@ async def _handle_memory_add(request: web.Request, principal: InternalAPIPrincip
         log.exception("Memory add workspace scope resolution failed")
         return web.json_response({"error": "Memory storage failed"}, status=500)
     final_metadata.update(_route_write_scope(None, active_project))
+
+    # On a protected install the save becomes a canonical claim through
+    # the fact lifecycle. A direct vector write would have no claim, so
+    # the current-truth gate would treat it as legacy memory and, once the
+    # owner's legacy memory is reconciled, never recall it: the agent
+    # would be told the fact was saved while it silently vanished. The
+    # lifecycle only records facts; episodes come from extraction.
+    memory_queries = getattr(request.app[CORE_HOST_KEY].services, "memory_queries", None)
+    if getattr(api_config, "protected_install", False) and memory_queries is not None:
+        if memory_type != "fact":
+            return web.json_response(
+                {"error": "Only facts can be saved; episodes are recorded by extraction"}, status=400
+            )
+        if principal.principal_id is None:
+            return web.json_response({"error": "Memory access denied"}, status=403)
+        try:
+            memory_id = await memory_queries.record_agent_fact(
+                principal_id=principal.principal_id,
+                runtime_profile_id=principal.runtime_profile_id,
+                content=content,
+                tags=tags,
+                vector_metadata=final_metadata,
+            )
+        except WorkshopMemoryValidationError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except WorkshopMemoryAccessDenied:
+            return web.json_response({"error": "Memory access denied"}, status=403)
+        except WorkshopMemoryMutationFailed as exc:
+            # The claim is canonical and its projection is retried at
+            # startup, but recall does not have it yet, so the agent must
+            # not report the save as complete.
+            return web.json_response({"error": str(exc)}, status=503)
+        except Exception:
+            log.exception("Canonical memory save failed for canonical principal")
+            return web.json_response({"error": "Memory storage failed"}, status=500)
+        log.info("Stored memory %s as a canonical claim through internal API authority", memory_id)
+        return web.json_response({"id": memory_id})
 
     # Defense-in-depth guard, matching the pattern used in the other
     # three memory handlers. add_structured catches its own internal
@@ -2077,7 +2124,13 @@ async def _handle_memory_stats(request: web.Request, principal: InternalAPIPrinc
 @_require_internal_api(InternalAPIOperation.MEMORY_DELETE_ALL)
 async def _handle_memory_delete_all(request: web.Request, principal: InternalAPIPrincipal) -> web.Response:
     """
-    Delete all memories for a user via memory.delete_all().
+    Forget all of the calling principal's memories.
+
+    On a protected install every current fact is retracted through the
+    fact lifecycle (it leaves recall but stays in history and can be
+    restored) and legacy vector rows are deleted. Facts in an unresolved
+    conflict and canonical episodes are kept and counted. Elsewhere this
+    calls memory.delete_all().
 
     Requires an exact-match confirm token in the body. Static
     well-known token (not per-request UUID) because the threat model
@@ -2087,13 +2140,17 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
         confirm: str, required, must equal "delete-all-memories"
 
     Responses:
-        200 {"status": "deleted"} on success
+        200 {"status": "deleted"} on success; on a protected install it
+            also carries retracted, projection_failed, legacy_deleted,
+            kept_conflicts, and kept_episodes counts
         400 on missing/wrong confirm or a retired caller identity selector
         401 on bad secret
-        503 when memory is disabled
+        403 on a protected install when the runtime is not the principal's
+        503 when memory is disabled, or when the search index could not be
+            read to find legacy rows
 
-    Caveat: delete_all() swallows internal errors (memory.py:1066-1069).
-    Partial failures inside Mem0 are logged but invisible at the API
+    Caveat: delete_all() swallows internal errors, so off a protected
+    install partial failures inside Mem0 are logged but invisible at the API
     layer. Surfacing them would require widening memory.py's error
     contract, which is out of scope for the foundation issue.
     """
@@ -2132,6 +2189,39 @@ async def _handle_memory_delete_all(request: web.Request, principal: InternalAPI
         return _memory_disabled_response()
 
     user_id = str(principal.principal_id)
+    # On a protected install every current fact is retracted through the
+    # fact lifecycle and only legacy rows are deleted outright. Deleting
+    # the vector rows directly would leave each canonical claim active
+    # with a projection pointing at a row that no longer exists, so recall
+    # would lose the facts while history and install status still counted
+    # them as current. Retraction also keeps each fact restorable.
+    api_config: Config = request.app[CONFIG_KEY]
+    memory_queries = getattr(request.app[CORE_HOST_KEY].services, "memory_queries", None)
+    if getattr(api_config, "protected_install", False) and memory_queries is not None:
+        if principal.principal_id is None:
+            return web.json_response({"error": "Memory access denied"}, status=403)
+        try:
+            result = await memory_queries.forget_all_for_agent(
+                principal_id=principal.principal_id,
+                runtime_profile_id=principal.runtime_profile_id,
+            )
+        except WorkshopMemoryAccessDenied:
+            return web.json_response({"error": "Memory access denied"}, status=403)
+        except WorkshopMemoryMutationFailed as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        except Exception:
+            log.exception("Canonical forget-all failed for canonical principal")
+            return web.json_response({"error": "Memory delete failed"}, status=500)
+        return web.json_response(
+            {
+                "status": "deleted",
+                "retracted": result.retracted,
+                "projection_failed": result.projection_failed,
+                "legacy_deleted": result.legacy_deleted,
+                "kept_conflicts": result.kept_conflicts,
+                "kept_episodes": result.kept_episodes,
+            }
+        )
     # Defense-in-depth guard, matching the pattern used in
     # _handle_memory_search and _handle_memory_stats. delete_all()
     # catches its own internal errors today (memory.py:1066-1069), so

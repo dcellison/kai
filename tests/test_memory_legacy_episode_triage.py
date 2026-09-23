@@ -285,6 +285,11 @@ async def test_an_open_older_plan_moves_forward_keeping_unchanged_decisions(tmp_
         assert [item["disposition"] for item in record["dropped"]] == ["approve"]
         async with store.connection.execute("PRAGMA foreign_key_check") as cursor:
             assert await cursor.fetchall() == []
+        # The replan record names the plan it produced, so install status
+        # accounts for it instead of reporting a replay gap.
+        from kai.workshop.diagnostics import workshop_memory_reconciliation_status
+
+        assert "replay gaps=0;" in workshop_memory_reconciliation_status(tmp_path / "kai.db")
     finally:
         await store.close()
 

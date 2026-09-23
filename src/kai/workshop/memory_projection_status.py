@@ -25,6 +25,8 @@ import sqlite3
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
 import aiosqlite
 
@@ -99,15 +101,21 @@ class VectorAudit:
       current row (left behind by a delete, a rewrite, or a duplicate add).
     - `unknown`: rows naming a claim or episode the owner does not have.
     - `duplicate`: claims or episodes with more than one row.
+    - `missing`: current rows canonical state expects that the store does
+      not have. Unlike the others this one is a loss, not noise: the
+      current-truth gate admits a fact only through its current row, so a
+      missing row is a current fact recall cannot return.
 
-    The retrieval gate already keeps all of these out of recall; they are
-    wasted storage and noise in exclusion counts, not a leak. Memory ids
-    are kept so an operator can inspect them; content never is.
+    The retrieval gate keeps orphan, unknown, and duplicate rows out of
+    recall; they are wasted storage and noise in exclusion counts, not a
+    leak. Memory ids are kept so an operator can inspect them; content
+    never is.
     """
 
     orphan: tuple[str, ...]
     unknown: tuple[str, ...]
     duplicate: int
+    missing: tuple[str, ...] = ()
 
 
 # ── Outbox queries ───────────────────────────────────────────────────
@@ -263,8 +271,10 @@ def audit_vector_rows(
     """
     orphan: list[str] = []
     unknown: list[str] = []
+    present: set[str] = set()
     per_item: Counter[tuple[str, str]] = Counter()
     for row in rows:
+        present.add(row.id)
         claim_id = row.metadata.get(CANONICAL_CLAIM_ID_KEY)
         episode_id = row.metadata.get(CANONICAL_EPISODE_ID_KEY)
         if isinstance(claim_id, str) and claim_id:
@@ -278,10 +288,14 @@ def audit_vector_rows(
             unknown.append(row.id)
         elif expected[item_id] != row.id:
             orphan.append(row.id)
+    expected_ids = {
+        memory_id for memory_id in (*current_facts.values(), *current_episodes.values()) if memory_id is not None
+    }
     return VectorAudit(
         orphan=tuple(sorted(orphan)),
         unknown=tuple(sorted(unknown)),
         duplicate=sum(1 for count in per_item.values() if count > 1),
+        missing=tuple(sorted(expected_ids - present)),
     )
 
 
@@ -319,6 +333,64 @@ async def expected_rows_async(
     return _expected_facts(facts), _expected_episodes(episodes)
 
 
+def store_vector_audit(
+    db_path: Path,
+    audit: VectorAudit,
+    *,
+    principal_id: str,
+    runtime_profile_id: str,
+    now: datetime | None = None,
+) -> None:
+    """
+    Record one owner's latest vector audit counts for install status.
+
+    Only counts and the time are stored, never memory ids or content, so
+    install status can report drift and its age without reading the
+    vector store. The row is replaced on every audit.
+    """
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        connection.execute(
+            "INSERT INTO memory_vector_audit ("
+            "principal_id, runtime_profile_id, orphan_rows, unknown_rows, duplicate_items, missing_rows, checked_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (principal_id, runtime_profile_id) DO UPDATE SET orphan_rows = excluded.orphan_rows, "
+            "unknown_rows = excluded.unknown_rows, duplicate_items = excluded.duplicate_items, "
+            "missing_rows = excluded.missing_rows, checked_at = excluded.checked_at",
+            (
+                principal_id,
+                runtime_profile_id,
+                len(audit.orphan),
+                len(audit.unknown),
+                audit.duplicate,
+                len(audit.missing),
+                (now or datetime.now(UTC)).isoformat(timespec="seconds"),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def refresh_vector_audit(db_path: Path, *, principal_id: str, runtime_profile_id: str) -> VectorAudit:
+    """
+    Audit one owner's vector rows against canonical state and store the counts.
+
+    Call only from a process that holds the vector store (the service, or
+    the admin CLI with the service stopped). A read failure propagates and
+    the previous stored audit stays with its older time.
+    """
+    rows = memory.get_all_for_lifecycle_projection(user_id=principal_id, runtime_profile_id=runtime_profile_id)
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        facts, episodes = expected_rows(connection, (principal_id, runtime_profile_id))
+    finally:
+        connection.close()
+    audit = audit_vector_rows(rows, current_facts=facts, current_episodes=episodes)
+    store_vector_audit(db_path, audit, principal_id=principal_id, runtime_profile_id=runtime_profile_id)
+    return audit
+
+
 __all__ = [
     "MAX_FAILED_ITEMS",
     "FailedProjection",
@@ -330,4 +402,6 @@ __all__ = [
     "expected_rows_async",
     "projection_status",
     "projection_status_async",
+    "refresh_vector_audit",
+    "store_vector_audit",
 ]

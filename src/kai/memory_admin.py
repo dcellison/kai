@@ -1691,7 +1691,12 @@ def _cmd_projections(args: argparse.Namespace) -> int:
     """
     from kai.config import load_config
     from kai.memory_quality_corpus import MemoryQualityCorpusError, resolve_human_principal
-    from kai.workshop.memory_projection_status import audit_vector_rows, expected_rows, projection_status
+    from kai.workshop.memory_projection_status import (
+        audit_vector_rows,
+        expected_rows,
+        projection_status,
+        store_vector_audit,
+    )
 
     config = load_config()
     db_path = Path(config.session_db_path)
@@ -1743,11 +1748,14 @@ def _cmd_projections(args: argparse.Namespace) -> int:
                 rows = memory.get_all_for_lifecycle_projection(user_id=owner[0], runtime_profile_id=owner[1])
                 facts, episodes = expected[owner]
                 audit = audit_vector_rows(rows, current_facts=facts, current_episodes=episodes)
+                # Install status reads the stored counts; refreshing them
+                # here keeps them as current as this full read.
+                store_vector_audit(db_path, audit, principal_id=owner[0], runtime_profile_id=owner[1])
                 print(
                     f"memory projections: vector audit {owner[0]}/{owner[1]}; orphan={len(audit.orphan)}, "
-                    f"unknown={len(audit.unknown)}, duplicate={audit.duplicate}"
+                    f"unknown={len(audit.unknown)}, duplicate={audit.duplicate}, missing={len(audit.missing)}"
                 )
-                for memory_id in (*audit.orphan, *audit.unknown):
+                for memory_id in (*audit.orphan, *audit.unknown, *audit.missing):
                     print(f"  {memory_id}")
         finally:
             memory.close_memory()

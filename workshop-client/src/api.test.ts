@@ -1254,7 +1254,7 @@ describe("Workshop client API", () => {
           preview: "Dark themes.",
         }],
       }))
-      .mockResolvedValueOnce(Response.json({ version: 1, orphan: ["vec-2"], unknown: [], duplicate: 1 }))
+      .mockResolvedValueOnce(Response.json({ version: 1, orphan: ["vec-2"], unknown: [], duplicate: 1, missing: ["vec-9"] }))
       .mockResolvedValueOnce(Response.json({ version: 1, retried: 1, succeeded: 1, failed: 0 }))
       .mockResolvedValueOnce(Response.json({ version: 1, failed_total: 1, blocked: 0, failed: [{ kind: "row" }] }));
     vi.stubGlobal("fetch", fetchMock);
@@ -1274,7 +1274,7 @@ describe("Workshop client API", () => {
       }],
     });
     await expect(loadMemoryProjectionAudit("session-secret")).resolves.toEqual({
-      duplicate: 1, orphan: ["vec-2"], unknown: [],
+      duplicate: 1, missing: ["vec-9"], orphan: ["vec-2"], unknown: [],
     });
     await expect(retryMemoryProjections("session-secret", { episodeIds: ["mep_1"] })).resolves.toEqual({
       failed: 0, retried: 1, succeeded: 1,

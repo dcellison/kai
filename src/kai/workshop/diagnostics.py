@@ -2121,7 +2121,16 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
                 "SELECT 1 FROM memory_fact_revision_states s WHERE s.revision_id = r.revision_id "
                 "AND s.claim_id = r.claim_id)",
             )
-            legacy_unclassified, census_age = _legacy_census_summary(connection, tables)
+            legacy_unclassified, census_age, review_pending_owners, review_pending_rows = _legacy_census_summary(
+                connection, tables
+            )
+            state_counts = {
+                str(row[0]): int(row[1])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) FROM memory_fact_revision_states GROUP BY state"
+                ).fetchall()
+            }
+            vector_drift, vector_missing, vector_age = _vector_audit_summary(connection, tables)
             staged_consolidations, consolidated_facts = _consolidation_summary(connection, tables)
             legacy_active, legacy_inactive = _legacy_admission_owner_counts(connection, tables)
             conflicts, oldest_conflict_days = _unresolved_conflict_summary(connection)
@@ -2138,15 +2147,21 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
     # No census yet means the count is unknown, which is not "complete".
     gaps = malformed + quarantined + projection_gaps + (legacy_unclassified if legacy_unclassified is not None else 1)
     gaps += failed_projections + blocked
+    # A vector store that disagrees with canonical state is a fault, and an
+    # audit that never ran is unknown, which is not "complete" either.
+    gaps += vector_drift if vector_drift is not None else 1
     state = "active" if memory_enabled is True and gaps == 0 else "INCOMPLETE"
     if memory_enabled is None:
         state = "NOT VERIFIED"
     return (
         f"{prefix} {state}; claims={claims}, revisions={revisions}, current={active}, "
-        f"inactive={inactive}, validity excluded={validity_excluded}, quarantined={quarantined}, "
+        f"inactive={inactive}, states=({_state_label(state_counts)}), "
+        f"validity excluded={validity_excluded}, quarantined={quarantined}, "
         f"operator admitted={operator_admitted}, "
-        f"legacy unclassified={_census_label(legacy_unclassified, census_age)}, projection gaps={projection_gaps}, "
-        f"integrity gaps={malformed}; "
+        f"legacy unclassified={_census_label(legacy_unclassified, census_age)}, "
+        f"legacy review pending={review_pending_owners} owner(s) ({review_pending_rows} rows), "
+        f"projection gaps={projection_gaps}, integrity gaps={malformed}; "
+        f"vector drift={_vector_audit_label(vector_drift, vector_missing, vector_age)}; "
         f"unresolved conflicts={conflicts}"
         f"{f' (oldest={oldest_conflict_days}d)' if conflicts else ''}; "
         f"projection failed={failed_projections} (facts={failed_facts}, episodes={failed_episodes}), "
@@ -2208,25 +2223,99 @@ def _consolidation_summary(connection: sqlite3.Connection, tables: set[str]) -> 
     return (int(row[0] or 0), int(row[1] or 0)) if row is not None else (0, 0)
 
 
-def _legacy_census_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int | None, str | None]:
+def _legacy_census_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int | None, str | None, int, int]:
     """
-    Sum unclassified legacy rows across owners from the stored census.
+    Split unclassified legacy rows into gaps and rows still awaiting review.
 
     The service counts legacy rows at startup and after every
     reconciliation apply, because only it can read the vector store; this
-    reads the stored counts. Returns (None, None) before any census, and
-    otherwise the sum with the age of the oldest owner's count, so a stale
-    number is visible as stale.
+    reads the stored counts. An owner who has applied a reconciliation
+    audit has had the chance to classify every row, so any row still
+    unclassified is a gap (a row written outside the lifecycle since, for
+    example). An owner who never applied one is simply waiting on their
+    own review: their rows stay recallable through temporary legacy
+    admission, so they are reported as review pending, not as a gap.
+
+    Returns (unclassified rows of reviewed owners, age of the oldest
+    count, owners pending review, their unclassified rows). The first two
+    are (None, None) before any census, so an unknown count is visible.
     """
     if "memory_legacy_census" not in tables:
-        return None, None
-    row = connection.execute("SELECT COUNT(*), SUM(unclassified), MIN(counted_at) FROM memory_legacy_census").fetchone()
+        return None, None, 0, 0
+    row = connection.execute("SELECT COUNT(*), MIN(counted_at) FROM memory_legacy_census").fetchone()
     if row is None or not row[0]:
-        return None, None
-    counted = datetime.fromisoformat(str(row[2]).replace("Z", "+00:00"))
+        return None, None, 0, 0
+    counted = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
     if counted.tzinfo is None:
         counted = counted.replace(tzinfo=UTC)
-    return int(row[1] or 0), _age_label(datetime.now(UTC) - counted)
+    applied: set[tuple[str, str]] = set()
+    if "memory_reconciliation_audits" in tables:
+        applied = {
+            (str(item[0]), str(item[1]))
+            for item in connection.execute(
+                "SELECT principal_id, runtime_profile_id FROM memory_reconciliation_audits WHERE status = 'applied'"
+            )
+        }
+    reviewed = pending_owners = pending_rows = 0
+    for principal_id, runtime_profile_id, unclassified in connection.execute(
+        "SELECT principal_id, runtime_profile_id, unclassified FROM memory_legacy_census"
+    ):
+        if (str(principal_id), str(runtime_profile_id)) in applied:
+            reviewed += int(unclassified)
+        elif int(unclassified):
+            pending_owners += 1
+            pending_rows += int(unclassified)
+    return reviewed, _age_label(datetime.now(UTC) - counted), pending_owners, pending_rows
+
+
+def _vector_audit_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int | None, int, str | None]:
+    """
+    Sum the stored vector audit across owners.
+
+    The service audits each owner's vector rows at startup and after
+    projection retries and stores only counts. Drift is every row or item
+    that disagrees with canonical state: orphan, unknown, and missing rows
+    plus items with duplicate rows. Missing rows are also returned on
+    their own because they are the one kind recall actually loses.
+    Returns (None, 0, None) before any audit, and otherwise the drift,
+    the missing count, and the age of the oldest owner's audit.
+    """
+    if "memory_vector_audit" not in tables:
+        return None, 0, None
+    row = connection.execute(
+        "SELECT COUNT(*), SUM(orphan_rows + unknown_rows + duplicate_items + missing_rows), SUM(missing_rows), "
+        "MIN(checked_at) FROM memory_vector_audit"
+    ).fetchone()
+    if row is None or not row[0]:
+        return None, 0, None
+    checked = datetime.fromisoformat(str(row[3]).replace("Z", "+00:00"))
+    if checked.tzinfo is None:
+        checked = checked.replace(tzinfo=UTC)
+    return int(row[1] or 0), int(row[2] or 0), _age_label(datetime.now(UTC) - checked)
+
+
+def _vector_audit_label(drift: int | None, missing: int, age: str | None) -> str:
+    if drift is None:
+        return "not checked"
+    return f"{drift} (missing={missing}, checked {age} ago)"
+
+
+def _relationship_label(counts: dict[str, int]) -> str:
+    """Render episode follow-ups per relationship in a fixed order, zeros included."""
+    order = ("repeated", "revisited", "outcome_changed", "invalidated_conclusion", "resolved_by")
+    rendered = [f"{name}={counts.get(name, 0)}" for name in order]
+    rendered.extend(f"{name}={count}" for name, count in sorted(counts.items()) if name not in order)
+    return ", ".join(rendered)
+
+
+def _state_label(counts: dict[str, int]) -> str:
+    """Render revision counts per lifecycle state in a fixed order, zeros included."""
+    order = ("active", "superseded", "retracted", "expired", "unresolved_conflict")
+    labels = {"unresolved_conflict": "conflicted"}
+    rendered = [f"{labels.get(name, name)}={counts.get(name, 0)}" for name in order]
+    # A state this code does not know is still shown, so it cannot hide.
+    rendered.extend(f"{name}={count}" for name, count in sorted(counts.items()) if name not in order)
+    return ", ".join(rendered)
 
 
 def _age_label(age: timedelta) -> str:
@@ -2403,10 +2492,39 @@ def workshop_memory_reconciliation_status(db_path: Path) -> str:
                 "AND r.input_sha256 = json_extract(g.recommendation_json, '$.input_sha256') "
                 "AND r.output_sha256 = json_extract(g.recommendation_json, '$.output_sha256'))",
             )
+            # An operation is replay-safe when its stored response names
+            # what it acted on and that target still accounts for it.
+            # Review decisions and applies name their audit. A policy
+            # replan names the plan it produced, which either still exists
+            # or was itself replanned later. Consolidation saves and
+            # cancels name their plan and consolidation; the consolidation
+            # either still exists or has a recorded cancellation.
+            # Anything else is a gap.
+            consolidations_known = "memory_reconciliation_triage_consolidations" in tables
+            consolidation_target = (
+                "(EXISTS (SELECT 1 FROM memory_reconciliation_triage_consolidations c "
+                "WHERE c.consolidation_id = COALESCE(json_extract(o.response_json, '$.consolidation.consolidation_id'), "
+                "json_extract(o.response_json, '$.consolidation_id'))) "
+                "OR EXISTS (SELECT 1 FROM memory_reconciliation_operations x "
+                "WHERE json_extract(x.response_json, '$.cancelled') = 1 "
+                "AND json_extract(x.response_json, '$.consolidation_id') = COALESCE("
+                "json_extract(o.response_json, '$.consolidation.consolidation_id'), "
+                "json_extract(o.response_json, '$.consolidation_id'))))"
+                if consolidations_known
+                else "0"
+            )
             replay_gaps = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM memory_reconciliation_operations o "
-                "WHERE json_extract(o.response_json, '$.audit_id') IS NULL",
+                "WHERE json_extract(o.response_json, '$.audit_id') IS NULL "
+                "AND NOT (o.client_operation_id LIKE 'replan:%' AND ("
+                "EXISTS (SELECT 1 FROM memory_reconciliation_triage_plans p "
+                "WHERE p.plan_id = json_extract(o.response_json, '$.new_plan_id')) "
+                "OR EXISTS (SELECT 1 FROM memory_reconciliation_operations r "
+                "WHERE r.client_operation_id = 'replan:' || json_extract(o.response_json, '$.new_plan_id')))) "
+                "AND NOT (EXISTS (SELECT 1 FROM memory_reconciliation_triage_plans p "
+                "WHERE p.plan_id = json_extract(o.response_json, '$.plan_id')) "
+                f"AND {consolidation_target})",
             )
         finally:
             connection.close()
@@ -2454,10 +2572,12 @@ def workshop_episode_history_status(db_path: Path, *, memory_enabled: bool | Non
             )
             legacy = episodes - canonical
             followups = _scalar(connection, "SELECT COUNT(*) FROM memory_episode_followups")
-            repeated = _scalar(
-                connection,
-                "SELECT COUNT(*) FROM memory_episode_followups WHERE relationship = 'repeated'",
-            )
+            relationships = {
+                str(row[0]): int(row[1])
+                for row in connection.execute(
+                    "SELECT relationship, COUNT(*) FROM memory_episode_followups GROUP BY relationship"
+                ).fetchall()
+            }
             pending = _scalar(
                 connection,
                 "SELECT COUNT(*) FROM memory_episode_vector_operations WHERE status IN ('pending', 'executing')",
@@ -2489,7 +2609,7 @@ def workshop_episode_history_status(db_path: Path, *, memory_enabled: bool | Non
     state = "active" if pending == 0 and failed == 0 and gaps == 0 else "INCOMPLETE"
     return (
         f"{prefix} {state}; episodes={episodes} (canonical={canonical}, legacy={legacy}), "
-        f"followups={followups} (repeated={repeated}), projections=(pending={pending}, failed={failed}), "
+        f"followups={followups} ({_relationship_label(relationships)}), projections=(pending={pending}, failed={failed}), "
         f"integrity gaps={gaps} (provenance={provenance_gaps}, projection={projection_gaps}); "
         "authority=immutable/canonical"
     )

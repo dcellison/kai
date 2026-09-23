@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 95
+WORKSHOP_SCHEMA_VERSION = 96
 
 
 @dataclass(frozen=True, slots=True)
@@ -4607,6 +4607,30 @@ _MEMORY_TRIAGE_CONSOLIDATION_SCHEMA = SchemaMigration(
     ),
 )
 
+# The last vector-store audit per owner. Install status runs as root and
+# must not open the service-owned vector store (its rows are unpickled),
+# so the service audits each owner at startup and after projection
+# retries, and install status reads the stored counts with their age,
+# the same way it reads the legacy census.
+_MEMORY_VECTOR_AUDIT_SCHEMA = SchemaMigration(
+    version=96,
+    name="memory_vector_audit",
+    statements=(
+        """
+        CREATE TABLE memory_vector_audit (
+            principal_id TEXT NOT NULL CHECK (length(principal_id) BETWEEN 1 AND 128),
+            runtime_profile_id TEXT NOT NULL CHECK (length(runtime_profile_id) BETWEEN 1 AND 128),
+            orphan_rows INTEGER NOT NULL CHECK (orphan_rows >= 0),
+            unknown_rows INTEGER NOT NULL CHECK (unknown_rows >= 0),
+            duplicate_items INTEGER NOT NULL CHECK (duplicate_items >= 0),
+            missing_rows INTEGER NOT NULL CHECK (missing_rows >= 0),
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, runtime_profile_id)
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4703,6 +4727,7 @@ _MIGRATIONS = (
     _MEMORY_ADMISSION_AUTHORITY_SCHEMA,
     _MEMORY_RECONCILIATION_RESUME_SCHEMA,
     _MEMORY_TRIAGE_CONSOLIDATION_SCHEMA,
+    _MEMORY_VECTOR_AUDIT_SCHEMA,
 )
 
 
