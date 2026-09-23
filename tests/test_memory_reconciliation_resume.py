@@ -444,6 +444,77 @@ async def test_a_deferral_comes_back_with_the_earlier_note(tmp_path: Path, monke
         await owner.close()
 
 
+async def test_an_applied_plan_with_its_own_deferral_still_loads(tmp_path: Path, monkeypatch) -> None:
+    # Applying the plan makes its own deferral an "applied" decision. That
+    # decision must not be carried back into the same audit's plan, or the
+    # rebuild on the next load no longer matches the stored plan.
+    rows = [
+        _episode("ep-defer", "Deployed the fix", complete=False),
+        _episode("ep-keep", "Repaired the deploy script", complete=True),
+    ]
+    owner = await _Owner(tmp_path, rows).start(monkeypatch)
+    try:
+        await _applied_plan(owner, reject=set(), defer={"ep-defer"})
+
+        summary = await owner.triage().latest(owner.principal)
+
+        assert summary is not None and summary.status == "applied"
+        page = await owner.triage().groups(owner.principal, summary.plan_id)
+        assert all(group["classification"] != "prior_review" for group in page.groups)
+    finally:
+        await owner.close()
+
+
+async def test_an_applied_plan_with_a_raw_review_deferral_still_loads(tmp_path: Path, monkeypatch) -> None:
+    # A deferral made in the raw review before triage became the plan's
+    # prior_review group. Applying the plan marks the audit applied, and
+    # the same deferral must not then be added a second time on reload.
+    rows = [_row("fact-defer", "Alice prefers exact summaries"), _row("fact-keep", "Alice uses dark mode")]
+    owner = await _Owner(tmp_path, rows).start(monkeypatch)
+    try:
+        candidate = next(
+            item
+            for item in owner.audit["candidates"]
+            if any(row["memory_id"] == "fact-defer" for row in item["evidence"])
+        )
+        await owner.store.connection.execute(
+            "UPDATE memory_reconciliation_decisions SET disposition = 'defer', state_version = 1 "
+            "WHERE audit_id = ? AND candidate_id = ?",
+            (owner.audit["audit_id"], candidate["candidate_id"]),
+        )
+        await owner.store.connection.commit()
+        # The prior_review group is never bulk-approved, so the owner
+        # approves it explicitly, as production did.
+        triage = owner.triage()
+        opened = await triage.latest(owner.principal)
+        assert opened is not None
+        (prior,) = [
+            group
+            for group in (await triage.groups(owner.principal, opened.plan_id)).groups
+            if group["classification"] == "prior_review"
+        ]
+        await triage.decide_group(
+            owner.principal,
+            opened.plan_id,
+            prior["group_id"],
+            disposition="approve",
+            action=prior["proposed_action"],
+            operator_note="",
+            expected_state_version=prior["decision"]["state_version"],
+            allowed_project_ids=frozenset(),
+            client_operation_id="approve-prior",
+        )
+        await _applied_plan(owner, reject=set(), defer=set())
+
+        summary = await owner.triage().latest(owner.principal)
+
+        assert summary is not None and summary.status == "applied"
+        page = await owner.triage().groups(owner.principal, summary.plan_id)
+        assert sum(group["classification"] == "prior_review" for group in page.groups) == 1
+    finally:
+        await owner.close()
+
+
 # ── Summary counts and the census ────────────────────────────────────
 
 

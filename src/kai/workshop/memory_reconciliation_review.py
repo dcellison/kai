@@ -209,6 +209,7 @@ def prior_reconciliation_row_dispositions(
     *,
     principal_id: str,
     runtime_profile_id: str,
+    exclude_audit_id: str | None = None,
 ) -> dict[str, PriorRowDisposition]:
     """
     Return each row's latest reject or defer from the owner's applied reviews.
@@ -219,7 +220,15 @@ def prior_reconciliation_row_dispositions(
     decisions are final, so a plan built from a later audit is the same
     every time it is rebuilt. When several decisions cover a row, the
     newest wins.
+
+    `exclude_audit_id` leaves out one audit's own decisions and its plan's.
+    A plan rebuilt from its own audit must not see them: before the apply
+    they do not count (nothing is applied yet), and after it they would,
+    so the same audit would rebuild into a different plan once applied.
     """
+    # SQL NULL never equals anything, so `!= NULL` would drop every row;
+    # an empty id matches no real audit and keeps them all instead.
+    excluded = exclude_audit_id or ""
     connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
     try:
         sources: list[tuple[str, str, str, str, object, str, str]] = []
@@ -233,8 +242,8 @@ def prior_reconciliation_row_dispositions(
                     "JOIN memory_reconciliation_triage_plans p ON p.plan_id = g.plan_id "
                     "JOIN memory_reconciliation_audits a ON a.audit_id = p.audit_id "
                     "WHERE a.principal_id = ? AND a.runtime_profile_id = ? AND p.status = 'applied' "
-                    "AND g.disposition IN ('reject', 'defer')",
-                    (principal_id, runtime_profile_id),
+                    "AND g.disposition IN ('reject', 'defer') AND a.audit_id != ?",
+                    (principal_id, runtime_profile_id, excluded),
                 ).fetchall()
             )
         if "memory_reconciliation_decisions" in tables:
@@ -245,8 +254,8 @@ def prior_reconciliation_row_dispositions(
                     "FROM memory_reconciliation_decisions d "
                     "JOIN memory_reconciliation_audits a ON a.audit_id = d.audit_id "
                     "WHERE a.principal_id = ? AND a.runtime_profile_id = ? AND a.status = 'applied' "
-                    "AND d.disposition IN ('reject', 'defer')",
-                    (principal_id, runtime_profile_id),
+                    "AND d.disposition IN ('reject', 'defer') AND a.audit_id != ?",
+                    (principal_id, runtime_profile_id, excluded),
                 ).fetchall()
             )
     finally:
