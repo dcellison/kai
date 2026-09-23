@@ -2132,6 +2132,7 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
                 "WHERE json_extract(vector_metadata_json, '$._canonical_adopt_memory_id') IS NOT NULL",
             )
             legacy_unclassified = max(baseline - adopted, 0)
+            legacy_active, legacy_inactive = _legacy_admission_owner_counts(connection, tables)
         finally:
             connection.close()
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
@@ -2145,8 +2146,40 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
         f"inactive={inactive}, validity excluded={validity_excluded}, quarantined={quarantined}, "
         f"operator admitted={operator_admitted}, "
         f"legacy unclassified={legacy_unclassified}, projection gaps={projection_gaps}, "
-        f"integrity gaps={malformed}; authority=canonical/current-only"
+        f"integrity gaps={malformed}; "
+        f"legacy admission active={legacy_active} (no applied audit), inactive={legacy_inactive} (audit applied); "
+        "authority=canonical/current-only"
     )
+
+
+def _legacy_admission_owner_counts(connection: sqlite3.Connection, tables: set[str]) -> tuple[int, int]:
+    """
+    Count owners for whom temporary legacy admission is active or inactive.
+
+    An owner is a (principal, runtime profile) pair known either from
+    runtime profile ownership or from a reconciliation audit. Admission is
+    inactive for an owner once any of that owner's audits is applied, and
+    active otherwise, matching the retrieval gate. The "no applied audit"
+    wording is deliberate: an owner reconciled only through the file-based
+    CLI records no audit row, so it stays active without any reconciliation
+    being pending. Only counts are reported, never identifiers or content.
+    """
+    owners: set[tuple[str, str]] = set()
+    if "runtime_profile_owners" in tables:
+        owners.update(
+            (str(row[0]), str(row[1]))
+            for row in connection.execute("SELECT principal_id, runtime_profile_id FROM runtime_profile_owners")
+        )
+    applied: set[tuple[str, str]] = set()
+    if "memory_reconciliation_audits" in tables:
+        for principal_id, runtime_profile_id, status in connection.execute(
+            "SELECT principal_id, runtime_profile_id, status FROM memory_reconciliation_audits"
+        ):
+            owner = (str(principal_id), str(runtime_profile_id))
+            owners.add(owner)
+            if status == "applied":
+                applied.add(owner)
+    return len(owners - applied), len(applied)
 
 
 def workshop_memory_reconciliation_status(db_path: Path) -> str:

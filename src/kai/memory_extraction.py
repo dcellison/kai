@@ -62,6 +62,7 @@ from kai.oneshot import _ensure_extractor_cwd as _ensure_extractor_cwd
 from kai.prompt_utils import encode_untrusted_json_record, make_untrusted_json_envelope
 from kai.workshop.domain import PrincipalId, RuntimeProfileId
 from kai.workshop.fact_lifecycle import FactRevisionInput
+from kai.workshop.memory_current_truth import CANONICAL_TEMPORAL_ROLE_KEY, LEGACY_UNRECONCILED_ROLE
 from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptClaim,
     MemoryExtractionReceiptCompletion,
@@ -3561,8 +3562,18 @@ async def _store_canonical_facts(
     provider: str,
     model: str,
     receipt_decisions: list[MemoryExtractionStorageDecision],
+    legacy_candidate_ids: frozenset[str] = frozenset(),
 ) -> tuple[int, int, int]:
-    """Store production facts through canonical revision authority."""
+    """
+    Store production facts through canonical revision authority.
+
+    `legacy_candidate_ids` names consolidation candidates that retrieval
+    admitted only as unreconciled legacy memory. The model may propose
+    `update_of` against one of them, but exact-id reads stay strict for
+    legacy rows, so the target resolves to nothing. That case is recorded
+    as `legacy_target_unreconciled` instead of `stale_existing_fact`, and
+    the legacy row is left untouched for reconciliation to handle.
+    """
     from kai import sessions
 
     stored = replaced = skipped = 0
@@ -3715,7 +3726,9 @@ async def _store_canonical_facts(
                 record_decision(
                     index=index,
                     intent=intent,
-                    outcome="stale_existing_fact",
+                    outcome=(
+                        "legacy_target_unreconciled" if existing_id in legacy_candidate_ids else "stale_existing_fact"
+                    ),
                     replaced_memory_id=existing_id,
                     scope_meta=scope_meta,
                 )
@@ -3967,6 +3980,10 @@ def _fact_receipt_completion(
             decision_outcome = "duplicate_skipped"
         elif outcomes == {"stored"}:
             decision_outcome = "stored"
+        elif outcomes == {"legacy_target_unreconciled"}:
+            # Every proposal targeted a legacy row that only temporary
+            # legacy admission made visible; nothing was changed.
+            decision_outcome = "legacy_target_unreconciled"
         else:
             decision_outcome = "mixed"
         failure_code = None
@@ -4383,6 +4400,11 @@ async def extract_and_store(
                         provider=effective_provider,
                         model=fact_model,
                         receipt_decisions=receipt_decisions,
+                        legacy_candidate_ids=frozenset(
+                            candidate.id
+                            for candidate in candidates
+                            if candidate.metadata.get(CANONICAL_TEMPORAL_ROLE_KEY) == LEGACY_UNRECONCILED_ROLE
+                        ),
                     )
                 else:
                     loop = asyncio.get_running_loop()

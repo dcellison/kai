@@ -29,10 +29,13 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from kai.config import DATA_DIR, Config
 from kai.prompt_utils import encode_untrusted_json_record, make_untrusted_json_envelope
+
+if TYPE_CHECKING:
+    from kai.workshop.memory_current_truth import CurrentTruthProjection
 
 log = logging.getLogger(__name__)
 
@@ -2009,6 +2012,56 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return _embed_via_configured_embedder(texts)
 
 
+# ── Current-truth admission logging ─────────────────────────────────
+
+# Minimum seconds between admission-count log lines per owner and surface.
+# Recall runs on every private message, so an unthrottled line would flood
+# the log; one line a minute is enough to see whether legacy admission is
+# active and what the gate is excluding.
+_CURRENT_TRUTH_LOG_INTERVAL_SECONDS = 60.0
+
+# Last log time per (surface, principal, runtime profile). The clock is a
+# module attribute so tests can substitute it instead of sleeping.
+_current_truth_log_times: dict[tuple[str, str, str], float] = {}
+_current_truth_log_clock = time.monotonic
+
+
+def _log_current_truth_counts(
+    surface: str,
+    namespace: _CanonicalMemoryNamespace,
+    projection: CurrentTruthProjection,
+) -> None:
+    """
+    Log privacy-safe admission and exclusion counts for one gated read.
+
+    Only reason counts and opaque owner identifiers are logged, never
+    memory content. Lines are rate-limited per surface and owner, and a
+    read that neither admitted legacy rows nor excluded anything logs
+    nothing.
+
+    Args:
+        surface: Gated read path, such as "search" or "get_all".
+        namespace: Canonical owner the read was projected for.
+        projection: Result of the current-truth projection.
+    """
+    if not projection.admitted and not projection.excluded:
+        return
+    key = (surface, str(namespace.principal_id), str(namespace.runtime_profile_id))
+    now = _current_truth_log_clock()
+    last = _current_truth_log_times.get(key)
+    if last is not None and now - last < _CURRENT_TRUTH_LOG_INTERVAL_SECONDS:
+        return
+    _current_truth_log_times[key] = now
+    log.info(
+        "Memory current truth %s for %s/%s: admitted=%s excluded=%s",
+        surface,
+        namespace.principal_id,
+        namespace.runtime_profile_id,
+        projection.admitted,
+        projection.excluded,
+    )
+
+
 def search(
     query: str,
     *,
@@ -2060,14 +2113,15 @@ def search(
             from kai.workshop.memory_current_truth import project_current_truth
 
             assert namespace is not None
-            rows = list(
-                project_current_truth(
-                    rows,
-                    db_path=Path(_config.session_db_path),
-                    principal_id=str(namespace.principal_id),
-                    runtime_profile_id=str(namespace.runtime_profile_id),
-                ).rows
+            projection = project_current_truth(
+                rows,
+                db_path=Path(_config.session_db_path),
+                principal_id=str(namespace.principal_id),
+                runtime_profile_id=str(namespace.runtime_profile_id),
+                admit_legacy=True,
             )
+            _log_current_truth_counts("search", namespace, projection)
+            rows = list(projection.rows)
         return rows[:effective_limit]
     except Exception:
         log.warning("Memory search failed", exc_info=True)
@@ -2147,6 +2201,12 @@ def _format_memory_result_line(
         if temporal_role == "current_fact":
             record["temporal_role"] = temporal_role
             record["current_truth"] = True
+        elif temporal_role == "legacy_unreconciled":
+            # Admitted temporarily while legacy reconciliation is open. The
+            # row predates canonical lifecycle authority, so it must never
+            # read as verified current truth.
+            record["temporal_role"] = temporal_role
+            record["current_truth"] = False
     if outcome_quality is not None:
         record["outcome_quality"] = outcome_quality
     return encode_untrusted_json_record(record)
@@ -3449,14 +3509,15 @@ def get_all(
             from kai.workshop.memory_current_truth import project_current_truth
 
             assert namespace is not None
-            rows = list(
-                project_current_truth(
-                    rows,
-                    db_path=Path(_config.session_db_path),
-                    principal_id=str(namespace.principal_id),
-                    runtime_profile_id=str(namespace.runtime_profile_id),
-                ).rows
+            projection = project_current_truth(
+                rows,
+                db_path=Path(_config.session_db_path),
+                principal_id=str(namespace.principal_id),
+                runtime_profile_id=str(namespace.runtime_profile_id),
+                admit_legacy=True,
             )
+            _log_current_truth_counts("get_all", namespace, projection)
+            rows = list(projection.rows)
         return rows if limit is None else rows[:limit]
     except Exception:
         log.warning("Memory get_all failed", exc_info=True)
