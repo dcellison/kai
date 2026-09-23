@@ -6673,6 +6673,12 @@ button:disabled {
   color: var(--color-danger);
 }
 
+.memory-review-state.obsolete {
+  border-color: color-mix(in srgb, var(--color-text-muted) 70%, transparent);
+  color: var(--color-text-muted);
+  text-decoration: line-through;
+}
+
 .memory-review-state.defer {
   border-color: color-mix(in srgb, var(--color-warning) 55%, transparent);
   color: var(--color-warning);

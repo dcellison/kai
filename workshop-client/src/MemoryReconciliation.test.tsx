@@ -162,6 +162,35 @@ describe("Memory reconciliation triage", () => {
     expect(screen.getByRole("button", { name: "Apply plan" })).toBeDisabled();
   });
 
+  it("labels a saved decision by its outcome, so obsolete is not shown as approved", async () => {
+    const decided = (groupId: string, text: string, kind: string): WorkshopMemoryTriageGroup => ({
+      ...group,
+      decision: { ...group.decision, action: { kind }, disposition: "approve", stateVersion: 1 },
+      evidence: [{ ...group.evidence[0], memoryId: `${groupId}-memory`, text }],
+      groupId,
+    });
+    vi.mocked(loadMemoryTriageGroups).mockImplementation(async (_token, _planId, options = {}) => ({
+      triage: summary,
+      groups: options.exceptionsOnly
+        ? [decided("retired", "An outdated fact", "expire_all"), decided("kept", "A current fact", "adopt_as_current")]
+        : safeGroups,
+      nextOffset: null,
+    }));
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const list = await screen.findByRole("listbox", { name: "Memory triage exceptions" });
+    const retired = within(list).getByRole("option", { name: /An outdated fact/ });
+    const kept = within(list).getByRole("option", { name: /A current fact/ });
+    expect(retired).toHaveTextContent("obsolete");
+    expect(retired).not.toHaveTextContent("approve");
+    expect(within(retired).getByText("obsolete")).toHaveClass("memory-review-state", "obsolete");
+    expect(kept).toHaveTextContent("approved");
+  });
+
   it("offers only reject or defer for an episode missing required fields", async () => {
     const incomplete: WorkshopMemoryTriageGroup = {
       ...group,
