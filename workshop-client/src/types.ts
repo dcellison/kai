@@ -1312,6 +1312,8 @@ export interface WorkshopMemoryStats {
   total: number;
   // Claims waiting on an owner decision; drives the Fact review badge.
   unresolvedConflicts: number;
+  // Facts and episodes whose search projection failed; also in the badge.
+  projectionFailures: number;
 }
 
 // One side of an unresolved fact conflict, as shown in the review list.
@@ -1346,6 +1348,40 @@ export interface WorkshopMemoryForgottenFact {
 export interface WorkshopMemoryReviewList<T> {
   items: T[];
   total: number;
+}
+
+// A fact or episode whose search projection failed. It is missing from
+// recall until retried, and for facts later changes queue behind it.
+export interface WorkshopMemoryProjectionFailure {
+  attempts: number;
+  errorCode: string | null;
+  id: string;
+  kind: "fact" | "episode";
+  operation: string;
+  preview: string;
+  revisionId: string | null;
+  updatedAt: string;
+}
+
+export interface WorkshopMemoryProjectionReview {
+  // Fact operations queued behind a failure on the same fact.
+  blocked: number;
+  failed: WorkshopMemoryProjectionFailure[];
+  failedTotal: number;
+}
+
+// Search rows that no longer match canonical state. Recall never uses
+// them; they are reported so the owner knows the index has leftovers.
+export interface WorkshopMemoryProjectionAudit {
+  duplicate: number;
+  orphan: string[];
+  unknown: string[];
+}
+
+export interface WorkshopMemoryProjectionRetry {
+  failed: number;
+  retried: number;
+  succeeded: number;
 }
 
 // Result of keeping a conflict revision or restoring a forgotten fact.

@@ -175,12 +175,14 @@ def _service(tmp_path: Path):
     )
     service._fact_lifecycle = _FactLifecycleStub()  # type: ignore[assignment]
 
-    # This fixture has no canonical store; the conflict count it would read
-    # is covered by the real-schema owner review tests.
-    async def no_conflicts(_authority) -> int:
+    # This fixture has no canonical store; the conflict and projection
+    # failure counts it would read are covered by the real-schema owner
+    # review and projection tests.
+    async def none_waiting(_authority) -> int:
         return 0
 
-    service.unresolved_conflict_count = no_conflicts  # type: ignore[method-assign]
+    service.unresolved_conflict_count = none_waiting  # type: ignore[method-assign]
+    service.projection_failure_count = none_waiting  # type: ignore[method-assign]
     return service, service.authority_for_principal(principal_id), principal_id
 
 
@@ -300,6 +302,15 @@ async def test_explicit_fact_create_and_edit_share_canonical_revision_authority(
     monkeypatch.setattr(memory, "add_structured", add_structured)
     monkeypatch.setattr(memory, "update_metadata", update_metadata)
     monkeypatch.setattr(memory, "delete_by_id", delete_by_id)
+    # The lifecycle projection worker reads through its own owner-verified
+    # helpers; answer them from the same rows so a rewrite finds the row.
+    monkeypatch.setattr(
+        memory,
+        "find_for_lifecycle_projection",
+        lambda *, key, value, **_kwargs: [row for row in rows.values() if row.metadata.get(key) == value],
+    )
+    monkeypatch.setattr(memory, "get_by_id_for_lifecycle_projection", lambda **kwargs: rows.get(kwargs["memory_id"]))
+    monkeypatch.setattr(memory, "update_for_lifecycle_projection", update_metadata)
     try:
         await bootstrap_default_workshop(
             store,

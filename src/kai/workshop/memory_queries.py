@@ -20,6 +20,7 @@ from kai.workshop.domain import (
     AgentId,
     ChannelId,
     MemoryClaimId,
+    MemoryEpisodeId,
     MemoryRevisionId,
     MessageId,
     PrincipalId,
@@ -48,6 +49,14 @@ from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptAccessDenied,
     MemoryExtractionReceiptService,
     MemoryExtractionReceiptSnapshot,
+)
+from kai.workshop.memory_projection_status import (
+    ProjectionRetryResult,
+    ProjectionStatus,
+    VectorAudit,
+    audit_vector_rows,
+    expected_rows_async,
+    projection_status_async,
 )
 from kai.workshop.memory_reconciliation_review import WorkshopMemoryReconciliationReviewService
 from kai.workshop.memory_reconciliation_triage import WorkshopMemoryReconciliationTriageService
@@ -352,6 +361,9 @@ class MemoryStatsSnapshot:
     # Claims waiting for their owner to settle competing revisions. These
     # have no vector row, so the counts above never include them.
     unresolved_conflicts: int = 0
+    # Facts and episodes whose search projection failed; together with
+    # conflicts they drive the Fact review badge.
+    projection_failures: int = 0
     by_prompt_version: dict[str, int] = field(default_factory=dict)
 
 
@@ -586,9 +598,33 @@ class WorkshopMemoryQueryService:
         )
 
     async def recover_fact_projections(self) -> int:
-        """Recover canonical fact and episode projections interrupted by a prior process."""
+        """
+        Recover canonical fact and episode projections at service startup.
+
+        Operations interrupted by a prior process resume first. Failed
+        operations then get one more round of attempts, because a restart
+        often clears whatever failed them (an embedder that had not
+        loaded, a store another process held). A failure that persists
+        costs one bounded round per start and stays visible in Fact
+        review and install status.
+
+        Nothing runs while semantic memory is disabled: every projection
+        read would fail, turning pending work into failures for no reason.
+        """
+        if not memory.is_enabled():
+            return 0
         facts = await self._fact_lifecycle.recover_pending()
         episodes = await self._episode_history.recover_pending()
+        retried_facts = await self._fact_lifecycle.retry_failed()
+        retried_episodes = await self._episode_history.retry_failed()
+        retried = retried_facts.retried + retried_episodes.retried
+        if retried:
+            log.info(
+                "Retried %d failed memory vector projection(s) at startup: succeeded=%d, failed=%d",
+                retried,
+                retried_facts.succeeded + retried_episodes.succeeded,
+                retried_facts.failed + retried_episodes.failed,
+            )
         return facts + episodes
 
     def authority_for_principal(
@@ -930,6 +966,7 @@ class WorkshopMemoryQueryService:
             confidence_below_0_6=sum(1 for value in confidences if value < 0.6),
             confirmation_quote_count=confirmation_quote_count,
             unresolved_conflicts=await self.unresolved_conflict_count(authority),
+            projection_failures=await self.projection_failure_count(authority),
             by_prompt_version=dict(sorted(by_prompt_version.items())),
         )
 
@@ -2274,6 +2311,73 @@ class WorkshopMemoryQueryService:
         ) as cursor:
             row = await cursor.fetchone()
         return str(row[0]) if row is not None else None
+
+    async def projection_review(self, authority: MemoryQueryAuthority) -> ProjectionStatus:
+        """List the owner's failed projections and count the operations blocked behind them."""
+        return await projection_status_async(self._store.connection, self._owner_pair(authority))
+
+    async def projection_failure_count(self, authority: MemoryQueryAuthority) -> int:
+        """Count the owner's failed facts and episodes; zero when no runtime profile is unambiguous."""
+        if authority.search_namespace is None:
+            return 0
+        return (await self.projection_review(authority)).failed_total
+
+    async def retry_projections(
+        self,
+        authority: MemoryQueryAuthority,
+        *,
+        claim_ids: tuple[str, ...] | None,
+        episode_ids: tuple[str, ...] | None,
+    ) -> ProjectionRetryResult:
+        """
+        Retry the owner's failed fact and episode projections.
+
+        With neither list given, every failed item the owner has is
+        retried. With either list given, only the named items are, and an
+        omitted list retries none of its kind. Retrying only resets rows
+        already marked failed, so repeating a request is harmless and the
+        route needs no operation id. Retries are scoped to the owner pair,
+        so an id the owner does not have simply matches nothing.
+        """
+        _, runtime_profile_id = self._owner_pair(authority)
+        for item_id in (*(claim_ids or ()), *(episode_ids or ())):
+            self._validate_claim_id(item_id)
+        everything = claim_ids is None and episode_ids is None
+        facts = await self._fact_lifecycle.retry_failed(
+            principal_id=authority.principal_id,
+            runtime_profile_id=RuntimeProfileId(runtime_profile_id),
+            claim_ids=None if everything else tuple(MemoryClaimId(item) for item in claim_ids or ()),
+        )
+        episodes = await self._episode_history.retry_failed(
+            principal_id=authority.principal_id,
+            runtime_profile_id=RuntimeProfileId(runtime_profile_id),
+            episode_ids=None if everything else tuple(MemoryEpisodeId(item) for item in episode_ids or ()),
+        )
+        return ProjectionRetryResult(
+            facts.retried + episodes.retried,
+            facts.succeeded + episodes.succeeded,
+            facts.failed + episodes.failed,
+        )
+
+    async def audit_projections(self, authority: MemoryQueryAuthority) -> VectorAudit:
+        """
+        Compare the owner's vector rows with canonical state.
+
+        This reads the owner's whole vector corpus, so the Workshop runs it
+        only when the owner asks. A store that cannot answer is a failed
+        mutation-class error, not an empty audit.
+        """
+        owner = self._owner_pair(authority)
+        try:
+            rows = await asyncio.to_thread(
+                memory.get_all_for_lifecycle_projection,
+                user_id=owner[0],
+                runtime_profile_id=owner[1],
+            )
+        except Exception as exc:
+            raise WorkshopMemoryMutationFailed("The search index could not be read") from exc
+        facts, episodes = await expected_rows_async(self._store.connection, owner)
+        return audit_vector_rows(rows, current_facts=facts, current_episodes=episodes)
 
     async def unresolved_conflict_count(self, authority: MemoryQueryAuthority) -> int:
         """Count the owner's conflicted claims; zero when no runtime profile is unambiguous."""

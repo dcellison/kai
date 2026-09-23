@@ -663,6 +663,16 @@ async def apply_review(
     receipt_id = f"mrr_{str(review['sha256'])[:32]}"
     store = await WorkshopEventStore.open(db_path)
     applied: list[dict[str, Any]] = []
+    # Canonical state commits even when a vector projection fails, so the
+    # receipt must say which items are not in recall yet. They show up in
+    # the owner's Search sync review, where a retry repairs them.
+    projection_failures: list[dict[str, str]] = []
+
+    def note_projection(candidate_id: str, kind: str, item_id: str, status: str) -> str:
+        if status != "succeeded":
+            projection_failures.append({"candidate_id": candidate_id, "kind": kind, "id": item_id, "status": status})
+        return status
+
     try:
         fact_service = MemoryFactLifecycleService(store)
         episode_service = MemoryEpisodeHistoryService(store)
@@ -681,6 +691,7 @@ async def apply_review(
                 if any(row["kind"] != "episode" for row in rows):
                     raise MemoryReconciliationError("Episode action contains a fact row")
                 results = []
+                episode_statuses: list[str] = []
                 for index, row in enumerate(rows):
                     result = await episode_service.record(
                         episode_authority,
@@ -688,6 +699,11 @@ async def apply_review(
                         idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:{index}",
                     )
                     results.append(str(result.episode_id))
+                    episode_statuses.append(
+                        note_projection(
+                            decision["candidate_id"], "episode", str(result.episode_id), result.projection_status
+                        )
+                    )
                 for index, (source, target) in enumerate(pairwise(results)):
                     await episode_service.followup(
                         episode_authority,
@@ -697,11 +713,14 @@ async def apply_review(
                         reason="Operator-reviewed legacy episodes belong to the same historical sequence.",
                         idempotency_key=(f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:followup:{index}"),
                     )
-                applied.append({"candidate_id": decision["candidate_id"], "events": results})
+                applied.append(
+                    {"candidate_id": decision["candidate_id"], "events": results, "projection": episode_statuses}
+                )
                 continue
             if any(row["kind"] != "fact" for row in rows):
                 raise MemoryReconciliationError("Fact action contains an episode row")
             mutations = []
+            statuses: list[str] = []
             if kind == "adopt_corrected":
                 source_id = action.get("source_memory_id")
                 source = next(
@@ -720,7 +739,16 @@ async def apply_review(
                     idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:corrected",
                     stable_claim_key=f"reconciled:{decision['candidate_id']}",
                 )
-                applied.append({"candidate_id": decision["candidate_id"], "events": [str(adopted.revision_id)]})
+                status = note_projection(
+                    decision["candidate_id"], "fact", str(adopted.revision_id), adopted.projection_status
+                )
+                applied.append(
+                    {
+                        "candidate_id": decision["candidate_id"],
+                        "events": [str(adopted.revision_id)],
+                        "projection": [status],
+                    }
+                )
                 continue
             keeper = action.get("keeper_memory_id")
             if kind == "keep_first_retract_rest" and keeper not in {row["memory_id"] for row in rows}:
@@ -742,8 +770,17 @@ async def apply_review(
                 )
                 mutations.append(str(adopted.revision_id))
                 retract = kind == "expire_all" or (kind == "keep_first_retract_rest" and row["memory_id"] != keeper)
-                if retract:
-                    await fact_service.retract(
+                if not retract:
+                    statuses.append(
+                        note_projection(
+                            decision["candidate_id"], "fact", str(adopted.revision_id), adopted.projection_status
+                        )
+                    )
+                else:
+                    # The adoption and the retirement project in order on
+                    # one claim, so the retirement's status is the claim's
+                    # final outcome (a failed adoption leaves it blocked).
+                    retired = await fact_service.retract(
                         fact_authority,
                         adopted.claim_id,
                         adopted.revision_id,
@@ -751,7 +788,12 @@ async def apply_review(
                         idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:{index}:retire",
                         expired=kind == "expire_all",
                     )
-            applied.append({"candidate_id": decision["candidate_id"], "events": mutations})
+                    statuses.append(
+                        note_projection(
+                            decision["candidate_id"], "fact", str(retired.revision_id), retired.projection_status
+                        )
+                    )
+            applied.append({"candidate_id": decision["candidate_id"], "events": mutations, "projection": statuses})
     finally:
         await store.close()
     receipt: dict[str, Any] = {
@@ -767,6 +809,7 @@ async def apply_review(
         "applied_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "decisions": review["decisions"],
         "applied": applied,
+        "projection_failures": projection_failures,
     }
     receipt["sha256"] = _document_digest(receipt)
     return receipt

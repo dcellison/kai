@@ -69,6 +69,10 @@ import type {
   WorkshopMemoryForgottenFact,
   WorkshopMemoryLifecycle,
   WorkshopMemoryLifecycleOutcome,
+  WorkshopMemoryProjectionAudit,
+  WorkshopMemoryProjectionFailure,
+  WorkshopMemoryProjectionRetry,
+  WorkshopMemoryProjectionReview,
   WorkshopMemoryReviewList,
   WorkshopMemoryReconciliationCandidate,
   WorkshopMemoryReconciliationDisposition,
@@ -4045,6 +4049,7 @@ export async function loadMemoryStats(token: string): Promise<WorkshopMemoryStat
     !Number.isSafeInteger(stats.facts) ||
     !Number.isSafeInteger(stats.episodes) ||
     !Number.isSafeInteger(stats.unresolved_conflicts) ||
+    !Number.isSafeInteger(stats.projection_failures) ||
     !byScope || !bySource || !byType || !allowedProjects ||
     allowedProjects.some((project) => project === null)
   ) {
@@ -4059,6 +4064,7 @@ export async function loadMemoryStats(token: string): Promise<WorkshopMemoryStat
     facts: stats.facts as number,
     total: stats.total as number,
     unresolvedConflicts: stats.unresolved_conflicts as number,
+    projectionFailures: stats.projection_failures as number,
   };
 }
 
@@ -5085,6 +5091,93 @@ export async function restoreForgottenMemory(
     { revision_id: input.revisionId, note: input.note },
     "Could not restore this fact.",
   );
+}
+
+// Search sync: failed vector projections and the index audit.
+
+function parseProjectionFailure(value: unknown): WorkshopMemoryProjectionFailure | null {
+  if (
+    !isRecord(value) || (value.kind !== "fact" && value.kind !== "episode") || typeof value.id !== "string" ||
+    typeof value.operation !== "string" || !Number.isSafeInteger(value.attempts) ||
+    typeof value.updated_at !== "string" || typeof value.preview !== "string" ||
+    (value.revision_id !== null && typeof value.revision_id !== "string") ||
+    (value.error_code !== null && typeof value.error_code !== "string")
+  ) return null;
+  return {
+    attempts: value.attempts as number,
+    errorCode: value.error_code as string | null,
+    id: value.id,
+    kind: value.kind,
+    operation: value.operation,
+    preview: value.preview,
+    revisionId: value.revision_id as string | null,
+    updatedAt: value.updated_at,
+  };
+}
+
+export async function loadMemoryProjections(token: string): Promise<WorkshopMemoryProjectionReview> {
+  const response = await authorizedFetch({ channelId: "", token }, "/v1/memory/projections");
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not load search sync status."));
+  const failed = isRecord(payload) && payload.version === 1 && Array.isArray(payload.failed)
+    ? payload.failed.map(parseProjectionFailure)
+    : null;
+  if (
+    !failed || failed.some((item) => item === null) || !isRecord(payload) ||
+    !Number.isSafeInteger(payload.failed_total) || !Number.isSafeInteger(payload.blocked)
+  ) {
+    throw new Error("Kai returned an unsupported search sync status.");
+  }
+  return {
+    blocked: payload.blocked as number,
+    failed: failed as WorkshopMemoryProjectionFailure[],
+    failedTotal: payload.failed_total as number,
+  };
+}
+
+export async function loadMemoryProjectionAudit(token: string): Promise<WorkshopMemoryProjectionAudit> {
+  const response = await authorizedFetch({ channelId: "", token }, "/v1/memory/projections/audit");
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not check the search index."));
+  const isIdList = (value: unknown): value is string[] =>
+    Array.isArray(value) && value.every((item) => typeof item === "string");
+  if (
+    !isRecord(payload) || payload.version !== 1 || !isIdList(payload.orphan) ||
+    !isIdList(payload.unknown) || !Number.isSafeInteger(payload.duplicate)
+  ) {
+    throw new Error("Kai returned an unsupported search index check.");
+  }
+  return { duplicate: payload.duplicate as number, orphan: payload.orphan, unknown: payload.unknown };
+}
+
+// Retrying only resets items that are already failed, so a repeated
+// request is harmless and carries no operation id. With no ids at all,
+// every failed item the owner has is retried.
+export async function retryMemoryProjections(
+  token: string,
+  input: { claimIds?: string[]; episodeIds?: string[] } = {},
+): Promise<WorkshopMemoryProjectionRetry> {
+  const response = await authorizedFetch({ channelId: "", token }, "/v1/memory/projections/retry", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...(input.claimIds ? { claim_ids: input.claimIds } : {}),
+      ...(input.episodeIds ? { episode_ids: input.episodeIds } : {}),
+    }),
+  });
+  const payload = await responsePayload(response);
+  if (!response.ok) throw new Error(safeErrorMessage(payload, "Could not retry search sync."));
+  if (
+    !isRecord(payload) || payload.version !== 1 || !Number.isSafeInteger(payload.retried) ||
+    !Number.isSafeInteger(payload.succeeded) || !Number.isSafeInteger(payload.failed)
+  ) {
+    throw new Error("Kai returned an unsupported search sync result.");
+  }
+  return {
+    failed: payload.failed as number,
+    retried: payload.retried as number,
+    succeeded: payload.succeeded as number,
+  };
 }
 
 function mutationRequestId(): string {

@@ -7,8 +7,11 @@ import {
   loadForgottenMemories,
   loadMemoryConflict,
   loadMemoryConflicts,
+  loadMemoryProjectionAudit,
+  loadMemoryProjections,
   resolveMemoryConflict,
   restoreForgottenMemory,
+  retryMemoryProjections,
 } from "./api";
 import { FactReview } from "./FactReview";
 import type { WorkshopMemoryLifecycle, WorkshopMemoryLifecycleRevision } from "./types";
@@ -20,8 +23,11 @@ vi.mock("./api", async (importOriginal) => {
     loadForgottenMemories: vi.fn(),
     loadMemoryConflict: vi.fn(),
     loadMemoryConflicts: vi.fn(),
+    loadMemoryProjectionAudit: vi.fn(),
+    loadMemoryProjections: vi.fn(),
     resolveMemoryConflict: vi.fn(),
     restoreForgottenMemory: vi.fn(),
+    retryMemoryProjections: vi.fn(),
   };
 });
 
@@ -93,6 +99,33 @@ const forgottenList = {
 
 const empty = { total: 0, items: [] };
 
+const syncStatus = {
+  blocked: 1,
+  failedTotal: 2,
+  failed: [
+    {
+      attempts: 3,
+      errorCode: "LifecycleProjectionReadError",
+      id: "mcl_9",
+      kind: "fact" as const,
+      operation: "upsert",
+      preview: "The operator prefers dark themes.",
+      revisionId: "mrv_9",
+      updatedAt: "2026-09-23T10:00:00Z",
+    },
+    {
+      attempts: 3,
+      errorCode: "EpisodeHistoryProjectionFailed",
+      id: "mep_4",
+      kind: "episode" as const,
+      operation: "upsert",
+      preview: "Repaired the memory lifecycle.",
+      revisionId: null,
+      updatedAt: "2026-09-22T10:00:00Z",
+    },
+  ],
+};
+
 function renderReview(overrides: { onChanged?: () => void; onOpenMemory?: (id: string) => void } = {}) {
   return render(
     <FactReview
@@ -111,6 +144,7 @@ describe("Workshop fact review", () => {
     vi.mocked(loadMemoryConflicts).mockResolvedValue(conflictList);
     vi.mocked(loadForgottenMemories).mockResolvedValue(forgottenList);
     vi.mocked(loadMemoryConflict).mockResolvedValue(lifecycle([newer, older]));
+    vi.mocked(loadMemoryProjections).mockResolvedValue({ blocked: 0, failed: [], failedTotal: 0 });
   });
 
   it("compares both versions oldest first and keeps the chosen one with a note", async () => {
@@ -212,5 +246,43 @@ describe("Workshop fact review", () => {
     expect(onChanged).toHaveBeenCalledTimes(1);
     // No projected row yet, so there is nothing to open.
     expect(screen.queryByRole("button", { name: "Open in memory" })).not.toBeInTheDocument();
+  });
+
+  it("lists failed search syncs and retries one item", async () => {
+    const onChanged = vi.fn();
+    vi.mocked(loadMemoryProjections).mockResolvedValue(syncStatus);
+    vi.mocked(retryMemoryProjections).mockResolvedValue({ failed: 0, retried: 1, succeeded: 1 });
+    const user = userEvent.setup();
+    renderReview({ onChanged });
+
+    await user.click(await screen.findByRole("tab", { name: /Search sync 2/ }));
+    expect(screen.getByLabelText("Search sync summary")).toHaveTextContent("1 later change is waiting behind them");
+    await user.click(screen.getByRole("option", { name: /dark themes/ }));
+    expect(screen.getByText("The search index could not be read")).toBeInTheDocument();
+    vi.mocked(loadMemoryProjections).mockResolvedValue({ ...syncStatus, blocked: 0, failed: [syncStatus.failed[1]], failedTotal: 1 });
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(retryMemoryProjections).toHaveBeenCalledWith("session-secret", { claimIds: ["mcl_9"] });
+    expect(await screen.findByRole("status")).toHaveTextContent("Retried 1: 1 back in search.");
+    expect(onChanged).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("tab", { name: /Search sync 1/ })).toBeInTheDocument();
+  });
+
+  it("retries everything and checks the search index on request", async () => {
+    vi.mocked(loadMemoryProjections).mockResolvedValue(syncStatus);
+    vi.mocked(retryMemoryProjections).mockResolvedValue({ failed: 1, retried: 2, succeeded: 1 });
+    vi.mocked(loadMemoryProjectionAudit).mockResolvedValue({ duplicate: 1, orphan: ["vec-2"], unknown: [] });
+    const user = userEvent.setup();
+    renderReview();
+
+    await user.click(await screen.findByRole("tab", { name: /Search sync/ }));
+    // The index check reads the whole index, so nothing runs until asked.
+    expect(loadMemoryProjectionAudit).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Check search index" }));
+    expect(await screen.findByRole("note")).toHaveTextContent("1 leftover and 0 unknown row(s), and 1 item(s) with duplicates");
+    await user.click(screen.getByRole("button", { name: "Retry all" }));
+
+    expect(retryMemoryProjections).toHaveBeenCalledWith("session-secret", {});
+    expect(await screen.findByRole("status")).toHaveTextContent("Retried 2: 1 back in search. 1 still failing.");
   });
 });

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,9 +23,12 @@ from kai.workshop.domain import (
     WorkshopId,
 )
 from kai.workshop.memory_current_truth import CANONICAL_TEMPORAL_ROLE_KEY
+from kai.workshop.memory_projection_status import ProjectionRetryResult
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
 from kai.workshop.temporal_memory import EpisodeFollowupRelationship, resolve_memory_admission
+
+log = logging.getLogger(__name__)
 
 CANONICAL_EPISODE_ID_KEY = "canonical_memory_episode_id"
 _MAX_VECTOR_ATTEMPTS = 3
@@ -120,15 +124,16 @@ class Mem0EpisodeVectorAdapter:
         authority: EpisodeHistoryAuthority,
         episode_id: MemoryEpisodeId,
     ) -> memory.MemoryResult | None:
+        # Filtered in the vector store rather than by loading the owner's
+        # whole corpus on every outbox step.
         rows = await asyncio.to_thread(
-            memory.get_all_for_lifecycle_projection,
+            memory.find_for_lifecycle_projection,
             user_id=str(authority.principal_id),
             runtime_profile_id=str(authority.runtime_profile_id),
+            key=CANONICAL_EPISODE_ID_KEY,
+            value=str(episode_id),
         )
-        return next(
-            (row for row in rows if row.metadata.get(CANONICAL_EPISODE_ID_KEY) == str(episode_id)),
-            None,
-        )
+        return rows[0] if rows else None
 
     async def add(
         self,
@@ -438,6 +443,62 @@ class MemoryEpisodeHistoryService:
                 completed += 1
         return completed
 
+    async def retry_failed(
+        self,
+        *,
+        principal_id: PrincipalId | None = None,
+        runtime_profile_id: RuntimeProfileId | None = None,
+        episode_ids: tuple[MemoryEpisodeId, ...] | None = None,
+    ) -> ProjectionRetryResult:
+        """
+        Re-run failed episode vector operations, then drain the outbox.
+
+        Episodes have one operation each and never block one another, so
+        this only resets the matching failed rows (keeping their identity)
+        and projects them again. Filters work as in the fact lifecycle
+        service; an empty `episode_ids` retries nothing.
+        """
+        if episode_ids is not None and not episode_ids:
+            return ProjectionRetryResult(0, 0, 0)
+        conditions = ["v.status = 'failed'"]
+        parameters: list[str] = []
+        if principal_id is not None:
+            conditions.append("e.owner_principal_id = ?")
+            parameters.append(str(principal_id))
+        if runtime_profile_id is not None:
+            conditions.append("e.runtime_profile_id = ?")
+            parameters.append(str(runtime_profile_id))
+        if episode_ids is not None:
+            conditions.append(f"v.episode_id IN ({', '.join('?' for _ in episode_ids)})")
+            parameters.extend(str(episode_id) for episode_id in episode_ids)
+        async with self._lock:
+            connection = self._store.connection
+            async with connection.execute(
+                "SELECT v.event_position FROM memory_episode_vector_operations v "
+                "JOIN memory_episodes e ON e.episode_id = v.episode_id WHERE " + " AND ".join(conditions),
+                parameters,
+            ) as cursor:
+                positions = [int(row[0]) for row in await cursor.fetchall()]
+            if not positions:
+                return ProjectionRetryResult(0, 0, 0)
+            marks = ", ".join("?" for _ in positions)
+            await connection.execute(
+                "UPDATE memory_episode_vector_operations SET status = 'pending', attempt_count = 0, "
+                "last_error_code = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+                f"WHERE status = 'failed' AND event_position IN ({marks})",
+                positions,
+            )
+            await connection.commit()
+            while await self._project_next():
+                pass
+            async with connection.execute(
+                "SELECT status, COUNT(*) FROM memory_episode_vector_operations "
+                f"WHERE event_position IN ({marks}) GROUP BY status",
+                positions,
+            ) as cursor:
+                outcomes = {str(row[0]): int(row[1]) for row in await cursor.fetchall()}
+        return ProjectionRetryResult(len(positions), outcomes.get("succeeded", 0), outcomes.get("failed", 0))
+
     async def _find_near_duplicate(
         self,
         authority: EpisodeHistoryAuthority,
@@ -567,10 +628,20 @@ class MemoryEpisodeHistoryService:
             )
             await connection.commit()
         except Exception as exc:
+            exhausted = attempt >= _MAX_VECTOR_ATTEMPTS
             await connection.execute(
                 "UPDATE memory_episode_vector_operations SET status = ?, last_error_code = ?, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE event_position = ?",
-                ("failed" if attempt >= _MAX_VECTOR_ATTEMPTS else "pending", type(exc).__name__[:128], event_position),
+                ("failed" if exhausted else "pending", type(exc).__name__[:128], event_position),
             )
             await connection.commit()
+            if exhausted:
+                # The episode stays out of recall until someone retries.
+                # Only identifiers and the error class are logged.
+                log.warning(
+                    "Episode vector projection failed for %s after %s attempts: %s",
+                    episode_id,
+                    attempt,
+                    type(exc).__name__,
+                )
         return True

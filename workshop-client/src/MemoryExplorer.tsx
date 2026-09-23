@@ -966,6 +966,9 @@ function MemoryExplorerContent({
   };
 
   const resultCount = searchQuery ? searchHits.length : records.length;
+  // Open conflicts and failed search syncs both need the owner's action,
+  // so the Fact review badge counts both; the tabs say which is which.
+  const waitingOnOwner = stats ? stats.unresolvedConflicts + stats.projectionFailures : 0;
 
   if (factReviewOpen) {
     return (
@@ -1008,15 +1011,13 @@ function MemoryExplorerContent({
             <button
               className="panel-icon-button fact-review-button"
               type="button"
-              aria-label={stats && stats.unresolvedConflicts > 0
-                ? `Fact review, ${stats.unresolvedConflicts} unresolved conflicts`
-                : "Fact review"}
+              aria-label={waitingOnOwner > 0 ? `Fact review, ${waitingOnOwner} waiting on you` : "Fact review"}
               title="Fact review"
               onClick={() => setFactReviewOpen(true)}
             >
               <FactReviewIcon />
-              {stats && stats.unresolvedConflicts > 0 && (
-                <span className="fact-review-badge" aria-hidden="true">{stats.unresolvedConflicts}</span>
+              {waitingOnOwner > 0 && (
+                <span className="fact-review-badge" aria-hidden="true">{waitingOnOwner}</span>
               )}
             </button>
             <button

@@ -1,9 +1,10 @@
 /*
- * Owner fact review: settle unresolved fact conflicts and restore forgotten facts.
+ * Owner fact review: settle unresolved fact conflicts, restore forgotten facts,
+ * and retry facts or episodes whose search sync failed.
  *
- * Both kinds of claim have no vector row (a conflict deletes the old row and
- * never projects the new one; forgetting or expiry deletes it), so the Memory
- * explorer cannot list them. This view reads them from the canonical review
+ * None of these have a usable vector row (a conflict deletes the old row and
+ * never projects the new one; forgetting or expiry deletes it; a failed sync
+ * never wrote or rewrote it), so the Memory explorer cannot list them. This view reads them from the canonical review
  * endpoints instead and follows the reconciliation view's layout: a list on
  * the left and a resizable detail pane on the right.
  *
@@ -19,8 +20,11 @@ import {
   loadForgottenMemories,
   loadMemoryConflict,
   loadMemoryConflicts,
+  loadMemoryProjectionAudit,
+  loadMemoryProjections,
   resolveMemoryConflict,
   restoreForgottenMemory,
+  retryMemoryProjections,
 } from "./api";
 import { MarkdownMessage } from "./MarkdownMessage";
 import type {
@@ -28,13 +32,35 @@ import type {
   WorkshopMemoryForgottenFact,
   WorkshopMemoryLifecycle,
   WorkshopMemoryLifecycleRevision,
+  WorkshopMemoryProjectionAudit,
+  WorkshopMemoryProjectionFailure,
+  WorkshopMemoryProjectionReview,
 } from "./types";
 
 // Matches the server's note limit so the field cannot submit a note the
 // server would reject.
 const MAX_NOTE_CHARACTERS = 500;
 
-type ReviewTab = "conflicts" | "forgotten";
+type ReviewTab = "conflicts" | "forgotten" | "sync";
+
+// Error classes are stored as short codes; say what the owner can act on.
+function syncErrorLabel(code: string | null): string {
+  switch (code) {
+    case "LifecycleProjectionReadError":
+      return "The search index could not be read";
+    case "FactLifecycleProjectionFailed":
+    case "EpisodeHistoryProjectionFailed":
+      return "The search index refused the write";
+    default:
+      return code ?? "Unknown error";
+  }
+}
+
+function syncOutcome(result: { failed: number; retried: number; succeeded: number }): string {
+  if (result.retried === 0) return "Nothing needed a retry.";
+  const still = result.failed > 0 ? ` ${result.failed} still failing.` : "";
+  return `Retried ${result.retried}: ${result.succeeded} back in search.${still}`;
+}
 
 // The decision awaiting confirmation. Keeping a revision names the side the
 // owner picked; restoring always restores the listed revision.
@@ -101,6 +127,11 @@ export function FactReview({
   const [conflictTotal, setConflictTotal] = useState(0);
   const [forgotten, setForgotten] = useState<WorkshopMemoryForgottenFact[]>([]);
   const [forgottenTotal, setForgottenTotal] = useState(0);
+  const [sync, setSync] = useState<WorkshopMemoryProjectionReview | null>(null);
+  // The index check reads the owner's whole search index, so it runs only
+  // when asked and its result is kept until the next check.
+  const [audit, setAudit] = useState<WorkshopMemoryProjectionAudit | null>(null);
+  const [auditing, setAuditing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -121,18 +152,19 @@ export function FactReview({
     return caught instanceof Error ? caught.message : fallback;
   }, [onAuthenticationFailure]);
 
-  // Both lists load together so each tab can show its count up front.
+  // Every list loads together so each tab can show its count up front.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    void Promise.all([loadMemoryConflicts(token), loadForgottenMemories(token)])
-      .then(([conflictList, forgottenList]) => {
+    void Promise.all([loadMemoryConflicts(token), loadForgottenMemories(token), loadMemoryProjections(token)])
+      .then(([conflictList, forgottenList, syncStatus]) => {
         if (cancelled) return;
         setConflicts(conflictList.items);
         setConflictTotal(conflictList.total);
         setForgotten(forgottenList.items);
         setForgottenTotal(forgottenList.total);
+        setSync(syncStatus);
       })
       .catch((caught: unknown) => {
         if (!cancelled) setError(failureMessage(caught, "Could not load fact review."));
@@ -177,6 +209,7 @@ export function FactReview({
 
   const selectedConflict = conflicts.find((item) => item.claimId === selectedClaimId) ?? null;
   const selectedForgotten = forgotten.find((item) => item.claimId === selectedClaimId) ?? null;
+  const selectedSync = sync?.failed.find((item) => item.id === selectedClaimId) ?? null;
   const sides = unresolvedRevisions(detail);
   const keptSide = pending?.kind === "keep"
     ? sides.find((revision) => revision.revisionId === pending.revisionId) ?? null
@@ -251,7 +284,52 @@ export function FactReview({
     </section>
   );
 
-  const list = tab === "conflicts"
+  // Retrying is harmless to repeat (only failed items reset), so it runs
+  // without a confirmation step. With no item, everything failed retries.
+  const retrySync = async (item: WorkshopMemoryProjectionFailure | null): Promise<void> => {
+    setMutating(true);
+    setDecisionError(null);
+    try {
+      const result = await retryMemoryProjections(
+        token,
+        item === null ? {} : item.kind === "fact" ? { claimIds: [item.id] } : { episodeIds: [item.id] },
+      );
+      setReport({ memoryId: null, text: syncOutcome(result) });
+      setSelectedClaimId(null);
+      setRefreshKey((value) => value + 1);
+      onChanged();
+    } catch (caught) {
+      setDecisionError(failureMessage(caught, "Could not retry search sync."));
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const checkIndex = async (): Promise<void> => {
+    setAuditing(true);
+    setDecisionError(null);
+    try {
+      setAudit(await loadMemoryProjectionAudit(token));
+    } catch (caught) {
+      setDecisionError(failureMessage(caught, "Could not check the search index."));
+    } finally {
+      setAuditing(false);
+    }
+  };
+
+  const syncList = (sync?.failed ?? []).map((item) => (
+    <button type="button" role="option" aria-selected={selectedClaimId === item.id} key={`${item.kind}:${item.id}`}
+      className={`memory-record ${selectedClaimId === item.id ? "selected" : ""}`}
+      onClick={() => select(item.id)}>
+      <span className="memory-review-state failed">not in search</span>
+      <span className="memory-record-copy">
+        <strong>{item.preview}</strong>
+        <small>{item.kind === "fact" ? "Fact" : "Episode"} · {item.operation} · last tried {formatDate(item.updatedAt)}</small>
+      </span>
+    </button>
+  ));
+
+  const list = tab === "sync" ? syncList : tab === "conflicts"
     ? conflicts.map((item) => (
       <button type="button" role="option" aria-selected={selectedClaimId === item.claimId} key={item.claimId}
         className={`memory-record ${selectedClaimId === item.claimId ? "selected" : ""}`}
@@ -292,7 +370,36 @@ export function FactReview({
             <button type="button" role="tab" aria-selected={tab === "forgotten"} onClick={() => switchTab("forgotten")}>
               Forgotten <span>{forgottenTotal}</span>
             </button>
+            <button type="button" role="tab" aria-selected={tab === "sync"} onClick={() => switchTab("sync")}>
+              Search sync <span>{sync?.failedTotal ?? 0}</span>
+            </button>
           </div>
+          {tab === "sync" && !loading && !error && (
+            <section className="fact-review-sync-summary" aria-label="Search sync summary">
+              <p className="memory-review-explanation">
+                These facts and episodes are saved, but their search copy failed to update, so Kai cannot recall them yet.
+                {sync && sync.blocked > 0 && ` ${sync.blocked} later change${sync.blocked === 1 ? " is" : "s are"} waiting behind them.`}
+              </p>
+              <div className="memory-review-toolbar">
+                <button type="button" disabled={mutating || (sync?.failedTotal ?? 0) === 0} onClick={() => void retrySync(null)}>
+                  Retry all
+                </button>
+                <button type="button" disabled={auditing} onClick={() => void checkIndex()}>
+                  {auditing ? "Checking…" : "Check search index"}
+                </button>
+              </div>
+              {audit && (
+                <p className="memory-review-explanation" role="note">
+                  {audit.orphan.length + audit.unknown.length === 0 && audit.duplicate === 0
+                    ? "The search index matches your memory."
+                    : `The search index has ${audit.orphan.length} leftover and ${audit.unknown.length} unknown row(s)` +
+                      `${audit.duplicate > 0 ? `, and ${audit.duplicate} item(s) with duplicates` : ""}. ` +
+                      "Kai never recalls them; they only take up space."}
+                </p>
+              )}
+              {decisionError && !selectedSync && <p className="memory-editor-error" role="alert">{decisionError}</p>}
+            </section>
+          )}
           {report && (
             <p className="memory-mutation-report" role="status">
               {report.text}
@@ -309,16 +416,18 @@ export function FactReview({
             <div className="memory-list-state error" role="alert"><p>{error}</p><button onClick={() => setRefreshKey((value) => value + 1)}>Retry</button></div>
           ) : list.length === 0 ? (
             <div className="memory-list-state">
-              <h2>{tab === "conflicts" ? "No open conflicts" : "No forgotten facts"}</h2>
+              <h2>{tab === "conflicts" ? "No open conflicts" : tab === "forgotten" ? "No forgotten facts" : "Everything is in search"}</h2>
               <p>
                 {tab === "conflicts"
                   ? "Conflicts appear when an extracted update is not certain enough to replace a stored fact."
-                  : "Facts you forget, or that expire, appear here and can be restored."}
+                  : tab === "forgotten"
+                    ? "Facts you forget, or that expire, appear here and can be restored."
+                    : "Facts and episodes appear here if their search copy fails to update."}
               </p>
             </div>
           ) : (
             <div className="memory-record-list memory-reconciliation-list" role="listbox"
-              aria-label={tab === "conflicts" ? "Unresolved conflicts" : "Forgotten facts"}>
+              aria-label={tab === "conflicts" ? "Unresolved conflicts" : tab === "forgotten" ? "Forgotten facts" : "Search sync failures"}>
               {list}
             </div>
           )}
@@ -393,9 +502,38 @@ export function FactReview({
               )}
               {confirmation}
             </>
+          ) : tab === "sync" && selectedSync ? (
+            <>
+              <header className="memory-detail-header">
+                <div><p className="overline">{selectedSync.kind === "fact" ? "Fact" : "Episode"} not in search</p><h2>Retry search sync?</h2></div>
+                <span className="memory-review-state failed">failed</span>
+              </header>
+              <section className="memory-detail-section">
+                <MarkdownMessage body={selectedSync.preview} />
+                <dl className="fact-review-facts">
+                  <dt>Step</dt><dd>{selectedSync.operation}</dd>
+                  <dt>Attempts</dt><dd>{selectedSync.attempts}</dd>
+                  <dt>Error</dt><dd>{syncErrorLabel(selectedSync.errorCode)}</dd>
+                  <dt>Last tried</dt><dd>{formatDate(selectedSync.updatedAt)}</dd>
+                </dl>
+              </section>
+              <p className="memory-review-explanation">
+                The saved {selectedSync.kind} is unchanged. Retrying only updates its search copy{selectedSync.kind === "fact" ? ", then runs any later changes that were waiting on it" : ""}.
+              </p>
+              {decisionError && <p className="memory-editor-error" role="alert">{decisionError}</p>}
+              <button type="button" disabled={mutating} onClick={() => void retrySync(selectedSync)}>
+                {mutating ? "Retrying…" : "Retry"}
+              </button>
+            </>
           ) : (
             <div className="memory-list-state">
-              <p>{tab === "conflicts" ? "Select a conflict to compare its versions." : "Select a fact to see why it left current truth."}</p>
+              <p>
+                {tab === "conflicts"
+                  ? "Select a conflict to compare its versions."
+                  : tab === "forgotten"
+                    ? "Select a fact to see why it left current truth."
+                    : "Select an item to see why it is not in search."}
+              </p>
             </div>
           )}
         </div>

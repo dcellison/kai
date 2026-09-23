@@ -12,6 +12,7 @@ import {
   loadForgottenMemories,
   loadMemoryConflicts,
   loadMemoryDetail,
+  loadMemoryProjections,
   loadMemoryRecords,
   loadMemorySource,
   loadMemoryStats,
@@ -42,6 +43,7 @@ vi.mock("./api", async (importOriginal) => {
     editMemory: vi.fn(),
     loadForgottenMemories: vi.fn(),
     loadMemoryConflicts: vi.fn(),
+    loadMemoryProjections: vi.fn(),
     searchMemories: vi.fn(),
   };
 });
@@ -170,6 +172,7 @@ describe("Workshop Memory explorer", () => {
       facts: 1,
       total: 2,
       unresolvedConflicts: 0,
+      projectionFailures: 0,
     });
     vi.mocked(loadMemoryRecords).mockResolvedValue({
       nextCursor: null,
@@ -236,7 +239,7 @@ describe("Workshop Memory explorer", () => {
     expect(onSelectMemory).toHaveBeenCalledWith("memory-2");
   });
 
-  it("badges open conflicts on the Fact review button and opens the review", async () => {
+  it("badges conflicts plus failed search syncs on the Fact review button and opens it", async () => {
     const user = userEvent.setup();
     vi.mocked(loadMemoryStats).mockResolvedValue({
       allowedProjects: [],
@@ -247,9 +250,11 @@ describe("Workshop Memory explorer", () => {
       facts: 1,
       total: 1,
       unresolvedConflicts: 3,
+      projectionFailures: 2,
     });
     vi.mocked(loadMemoryConflicts).mockResolvedValue({ items: [], total: 0 });
     vi.mocked(loadForgottenMemories).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(loadMemoryProjections).mockResolvedValue({ blocked: 0, failed: [], failedTotal: 0 });
     render(
       <MemoryExplorer
         initialMemoryId={null}
@@ -260,8 +265,8 @@ describe("Workshop Memory explorer", () => {
       />,
     );
 
-    const button = await screen.findByRole("button", { name: "Fact review, 3 unresolved conflicts" });
-    expect(button).toHaveTextContent("3");
+    const button = await screen.findByRole("button", { name: "Fact review, 5 waiting on you" });
+    expect(button).toHaveTextContent("5");
     await user.click(button);
     expect(await screen.findByRole("heading", { name: "Fact review" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Back to memories" }));

@@ -1108,7 +1108,9 @@ class WorkshopMemoryReconciliationTriageService:
             "rejected": sum(
                 len(groups[str(item[0])]["evidence"]) for item in decision_rows if str(item[1]) == "reject"
             ),
-            "failed": 0,
+            # Canonical state committed, but these items are not in recall
+            # until their search projection is retried from Fact review.
+            "failed": len(receipt.get("projection_failures", ())),
             "still_unresolved": 0,
             "not_adopted": sum(
                 len(groups[str(item[0])]["evidence"]) for item in decision_rows if str(item[1]) in {"reject", "defer"}

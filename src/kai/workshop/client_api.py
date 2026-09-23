@@ -547,6 +547,9 @@ _MEMORY_CONFLICT_PATH = "/v1/memory/conflicts/{claim_id}"
 _MEMORY_CONFLICT_RESOLVE_PATH = "/v1/memory/conflicts/{claim_id}/resolve"
 _MEMORY_FORGOTTEN_PATH = "/v1/memory/forgotten"
 _MEMORY_FORGOTTEN_RESTORE_PATH = "/v1/memory/forgotten/{claim_id}/restore"
+_MEMORY_PROJECTIONS_PATH = "/v1/memory/projections"
+_MEMORY_PROJECTIONS_AUDIT_PATH = "/v1/memory/projections/audit"
+_MEMORY_PROJECTIONS_RETRY_PATH = "/v1/memory/projections/retry"
 _MEMORY_RECONCILIATION_PATH = "/v1/memory/reconciliation"
 _MEMORY_RECONCILIATION_CANDIDATES_PATH = "/v1/memory/reconciliation/{audit_id}/candidates"
 _MEMORY_RECONCILIATION_DECISION_PATH = "/v1/memory/reconciliation/{audit_id}/candidates/{candidate_id}/decision"
@@ -2494,6 +2497,7 @@ async def _handle_memory_stats(
                     for project in stats.allowed_projects
                 ],
                 "unresolved_conflicts": stats.unresolved_conflicts,
+                "projection_failures": stats.projection_failures,
             },
         },
         status=200,
@@ -2689,6 +2693,127 @@ def _serialize_memory_lifecycle_outcome(outcome: MemoryLifecycleOutcome) -> dict
         "replayed": outcome.replayed,
         "memory_id": outcome.memory_id,
     }
+
+
+async def _handle_memory_projections(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """List the signed-in owner's failed search projections and blocked operations."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        status = await service.projection_review(authority)
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "failed_total": status.failed_total,
+            "failed_facts": status.failed_facts,
+            "failed_episodes": status.failed_episodes,
+            "blocked": status.blocked,
+            "failed": [
+                {
+                    "kind": item.kind,
+                    "id": item.item_id,
+                    "operation": item.operation,
+                    "revision_id": item.revision_id,
+                    "attempts": item.attempts,
+                    "error_code": item.error_code,
+                    "updated_at": item.updated_at,
+                    "preview": item.preview,
+                }
+                for item in status.failed
+            ],
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_projections_audit(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """Compare the owner's vector rows with canonical state; read-only, run on request."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        audit = await service.audit_projections(authority)
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "orphan": list(audit.orphan),
+            "unknown": list(audit.unknown),
+            "duplicate": audit.duplicate,
+        },
+        status=200,
+    )
+
+
+def _optional_id_list(payload: dict[str, object], field: str) -> tuple[str, ...] | None:
+    """Read an optional list of identifiers; any other shape is a validation error."""
+    if field not in payload:
+        return None
+    value = payload[field]
+    if not isinstance(value, list) or len(value) > 200 or not all(isinstance(item, str) for item in value):
+        raise WorkshopMemoryValidationError("Invalid memory mutation request")
+    return tuple(str(item) for item in value)
+
+
+async def _handle_memory_projections_retry(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """
+    Retry the owner's failed search projections.
+
+    The body names the facts and episodes to retry; an empty object
+    retries everything the owner has failed. Retrying only resets rows
+    that are already failed, so a repeated request is harmless.
+    """
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory mutation request")
+    assert authority is not None
+    try:
+        if request.content_type != "application/json":
+            raise WorkshopMemoryValidationError("Content-Type must be application/json")
+        try:
+            payload = await request.json()
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise WorkshopMemoryValidationError("Invalid memory mutation request") from exc
+        if not isinstance(payload, dict) or not set(payload) <= {"claim_ids", "episode_ids"}:
+            raise WorkshopMemoryValidationError("Invalid memory mutation request")
+        result = await service.retry_projections(
+            authority,
+            claim_ids=_optional_id_list(payload, "claim_ids"),
+            episode_ids=_optional_id_list(payload, "episode_ids"),
+        )
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        {"version": 1, "retried": result.retried, "succeeded": result.succeeded, "failed": result.failed},
+        status=200,
+    )
 
 
 async def _handle_memory_records(
@@ -12109,6 +12234,26 @@ def register_workshop_read_routes(
             async with request_lock:
                 return await _handle_memory_forgotten(request, authenticator=authenticator, service=memory_queries)
 
+        async def handle_memory_projections(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_projections(request, authenticator=authenticator, service=memory_queries)
+
+        async def handle_memory_projections_audit(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_projections_audit(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_projections_retry(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_projections_retry(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
         async def handle_memory_forgotten_restore(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_memory_forgotten_restore(
@@ -12228,6 +12373,8 @@ def register_workshop_read_routes(
         app.router.add_get(_MEMORY_CONFLICTS_PATH, handle_memory_conflicts)
         app.router.add_get(_MEMORY_CONFLICT_PATH, handle_memory_conflict_detail)
         app.router.add_get(_MEMORY_FORGOTTEN_PATH, handle_memory_forgotten)
+        app.router.add_get(_MEMORY_PROJECTIONS_PATH, handle_memory_projections)
+        app.router.add_get(_MEMORY_PROJECTIONS_AUDIT_PATH, handle_memory_projections_audit)
         app.router.add_get(_MEMORY_DETAIL_PATH, handle_memory_detail)
         _register_workshop_capability_route(
             app,
@@ -12306,6 +12453,7 @@ def register_workshop_read_routes(
             ("POST", _MEMORY_BULK_DELETE_PATH, handle_memory_bulk_delete_mutation, "memory_bulk_delete"),
             ("POST", _MEMORY_CONFLICT_RESOLVE_PATH, handle_memory_conflict_resolve, "memory_conflict_resolve"),
             ("POST", _MEMORY_FORGOTTEN_RESTORE_PATH, handle_memory_forgotten_restore, "memory_fact_restore"),
+            ("POST", _MEMORY_PROJECTIONS_RETRY_PATH, handle_memory_projections_retry, "memory_projection_retry"),
         ):
             _register_workshop_capability_route(
                 app,
