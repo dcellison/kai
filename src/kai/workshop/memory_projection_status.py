@@ -364,7 +364,9 @@ def store_vector_audit(
                 len(audit.unknown),
                 audit.duplicate,
                 len(audit.missing),
-                (now or datetime.now(UTC)).isoformat(timespec="seconds"),
+                # Full precision: qualification compares this time with the
+                # latest projection's, which is recorded to the millisecond.
+                (now or datetime.now(UTC)).isoformat(),
             ),
         )
         connection.commit()
