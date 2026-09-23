@@ -413,13 +413,17 @@ class WorkshopMemoryReconciliationTriageService:
         group that shows the earlier decision and note. Only unchanged rows
         carry the deferral; a row that changed since is simply new again.
         Rows are grouped by the decision they came from, so each earlier
-        group or candidate appears once.
+        group or candidate appears once. This audit's own decisions are
+        not earlier ones: the plan already shows its raw deferrals as
+        prior review evidence, and applying the plan must not add them a
+        second time on the next rebuild.
         """
         prior = await asyncio.to_thread(
             prior_reconciliation_row_dispositions,
             self._db_path,
             principal_id=str(principal_id),
             runtime_profile_id=str(audit["runtime_profile_id"]),
+            exclude_audit_id=str(audit["audit_id"]),
         )
         carried: dict[str, dict[str, Any]] = {}
         for candidate in audit["candidates"]:
@@ -503,16 +507,20 @@ class WorkshopMemoryReconciliationTriageService:
                 (audit_id,),
             ) as cursor:
                 existing = await cursor.fetchone()
+            if existing is not None and str(existing[3]) != "open":
+                # An applied plan is history: show it exactly as it was
+                # applied. Comparing it with a fresh rebuild would only
+                # turn any later change to the rebuild's inputs into a
+                # plan the owner can no longer open.
+                row, stored = await self._plan_row(principal_id, str(existing[0]))
+                return await self._summary(row, stored)
             if existing is not None and str(existing[2]) != str(plan["policy_version"]):
-                if (
-                    str(existing[3]) != "open"
-                    or await memory_reconciliation.apply_in_progress(self._store.connection, str(existing[0]))
-                    or await self._has_consolidations(str(existing[0]))
-                ):
-                    # An applied plan is history: show it exactly as it was
-                    # applied, under the policy that produced it. A plan
-                    # with an unfinished apply stays as it is too, because
-                    # that run's progress is keyed to this plan's id.
+                if await memory_reconciliation.apply_in_progress(
+                    self._store.connection, str(existing[0])
+                ) or await self._has_consolidations(str(existing[0])):
+                    # A plan with an unfinished apply stays under the policy
+                    # that produced it, because that run's progress is keyed
+                    # to this plan's id.
                     row, stored = await self._plan_row(principal_id, str(existing[0]))
                     return await self._summary(row, stored)
                 await self._replan(principal_id, str(existing[0]), str(existing[1]), str(existing[2]), plan)
