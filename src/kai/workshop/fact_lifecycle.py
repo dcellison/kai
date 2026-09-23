@@ -182,8 +182,12 @@ class Mem0FactVectorAdapter:
         content: str,
         metadata: dict[str, object],
     ) -> bool:
+        # The lifecycle authority already decided this rewrite, so it goes
+        # through the owner-verified projection path rather than the
+        # user-facing update, whose current-truth gate hides the very rows
+        # an in-place rewrite targets.
         updated = await asyncio.to_thread(
-            memory.update_metadata,
+            memory.update_for_lifecycle_projection,
             user_id=str(authority.principal_id),
             memory_id=memory_id,
             data=content,

@@ -69,6 +69,7 @@ from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptSpec,
     MemoryExtractionStorageDecision,
 )
+from kai.workshop.temporal_memory import FactLifecycleState
 
 log = logging.getLogger(__name__)
 
@@ -3748,7 +3749,7 @@ async def _store_canonical_facts(
                     ),
                     evidence=(
                         {
-                            "kind": "canonical_message",
+                            "kind": "message",
                             "reference_id": source_message_id,
                             "sha256": None,
                         },
@@ -3791,7 +3792,7 @@ async def _store_canonical_facts(
                 scope_meta=scope_meta,
             )
             continue
-        if mutation.state == "conflicted":
+        if mutation.state == FactLifecycleState.UNRESOLVED_CONFLICT.value:
             _emit_intent_log(
                 user_id=user_id,
                 intent="update_of",
@@ -3980,6 +3981,10 @@ def _fact_receipt_completion(
             decision_outcome = "duplicate_skipped"
         elif outcomes == {"stored"}:
             decision_outcome = "stored"
+        elif outcomes == {"conflict_opened"}:
+            # A low-confidence update opened a conflict instead of replacing
+            # the prior fact; the receipt says so rather than "mixed".
+            decision_outcome = "conflict_opened"
         elif outcomes == {"legacy_target_unreconciled"}:
             # Every proposal targeted a legacy row that only temporary
             # legacy admission made visible; nothing was changed.
