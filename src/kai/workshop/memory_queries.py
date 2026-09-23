@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import logging
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ from kai.workshop.execution_state import (
     WorkshopExecutionStateRegistry,
 )
 from kai.workshop.fact_lifecycle import (
+    FactLifecycleAccessDenied,
     FactLifecycleConflict,
     FactMutationSource,
     FactRevisionInput,
@@ -58,6 +60,8 @@ from kai.workshop.memory_projection_status import (
     audit_vector_rows,
     expected_rows_async,
     projection_status_async,
+    refresh_vector_audit,
+    store_vector_audit,
 )
 from kai.workshop.memory_reconciliation_review import WorkshopMemoryReconciliationReviewService
 from kai.workshop.memory_reconciliation_triage import WorkshopMemoryReconciliationTriageService
@@ -259,6 +263,23 @@ class MemoryEditSnapshot:
 class MemoryCreationSnapshot:
     record: MemoryRecordDetail
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AgentForgetAllResult:
+    """What forgetting all of an owner's memory did, for the internal API reply."""
+
+    # Active claims retracted through the lifecycle.
+    retracted: int
+    # Of those, claims whose vector delete failed and awaits retry; they
+    # stay in recall until it succeeds.
+    projection_failed: int
+    # Legacy vector rows (no canonical claim) deleted outright.
+    legacy_deleted: int
+    # Claims in an unresolved conflict, left for the owner to decide.
+    kept_conflicts: int
+    # Canonical episodes, which are immutable history and never deleted.
+    kept_episodes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,14 +661,7 @@ class WorkshopMemoryQueryService:
         if not memory.is_enabled():
             return 0
         counted = 0
-        owners = sorted(
-            {
-                (str(namespace.principal_id), str(namespace.runtime_profile_id))
-                for namespaces in self._namespaces.values()
-                for namespace in namespaces
-            }
-        )
-        for principal_id, runtime_profile_id in owners:
+        for principal_id, runtime_profile_id in self._owners():
             try:
                 await asyncio.to_thread(
                     refresh_legacy_census,
@@ -660,6 +674,44 @@ class WorkshopMemoryQueryService:
                 continue
             counted += 1
         return counted
+
+    async def refresh_vector_audits(self) -> int:
+        """
+        Audit every owner's vector rows against canonical state at startup.
+
+        Install status reads the stored counts because, running as root, it
+        must not open the vector store the service holds. This runs after
+        projection recovery, so it sees the store as recovery left it. A
+        failure for one owner is logged and the others still run; that
+        owner's previous audit stays with its older time. Returns the
+        number of owners audited.
+        """
+        if not memory.is_enabled():
+            return 0
+        audited = 0
+        for principal_id, runtime_profile_id in self._owners():
+            try:
+                await asyncio.to_thread(
+                    refresh_vector_audit,
+                    Path(self._config.session_db_path),
+                    principal_id=principal_id,
+                    runtime_profile_id=runtime_profile_id,
+                )
+            except Exception:
+                log.warning("Vector audit failed for %s/%s", principal_id, runtime_profile_id, exc_info=True)
+                continue
+            audited += 1
+        return audited
+
+    def _owners(self) -> list[tuple[str, str]]:
+        """Every (principal, runtime profile) pair with a memory namespace, in a stable order."""
+        return sorted(
+            {
+                (str(namespace.principal_id), str(namespace.runtime_profile_id))
+                for namespaces in self._namespaces.values()
+                for namespace in namespaces
+            }
+        )
 
     def authority_for_principal(
         self,
@@ -1274,6 +1326,201 @@ class WorkshopMemoryQueryService:
                 outcome="succeeded",
             )
             return MemoryCreationSnapshot(await self.detail(authority, memory_id), True)
+
+    async def record_agent_fact(
+        self,
+        *,
+        principal_id: PrincipalId,
+        runtime_profile_id: RuntimeProfileId,
+        content: str,
+        tags: Sequence[str] | None,
+        vector_metadata: Mapping[str, object],
+    ) -> str:
+        """
+        Record a fact an agent saved deliberately, as a canonical claim.
+
+        The internal memory API used to write these straight to the vector
+        store. On a protected install such a row has no canonical claim, so
+        the current-truth gate treats it as legacy and, once the owner's
+        legacy memory is reconciled, never recalls it. Recording it through
+        the lifecycle makes it current truth like any other fact, with
+        history, conflict handling, and projection retry.
+
+        The caller has already routed the scope (from the agent's workspace
+        project) and stamped provenance into `vector_metadata`. The agent
+        runtime is bound to one exact runtime profile, so the owner is
+        unambiguous even for a principal with several profiles.
+
+        Each call is its own claim: the internal API carries no request id,
+        so a retried save is a new fact, exactly as the old direct write
+        was. The evidence names this save by a fresh id so its history
+        says where the fact came from.
+
+        Returns:
+            The projected vector row id.
+
+        Raises:
+            WorkshopMemoryValidationError: Content, tags, or scope invalid.
+            WorkshopMemoryAccessDenied: The runtime profile is not the
+                principal's.
+            WorkshopMemoryMutationFailed: The fact is canonical but its
+                search projection did not succeed (it is retried later).
+        """
+        cleaned_content = self._validate_text(content, field="Content", maximum=MAX_CONTENT_CHARACTERS)
+        cleaned_tags = self._validate_tags(tags or ())
+        scope = vector_metadata.get("scope")
+        project_id = vector_metadata.get("project_id")
+        if scope not in _VALID_MUTATION_SCOPES or (
+            scope == memory.SCOPE_PROJECT and (not isinstance(project_id, str) or not project_id)
+        ):
+            raise WorkshopMemoryValidationError("Memory scope must be global or a named project")
+        confidence = vector_metadata.get("confidence", 0.9)
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise WorkshopMemoryValidationError("Memory confidence must be a number")
+        try:
+            lifecycle_authority = await self._fact_lifecycle.authority_for(principal_id, runtime_profile_id)
+        except FactLifecycleAccessDenied as exc:
+            raise WorkshopMemoryAccessDenied("Memory access denied") from exc
+        save_id = f"agent-save-{uuid.uuid4().hex}"
+        now_value = datetime.now(UTC)
+        lock = self._mutation_locks.setdefault(principal_id, asyncio.Lock())
+        async with lock:
+            mutation = await self._fact_lifecycle.create(
+                lifecycle_authority,
+                FactRevisionInput(
+                    content=cleaned_content,
+                    scope_kind=str(scope),
+                    scope_key=str(project_id) if scope == memory.SCOPE_PROJECT else "",
+                    reason="Fact saved deliberately by the owner's agent.",
+                    evidence=({"kind": "agent", "reference_id": save_id, "sha256": None},),
+                    vector_metadata={**vector_metadata, "tags": list(cleaned_tags)},
+                    confidence=float(confidence),
+                    asserted_at=now_value,
+                    observed_at=now_value,
+                    valid_from=now_value,
+                ),
+                idempotency_key=f"workshop-memory:agent-save:{principal_id}:{runtime_profile_id}:{save_id}",
+                stable_claim_key=save_id,
+            )
+        memory_id = mutation.memory_id
+        if not isinstance(memory_id, str) or not memory_id or mutation.projection_status != "succeeded":
+            raise WorkshopMemoryMutationFailed("The fact was saved but its search projection is pending; it is retried")
+        return memory_id
+
+    async def forget_all_for_agent(
+        self,
+        *,
+        principal_id: PrincipalId,
+        runtime_profile_id: RuntimeProfileId,
+    ) -> AgentForgetAllResult:
+        """
+        Forget every current fact of one owner, keeping its history.
+
+        Deleting vector rows directly would leave every canonical claim
+        active with a projection that points at a row that no longer
+        exists: recall would lose the facts while history and install
+        status still counted them as current. Instead each active claim is
+        retracted through the lifecycle, which removes it from recall,
+        keeps it restorable, and records why. Legacy rows, which have no
+        canonical claim, are then deleted from the vector store.
+
+        Claims in an unresolved conflict are already out of recall and
+        need the owner's decision, and canonical episodes are immutable
+        history, so both are kept and counted rather than touched.
+
+        Raises:
+            WorkshopMemoryAccessDenied: The runtime profile is not the
+                principal's.
+            WorkshopMemoryMutationFailed: The vector store could not be
+                read to find legacy rows.
+        """
+        try:
+            lifecycle_authority = await self._fact_lifecycle.authority_for(principal_id, runtime_profile_id)
+        except FactLifecycleAccessDenied as exc:
+            raise WorkshopMemoryAccessDenied("Memory access denied") from exc
+        operation_id = uuid.uuid4().hex
+        retracted = projection_failed = 0
+        lock = self._mutation_locks.setdefault(principal_id, asyncio.Lock())
+        async with lock:
+            async with self._store.connection.execute(
+                "SELECT c.claim_id, s.revision_id FROM memory_fact_claims c "
+                "JOIN memory_fact_revision_states s ON s.claim_id = c.claim_id "
+                "WHERE c.owner_principal_id = ? AND c.runtime_profile_id = ? AND s.state = 'active' "
+                "ORDER BY c.claim_id",
+                (str(principal_id), str(runtime_profile_id)),
+            ) as cursor:
+                active = [(str(row[0]), str(row[1])) for row in await cursor.fetchall()]
+            for claim_id, revision_id in active:
+                result = await self._fact_lifecycle.retract(
+                    lifecycle_authority,
+                    MemoryClaimId(claim_id),
+                    MemoryRevisionId(revision_id),
+                    reason="Forgotten with every other memory at the owner's request.",
+                    idempotency_key=(
+                        f"workshop-memory:forget-all:{principal_id}:{runtime_profile_id}:{operation_id}:{claim_id}"
+                    ),
+                )
+                retracted += 1
+                if result.projection_status != "succeeded":
+                    # The claim is retracted canonically; its vector row
+                    # stays until the failed delete is retried. Counting it
+                    # keeps the response honest about what recall shows now.
+                    projection_failed += 1
+            async with self._store.connection.execute(
+                "SELECT COUNT(DISTINCT c.claim_id) FROM memory_fact_claims c "
+                "JOIN memory_fact_revision_states s ON s.claim_id = c.claim_id "
+                "WHERE c.owner_principal_id = ? AND c.runtime_profile_id = ? AND s.state = 'unresolved_conflict'",
+                (str(principal_id), str(runtime_profile_id)),
+            ) as cursor:
+                row = await cursor.fetchone()
+            kept_conflicts = int(row[0]) if row is not None else 0
+            async with self._store.connection.execute(
+                "SELECT COUNT(*) FROM memory_episodes WHERE owner_principal_id = ? AND runtime_profile_id = ?",
+                (str(principal_id), str(runtime_profile_id)),
+            ) as cursor:
+                row = await cursor.fetchone()
+            kept_episodes = int(row[0]) if row is not None else 0
+            try:
+                rows = await asyncio.to_thread(
+                    memory.get_all_for_lifecycle_projection,
+                    user_id=str(principal_id),
+                    runtime_profile_id=str(runtime_profile_id),
+                )
+            except Exception as exc:
+                raise WorkshopMemoryMutationFailed("The search index could not be read") from exc
+            legacy_deleted = 0
+            for item in rows:
+                # Rows carrying a canonical id belong to the lifecycle: the
+                # retractions above removed the current ones, and anything
+                # left is a pending projection the retry will settle.
+                if item.metadata.get(CANONICAL_CLAIM_ID_KEY) or item.metadata.get(CANONICAL_EPISODE_ID_KEY):
+                    continue
+                deleted = await asyncio.to_thread(
+                    memory.delete_by_id_for_lifecycle_projection,
+                    user_id=str(principal_id),
+                    memory_id=item.id,
+                    runtime_profile_id=str(runtime_profile_id),
+                )
+                if deleted:
+                    legacy_deleted += 1
+        log.info(
+            "Forgot all memory for %s/%s: retracted=%d, projection_failed=%d, legacy_deleted=%d, "
+            "kept_conflicts=%d, kept_episodes=%d",
+            principal_id,
+            runtime_profile_id,
+            retracted,
+            projection_failed,
+            legacy_deleted,
+            kept_conflicts,
+            kept_episodes,
+        )
+        return AgentForgetAllResult(
+            retracted=retracted,
+            projection_failed=projection_failed,
+            legacy_deleted=legacy_deleted,
+            kept_conflicts=kept_conflicts,
+            kept_episodes=kept_episodes,
+        )
 
     async def edit(
         self,
@@ -2387,6 +2634,19 @@ class WorkshopMemoryQueryService:
             runtime_profile_id=RuntimeProfileId(runtime_profile_id),
             episode_ids=None if everything else tuple(MemoryEpisodeId(item) for item in episode_ids or ()),
         )
+        if facts.retried or episodes.retried:
+            # A retry changes which rows the store should hold, so the
+            # stored audit install status reads is refreshed with it. The
+            # retry result stands even if this read fails.
+            try:
+                await asyncio.to_thread(
+                    refresh_vector_audit,
+                    Path(self._config.session_db_path),
+                    principal_id=str(authority.principal_id),
+                    runtime_profile_id=runtime_profile_id,
+                )
+            except Exception:
+                log.warning("Vector audit after projection retry failed", exc_info=True)
         return ProjectionRetryResult(
             facts.retried + episodes.retried,
             facts.succeeded + episodes.succeeded,
@@ -2411,7 +2671,17 @@ class WorkshopMemoryQueryService:
         except Exception as exc:
             raise WorkshopMemoryMutationFailed("The search index could not be read") from exc
         facts, episodes = await expected_rows_async(self._store.connection, owner)
-        return audit_vector_rows(rows, current_facts=facts, current_episodes=episodes)
+        audit = audit_vector_rows(rows, current_facts=facts, current_episodes=episodes)
+        # The owner just paid for a full read, so install status gets the
+        # fresh counts too.
+        await asyncio.to_thread(
+            store_vector_audit,
+            Path(self._config.session_db_path),
+            audit,
+            principal_id=owner[0],
+            runtime_profile_id=owner[1],
+        )
+        return audit
 
     async def unresolved_conflict_count(self, authority: MemoryQueryAuthority) -> int:
         """Count the owner's conflicted claims; zero when no runtime profile is unambiguous."""

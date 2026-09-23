@@ -2882,6 +2882,7 @@ async def _handle_memory_projections_audit(
             "orphan": list(audit.orphan),
             "unknown": list(audit.unknown),
             "duplicate": audit.duplicate,
+            "missing": list(audit.missing),
         },
         status=200,
     )

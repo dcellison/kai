@@ -233,7 +233,10 @@ def _evidence(payload: dict[str, Any], *, canonical: bool) -> str:
         if not isinstance(item, dict) or set(item) != {"kind", "reference_id", "sha256"}:
             raise ValueError("Temporal memory evidence entries have an invalid shape")
         kind = _required_text(item.get("kind"), field="evidence kind", maximum=32)
-        if kind not in {"message", "run", "operator", "legacy"}:
+        # `agent` names a fact the owner's agent saved deliberately through
+        # the internal memory API; that save has no message or run id of its
+        # own, so it is cited by the save's id instead.
+        if kind not in {"message", "run", "operator", "legacy", "agent"}:
             raise ValueError("Temporal memory evidence kind is invalid")
         reference_id = _required_text(item.get("reference_id"), field="evidence reference", maximum=128)
         digest = item.get("sha256")

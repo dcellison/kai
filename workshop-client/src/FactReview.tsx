@@ -390,11 +390,21 @@ export function FactReview({
               </div>
               {audit && (
                 <p className="memory-review-explanation" role="note">
-                  {audit.orphan.length + audit.unknown.length === 0 && audit.duplicate === 0
+                  {audit.orphan.length + audit.unknown.length + audit.missing.length === 0 && audit.duplicate === 0
                     ? "The search index matches your memory."
-                    : `The search index has ${audit.orphan.length} leftover and ${audit.unknown.length} unknown row(s)` +
-                      `${audit.duplicate > 0 ? `, and ${audit.duplicate} item(s) with duplicates` : ""}. ` +
-                      "Kai never recalls them; they only take up space."}
+                    : [
+                        // Missing rows come first: they are current facts
+                        // Kai cannot recall, unlike leftovers, which only
+                        // take up space.
+                        audit.missing.length > 0
+                          ? `${audit.missing.length} current fact(s) have no search row, so Kai cannot recall them.`
+                          : "",
+                        audit.orphan.length + audit.unknown.length + audit.duplicate > 0
+                          ? `The search index has ${audit.orphan.length} leftover and ${audit.unknown.length} unknown row(s)` +
+                            `${audit.duplicate > 0 ? `, and ${audit.duplicate} item(s) with duplicates` : ""}. ` +
+                            "Kai never recalls them; they only take up space."
+                          : "",
+                      ].filter(Boolean).join(" ")}
                 </p>
               )}
               {decisionError && !selectedSync && <p className="memory-editor-error" role="alert">{decisionError}</p>}

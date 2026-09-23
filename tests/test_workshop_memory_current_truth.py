@@ -85,6 +85,24 @@ def _database(path: Path) -> sqlite3.Connection:
         );
         -- The service counts legacy rows at startup; here nothing is unclassified.
         INSERT INTO memory_legacy_census VALUES ('prn_x', 'rtp_x', 0, 0, 0, 0, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+        CREATE TABLE memory_reconciliation_audits (
+            audit_id TEXT PRIMARY KEY,
+            principal_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE memory_vector_audit (
+            principal_id TEXT NOT NULL,
+            runtime_profile_id TEXT NOT NULL,
+            orphan_rows INTEGER NOT NULL,
+            unknown_rows INTEGER NOT NULL,
+            duplicate_items INTEGER NOT NULL,
+            missing_rows INTEGER NOT NULL,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, runtime_profile_id)
+        );
+        -- The service audits vector rows at startup; here the store matches.
+        INSERT INTO memory_vector_audit VALUES ('prn_x', 'rtp_x', 0, 0, 0, 0, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
         """
     )
     return connection
@@ -427,8 +445,10 @@ def test_status_surfaces_quarantine_projection_and_legacy_gaps(tmp_path: Path) -
         "UPDATE memory_fact_revisions SET migration_classification = 'legacy_quarantined', "
         "admission_authority = 'quarantined'"
     )
-    # The latest census found two legacy rows nothing has settled.
+    # The latest census found two legacy rows nothing has settled, for an
+    # owner who applied a reconciliation audit, so they are gaps.
     connection.execute("UPDATE memory_legacy_census SET legacy_rows = 2, unclassified = 2")
+    connection.execute("INSERT INTO memory_reconciliation_audits VALUES ('mra_x', 'prn_x', 'rtp_x', 'applied')")
     connection.commit()
     connection.close()
     incomplete = workshop_memory_current_truth_status(database, memory_enabled=True)
@@ -442,3 +462,57 @@ def test_status_surfaces_quarantine_projection_and_legacy_gaps(tmp_path: Path) -
     connection.close()
     uncounted = workshop_memory_current_truth_status(database, memory_enabled=True)
     assert "legacy unclassified=not counted" in uncounted and "INCOMPLETE" in uncounted
+
+
+def test_status_reports_owners_awaiting_review_without_marking_gaps(tmp_path: Path) -> None:
+    # An owner who never applied a reconciliation audit keeps temporary
+    # legacy admission, so their unclassified rows wait on their own review
+    # and are not integrity gaps.
+    from kai.workshop.diagnostics import workshop_memory_current_truth_status
+
+    database = tmp_path / "kai.db"
+    connection = _database(database)
+    _insert_revision(connection)
+    connection.execute("UPDATE memory_legacy_census SET legacy_rows = 7, unclassified = 7")
+    connection.commit()
+    connection.close()
+
+    status = workshop_memory_current_truth_status(database, memory_enabled=True)
+
+    assert status.startswith("Workshop memory current truth: active;")
+    assert "legacy unclassified=0 (counted 0m ago)" in status
+    assert "legacy review pending=1 owner(s) (7 rows)" in status
+
+
+def test_status_counts_revisions_per_lifecycle_state(tmp_path: Path) -> None:
+    from kai.workshop.diagnostics import workshop_memory_current_truth_status
+
+    database = tmp_path / "kai.db"
+    connection = _database(database)
+    _insert_revision(connection)
+    connection.execute(
+        "INSERT INTO memory_fact_revision_states VALUES ('mrv_old', 'mcl_x', 'superseded', 1), "
+        "('mrv_gone', 'mcl_y', 'retracted', 2), ('mrv_split', 'mcl_z', 'unresolved_conflict', 3)"
+    )
+    connection.commit()
+    connection.close()
+
+    status = workshop_memory_current_truth_status(database, memory_enabled=True)
+
+    assert "states=(active=1, superseded=1, retracted=1, expired=0, conflicted=1)" in status
+
+
+def test_status_without_a_vector_audit_is_incomplete(tmp_path: Path) -> None:
+    from kai.workshop.diagnostics import workshop_memory_current_truth_status
+
+    database = tmp_path / "kai.db"
+    connection = _database(database)
+    _insert_revision(connection)
+    connection.execute("DELETE FROM memory_vector_audit")
+    connection.commit()
+    connection.close()
+
+    status = workshop_memory_current_truth_status(database, memory_enabled=True)
+
+    assert status.startswith("Workshop memory current truth: INCOMPLETE;")
+    assert "vector drift=not checked" in status

@@ -306,3 +306,43 @@ def test_related_facts_come_from_the_recommendation_and_must_be_other_fact_group
     assert related_group_ids(current, prose, groups) == ["mtg_" + "b" * 32]
     assert related_group_ids(current, structured, groups) == ["mtg_" + "b" * 32]
     assert related_group_ids(current, {}, groups) == []
+
+
+async def test_consolidation_operations_are_not_replay_gaps(tmp_path: Path, monkeypatch) -> None:
+    # Consolidation saves and cancels carry no audit id by design; install
+    # status accounts for them through their plan and consolidation.
+    from kai.workshop.diagnostics import workshop_memory_reconciliation_status
+
+    owner = await _Owner(tmp_path, list(_FACTS)).start(monkeypatch)
+    try:
+        plan_id, groups = await _groups(owner)
+        kept = (await _stage(owner, plan_id, groups, ["fact-1", "fact-2"], operation="stage-kept"))["consolidation"]
+        _plan, groups = await _groups(owner)
+        cancelled = (
+            await _stage(
+                owner,
+                plan_id,
+                groups,
+                ["fact-3", "fact-4"],
+                operation="stage-cancelled",
+                canonical={**_CANONICAL, "source_memory_id": "fact-3"},
+            )
+        )["consolidation"]
+        await owner.triage().cancel_consolidation(
+            owner.principal, plan_id, cancelled["consolidation_id"], expected_revision=1, client_operation_id="cancel"
+        )
+
+        assert kept["consolidation_id"] != cancelled["consolidation_id"]
+        assert "replay gaps=0;" in workshop_memory_reconciliation_status(owner.db_path)
+
+        # An operation nothing accounts for is still a gap.
+        connection = sqlite3.connect(owner.db_path)
+        connection.execute(
+            "INSERT INTO memory_reconciliation_operations VALUES (?, 'stray', ?, '{}', '2026-01-01T00:00:00Z')",
+            (str(owner.principal), "0" * 64),
+        )
+        connection.commit()
+        connection.close()
+        assert "replay gaps=1;" in workshop_memory_reconciliation_status(owner.db_path)
+    finally:
+        await owner.close()

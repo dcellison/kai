@@ -200,6 +200,9 @@ class _FakeMemoryQueries:
     async def refresh_legacy_census(self) -> int:
         return 0
 
+    async def refresh_vector_audits(self) -> int:
+        return 0
+
 
 class _FakeIntegrationNotifications:
     def __init__(self, events: list[str]) -> None:
