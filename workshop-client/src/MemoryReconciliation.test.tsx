@@ -721,6 +721,45 @@ describe("Memory reconciliation triage", () => {
     await waitFor(() => expect(approveSafeMemoryTriage).toHaveBeenCalledTimes(1));
   });
 
+  it("counts only undecided exception groups as needing review", async () => {
+    // One exception group and two deterministic groups, all still pending:
+    // only the exception group needs the owner's review.
+    vi.mocked(loadMemoryTriage).mockResolvedValue(summary);
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: summary, groups: [], nextOffset: null });
+
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const cards = await screen.findByRole("region", { name: "Triage summary" });
+    expect(within(cards).getByText("Need review").previousSibling).toHaveTextContent("1");
+  });
+
+  it("shows zero needing review once an applied plan decided every group", async () => {
+    const applied = {
+      ...summary,
+      appliedAt: "2026-09-23T16:15:14Z",
+      dispositionCounts: { approve: 2, defer: 0, pending: 0, reject: 1 },
+      exceptionGroups: 52,
+      pendingDeterministicGroups: 0,
+      status: "applied" as const,
+    };
+    vi.mocked(loadMemoryTriage).mockResolvedValue(applied);
+    vi.mocked(loadMemoryTriageGroups).mockResolvedValue({ triage: applied, groups: [], nextOffset: null });
+
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const cards = await screen.findByRole("region", { name: "Triage summary" });
+    expect(within(cards).getByText("Need review").previousSibling).toHaveTextContent("0");
+    expect(screen.getByText(/Applied: every group was decided/)).toBeVisible();
+  });
+
   it("reports operator admission separately from lifecycle outcomes", async () => {
     const user = userEvent.setup();
     const readySummary = {
