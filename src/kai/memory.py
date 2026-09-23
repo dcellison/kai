@@ -4051,6 +4051,68 @@ def get_by_id_for_lifecycle_projection(
     return result if _memory_result_belongs_to_principal(result, namespace) else None
 
 
+def update_for_lifecycle_projection(
+    *,
+    user_id: str,
+    memory_id: str,
+    data: str,
+    metadata: dict[str, Any],
+    runtime_profile_id: str,
+) -> bool:
+    """
+    Rewrite one owner-verified vector on behalf of canonical lifecycle.
+
+    The lifecycle projection worker rewrites vectors in place when it
+    adopts a legacy row, supersedes a revision, or restores one. The
+    ordinary `update_metadata` path cannot serve it on protected
+    installs: it first reads the row through the current-truth gate,
+    which hides exactly the rows an in-place rewrite targets (a legacy
+    row not yet adopted, or a canonical row whose revision was just
+    superseded). This path verifies ownership the same way the other
+    lifecycle projection helpers do, without the current-truth gate,
+    because the lifecycle authority itself decided the rewrite.
+
+    `metadata` replaces the row's metadata wholesale (Mem0 semantics),
+    so the caller must pass the complete projected metadata.
+
+    Args:
+        user_id: Canonical owning principal.
+        memory_id: Vector row to rewrite.
+        data: New row text; Mem0 re-embeds it.
+        metadata: Complete replacement metadata for the row.
+        runtime_profile_id: Owning runtime profile.
+
+    Returns:
+        True when the rewrite was issued; False when ownership cannot be
+        verified (including a failed read) or the provider update fails.
+    """
+    if _memory is None:
+        return False
+    if (
+        get_by_id_for_lifecycle_projection(
+            user_id=user_id,
+            memory_id=memory_id,
+            runtime_profile_id=runtime_profile_id,
+        )
+        is None
+    ):
+        return False
+    _, namespace = _canonical_memory_owner(
+        user_id,
+        runtime_profile_id=runtime_profile_id,
+    )
+    try:
+        _memory.update(
+            memory_id=memory_id,
+            data=data,
+            metadata=_metadata_for_owner(metadata, namespace),
+        )
+    except Exception:
+        log.warning("Lifecycle projection update failed for %s", memory_id, exc_info=True)
+        return False
+    return True
+
+
 def delete_by_id_for_lifecycle_projection(
     *,
     user_id: str,
