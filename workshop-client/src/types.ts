@@ -1316,7 +1316,8 @@ export type WorkshopMemoryMutationOutcome =
   | "succeeded"
   | "not_found"
   | "stale"
-  | "failed";
+  | "failed"
+  | "awaiting_reconciliation";
 
 export interface WorkshopMemoryMutationResult {
   memoryId: string;

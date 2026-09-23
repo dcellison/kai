@@ -4605,7 +4605,7 @@ function parseMemoryMutation(payload: unknown): WorkshopMemoryMutationBatch | nu
   }
   const results = payload.results.map((value) => {
     if (!isRecord(value) || typeof value.memory_id !== "string" ||
-      !["succeeded", "not_found", "stale", "failed"].includes(String(value.outcome))
+      !["succeeded", "not_found", "stale", "failed", "awaiting_reconciliation"].includes(String(value.outcome))
     ) {
       return null;
     }
