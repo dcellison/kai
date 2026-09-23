@@ -25,6 +25,7 @@ import {
   searchMemories,
 } from "./api";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { FactReview } from "./FactReview";
 import { MemoryReconciliation, MemoryReviewIcon } from "./MemoryReconciliation";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 import type {
@@ -87,6 +88,17 @@ function apiFilters(filters: ExplorerFilters): WorkshopMemoryFilters {
     scope: filters.scope || undefined,
     tag: filters.tag.trim() || undefined,
   };
+}
+
+// Two overlapping cards: one fact seen in two versions.
+function FactReviewIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <rect x="4" y="5" width="10" height="12" rx="1.5" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M17 8h1.5A1.5 1.5 0 0 1 20 9.5v9a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 10 18.5V20" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+      <path d="M7 9h4M7 12.5h4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
+  );
 }
 
 function formatDate(value: string): string {
@@ -663,6 +675,7 @@ function MemoryExplorerContent({
   const [mutationReport, setMutationReport] = useState<string | null>(null);
   const [editorDetail, setEditorDetail] = useState<WorkshopMemoryDetail | "create" | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
+  const [factReviewOpen, setFactReviewOpen] = useState(false);
   const recordRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   useEffect(() => {
@@ -954,6 +967,23 @@ function MemoryExplorerContent({
 
   const resultCount = searchQuery ? searchHits.length : records.length;
 
+  if (factReviewOpen) {
+    return (
+      <FactReview
+        detailPanelLayout={detailPanelLayout}
+        onAuthenticationFailure={onAuthenticationFailure}
+        onBack={() => setFactReviewOpen(false)}
+        // A kept or restored fact changes the counts and may join the list.
+        onChanged={() => setRefreshKey((value) => value + 1)}
+        onOpenMemory={(memoryId) => {
+          setFactReviewOpen(false);
+          selectMemory(memoryId);
+        }}
+        token={token}
+      />
+    );
+  }
+
   if (reviewOpen) {
     return (
       <MemoryReconciliation
@@ -975,6 +1005,20 @@ function MemoryExplorerContent({
             <h1>Memory</h1>
           </div>
           <div className="memory-header-actions">
+            <button
+              className="panel-icon-button fact-review-button"
+              type="button"
+              aria-label={stats && stats.unresolvedConflicts > 0
+                ? `Fact review, ${stats.unresolvedConflicts} unresolved conflicts`
+                : "Fact review"}
+              title="Fact review"
+              onClick={() => setFactReviewOpen(true)}
+            >
+              <FactReviewIcon />
+              {stats && stats.unresolvedConflicts > 0 && (
+                <span className="fact-review-badge" aria-hidden="true">{stats.unresolvedConflicts}</span>
+              )}
+            </button>
             <button
               className="panel-icon-button"
               type="button"

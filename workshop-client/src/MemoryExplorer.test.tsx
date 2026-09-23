@@ -9,6 +9,8 @@ import {
   deleteMemories,
   deleteMemory,
   editMemory,
+  loadForgottenMemories,
+  loadMemoryConflicts,
   loadMemoryDetail,
   loadMemoryRecords,
   loadMemorySource,
@@ -38,6 +40,8 @@ vi.mock("./api", async (importOriginal) => {
     deleteMemories: vi.fn(),
     createMemoryFact: vi.fn(),
     editMemory: vi.fn(),
+    loadForgottenMemories: vi.fn(),
+    loadMemoryConflicts: vi.fn(),
     searchMemories: vi.fn(),
   };
 });
@@ -165,6 +169,7 @@ describe("Workshop Memory explorer", () => {
       episodes: 1,
       facts: 1,
       total: 2,
+      unresolvedConflicts: 0,
     });
     vi.mocked(loadMemoryRecords).mockResolvedValue({
       nextCursor: null,
@@ -229,6 +234,52 @@ describe("Workshop Memory explorer", () => {
     expect(container.querySelector("script")).toBeNull();
     expect(screen.getByText("<script>window.bad = true</script>")).toBeVisible();
     expect(onSelectMemory).toHaveBeenCalledWith("memory-2");
+  });
+
+  it("badges open conflicts on the Fact review button and opens the review", async () => {
+    const user = userEvent.setup();
+    vi.mocked(loadMemoryStats).mockResolvedValue({
+      allowedProjects: [],
+      byScope: { global: 1 },
+      bySource: { extracted: 1 },
+      byType: { fact: 1 },
+      episodes: 0,
+      facts: 1,
+      total: 1,
+      unresolvedConflicts: 3,
+    });
+    vi.mocked(loadMemoryConflicts).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(loadForgottenMemories).mockResolvedValue({ items: [], total: 0 });
+    render(
+      <MemoryExplorer
+        initialMemoryId={null}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    const button = await screen.findByRole("button", { name: "Fact review, 3 unresolved conflicts" });
+    expect(button).toHaveTextContent("3");
+    await user.click(button);
+    expect(await screen.findByRole("heading", { name: "Fact review" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Back to memories" }));
+    expect(await screen.findByRole("heading", { name: "Memory" })).toBeInTheDocument();
+  });
+
+  it("shows no badge when nothing waits on the owner", async () => {
+    render(
+      <MemoryExplorer
+        initialMemoryId={null}
+        onAuthenticationFailure={vi.fn()}
+        onClose={vi.fn()}
+        onSelectMemory={vi.fn()}
+        token="session-secret"
+      />,
+    );
+
+    expect(await screen.findByRole("button", { name: "Fact review" })).not.toHaveTextContent(/\d/);
   });
 
   it("combines filters, server-backed browse order, search, and paging", async () => {

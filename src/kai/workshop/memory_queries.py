@@ -16,7 +16,16 @@ from typing import Literal
 from kai import memory
 from kai.config import Config
 from kai.workshop.authorization import CanonicalChannelAuthorizer
-from kai.workshop.domain import AgentId, ChannelId, MessageId, PrincipalId, RunId
+from kai.workshop.domain import (
+    AgentId,
+    ChannelId,
+    MemoryClaimId,
+    MemoryRevisionId,
+    MessageId,
+    PrincipalId,
+    RunId,
+    RuntimeProfileId,
+)
 from kai.workshop.episode_history import MemoryEpisodeHistoryService
 from kai.workshop.execution_state import (
     WorkshopExecutionStateNamespace,
@@ -57,6 +66,11 @@ MAX_COMPACT_RECALL_CHARACTERS = 120_000
 MAX_SOURCE_BODY_CHARACTERS = 50_000
 MAX_MUTATION_TARGETS = 50
 MAX_MEMORY_TAGS = 32
+# Owner review lists (conflicts, forgotten facts) are bounded so one read
+# stays cheap; a principal with more open items sees the newest first and
+# the total count.
+MAX_REVIEW_ITEMS = 200
+MAX_REVIEW_NOTE_CHARACTERS = 500
 MAX_MEMORY_TAG_CHARACTERS = 128
 MAX_EPISODE_FIELD_CHARACTERS = 20_000
 MAX_REQUEST_ID_CHARACTERS = 128
@@ -108,6 +122,18 @@ class WorkshopMemoryConflict(WorkshopMemoryQueryError):
 
 class WorkshopMemoryMutationFailed(WorkshopMemoryQueryError):
     """A provider mutation failed without producing a verified result."""
+
+
+class WorkshopMemoryConflictChanged(WorkshopMemoryQueryError):
+    """
+    The set of competing revisions changed since the owner opened it.
+
+    Resolution settles every unresolved revision of a claim at once, so it
+    must never settle a set the owner did not see.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("This conflict changed since you opened it")
 
 
 class WorkshopMemoryAwaitingReconciliation(WorkshopMemoryQueryError):
@@ -253,6 +279,61 @@ class MemoryProjectOption:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryRevisionPreview:
+    """One revision in an owner review list, bounded for display."""
+
+    revision_id: str
+    preview: str
+    stored_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryConflictSummary:
+    """A claim with unresolved competing revisions."""
+
+    claim_id: str
+    scope_kind: str
+    scope_key: str | None
+    opened_at: str
+    revisions: tuple[MemoryRevisionPreview, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryForgottenSummary:
+    """A claim with no current truth whose latest revision was retracted or expired."""
+
+    claim_id: str
+    scope_kind: str
+    scope_key: str | None
+    state: str
+    revision_id: str
+    changed_at: str
+    reason: str
+    preview: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryReviewList[T]:
+    """A bounded review list plus the unbounded total."""
+
+    items: tuple[T, ...]
+    total: int
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryLifecycleOutcome:
+    """Result of an owner resolution or restore."""
+
+    claim_id: str
+    active_revision_id: str
+    replayed: bool
+    # Vector memory id of the claim's current row, so the client can open
+    # the kept or restored fact in the explorer. None when no projection
+    # has succeeded yet (the caller then has nothing to open).
+    memory_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryStatsSnapshot:
     total: int
     facts: int
@@ -268,6 +349,9 @@ class MemoryStatsSnapshot:
     confidence_below_0_7: int = 0
     confidence_below_0_6: int = 0
     confirmation_quote_count: int = 0
+    # Claims waiting for their owner to settle competing revisions. These
+    # have no vector row, so the counts above never include them.
+    unresolved_conflicts: int = 0
     by_prompt_version: dict[str, int] = field(default_factory=dict)
 
 
@@ -309,6 +393,35 @@ def _bounded_text(value: object, *, maximum: int) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     return value[:maximum]
+
+
+def _stored_confidence(value: object) -> float | None:
+    """Read the confidence the lifecycle stores inside revision vector metadata."""
+    try:
+        metadata = json.loads(str(value))
+    except (TypeError, ValueError):
+        return None
+    confidence = metadata.get("confidence") if isinstance(metadata, dict) else None
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None
+    return float(confidence)
+
+
+def _parse_stored_time(value: object) -> datetime | None:
+    """Parse a stored aware timestamp; None when absent or unreadable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _review_preview(content: str) -> str:
+    """Bound review-list previews the same way record previews are bounded."""
+    text = " ".join(content.split())
+    return text if len(text) <= MAX_PREVIEW_CHARACTERS else text[: MAX_PREVIEW_CHARACTERS - 1] + "…"
 
 
 def _stored_json_list(value: object) -> list[object]:
@@ -816,6 +929,7 @@ class WorkshopMemoryQueryService:
             confidence_below_0_7=sum(1 for value in confidences if value < 0.7),
             confidence_below_0_6=sum(1 for value in confidences if value < 0.6),
             confirmation_quote_count=confirmation_quote_count,
+            unresolved_conflicts=await self.unresolved_conflict_count(authority),
             by_prompt_version=dict(sorted(by_prompt_version.items())),
         )
 
@@ -1622,7 +1736,8 @@ class WorkshopMemoryQueryService:
             "r.revision_id, r.content, r.asserted_at, r.observed_at, r.stored_at, "
             "r.valid_from, r.valid_until, r.reason, r.evidence_json, r.backend, r.provider, "
             "r.model, r.prompt_version, r.schema_version, r.supersedes_revision_id, "
-            "r.migration_classification, r.migration_gaps_json, s.state, s.state_reason, s.updated_at "
+            "r.migration_classification, r.migration_gaps_json, s.state, s.state_reason, s.updated_at, "
+            "r.vector_metadata_json, r.admission_authority "
             "FROM memory_fact_claims c "
             "JOIN runtime_profile_owners rpo ON rpo.runtime_profile_id = c.runtime_profile_id "
             "AND rpo.principal_id = c.owner_principal_id "
@@ -1675,6 +1790,8 @@ class WorkshopMemoryQueryService:
                     "state": str(row[21]),
                     "stateReason": str(row[22]),
                     "stateUpdatedAt": str(row[23]),
+                    "confidence": _stored_confidence(row[24]),
+                    "admissionAuthority": str(row[25]),
                 }
                 for row in rows
             ],
@@ -1805,6 +1922,372 @@ class WorkshopMemoryQueryService:
                 else ["canonical provenance"]
             ),
         }
+
+    # ── Owner review: conflicts and forgotten facts ─────────────────
+    #
+    # Conflicted, retracted, and expired claims have no vector row (their
+    # vectors are deleted by the lifecycle), so no vector-backed listing can
+    # show them. These reads go to the canonical fact tables directly and
+    # are scoped to the owner pair every fact mutation uses.
+
+    def _owner_pair(self, authority: MemoryQueryAuthority) -> tuple[str, str]:
+        namespace = self._namespace_for_mutation(authority)
+        return str(authority.principal_id), str(namespace.runtime_profile_id)
+
+    @staticmethod
+    def _validate_claim_id(claim_id: str) -> str:
+        if not isinstance(claim_id, str) or not claim_id or len(claim_id) > 128 or claim_id != claim_id.strip():
+            raise WorkshopMemoryValidationError("Invalid memory claim identifier")
+        return claim_id
+
+    @staticmethod
+    def _validate_note(note: str) -> str:
+        if not isinstance(note, str) or len(note) > MAX_REVIEW_NOTE_CHARACTERS:
+            raise WorkshopMemoryValidationError("Notes must be at most 500 characters")
+        return note.strip()
+
+    async def _unresolved_revisions(self, claim_id: str) -> list[tuple[str, str, str]]:
+        """Return (revision_id, content, stored_at) of unresolved revisions, oldest first."""
+        async with self._store.connection.execute(
+            "SELECT r.revision_id, r.content, r.stored_at FROM memory_fact_revisions r "
+            "JOIN memory_fact_revision_states s ON s.claim_id = r.claim_id AND s.revision_id = r.revision_id "
+            "WHERE r.claim_id = ? AND s.state = 'unresolved_conflict' ORDER BY r.created_event_position",
+            (claim_id,),
+        ) as cursor:
+            return [(str(row[0]), str(row[1]), str(row[2])) for row in await cursor.fetchall()]
+
+    async def _owns_claim(self, owner: tuple[str, str], claim_id: str) -> bool:
+        async with self._store.connection.execute(
+            "SELECT 1 FROM memory_fact_claims WHERE claim_id = ? AND owner_principal_id = ? AND runtime_profile_id = ?",
+            (claim_id, *owner),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def list_conflicts(self, authority: MemoryQueryAuthority) -> MemoryReviewList[MemoryConflictSummary]:
+        """List the owner's claims with unresolved competing revisions, newest conflict first."""
+        owner = self._owner_pair(authority)
+        where = (
+            "FROM memory_fact_claims c WHERE c.owner_principal_id = ? AND c.runtime_profile_id = ? "
+            "AND EXISTS (SELECT 1 FROM memory_fact_revision_states s "
+            "WHERE s.claim_id = c.claim_id AND s.state = 'unresolved_conflict')"
+        )
+        async with self._store.connection.execute(f"SELECT COUNT(*) {where}", owner) as cursor:
+            total_row = await cursor.fetchone()
+        async with self._store.connection.execute(
+            "SELECT c.claim_id, c.scope_kind, c.scope_key, "
+            "(SELECT MAX(e.occurred_at) FROM memory_fact_lifecycle_events e "
+            "WHERE e.claim_id = c.claim_id AND e.transition = 'conflict_opened') AS opened_at "
+            f"{where} ORDER BY opened_at DESC, c.claim_id LIMIT ?",
+            (*owner, MAX_REVIEW_ITEMS),
+        ) as cursor:
+            claims = list(await cursor.fetchall())
+        items: list[MemoryConflictSummary] = []
+        for claim_id, scope_kind, scope_key, opened_at in claims:
+            revisions = await self._unresolved_revisions(str(claim_id))
+            items.append(
+                MemoryConflictSummary(
+                    claim_id=str(claim_id),
+                    scope_kind=str(scope_kind),
+                    scope_key=str(scope_key) or None,
+                    opened_at=str(opened_at or ""),
+                    revisions=tuple(
+                        MemoryRevisionPreview(revision_id, _review_preview(content), stored_at)
+                        for revision_id, content, stored_at in revisions
+                    ),
+                )
+            )
+        return MemoryReviewList(tuple(items), int(total_row[0]) if total_row is not None else 0)
+
+    async def conflict_detail(self, authority: MemoryQueryAuthority, claim_id: str) -> dict[str, object]:
+        """Return full lifecycle detail for one of the owner's conflicted claims."""
+        checked = self._validate_claim_id(claim_id)
+        owner = self._owner_pair(authority)
+        if not await self._owns_claim(owner, checked) or not await self._unresolved_revisions(checked):
+            raise WorkshopMemoryNotFound("Memory not found")
+        detail = await self._fact_lifecycle_detail(authority, checked, None)
+        if detail is None:
+            raise WorkshopMemoryNotFound("Memory not found")
+        return detail
+
+    async def resolve_conflict(
+        self,
+        authority: MemoryQueryAuthority,
+        claim_id: str,
+        *,
+        keep_revision_id: str,
+        expected_revision_ids: Sequence[str],
+        note: str,
+        client_operation_id: str,
+    ) -> MemoryLifecycleOutcome:
+        """
+        Keep one competing revision and supersede the rest.
+
+        `expected_revision_ids` is the set the owner was shown. A new request
+        whose set no longer matches the claim's unresolved revisions is
+        refused, so a stale screen can never settle revisions the owner did
+        not see. Replays of the same operation return the original outcome
+        without re-checking, because the claim has legitimately moved on.
+
+        Raises:
+            WorkshopMemoryValidationError: Malformed input, or the operation
+                id was already used for a different request.
+            WorkshopMemoryNotFound: The claim is not the owner's.
+            WorkshopMemoryConflictChanged: The unresolved set changed.
+            WorkshopMemoryMutationFailed: Resolved canonically, but the kept
+                revision's search projection did not complete.
+        """
+        checked_claim = self._validate_claim_id(claim_id)
+        operation_id = self._validate_request_id(client_operation_id)
+        checked_note = self._validate_note(note)
+        expected = [str(value) for value in expected_revision_ids] if isinstance(expected_revision_ids, list) else []
+        if (
+            not expected
+            or len(expected) > 32
+            or len(set(expected)) != len(expected)
+            or not all(value and len(value) <= 128 for value in expected)
+            or keep_revision_id not in expected
+        ):
+            raise WorkshopMemoryValidationError("Choose one of the competing versions")
+        losers = tuple(MemoryRevisionId(value) for value in sorted(set(expected) - {keep_revision_id}))
+        reason = "Owner resolved the conflict" + (f": {checked_note}" if checked_note else "")
+        owner = self._owner_pair(authority)
+        idempotency_key = f"memory-conflict-resolve:{authority.principal_id}:{operation_id}"
+        lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
+        async with lock:
+            if not await self._owns_claim(owner, checked_claim):
+                raise WorkshopMemoryNotFound("Memory not found")
+            prior = await self._store.event_by_idempotency_key(idempotency_key)
+            if prior is not None:
+                payload = prior.envelope.payload
+                if (
+                    str(prior.envelope.aggregate_id) != checked_claim
+                    or payload.get("winner_revision_id") != keep_revision_id
+                    or sorted(payload.get("loser_revision_ids") or []) != [str(value) for value in losers]
+                    or payload.get("reason") != reason
+                ):
+                    raise WorkshopMemoryValidationError("This operation was already used for a different request")
+                return MemoryLifecycleOutcome(
+                    checked_claim, keep_revision_id, True, await self._claim_memory_id(checked_claim)
+                )
+            current = {
+                revision_id for revision_id, _content, _stored in await self._unresolved_revisions(checked_claim)
+            }
+            if current != set(expected):
+                raise WorkshopMemoryConflictChanged()
+            lifecycle_authority = await self._fact_lifecycle.authority_for(
+                authority.principal_id,
+                RuntimeProfileId(owner[1]),
+            )
+            try:
+                mutation = await self._fact_lifecycle.resolve_conflict(
+                    lifecycle_authority,
+                    MemoryClaimId(checked_claim),
+                    MemoryRevisionId(keep_revision_id),
+                    losers,
+                    reason=reason,
+                    idempotency_key=idempotency_key,
+                )
+            except FactLifecycleConflict as exc:
+                # The unresolved set changed between the check above and the
+                # lifecycle commit; projection refused the stale settlement.
+                raise WorkshopMemoryConflictChanged() from exc
+        if mutation.projection_status != "succeeded":
+            raise WorkshopMemoryMutationFailed("The conflict is resolved, but its search projection is pending")
+        return MemoryLifecycleOutcome(
+            checked_claim,
+            str(mutation.revision_id),
+            mutation.replayed,
+            await self._claim_memory_id(checked_claim),
+        )
+
+    async def list_forgotten(self, authority: MemoryQueryAuthority) -> MemoryReviewList[MemoryForgottenSummary]:
+        """List the owner's claims with no current truth whose latest revision was retracted or expired."""
+        owner = self._owner_pair(authority)
+        latest = (
+            "FROM memory_fact_claims c "
+            "JOIN memory_fact_revisions r ON r.claim_id = c.claim_id AND r.created_event_position = ("
+            "SELECT MAX(latest.created_event_position) FROM memory_fact_revisions latest "
+            "WHERE latest.claim_id = c.claim_id) "
+            "JOIN memory_fact_revision_states s ON s.claim_id = r.claim_id AND s.revision_id = r.revision_id "
+            "WHERE c.owner_principal_id = ? AND c.runtime_profile_id = ? AND s.state IN ('retracted', 'expired') "
+            "AND NOT EXISTS (SELECT 1 FROM memory_fact_revision_states current "
+            "WHERE current.claim_id = c.claim_id AND current.state IN ('active', 'unresolved_conflict'))"
+        )
+        async with self._store.connection.execute(f"SELECT COUNT(*) {latest}", owner) as cursor:
+            total_row = await cursor.fetchone()
+        async with self._store.connection.execute(
+            "SELECT c.claim_id, c.scope_kind, c.scope_key, s.state, r.revision_id, s.updated_at, "
+            f"s.state_reason, r.content {latest} ORDER BY s.updated_at DESC, c.claim_id LIMIT ?",
+            (*owner, MAX_REVIEW_ITEMS),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        items = tuple(
+            MemoryForgottenSummary(
+                claim_id=str(row[0]),
+                scope_kind=str(row[1]),
+                scope_key=str(row[2]) or None,
+                state=str(row[3]),
+                revision_id=str(row[4]),
+                changed_at=str(row[5]),
+                reason=str(row[6]),
+                preview=_review_preview(str(row[7])),
+            )
+            for row in rows
+        )
+        return MemoryReviewList(items, int(total_row[0]) if total_row is not None else 0)
+
+    async def restore_fact(
+        self,
+        authority: MemoryQueryAuthority,
+        claim_id: str,
+        *,
+        revision_id: str,
+        note: str,
+        client_operation_id: str,
+    ) -> MemoryLifecycleOutcome:
+        """
+        Restore a forgotten or expired fact to current truth.
+
+        The new revision copies the prior revision's content, scope, and
+        vector metadata (tags, source, speaker, confidence), becomes valid
+        from now, and has no end date: restoring an expired fact with its
+        old end date would expire it again immediately.
+
+        Raises:
+            WorkshopMemoryValidationError: Malformed input, or the operation
+                id was already used for a different request.
+            WorkshopMemoryNotFound: The claim is not the owner's, or the
+                revision is not its latest retracted or expired revision.
+            WorkshopMemoryConflictChanged: The claim gained current truth.
+            WorkshopMemoryMutationFailed: Restored canonically, but the
+                search projection did not complete.
+        """
+        checked_claim = self._validate_claim_id(claim_id)
+        operation_id = self._validate_request_id(client_operation_id)
+        checked_note = self._validate_note(note)
+        if not isinstance(revision_id, str) or not revision_id or len(revision_id) > 128:
+            raise WorkshopMemoryValidationError("Invalid memory revision")
+        reason = "Owner restored the fact" + (f": {checked_note}" if checked_note else "")
+        owner = self._owner_pair(authority)
+        idempotency_key = f"memory-fact-restore:{authority.principal_id}:{operation_id}"
+        lock = self._mutation_locks.setdefault(authority.principal_id, asyncio.Lock())
+        async with lock:
+            if not await self._owns_claim(owner, checked_claim):
+                raise WorkshopMemoryNotFound("Memory not found")
+            prior_event = await self._store.event_by_idempotency_key(idempotency_key)
+            if prior_event is not None:
+                payload = prior_event.envelope.payload
+                if (
+                    str(prior_event.envelope.aggregate_id) != checked_claim
+                    or payload.get("prior_revision_id") != revision_id
+                    or payload.get("reason") != reason
+                ):
+                    raise WorkshopMemoryValidationError("This operation was already used for a different request")
+                restored = payload.get("revision")
+                restored_id = restored.get("revision_id") if isinstance(restored, dict) else None
+                return MemoryLifecycleOutcome(
+                    checked_claim, str(restored_id), True, await self._claim_memory_id(checked_claim)
+                )
+            async with self._store.connection.execute(
+                "SELECT r.content, r.asserted_at, r.observed_at, r.migration_classification, r.migration_gaps_json, "
+                "r.vector_metadata_json, c.scope_kind, c.scope_key, s.state, "
+                "(SELECT MAX(latest.created_event_position) FROM memory_fact_revisions latest "
+                "WHERE latest.claim_id = c.claim_id) = r.created_event_position, "
+                "(SELECT COUNT(*) FROM memory_fact_revision_states current "
+                "WHERE current.claim_id = c.claim_id AND current.state IN ('active', 'unresolved_conflict')), "
+                "r.admission_authority "
+                "FROM memory_fact_revisions r JOIN memory_fact_claims c ON c.claim_id = r.claim_id "
+                "JOIN memory_fact_revision_states s ON s.claim_id = r.claim_id AND s.revision_id = r.revision_id "
+                "WHERE r.claim_id = ? AND r.revision_id = ?",
+                (checked_claim, revision_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or not bool(row[9]) or str(row[8]) not in {"retracted", "expired"}:
+                raise WorkshopMemoryNotFound("Memory not found")
+            if int(row[10]) != 0:
+                raise WorkshopMemoryConflictChanged()
+            metadata = json.loads(str(row[5])) if row[5] else {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            confidence = metadata.get("confidence")
+            now = datetime.now(UTC)
+            spec = FactRevisionInput(
+                content=str(row[0]),
+                scope_kind=str(row[6]),
+                scope_key=str(row[7] or ""),
+                reason=reason,
+                evidence=({"kind": "operator", "reference_id": operation_id, "sha256": None},),
+                vector_metadata=metadata,
+                confidence=(
+                    float(confidence)
+                    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+                    else 1.0
+                ),
+                asserted_at=_parse_stored_time(row[1]),
+                observed_at=_parse_stored_time(row[2]),
+                valid_from=now,
+                valid_until=None,
+                migration_classification=str(row[3]),
+                migration_gaps=tuple(str(value) for value in _stored_json_list(row[4])),
+                # Keep the prior admission: a fact the owner or operator had
+                # admitted must not come back quarantined just because the
+                # restore is a new revision.
+                admission_authority=str(row[11]),
+            )
+            lifecycle_authority = await self._fact_lifecycle.authority_for(
+                authority.principal_id,
+                RuntimeProfileId(owner[1]),
+            )
+            try:
+                mutation = await self._fact_lifecycle.restore(
+                    lifecycle_authority,
+                    MemoryClaimId(checked_claim),
+                    MemoryRevisionId(revision_id),
+                    spec,
+                    idempotency_key=idempotency_key,
+                )
+            except FactLifecycleConflict as exc:
+                raise WorkshopMemoryConflictChanged() from exc
+        if mutation.projection_status != "succeeded":
+            raise WorkshopMemoryMutationFailed("The fact is restored, but its search projection is pending")
+        return MemoryLifecycleOutcome(
+            checked_claim,
+            str(mutation.revision_id),
+            mutation.replayed,
+            await self._claim_memory_id(checked_claim),
+        )
+
+    async def _claim_memory_id(self, claim_id: str) -> str | None:
+        """
+        Return the vector memory id of the claim's newest succeeded projection.
+
+        The explorer addresses facts by vector memory id, not claim id. A
+        resolution recreates the row through an upsert and a restore
+        replaces it, so the newest succeeded operation that names a memory
+        id is the row the owner can open next. Delete operations are
+        excluded because any id they carry names a row that is gone.
+        """
+        async with self._store.connection.execute(
+            "SELECT memory_id FROM memory_fact_vector_operations "
+            "WHERE claim_id = ? AND status = 'succeeded' AND operation != 'delete' AND memory_id IS NOT NULL "
+            "ORDER BY event_position DESC LIMIT 1",
+            (claim_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row[0]) if row is not None else None
+
+    async def unresolved_conflict_count(self, authority: MemoryQueryAuthority) -> int:
+        """Count the owner's conflicted claims; zero when no runtime profile is unambiguous."""
+        if authority.search_namespace is None:
+            return 0
+        owner = self._owner_pair(authority)
+        async with self._store.connection.execute(
+            "SELECT COUNT(*) FROM memory_fact_claims c WHERE c.owner_principal_id = ? AND c.runtime_profile_id = ? "
+            "AND EXISTS (SELECT 1 FROM memory_fact_revision_states s "
+            "WHERE s.claim_id = c.claim_id AND s.state = 'unresolved_conflict')",
+            owner,
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row is not None else 0
 
     async def _awaiting_reconciliation(self, authority: MemoryQueryAuthority, memory_id: str) -> bool:
         """

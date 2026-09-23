@@ -231,6 +231,7 @@ from kai.workshop.memory_queries import (
     MemoryEditSnapshot,
     MemoryEpisodeEdit,
     MemoryFactEdit,
+    MemoryLifecycleOutcome,
     MemoryMutationBatch,
     MemoryQueryAuthority,
     MemoryQueryFilters,
@@ -241,6 +242,7 @@ from kai.workshop.memory_queries import (
     WorkshopMemoryAccessDenied,
     WorkshopMemoryAwaitingReconciliation,
     WorkshopMemoryConflict,
+    WorkshopMemoryConflictChanged,
     WorkshopMemoryMutationFailed,
     WorkshopMemoryNotFound,
     WorkshopMemoryQueryError,
@@ -540,6 +542,11 @@ _MEMORY_SOURCE_PATH = "/v1/memory/records/{memory_id}/source"
 _MEMORY_SCOPE_PATH = "/v1/memory/records/{memory_id}/scope"
 _MEMORY_BULK_SCOPE_PATH = "/v1/memory/actions/scope"
 _MEMORY_BULK_DELETE_PATH = "/v1/memory/actions/delete"
+_MEMORY_CONFLICTS_PATH = "/v1/memory/conflicts"
+_MEMORY_CONFLICT_PATH = "/v1/memory/conflicts/{claim_id}"
+_MEMORY_CONFLICT_RESOLVE_PATH = "/v1/memory/conflicts/{claim_id}/resolve"
+_MEMORY_FORGOTTEN_PATH = "/v1/memory/forgotten"
+_MEMORY_FORGOTTEN_RESTORE_PATH = "/v1/memory/forgotten/{claim_id}/restore"
 _MEMORY_RECONCILIATION_PATH = "/v1/memory/reconciliation"
 _MEMORY_RECONCILIATION_CANDIDATES_PATH = "/v1/memory/reconciliation/{audit_id}/candidates"
 _MEMORY_RECONCILIATION_DECISION_PATH = "/v1/memory/reconciliation/{audit_id}/candidates/{candidate_id}/decision"
@@ -1944,6 +1951,8 @@ def _memory_error_response(exc: Exception) -> web.Response:
             },
             status=409,
         )
+    if isinstance(exc, WorkshopMemoryConflictChanged):
+        return _error_response(status=409, code="memory_conflict_changed", message=str(exc))
     if isinstance(exc, WorkshopMemoryAwaitingReconciliation):
         return _error_response(status=409, code="memory_awaiting_reconciliation", message=str(exc))
     if isinstance(exc, WorkshopMemoryMutationFailed):
@@ -2484,10 +2493,202 @@ async def _handle_memory_stats(
                     }
                     for project in stats.allowed_projects
                 ],
+                "unresolved_conflicts": stats.unresolved_conflicts,
             },
         },
         status=200,
     )
+
+
+# ── Owner memory review: conflicts and forgotten facts ────────────────
+
+
+async def _handle_memory_conflicts(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """List the signed-in owner's unresolved fact conflicts."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        listing = await service.list_conflicts(authority)
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "total": listing.total,
+            "conflicts": [
+                {
+                    "claim_id": item.claim_id,
+                    "scope": {"kind": item.scope_kind, "key": item.scope_key},
+                    "opened_at": item.opened_at,
+                    "revisions": [
+                        {
+                            "revision_id": revision.revision_id,
+                            "preview": revision.preview,
+                            "stored_at": revision.stored_at,
+                        }
+                        for revision in item.revisions
+                    ],
+                }
+                for item in listing.items
+            ],
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_conflict_detail(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """Return the full lifecycle of one conflicted claim."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        lifecycle = await service.conflict_detail(authority, request.match_info["claim_id"])
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response({"version": 1, "lifecycle": lifecycle}, status=200)
+
+
+async def _handle_memory_conflict_resolve(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """Keep one competing revision of a conflicted claim."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory mutation request")
+    assert authority is not None
+    try:
+        payload = await _memory_mutation_payload(
+            request,
+            allowed_fields=frozenset({"keep_revision_id", "expected_revision_ids", "note", "client_operation_id"}),
+        )
+        keep = payload.get("keep_revision_id")
+        expected = payload.get("expected_revision_ids")
+        note = payload.get("note")
+        operation_id = payload.get("client_operation_id")
+        if (
+            not isinstance(keep, str)
+            or not isinstance(expected, list)
+            or not all(isinstance(item, str) for item in expected)
+            or not isinstance(note, str)
+            or not isinstance(operation_id, str)
+        ):
+            raise WorkshopMemoryValidationError("Invalid memory mutation request")
+        outcome = await service.resolve_conflict(
+            authority,
+            request.match_info["claim_id"],
+            keep_revision_id=keep,
+            expected_revision_ids=expected,
+            note=note,
+            client_operation_id=operation_id,
+        )
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(_serialize_memory_lifecycle_outcome(outcome), status=200)
+
+
+async def _handle_memory_forgotten(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """List the signed-in owner's retracted or expired facts that can be restored."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory request")
+    assert authority is not None
+    try:
+        listing = await service.list_forgotten(authority)
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(
+        {
+            "version": 1,
+            "total": listing.total,
+            "facts": [
+                {
+                    "claim_id": item.claim_id,
+                    "scope": {"kind": item.scope_kind, "key": item.scope_key},
+                    "state": item.state,
+                    "revision_id": item.revision_id,
+                    "changed_at": item.changed_at,
+                    "reason": item.reason,
+                    "preview": item.preview,
+                }
+                for item in listing.items
+            ],
+        },
+        status=200,
+    )
+
+
+async def _handle_memory_forgotten_restore(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """Restore a forgotten or expired fact to current truth."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory mutation request")
+    assert authority is not None
+    try:
+        payload = await _memory_mutation_payload(
+            request,
+            allowed_fields=frozenset({"revision_id", "note", "client_operation_id"}),
+        )
+        revision_id = payload.get("revision_id")
+        note = payload.get("note")
+        operation_id = payload.get("client_operation_id")
+        if not isinstance(revision_id, str) or not isinstance(note, str) or not isinstance(operation_id, str):
+            raise WorkshopMemoryValidationError("Invalid memory mutation request")
+        outcome = await service.restore_fact(
+            authority,
+            request.match_info["claim_id"],
+            revision_id=revision_id,
+            note=note,
+            client_operation_id=operation_id,
+        )
+    except (KeyError, WorkshopMemoryQueryError) as exc:
+        return _memory_error_response(exc)
+    return _json_response(_serialize_memory_lifecycle_outcome(outcome), status=200)
+
+
+def _serialize_memory_lifecycle_outcome(outcome: MemoryLifecycleOutcome) -> dict[str, object]:
+    return {
+        "version": 1,
+        "claim_id": outcome.claim_id,
+        "active_revision_id": outcome.active_revision_id,
+        "replayed": outcome.replayed,
+        "memory_id": outcome.memory_id,
+    }
 
 
 async def _handle_memory_records(
@@ -11884,6 +12085,38 @@ def register_workshop_read_routes(
                     bulk=False,
                 )
 
+        async def handle_memory_conflicts(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_conflicts(request, authenticator=authenticator, service=memory_queries)
+
+        async def handle_memory_conflict_detail(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_conflict_detail(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_conflict_resolve(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_conflict_resolve(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
+        async def handle_memory_forgotten(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_forgotten(request, authenticator=authenticator, service=memory_queries)
+
+        async def handle_memory_forgotten_restore(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_forgotten_restore(
+                    request,
+                    authenticator=authenticator,
+                    service=memory_queries,
+                )
+
         async def handle_memory_bulk_delete_mutation(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_memory_delete_mutation(
@@ -11992,6 +12225,9 @@ def register_workshop_read_routes(
             entrypoint="memory_create",
         )
         app.router.add_get(_MEMORY_SEARCH_PATH, handle_memory_search)
+        app.router.add_get(_MEMORY_CONFLICTS_PATH, handle_memory_conflicts)
+        app.router.add_get(_MEMORY_CONFLICT_PATH, handle_memory_conflict_detail)
+        app.router.add_get(_MEMORY_FORGOTTEN_PATH, handle_memory_forgotten)
         app.router.add_get(_MEMORY_DETAIL_PATH, handle_memory_detail)
         _register_workshop_capability_route(
             app,
@@ -12068,6 +12304,8 @@ def register_workshop_read_routes(
             ("DELETE", _MEMORY_DETAIL_PATH, handle_memory_delete_mutation, "memory_delete"),
             ("POST", _MEMORY_BULK_SCOPE_PATH, handle_memory_bulk_scope_mutation, "memory_bulk_scope"),
             ("POST", _MEMORY_BULK_DELETE_PATH, handle_memory_bulk_delete_mutation, "memory_bulk_delete"),
+            ("POST", _MEMORY_CONFLICT_RESOLVE_PATH, handle_memory_conflict_resolve, "memory_conflict_resolve"),
+            ("POST", _MEMORY_FORGOTTEN_RESTORE_PATH, handle_memory_forgotten_restore, "memory_fact_restore"),
         ):
             _register_workshop_capability_route(
                 app,

@@ -1211,7 +1211,12 @@ export interface WorkshopMemoryDetail extends WorkshopMemoryRecord {
 
 export interface WorkshopMemoryLifecycleRevision {
   assertedAt?: string | null;
+  // Operator-assigned retrieval admission of this revision, such as
+  // "provenance_verified" or "quarantined". Only fact revisions carry it.
+  admissionAuthority?: string;
   backend?: string | null;
+  // Extraction confidence stored with the revision, when one was recorded.
+  confidence?: number | null;
   content: string;
   evidence?: unknown[];
   migrationClassification?: string;
@@ -1305,6 +1310,51 @@ export interface WorkshopMemoryStats {
   episodes: number;
   facts: number;
   total: number;
+  // Claims waiting on an owner decision; drives the Fact review badge.
+  unresolvedConflicts: number;
+}
+
+// One side of an unresolved fact conflict, as shown in the review list.
+export interface WorkshopMemoryConflictRevision {
+  preview: string;
+  revisionId: string;
+  storedAt: string;
+}
+
+// A canonical fact claim whose competing revisions wait on the owner.
+// Conflicted claims have no vector row, so these come from the canonical
+// tables rather than the memory list.
+export interface WorkshopMemoryConflictSummary {
+  claimId: string;
+  openedAt: string;
+  revisions: WorkshopMemoryConflictRevision[];
+  scope: { kind: string; key: string | null };
+}
+
+// A fact with no current truth whose latest revision was retracted or
+// expired, and which the owner may restore.
+export interface WorkshopMemoryForgottenFact {
+  changedAt: string;
+  claimId: string;
+  preview: string;
+  reason: string;
+  revisionId: string;
+  scope: { kind: string; key: string | null };
+  state: "retracted" | "expired";
+}
+
+export interface WorkshopMemoryReviewList<T> {
+  items: T[];
+  total: number;
+}
+
+// Result of keeping a conflict revision or restoring a forgotten fact.
+export interface WorkshopMemoryLifecycleOutcome {
+  activeRevisionId: string;
+  claimId: string;
+  // Vector memory id to open the fact in the explorer, when projected.
+  memoryId: string | null;
+  replayed: boolean;
 }
 
 export interface WorkshopMemoryProjectOption {
