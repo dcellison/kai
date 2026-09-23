@@ -23,16 +23,17 @@ from kai import memory, memory_reconciliation
 from kai.workshop.diagnostics import workshop_memory_current_truth_status
 from kai.workshop.memory_queries import WorkshopMemoryMutationFailed
 from kai.workshop.memory_reconciliation_review import record_reconciliation_audit
-from tests.test_memory_canonical_write_path import (  # noqa: F401 - pytest fixture import
+from tests.memory_fixtures import (  # noqa: F401 - pytest fixture import
     NOW,
     PRINCIPAL_ID,
     RUNTIME_ID,
     _new,
+    _query_service,
     _recall,
     _store_fact,
     protected,
 )
-from tests.test_memory_owner_review import _conflict, _query_service
+from tests.test_memory_owner_review import _conflict
 
 
 def _agent_metadata(**overrides: object) -> dict[str, object]:

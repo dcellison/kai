@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import unicodedata
 from datetime import UTC, datetime
@@ -47,6 +48,8 @@ from kai.workshop.domain import (
 )
 from kai.workshop.human_handles import normalize_human_handle
 from kai.workshop.store import StoredEvent
+
+log = logging.getLogger(__name__)
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -2094,6 +2097,73 @@ async def _apply_agent_delegation_event(
     )
 
 
+# The vector outbox tables whose outcomes a rebuild must carry over. Each
+# row is created by replaying a memory event, but its outcome (whether the
+# vector store accepted it, and under which row id) comes from executing
+# the outbox, which no event records.
+_MEMORY_VECTOR_OUTCOME_TABLES = (
+    ("memory_fact_vector_operations", "canonical_rebuild_memory_fact_vector_outcomes", "claim_id"),
+    ("memory_episode_vector_operations", "canonical_rebuild_memory_episode_vector_outcomes", "episode_id"),
+)
+_MEMORY_VECTOR_OUTCOME_COLUMNS = (
+    "status",
+    "memory_id",
+    "attempt_count",
+    "last_error_code",
+    "updated_at",
+    "completed_at",
+)
+
+
+async def _snapshot_memory_vector_outcomes(connection: aiosqlite.Connection, existing_tables: set[str]) -> None:
+    """
+    Copy vector outbox outcomes aside before a rebuild resets them.
+
+    Replay recreates every outbox row as pending with no row id. Without
+    the outcomes the current-truth gate would admit nothing until recovery
+    re-projected every revision, and recovery, not knowing the existing
+    row ids, would add a second vector row per fact and orphan the first.
+    """
+    for table, snapshot, item_column in _MEMORY_VECTOR_OUTCOME_TABLES:
+        if table not in existing_tables:
+            continue
+        await connection.execute(f"DROP TABLE IF EXISTS temp.{snapshot}")
+        await connection.execute(
+            f"CREATE TEMP TABLE {snapshot} AS SELECT event_position, {item_column}, "
+            f"{', '.join(_MEMORY_VECTOR_OUTCOME_COLUMNS)} FROM {table}"
+        )
+
+
+async def _restore_memory_vector_outcomes(connection: aiosqlite.Connection, temporary_tables: set[str]) -> None:
+    """
+    Put saved vector outbox outcomes back onto the replayed rows.
+
+    Rows are matched by event position, the outbox key, and must name the
+    same claim or episode; a saved outcome whose row did not come back is
+    dropped and counted in the log rather than attached to something else.
+    """
+    for table, snapshot, item_column in _MEMORY_VECTOR_OUTCOME_TABLES:
+        if snapshot not in temporary_tables:
+            continue
+        match = (
+            f"FROM {snapshot} saved WHERE saved.event_position = {table}.event_position "
+            f"AND saved.{item_column} = {table}.{item_column}"
+        )
+        assignments = ", ".join(
+            f"{column} = (SELECT saved.{column} {match})" for column in _MEMORY_VECTOR_OUTCOME_COLUMNS
+        )
+        await connection.execute(f"UPDATE {table} SET {assignments} WHERE EXISTS (SELECT 1 {match})")
+        async with connection.execute(
+            f"SELECT COUNT(*) FROM {snapshot} saved WHERE NOT EXISTS (SELECT 1 FROM {table} replayed "
+            f"WHERE replayed.event_position = saved.event_position AND replayed.{item_column} = saved.{item_column})"
+        ) as cursor:
+            row = await cursor.fetchone()
+        dropped = int(row[0]) if row is not None else 0
+        if dropped:
+            log.warning("Rebuild dropped %d %s outcome(s) whose event no longer replays", dropped, table)
+        await connection.execute(f"DROP TABLE {snapshot}")
+
+
 class CanonicalConversationProjection:
     """Rebuild the initial Workshop collaboration records from events."""
 
@@ -2112,6 +2182,7 @@ class CanonicalConversationProjection:
         await connection.execute("PRAGMA defer_foreign_keys = ON")
         async with connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cursor:
             existing_tables = {str(row[0]) for row in await cursor.fetchall()}
+        await _snapshot_memory_vector_outcomes(connection, existing_tables)
         if "agent_provisioning_operations" not in existing_tables:
             return
         await connection.execute("DROP TABLE IF EXISTS temp.canonical_rebuild_agent_provisioning_receipts")
@@ -2131,6 +2202,7 @@ class CanonicalConversationProjection:
         """Restore durable coordination rows after their references are replayed."""
         async with connection.execute("SELECT name FROM sqlite_temp_master WHERE type = 'table'") as cursor:
             temporary_tables = {str(row[0]) for row in await cursor.fetchall()}
+        await _restore_memory_vector_outcomes(connection, temporary_tables)
         if "canonical_rebuild_agent_provisioning_operations" not in temporary_tables:
             return
         await connection.execute(
