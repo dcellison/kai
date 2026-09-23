@@ -7,8 +7,10 @@ review before ``apply`` will emit canonical fact/episode lifecycle events.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -39,8 +41,19 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 _CURRENT_WORDS = frozenset({"currently", "current", "now", "today", "latest"})
 
 
+log = logging.getLogger(__name__)
+
+
 class MemoryReconciliationError(RuntimeError):
     """A reconciliation artifact or requested mutation is unsafe."""
+
+
+class MemoryReconciliationDrift(MemoryReconciliationError):
+    """A memory row the review approved changed or disappeared after review."""
+
+
+class MemoryReconciliationApplyInProgress(MemoryReconciliationError):
+    """An unfinished apply of different decisions exists for this audit."""
 
 
 def _canonical(value: object) -> str:
@@ -205,9 +218,18 @@ def build_audit(
     runtime_profile_id: str,
     rows: list[MemoryResult],
     prior_decisions: set[tuple[str, str]] = frozenset(),
+    prior_rejected_rows: dict[str, str] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Build a deterministic candidate report without mutating memory."""
+    """
+    Build a deterministic candidate report without mutating memory.
+
+    `prior_decisions` suppresses raw candidates a receipt already rejected
+    or deferred. `prior_rejected_rows` maps memory ids an applied review
+    rejected to the review state they were rejected in; such a row is left
+    out of every candidate while it is unchanged, and reviewed again once
+    its text or metadata differ from what the reviewer saw.
+    """
     observed_at = (now or datetime.now(UTC)).astimezone(UTC)
     snapshots = [_row_snapshot(row) for row in sorted(rows, key=lambda item: item.id)]
     legacy = [
@@ -216,6 +238,10 @@ def build_audit(
         if not row["metadata"].get("canonical_memory_revision_id")
         and not row["metadata"].get("canonical_memory_episode_id")
     ]
+    rejected_states = prior_rejected_rows or {}
+    reviewed_legacy = len(legacy)
+    legacy = [row for row in legacy if rejected_states.get(str(row["memory_id"])) != row_review_state(row)]
+    suppressed_rejected_rows = reviewed_legacy - len(legacy)
     facts = [row for row in legacy if row["kind"] == "fact"]
     episodes = [row for row in legacy if row["kind"] == "episode"]
     candidates: list[dict[str, Any]] = []
@@ -342,6 +368,7 @@ def build_audit(
         "corpus_count": len(snapshots),
         "candidate_count": len(visible),
         "suppressed_unchanged_count": len(unique) - len(visible),
+        "suppressed_rejected_rows": suppressed_rejected_rows,
         "candidates": visible,
     }
     document["sha256"] = _document_digest(document)
@@ -638,8 +665,13 @@ def _fact_spec(
     reason: str,
     action: dict[str, Any] | None = None,
     evidence_rows: list[dict[str, Any]] | None = None,
+    observed_at: datetime | None = None,
 ) -> FactRevisionInput:
-    now = datetime.now(UTC)
+    # Legacy rows often lack assertion and observation times. The fallback
+    # is when reconciliation observed the row (the audit time) rather than
+    # the moment of each apply attempt, so a retry builds exactly the same
+    # revision and its idempotency key replays instead of conflicting.
+    now = observed_at or datetime.now(UTC)
     metadata = dict(row["metadata"])
     metadata["_canonical_adopt_memory_id"] = row["memory_id"]
     replacement = action.get("replacement", {}) if action is not None else {}
@@ -680,7 +712,7 @@ def _fact_spec(
     )
 
 
-def _episode_spec(row: dict[str, Any], *, receipt_id: str) -> EpisodeInput:
+def _episode_spec(row: dict[str, Any], *, receipt_id: str, observed_at: datetime | None = None) -> EpisodeInput:
     metadata = dict(row["metadata"])
     content = str(row["text"])
     scope = row["scope"] if row["scope"] in {"global", "project"} else "global"
@@ -704,7 +736,8 @@ def _episode_spec(row: dict[str, Any], *, receipt_id: str) -> EpisodeInput:
         vector_metadata=metadata,
         occurred_from=_parse_time(row["occurred_from"]) or _parse_time(row["created_at"]),
         occurred_until=_parse_time(row["occurred_until"]),
-        observed_at=_parse_time(row["observed_at"]) or datetime.now(UTC),
+        # Same stable fallback as `_fact_spec`, for the same replay reason.
+        observed_at=_parse_time(row["observed_at"]) or observed_at or datetime.now(UTC),
         backend=row["backend"],
         provider=row["provider"],
         model=row["model"],
@@ -716,16 +749,263 @@ def _episode_spec(row: dict[str, Any], *, receipt_id: str) -> EpisodeInput:
     )
 
 
+def _row_review_state(text: str, metadata: dict[str, Any]) -> str:
+    """
+    Digest the parts of a memory row a review decision was made about.
+
+    Used both to detect drift before apply and to carry reject and defer
+    decisions into later audits: a decision holds only while the row's
+    text and metadata are what the reviewer saw.
+    """
+    return _digest({"text_sha256": hashlib.sha256(text.encode()).hexdigest(), "metadata_sha256": _digest(metadata)})
+
+
+def row_review_state(row: dict[str, Any]) -> str:
+    """Review state of an audit evidence row, as `_row_review_state` defines it."""
+    return _row_review_state(str(row["text"]), dict(row["metadata"]))
+
+
+async def _adopted_by_receipt(store: WorkshopEventStore, receipt_id: str, memory_id: str) -> bool:
+    """
+    Return True when a revision written under this receipt adopted the row.
+
+    Every revision apply writes cites the receipt as operator evidence and
+    records the legacy row it adopted, so this recognizes a row this same
+    run already rewrote (or retired and deleted) before it could record
+    its progress.
+    """
+    async with store.connection.execute(
+        "SELECT 1 FROM memory_fact_revisions r, json_each(r.evidence_json) AS evidence "
+        "WHERE json_extract(r.vector_metadata_json, '$._canonical_adopt_memory_id') = ? "
+        "AND json_extract(evidence.value, '$.kind') = 'operator' "
+        "AND json_extract(evidence.value, '$.reference_id') = ? LIMIT 1",
+        (memory_id, receipt_id),
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
+async def _verify_apply_evidence(
+    candidates: list[dict[str, Any]],
+    *,
+    principal_id: str,
+    runtime_profile_id: str,
+    store: WorkshopEventStore,
+    receipt_id: str,
+) -> None:
+    """
+    Require every row apply is about to change to be exactly as reviewed.
+
+    Only the rows of approved candidates that have not been applied are
+    read, one by one. Rows written after the audit, rows the review did
+    not approve, and rows an earlier attempt already rewrote are not part
+    of the decision being carried out, so they cannot block it.
+
+    A row that looks changed or gone is still accepted when this run's own
+    receipt adopted it: the process stopped after the candidate's writes
+    but before its progress row, and the retry replays those writes under
+    the same keys instead of repeating them.
+
+    Raises:
+        MemoryReconciliationDrift: A row is gone or changed.
+        memory.LifecycleProjectionReadError: A row could not be read; the
+            apply fails and can be retried.
+    """
+    from kai import memory
+
+    for candidate in candidates:
+        for row in candidate["evidence"]:
+            current = await asyncio.to_thread(
+                memory.get_by_id_for_lifecycle_projection,
+                user_id=principal_id,
+                memory_id=str(row["memory_id"]),
+                runtime_profile_id=runtime_profile_id,
+            )
+            unchanged = current is not None and _row_review_state(
+                current.text, dict(current.metadata or {})
+            ) == row_review_state(row)
+            if unchanged or await _adopted_by_receipt(store, receipt_id, str(row["memory_id"])):
+                continue
+            if current is None:
+                raise MemoryReconciliationDrift("A reviewed memory no longer exists; create a fresh audit")
+            raise MemoryReconciliationDrift("A reviewed memory changed after review; create a fresh audit")
+
+
+async def _begin_apply_run(
+    store: WorkshopEventStore,
+    audit: dict[str, Any],
+    review: dict[str, Any],
+    receipt_id: str,
+) -> dict[str, tuple[str, dict[str, Any]]]:
+    """
+    Start or resume the audit's apply run; return finished candidates.
+
+    Returns a map of candidate id to (decision digest, recorded progress).
+    A run already bound to a different review is refused, because its
+    finished steps were keyed to that review's receipt id.
+    """
+    connection = store.connection
+    audit_id = str(audit["audit_id"])
+    async with connection.execute(
+        "SELECT review_sha256, completed_at FROM memory_reconciliation_apply_runs WHERE audit_id = ?",
+        (audit_id,),
+    ) as cursor:
+        run = await cursor.fetchone()
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    if run is None:
+        await connection.execute(
+            "INSERT INTO memory_reconciliation_apply_runs ("
+            "audit_id, principal_id, runtime_profile_id, review_sha256, receipt_id, started_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (audit_id, str(audit["principal_id"]), str(audit["runtime_profile_id"]), review["sha256"], receipt_id, now),
+        )
+    elif str(run[0]) != str(review["sha256"]):
+        raise MemoryReconciliationApplyInProgress(
+            "This audit already has an apply of different decisions; finish or inspect it first"
+        )
+    else:
+        await connection.execute(
+            "UPDATE memory_reconciliation_apply_runs SET attempts = attempts + 1, last_error = NULL "
+            "WHERE audit_id = ? AND completed_at IS NULL",
+            (audit_id,),
+        )
+    await connection.commit()
+    async with connection.execute(
+        "SELECT candidate_id, decision_sha256, applied_json FROM memory_reconciliation_apply_progress "
+        "WHERE audit_id = ?",
+        (audit_id,),
+    ) as cursor:
+        return {str(row[0]): (str(row[1]), json.loads(str(row[2]))) for row in await cursor.fetchall()}
+
+
+async def _record_apply_progress(
+    store: WorkshopEventStore,
+    audit_id: str,
+    candidate_id: str,
+    decision_sha256: str,
+    recorded: dict[str, Any],
+) -> None:
+    await store.connection.execute(
+        "INSERT INTO memory_reconciliation_apply_progress ("
+        "audit_id, candidate_id, decision_sha256, applied_json, completed_at) VALUES (?, ?, ?, ?, ?)",
+        (
+            audit_id,
+            candidate_id,
+            decision_sha256,
+            _canonical(recorded),
+            datetime.now(UTC).isoformat(timespec="seconds"),
+        ),
+    )
+    await store.connection.commit()
+
+
+async def _record_apply_failure(store: WorkshopEventStore, audit_id: str, error: str) -> None:
+    await store.connection.execute(
+        "UPDATE memory_reconciliation_apply_runs SET last_error = ? WHERE audit_id = ?",
+        (error[:128], audit_id),
+    )
+    await store.connection.commit()
+
+
+async def _complete_apply_run(store: WorkshopEventStore, audit_id: str) -> None:
+    await store.connection.execute(
+        "UPDATE memory_reconciliation_apply_runs SET completed_at = COALESCE(completed_at, ?), last_error = NULL "
+        "WHERE audit_id = ?",
+        (datetime.now(UTC).isoformat(timespec="seconds"), audit_id),
+    )
+    await store.connection.commit()
+
+
+async def _canonicalized_in_quarantine(store: WorkshopEventStore, receipt_id: str) -> int:
+    """
+    Count facts and episodes this receipt created that recall still excludes.
+
+    Every revision and episode apply writes cites the receipt as
+    `operator` evidence, so the count comes from canonical state rather
+    than from what the plan proposed.
+    """
+    total = 0
+    for query in (
+        "SELECT COUNT(*) FROM memory_fact_revisions r, json_each(r.evidence_json) AS evidence "
+        "WHERE r.admission_authority = 'quarantined' AND json_extract(evidence.value, '$.kind') = 'operator' "
+        "AND json_extract(evidence.value, '$.reference_id') = ?",
+        "SELECT COUNT(*) FROM memory_episodes e, json_each(e.evidence_json) AS evidence "
+        "WHERE e.admission_authority = 'quarantined' AND json_extract(evidence.value, '$.kind') = 'operator' "
+        "AND json_extract(evidence.value, '$.reference_id') = ?",
+    ):
+        async with store.connection.execute(query, (receipt_id,)) as cursor:
+            row = await cursor.fetchone()
+        total += int(row[0]) if row is not None else 0
+    return total
+
+
+async def _refresh_census_after_apply(
+    db_path: Path,
+    *,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> dict[str, Any] | None:
+    """
+    Recount the owner's unclassified legacy rows now that apply has settled some.
+
+    Apply has already committed, so a failed count must not undo it: the
+    receipt records None, the earlier census stays with its older time,
+    and the next service start counts again.
+    """
+    from kai.workshop.memory_legacy_census import refresh_legacy_census
+
+    try:
+        census = await asyncio.to_thread(
+            refresh_legacy_census, db_path, principal_id=principal_id, runtime_profile_id=runtime_profile_id
+        )
+    except Exception:
+        log.warning("Legacy memory census failed after reconciliation apply", exc_info=True)
+        return None
+    return {
+        "legacy_rows": census.legacy_rows,
+        "absorbed": census.absorbed,
+        "rejected": census.rejected,
+        "unclassified": census.unclassified,
+        "counted_at": census.counted_at,
+    }
+
+
+async def apply_in_progress(connection: Any, audit_id: str) -> bool:
+    """Return True while the audit has an apply run that has not finished."""
+    async with connection.execute(
+        "SELECT 1 FROM memory_reconciliation_apply_runs WHERE audit_id = ? AND completed_at IS NULL",
+        (audit_id,),
+    ) as cursor:
+        return await cursor.fetchone() is not None
+
+
 async def apply_review(
     *,
     db_path: Path,
     audit: dict[str, Any],
     review: dict[str, Any],
 ) -> dict[str, Any]:
-    """Apply only sealed approvals through canonical lifecycle services."""
+    """
+    Apply only sealed approvals through canonical lifecycle services, resumably.
+
+    A run row fixes the sealed review for the audit, so the receipt id and
+    every idempotency key derived from it stay the same on each retry.
+    After each approved candidate finishes, a progress row records its
+    receipt entry. A retry skips finished candidates and checks drift only
+    on rows it has yet to change, because apply itself rewrote the others.
+    A crash between a candidate's last write and its progress row is
+    safe: the retry runs the candidate again with the same keys, and the
+    lifecycle services replay rather than repeat those writes.
+
+    Raises:
+        MemoryReconciliationApplyInProgress: An unfinished run applies a
+            different review of the same audit.
+        MemoryReconciliationDrift: A row this apply would change no longer
+            matches the audit snapshot.
+    """
     validate_sealed_review(audit, review)
     candidates = {item["candidate_id"]: item for item in audit["candidates"]}
     receipt_id = f"mrr_{str(review['sha256'])[:32]}"
+    audit_time = _parse_time(audit.get("generated_at"))
     store = await WorkshopEventStore.open(db_path)
     applied: list[dict[str, Any]] = []
     # Canonical state commits even when a vector projection fails, so the
@@ -745,9 +1025,9 @@ async def apply_review(
         runtime = RuntimeProfileId(str(audit["runtime_profile_id"]))
         fact_authority = await fact_service.authority_for(principal, runtime)
         episode_authority = await episode_service.authority_for(principal, runtime)
-        for decision in review["decisions"]:
-            if decision["disposition"] != "approve":
-                continue
+
+        async def apply_candidate(decision: dict[str, Any]) -> None:
+            """Run one approved candidate's mutations and append its receipt entry."""
             candidate = candidates[decision["candidate_id"]]
             action = decision["action"]
             rows = list(candidate["evidence"])
@@ -760,7 +1040,7 @@ async def apply_review(
                 for index, row in enumerate(rows):
                     result = await episode_service.record(
                         episode_authority,
-                        _episode_spec(row, receipt_id=receipt_id),
+                        _episode_spec(row, receipt_id=receipt_id, observed_at=audit_time),
                         idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:{index}",
                     )
                     results.append(str(result.episode_id))
@@ -781,7 +1061,7 @@ async def apply_review(
                 applied.append(
                     {"candidate_id": decision["candidate_id"], "events": results, "projection": episode_statuses}
                 )
-                continue
+                return
             if any(row["kind"] != "fact" for row in rows):
                 raise MemoryReconciliationError("Fact action contains an episode row")
             mutations = []
@@ -800,6 +1080,7 @@ async def apply_review(
                         reason="Operator-corrected reconciliation of existing semantic memory.",
                         action=action,
                         evidence_rows=rows,
+                        observed_at=audit_time,
                     ),
                     idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:corrected",
                     stable_claim_key=f"reconciled:{decision['candidate_id']}",
@@ -814,7 +1095,7 @@ async def apply_review(
                         "projection": [status],
                     }
                 )
-                continue
+                return
             keeper = action.get("keeper_memory_id")
             if kind == "keep_first_retract_rest" and keeper not in {row["memory_id"] for row in rows}:
                 raise MemoryReconciliationError("Duplicate action keeper is not part of the candidate")
@@ -829,6 +1110,7 @@ async def apply_review(
                         receipt_id=receipt_id,
                         reason="Operator-reviewed reconciliation of existing semantic memory.",
                         evidence_rows=all_duplicate_evidence,
+                        observed_at=audit_time,
                     ),
                     idempotency_key=f"memory-reconcile:{receipt_id}:{decision['candidate_id']}:{index}:adopt",
                     stable_claim_key=f"legacy:{row['memory_id']}",
@@ -859,8 +1141,53 @@ async def apply_review(
                         )
                     )
             applied.append({"candidate_id": decision["candidate_id"], "events": mutations, "projection": statuses})
+
+        completed = await _begin_apply_run(store, audit, review, receipt_id)
+        approved = [decision for decision in review["decisions"] if decision["disposition"] == "approve"]
+        for decision in approved:
+            done = completed.get(str(decision["candidate_id"]))
+            if done is not None and done[0] != _digest(decision):
+                raise MemoryReconciliationError("A completed reconciliation step no longer matches its decision")
+        await _verify_apply_evidence(
+            [
+                candidates[decision["candidate_id"]]
+                for decision in approved
+                if str(decision["candidate_id"]) not in completed
+            ],
+            principal_id=str(principal),
+            runtime_profile_id=str(runtime),
+            store=store,
+            receipt_id=receipt_id,
+        )
+        try:
+            for decision in approved:
+                candidate_id = str(decision["candidate_id"])
+                if candidate_id in completed:
+                    # Finished by an earlier attempt: its writes are
+                    # committed, so its recorded entry stands in for them.
+                    _decision_sha256, recorded = completed[candidate_id]
+                    applied.append(recorded["entry"])
+                    projection_failures.extend(recorded["projection_failures"])
+                    continue
+                failures_before = len(projection_failures)
+                await apply_candidate(decision)
+                await _record_apply_progress(
+                    store,
+                    str(audit["audit_id"]),
+                    candidate_id,
+                    _digest(decision),
+                    {"entry": applied[-1], "projection_failures": projection_failures[failures_before:]},
+                )
+        except Exception as exc:
+            await _record_apply_failure(store, str(audit["audit_id"]), type(exc).__name__)
+            raise
+        await _complete_apply_run(store, str(audit["audit_id"]))
+        quarantined = await _canonicalized_in_quarantine(store, receipt_id)
     finally:
         await store.close()
+    legacy_census = await _refresh_census_after_apply(
+        db_path, principal_id=str(audit["principal_id"]), runtime_profile_id=str(audit["runtime_profile_id"])
+    )
     receipt: dict[str, Any] = {
         "kind": RECEIPT_KIND,
         "version": FORMAT_VERSION,
@@ -875,6 +1202,8 @@ async def apply_review(
         "decisions": review["decisions"],
         "applied": applied,
         "projection_failures": projection_failures,
+        "canonicalized_in_quarantine": quarantined,
+        "legacy_census": legacy_census,
     }
     receipt["sha256"] = _document_digest(receipt)
     return receipt

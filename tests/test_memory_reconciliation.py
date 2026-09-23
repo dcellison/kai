@@ -219,7 +219,14 @@ async def test_apply_routes_approval_through_fact_lifecycle_and_returns_receipt(
     sealed = reconciliation.seal_review(audit, review, reviewer="Daniel")
     calls: list[tuple[str, str]] = []
 
+    real_open = reconciliation.WorkshopEventStore.open
+    real_store = await real_open(tmp_path / "kai.db")
+
     class FakeStore:
+        """The real store's connection (apply records its run there) with the close observed."""
+
+        connection = real_store.connection
+
         async def close(self):
             calls.append(("store", "close"))
 
@@ -251,6 +258,12 @@ async def test_apply_routes_approval_through_fact_lifecycle_and_returns_receipt(
         return FakeStore()
 
     monkeypatch.setattr(reconciliation.WorkshopEventStore, "open", fake_open)
+
+    async def evidence_unchanged(*_args, **_kwargs) -> None:
+        return None
+
+    # The row-level drift check is covered with a real store elsewhere.
+    monkeypatch.setattr(reconciliation, "_verify_apply_evidence", evidence_unchanged)
     monkeypatch.setattr(reconciliation, "MemoryFactLifecycleService", FakeFactService)
     monkeypatch.setattr(reconciliation, "MemoryEpisodeHistoryService", FakeEpisodeService)
 
@@ -259,6 +272,7 @@ async def test_apply_routes_approval_through_fact_lifecycle_and_returns_receipt(
     assert receipt["kind"] == reconciliation.RECEIPT_KIND
     assert receipt["applied"][0]["candidate_id"] == audit["candidates"][0]["candidate_id"]
     assert receipt["applied"][0]["projection"] == ["failed"]
+    await real_store.close()
     assert receipt["projection_failures"] == [
         {
             "candidate_id": audit["candidates"][0]["candidate_id"],

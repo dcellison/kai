@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from kai import memory, memory_reconciliation
+from kai import memory_reconciliation
 from kai.config import ModelRole
 from kai.memory_reconciliation_triage import build_triage_plan, validate_triage_plan
 from kai.oneshot import OneShotError
@@ -25,11 +25,17 @@ from kai.workshop.memory_reconciliation_review import (
     MemoryReconciliationReviewError,
     MemoryReconciliationReviewNotFound,
     MemoryReconciliationReviewValidationError,
+    prior_reconciliation_row_dispositions,
 )
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
 
 log = logging.getLogger(__name__)
+
+# Decisions stay fixed while an apply run is unfinished: the run's
+# idempotency keys derive from the sealed decisions, so changing one
+# would let a retry repeat writes instead of replaying them.
+_APPLY_IN_PROGRESS = "An apply of this plan is unfinished; retry the apply to finish it before changing decisions"
 
 PROMPT_VERSION = "memory_reconciliation_triage_v2"
 MAX_GROUPS = 100
@@ -312,6 +318,47 @@ class WorkshopMemoryReconciliationTriageService:
         memory_reconciliation.validate_audit(audit)
         return audit
 
+    async def _carried_deferrals(self, principal_id: PrincipalId, audit: dict[str, Any]) -> list[dict[str, Any]]:
+        """
+        Earlier applied deferrals of rows this audit covers, as prior review evidence.
+
+        A deferral means "not now", so the row is reviewed again rather than
+        suppressed, and triage turns this evidence into a `prior_review`
+        group that shows the earlier decision and note. Only unchanged rows
+        carry the deferral; a row that changed since is simply new again.
+        Rows are grouped by the decision they came from, so each earlier
+        group or candidate appears once.
+        """
+        prior = await asyncio.to_thread(
+            prior_reconciliation_row_dispositions,
+            self._db_path,
+            principal_id=str(principal_id),
+            runtime_profile_id=str(audit["runtime_profile_id"]),
+        )
+        carried: dict[str, dict[str, Any]] = {}
+        for candidate in audit["candidates"]:
+            for row in candidate["evidence"]:
+                earlier = prior.get(str(row["memory_id"]))
+                if (
+                    earlier is None
+                    or earlier.disposition != "defer"
+                    or earlier.review_state != memory_reconciliation.row_review_state(row)
+                ):
+                    continue
+                entry = carried.setdefault(
+                    earlier.source_id,
+                    {
+                        "candidate_id": earlier.source_id,
+                        "disposition": "defer",
+                        "operator_note": earlier.operator_note,
+                        "state_version": 0,
+                        "memory_ids": [],
+                    },
+                )
+                if str(row["memory_id"]) not in entry["memory_ids"]:
+                    entry["memory_ids"].append(str(row["memory_id"]))
+        return [{**entry, "memory_ids": sorted(entry["memory_ids"])} for _source_id, entry in sorted(carried.items())]
+
     async def _plan_row(self, principal_id: PrincipalId, plan_id: str) -> tuple[Any, dict[str, Any]]:
         async with self._store.connection.execute(
             "SELECT p.plan_id, p.audit_id, p.plan_json, p.status, p.review_version, p.applied_at "
@@ -357,6 +404,7 @@ class WorkshopMemoryReconciliationTriageService:
                     "memory_ids": sorted(str(row["memory_id"]) for row in candidate["evidence"]),
                 }
             )
+        prior_review_evidence.extend(await self._carried_deferrals(principal_id, audit))
         plan = build_triage_plan(
             audit,
             allowed_project_ids=allowed_project_ids,
@@ -370,9 +418,13 @@ class WorkshopMemoryReconciliationTriageService:
             ) as cursor:
                 existing = await cursor.fetchone()
             if existing is not None and str(existing[2]) != str(plan["policy_version"]):
-                if str(existing[3]) != "open":
+                if str(existing[3]) != "open" or await memory_reconciliation.apply_in_progress(
+                    self._store.connection, str(existing[0])
+                ):
                     # An applied plan is history: show it exactly as it was
-                    # applied, under the policy that produced it.
+                    # applied, under the policy that produced it. A plan
+                    # with an unfinished apply stays as it is too, because
+                    # that run's progress is keyed to this plan's id.
                     row, stored = await self._plan_row(principal_id, str(existing[0]))
                     return await self._summary(row, stored)
                 await self._replan(principal_id, str(existing[0]), str(existing[1]), str(existing[2]), plan)
@@ -795,6 +847,8 @@ class WorkshopMemoryReconciliationTriageService:
             replay = await self._operation_replay(principal_id, operation_id, request_sha256)
             if replay is not None:
                 return replay
+            if await memory_reconciliation.apply_in_progress(self._store.connection, plan_id):
+                raise MemoryReconciliationReviewConflict(_APPLY_IN_PROGRESS)
             preview = await self.preview_safe_approval(
                 principal_id,
                 plan_id,
@@ -868,6 +922,8 @@ class WorkshopMemoryReconciliationTriageService:
         row, plan = await self._plan_row(principal_id, plan_id)
         if str(row[3]) != "open":
             raise MemoryReconciliationReviewConflict("Memory triage plan has already been applied")
+        if await memory_reconciliation.apply_in_progress(self._store.connection, plan_id):
+            raise MemoryReconciliationReviewConflict(_APPLY_IN_PROGRESS)
         group = next((item for item in plan["groups"] if item["group_id"] == group_id), None)
         if group is None:
             raise MemoryReconciliationReviewNotFound("Memory triage group not found")
@@ -1239,14 +1295,16 @@ class WorkshopMemoryReconciliationTriageService:
                 }
             )
         sealed = memory_reconciliation.seal_review(synthetic, template, reviewer=str(principal_id))
-        current = await asyncio.to_thread(
-            memory.get_all_for_lifecycle_projection,
-            user_id=str(principal_id),
-            runtime_profile_id=str(plan["runtime_profile_id"]),
-        )
-        if memory_reconciliation.corpus_sha256(current) != plan["corpus_sha256"]:
-            raise MemoryReconciliationReviewConflict("Memory changed after this triage plan")
-        receipt = await memory_reconciliation.apply_review(db_path=self._db_path, audit=synthetic, review=sealed)
+        # Apply checks only the rows it is about to change and resumes an
+        # interrupted run, so unrelated writes since the audit (new
+        # extracted facts, for example) no longer block it.
+        try:
+            receipt = await memory_reconciliation.apply_review(db_path=self._db_path, audit=synthetic, review=sealed)
+        except (
+            memory_reconciliation.MemoryReconciliationDrift,
+            memory_reconciliation.MemoryReconciliationApplyInProgress,
+        ) as exc:
+            raise MemoryReconciliationReviewConflict(str(exc)) from exc
         approved_outcomes = _approved_outcome_summary(groups, decision_rows)
         summary = {
             "adopted": approved_outcomes["adopted"],
@@ -1259,12 +1317,14 @@ class WorkshopMemoryReconciliationTriageService:
             # Canonical state committed, but these items are not in recall
             # until their search projection is retried from Fact review.
             "failed": len(receipt.get("projection_failures", ())),
-            "still_unresolved": 0,
+            # The owner's legacy rows still unclassified after this apply,
+            # from the census apply refreshes (0 if that count failed).
+            "still_unresolved": int((receipt.get("legacy_census") or {}).get("unclassified", 0)),
             "not_adopted": sum(
                 len(groups[str(item[0])]["evidence"]) for item in decision_rows if str(item[1]) in {"reject", "defer"}
             ),
             "operator_admitted": approved_outcomes["operator_admitted"],
-            "canonicalized_in_quarantine": 0,
+            "canonicalized_in_quarantine": int(receipt.get("canonicalized_in_quarantine", 0)),
         }
         response = {
             "audit_id": plan["audit_id"],

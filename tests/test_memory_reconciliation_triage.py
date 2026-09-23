@@ -593,9 +593,6 @@ async def test_grouped_apply_emits_aggregate_summary_and_is_replay_safe(
         operator_note="Safe adoption batch.",
         client_operation_id="approve-safe-apply",
     )
-    monkeypatch.setattr(
-        "kai.workshop.memory_reconciliation_triage.memory.get_all_for_lifecycle_projection", lambda **_k: rows
-    )
 
     async def fake_apply_review(**kwargs: object) -> dict[str, object]:
         review = kwargs["review"]

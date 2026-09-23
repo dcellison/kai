@@ -50,6 +50,7 @@ from kai.workshop.memory_extraction_receipts import (
     MemoryExtractionReceiptService,
     MemoryExtractionReceiptSnapshot,
 )
+from kai.workshop.memory_legacy_census import refresh_legacy_census
 from kai.workshop.memory_projection_status import (
     ProjectionRetryResult,
     ProjectionStatus,
@@ -626,6 +627,39 @@ class WorkshopMemoryQueryService:
                 retried_facts.failed + retried_episodes.failed,
             )
         return facts + episodes
+
+    async def refresh_legacy_census(self) -> int:
+        """
+        Recount every owner's unclassified legacy rows at service startup.
+
+        Install status reads this census because it cannot open the vector
+        store the service holds. A failure for one owner is logged and the
+        others still count; their previous census stays with its older time.
+        Returns the number of owners counted.
+        """
+        if not memory.is_enabled():
+            return 0
+        counted = 0
+        owners = sorted(
+            {
+                (str(namespace.principal_id), str(namespace.runtime_profile_id))
+                for namespaces in self._namespaces.values()
+                for namespace in namespaces
+            }
+        )
+        for principal_id, runtime_profile_id in owners:
+            try:
+                await asyncio.to_thread(
+                    refresh_legacy_census,
+                    Path(self._config.session_db_path),
+                    principal_id=principal_id,
+                    runtime_profile_id=runtime_profile_id,
+                )
+            except Exception:
+                log.warning("Legacy memory census failed for %s/%s", principal_id, runtime_profile_id, exc_info=True)
+                continue
+            counted += 1
+        return counted
 
     def authority_for_principal(
         self,

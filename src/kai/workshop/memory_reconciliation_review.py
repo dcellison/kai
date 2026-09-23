@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from kai import memory, memory_reconciliation
+from kai import memory_reconciliation
 from kai.workshop.domain import PrincipalId
 from kai.workshop.store import WorkshopEventStore
 
@@ -183,6 +183,92 @@ def prior_reconciliation_dispositions(
             if isinstance(candidate_id, str) and isinstance(state_sha256, str):
                 terminal.add((candidate_id, state_sha256))
     return terminal
+
+
+@dataclass(frozen=True, slots=True)
+class PriorRowDisposition:
+    """
+    The latest applied reject or defer decision covering one memory row.
+
+    `review_state` is the row's text and metadata digest at the time of the
+    decision (`memory_reconciliation.row_review_state`); the decision
+    carries forward only while the row is unchanged. `source_id` is the
+    triage group or raw candidate the decision was made on.
+    """
+
+    memory_id: str
+    review_state: str
+    disposition: str
+    source_id: str
+    operator_note: str
+    decided_at: str
+
+
+def prior_reconciliation_row_dispositions(
+    db_path: Path,
+    *,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> dict[str, PriorRowDisposition]:
+    """
+    Return each row's latest reject or defer from the owner's applied reviews.
+
+    Triage decisions are made on groups and raw decisions on candidates,
+    and a fresh audit gives both new ids, so carrying a decision forward
+    has to work row by row. Only applied plans and audits count: their
+    decisions are final, so a plan built from a later audit is the same
+    every time it is rebuilt. When several decisions cover a row, the
+    newest wins.
+    """
+    connection = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        sources: list[tuple[str, str, str, str, object, str, str]] = []
+        tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "memory_reconciliation_triage_groups" in tables:
+            sources.extend(
+                (str(row[0]), str(row[1]), str(row[2]), str(row[3]), row[4], "groups", "group_id")
+                for row in connection.execute(
+                    "SELECT g.group_id, g.disposition, g.operator_note, g.updated_at, p.plan_json "
+                    "FROM memory_reconciliation_triage_groups g "
+                    "JOIN memory_reconciliation_triage_plans p ON p.plan_id = g.plan_id "
+                    "JOIN memory_reconciliation_audits a ON a.audit_id = p.audit_id "
+                    "WHERE a.principal_id = ? AND a.runtime_profile_id = ? AND p.status = 'applied' "
+                    "AND g.disposition IN ('reject', 'defer')",
+                    (principal_id, runtime_profile_id),
+                ).fetchall()
+            )
+        if "memory_reconciliation_decisions" in tables:
+            sources.extend(
+                (str(row[0]), str(row[1]), str(row[2]), str(row[3]), row[4], "candidates", "candidate_id")
+                for row in connection.execute(
+                    "SELECT d.candidate_id, d.disposition, d.operator_note, d.updated_at, a.audit_json "
+                    "FROM memory_reconciliation_decisions d "
+                    "JOIN memory_reconciliation_audits a ON a.audit_id = d.audit_id "
+                    "WHERE a.principal_id = ? AND a.runtime_profile_id = ? AND a.status = 'applied' "
+                    "AND d.disposition IN ('reject', 'defer')",
+                    (principal_id, runtime_profile_id),
+                ).fetchall()
+            )
+    finally:
+        connection.close()
+    latest: dict[str, PriorRowDisposition] = {}
+    for source_id, disposition, note, decided_at, document, collection, id_key in sorted(
+        sources, key=lambda item: item[3]
+    ):
+        entries = _load_json(document, label="reconciliation document").get(collection, [])
+        entry = next((item for item in entries if isinstance(item, dict) and item.get(id_key) == source_id), None)
+        if entry is None:
+            raise MemoryReconciliationReviewError("Stored reconciliation decision has no document entry")
+        for row in entry.get("evidence", []):
+            latest[str(row["memory_id"])] = PriorRowDisposition(
+                memory_id=str(row["memory_id"]),
+                review_state=memory_reconciliation.row_review_state(row),
+                disposition=disposition,
+                source_id=source_id,
+                operator_note=note,
+                decided_at=decided_at,
+            )
+    return latest
 
 
 class WorkshopMemoryReconciliationReviewService:
@@ -460,6 +546,10 @@ class WorkshopMemoryReconciliationReviewService:
             row, audit = await self._owned_audit(principal_id, audit_id)
             if str(row[6]) != "open":
                 raise MemoryReconciliationReviewConflict("Reconciliation audit has already been applied")
+            if await memory_reconciliation.apply_in_progress(self._store.connection, audit_id):
+                raise MemoryReconciliationReviewConflict(
+                    "An apply of this audit is unfinished; retry the apply to finish it before changing decisions"
+                )
             if disposition not in {"approve", "reject", "defer"}:
                 raise MemoryReconciliationReviewValidationError("Invalid reconciliation disposition")
             if not isinstance(action, dict):
@@ -567,6 +657,10 @@ class WorkshopMemoryReconciliationReviewService:
             if replay is not None:
                 return replay
             row, _audit = await self._owned_audit(principal_id, audit_id)
+            if await memory_reconciliation.apply_in_progress(self._store.connection, audit_id):
+                raise MemoryReconciliationReviewConflict(
+                    "An apply of this audit is unfinished; retry the apply to finish it before changing decisions"
+                )
             if str(row[6]) != "open" or int(row[7]) != expected_review_version:
                 raise MemoryReconciliationReviewConflict("Reconciliation review changed after it was loaded")
             connection = self._store.connection
@@ -674,13 +768,9 @@ class WorkshopMemoryReconciliationReviewService:
             except memory_reconciliation.MemoryReconciliationError as exc:
                 raise MemoryReconciliationReviewValidationError(str(exc)) from exc
             try:
-                current = await asyncio.to_thread(
-                    memory.get_all_for_lifecycle_projection,
-                    user_id=str(principal_id),
-                    runtime_profile_id=str(audit["runtime_profile_id"]),
-                )
-                if memory_reconciliation.corpus_sha256(current) != audit["corpus_sha256"]:
-                    raise MemoryReconciliationReviewConflict("Memory changed after this reconciliation audit")
+                # Apply checks the rows it is about to change against the
+                # audit and resumes an interrupted run, so there is no
+                # whole-corpus comparison here.
                 receipt = await memory_reconciliation.apply_review(
                     db_path=self._db_path,
                     audit=audit,
@@ -688,6 +778,11 @@ class WorkshopMemoryReconciliationReviewService:
                 )
             except MemoryReconciliationReviewError:
                 raise
+            except (
+                memory_reconciliation.MemoryReconciliationDrift,
+                memory_reconciliation.MemoryReconciliationApplyInProgress,
+            ) as exc:
+                raise MemoryReconciliationReviewConflict(str(exc)) from exc
             except memory_reconciliation.MemoryReconciliationError as exc:
                 raise MemoryReconciliationReviewValidationError(str(exc)) from exc
             except Exception as exc:

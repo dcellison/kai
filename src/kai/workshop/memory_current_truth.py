@@ -592,6 +592,27 @@ def _absorbed_legacy_ids(
     return frozenset(absorbed)
 
 
+def absorbed_legacy_ids(
+    connection: sqlite3.Connection,
+    *,
+    principal_id: str,
+    runtime_profile_id: str,
+) -> frozenset[str]:
+    """
+    Public form of `_absorbed_legacy_ids` for the legacy census.
+
+    The census and the retrieval gate must agree on which legacy rows are
+    already represented canonically, so both read the same query.
+    """
+    tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    return _absorbed_legacy_ids(
+        connection,
+        tables,
+        principal_id=principal_id,
+        runtime_profile_id=runtime_profile_id,
+    )
+
+
 def _rejected_legacy_ids(
     connection: sqlite3.Connection,
     tables: set[str],

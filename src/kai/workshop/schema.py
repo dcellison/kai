@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-WORKSHOP_SCHEMA_VERSION = 93
+WORKSHOP_SCHEMA_VERSION = 94
 
 
 @dataclass(frozen=True, slots=True)
@@ -4518,6 +4518,54 @@ _MEMORY_ADMISSION_AUTHORITY_SCHEMA = SchemaMigration(
     ),
 )
 
+# Reconciliation apply is resumable: a run fixes the sealed review it
+# applies (so every idempotency key stays the same across retries), and a
+# progress row per finished candidate lets a retry skip completed work
+# and check drift only on rows it has yet to change. The legacy census
+# gives install status a per-owner count of unclassified legacy rows,
+# which only a process holding the vector store can compute.
+_MEMORY_RECONCILIATION_RESUME_SCHEMA = SchemaMigration(
+    version=94,
+    name="resumable_memory_reconciliation_apply",
+    statements=(
+        """
+        CREATE TABLE memory_reconciliation_apply_runs (
+            audit_id TEXT PRIMARY KEY CHECK (length(audit_id) BETWEEN 1 AND 128),
+            principal_id TEXT NOT NULL CHECK (length(principal_id) BETWEEN 1 AND 128),
+            runtime_profile_id TEXT NOT NULL CHECK (length(runtime_profile_id) BETWEEN 1 AND 128),
+            review_sha256 TEXT NOT NULL CHECK (length(review_sha256) = 64),
+            receipt_id TEXT NOT NULL CHECK (length(receipt_id) BETWEEN 1 AND 128),
+            started_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1 CHECK (attempts >= 1),
+            last_error TEXT CHECK (last_error IS NULL OR length(last_error) BETWEEN 1 AND 128),
+            completed_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE memory_reconciliation_apply_progress (
+            audit_id TEXT NOT NULL REFERENCES memory_reconciliation_apply_runs(audit_id) ON DELETE CASCADE,
+            candidate_id TEXT NOT NULL CHECK (length(candidate_id) BETWEEN 1 AND 128),
+            decision_sha256 TEXT NOT NULL CHECK (length(decision_sha256) = 64),
+            applied_json TEXT NOT NULL CHECK (json_valid(applied_json) AND json_type(applied_json) = 'object'),
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (audit_id, candidate_id)
+        )
+        """,
+        """
+        CREATE TABLE memory_legacy_census (
+            principal_id TEXT NOT NULL CHECK (length(principal_id) BETWEEN 1 AND 128),
+            runtime_profile_id TEXT NOT NULL CHECK (length(runtime_profile_id) BETWEEN 1 AND 128),
+            legacy_rows INTEGER NOT NULL CHECK (legacy_rows >= 0),
+            absorbed INTEGER NOT NULL CHECK (absorbed >= 0),
+            rejected INTEGER NOT NULL CHECK (rejected >= 0),
+            unclassified INTEGER NOT NULL CHECK (unclassified >= 0),
+            counted_at TEXT NOT NULL,
+            PRIMARY KEY (principal_id, runtime_profile_id)
+        )
+        """,
+    ),
+)
+
 _MIGRATIONS = (
     _INITIAL_SCHEMA,
     _DELIVERY_SCHEMA,
@@ -4612,6 +4660,7 @@ _MIGRATIONS = (
     _MEMORY_RECONCILIATION_REVIEW_SCHEMA,
     _MEMORY_RECONCILIATION_TRIAGE_SCHEMA,
     _MEMORY_ADMISSION_AUTHORITY_SCHEMA,
+    _MEMORY_RECONCILIATION_RESUME_SCHEMA,
 )
 
 

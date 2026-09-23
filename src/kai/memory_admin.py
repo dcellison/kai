@@ -1485,6 +1485,7 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
         if args.reconciliation_command == "audit":
             from kai.workshop.memory_reconciliation_review import (
                 prior_reconciliation_dispositions,
+                prior_reconciliation_row_dispositions,
                 record_reconciliation_audit,
             )
 
@@ -1523,11 +1524,24 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                         runtime_profile_id=args.runtime_profile,
                     )
                 )
+                # Rows rejected in an applied review stay out of the new
+                # audit while unchanged; deferred rows come back and triage
+                # shows the earlier deferral with them.
+                prior_rows = prior_reconciliation_row_dispositions(
+                    db_path,
+                    principal_id=principal_id,
+                    runtime_profile_id=args.runtime_profile,
+                )
                 audit = reconciliation.build_audit(
                     principal_id=principal_id,
                     runtime_profile_id=args.runtime_profile,
                     rows=rows,
                     prior_decisions=prior_decisions,
+                    prior_rejected_rows={
+                        memory_id: prior.review_state
+                        for memory_id, prior in prior_rows.items()
+                        if prior.disposition == "reject"
+                    },
                 )
                 stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
                 out_path = out_dir / f"audit-{audit['audit_id']}-{stamp}.json"
@@ -1537,17 +1551,36 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
                 reconciliation.write_private_text(markdown_path, reconciliation.render_audit_markdown(audit))
                 _claim_reconciliation_artifact(markdown_path, artifact_owner)
                 recorded = record_reconciliation_audit(db_path, audit)
+                # This process holds the vector store, so it refreshes the
+                # legacy count install status reads, from the rows it
+                # already has in hand.
+                # A failed count must not fail an audit that has already been
+                # recorded; install status keeps the previous count and age.
+                from kai.workshop.memory_legacy_census import count_legacy_census
+
+                try:
+                    census_unclassified: int | None = count_legacy_census(
+                        db_path, rows, principal_id=principal_id, runtime_profile_id=args.runtime_profile
+                    ).unclassified
+                except (sqlite3.Error, ValueError) as exc:
+                    census_unclassified = None
+                    census_error = type(exc).__name__
             finally:
                 memory.close_memory()
             print(
                 "memory reconciliation: read-only audit complete; "
                 f"rows={audit['corpus_count']}, candidates={audit['candidate_count']}, "
-                f"suppressed unchanged={audit['suppressed_unchanged_count']}"
+                f"suppressed unchanged={audit['suppressed_unchanged_count']}, "
+                f"suppressed rejected rows={audit['suppressed_rejected_rows']}"
             )
+            if census_unclassified is None:
+                print(f"memory reconciliation: legacy census not updated ({census_error})")
+            else:
+                print(f"memory reconciliation: legacy rows unclassified={census_unclassified}")
             print(f"memory reconciliation: audit: {out_path}")
             print(f"memory reconciliation: human report: {markdown_path}")
             print("memory reconciliation: Workshop review queue: " + ("recorded" if recorded else "already recorded"))
-            print("memory reconciliation: no memory or canonical state was changed")
+            print("memory reconciliation: no memory or canonical memory state was changed")
             return 0
 
         audit_path = Path(args.audit)
@@ -1614,14 +1647,8 @@ def _cmd_reconciliation(args: argparse.Namespace) -> int:
             try:
                 if _initialize_memory(config) is None:
                     return 1
-                rows = memory.get_all_for_lifecycle_projection(
-                    user_id=str(audit["principal_id"]),
-                    runtime_profile_id=str(audit["runtime_profile_id"]),
-                )
-                if reconciliation.corpus_sha256(rows) != audit["corpus_sha256"]:
-                    raise reconciliation.MemoryReconciliationError(
-                        "Memory corpus changed after audit; create and review a fresh audit"
-                    )
+                # Apply checks the rows it will change and resumes an
+                # interrupted run of the same sealed review.
                 receipt = asyncio.run(reconciliation.apply_review(db_path=db_path, audit=audit, review=review))
                 reconciliation.write_receipt(receipt_path, receipt)
                 _claim_reconciliation_artifact(receipt_path, owner)
