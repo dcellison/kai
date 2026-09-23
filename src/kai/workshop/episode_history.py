@@ -26,7 +26,11 @@ from kai.workshop.memory_current_truth import CANONICAL_TEMPORAL_ROLE_KEY
 from kai.workshop.memory_projection_status import ProjectionRetryResult
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
-from kai.workshop.temporal_memory import EpisodeFollowupRelationship, resolve_memory_admission
+from kai.workshop.temporal_memory import (
+    EpisodeFollowupRelationship,
+    resolve_memory_admission,
+    validate_episode_payload,
+)
 
 log = logging.getLogger(__name__)
 
@@ -229,6 +233,29 @@ def _episode_payload(spec: EpisodeInput) -> dict[str, object]:
         "vector_metadata": dict(spec.vector_metadata),
         "similarity_fingerprint": _similarity_fingerprint(spec),
     }
+
+
+def validate_episode_input(
+    spec: EpisodeInput,
+    *,
+    principal_id: PrincipalId,
+    runtime_profile_id: RuntimeProfileId,
+) -> None:
+    """
+    Raise ValueError when recording `spec` would be rejected, without writing.
+
+    Builds exactly the payload `record` appends and runs the projection's
+    own pure checks on it, so callers deciding in advance (reconciliation
+    triage, apply preflight) use the rules that will actually apply. Only
+    the database-backed ownership check is left to `record`.
+    """
+    try:
+        payload = _episode_payload(spec)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("Episode input has an invalid shape") from exc
+    payload["owner_principal_id"] = str(principal_id)
+    payload["runtime_profile_id"] = str(runtime_profile_id)
+    validate_episode_payload(payload)
 
 
 class MemoryEpisodeHistoryService:

@@ -1531,6 +1531,8 @@ export interface WorkshopMemoryTriageGroup {
   deterministic: boolean;
   evidence: WorkshopMemoryReconciliationEvidence[];
   groupId: string;
+  // Schema fields an incomplete legacy episode lacks; empty otherwise.
+  missingFields: string[];
   priorReviewEvidence: {
     candidateId: string;
     disposition: Exclude<WorkshopMemoryReconciliationDisposition, "pending">;
