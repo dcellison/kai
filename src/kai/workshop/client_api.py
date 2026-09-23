@@ -561,6 +561,10 @@ _MEMORY_TRIAGE_SAFE_PREVIEW_PATH = "/v1/memory/reconciliation/triage/{plan_id}/s
 _MEMORY_TRIAGE_SAFE_APPROVE_PATH = "/v1/memory/reconciliation/triage/{plan_id}/safe/approve"
 _MEMORY_TRIAGE_RECOMMEND_PATH = "/v1/memory/reconciliation/triage/{plan_id}/recommend"
 _MEMORY_TRIAGE_APPLY_PATH = "/v1/memory/reconciliation/triage/{plan_id}/apply"
+_MEMORY_TRIAGE_CONSOLIDATIONS_PATH = "/v1/memory/reconciliation/triage/{plan_id}/consolidations"
+_MEMORY_TRIAGE_CONSOLIDATION_CANCEL_PATH = (
+    "/v1/memory/reconciliation/triage/{plan_id}/consolidations/{consolidation_id}/cancel"
+)
 _ALLOWED_MEMORY_RECONCILIATION_FILTERS = frozenset(
     {"category", "kind", "scope", "uncertainty", "disposition", "action", "gap", "offset", "limit"}
 )
@@ -2230,6 +2234,124 @@ async def _handle_memory_triage_group_decision(
             operator_note=payload["operator_note"],
             expected_state_version=payload["expected_state_version"],
             allowed_project_ids=allowed,
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_triage_consolidations(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """List the plan's staged consolidations."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query or request.can_read_body:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory triage request")
+    assert authority is not None
+    try:
+        items = await service.reconciliation_triage.consolidations(
+            authority.principal_id, request.match_info["plan_id"]
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, "consolidations": items}, status=200)
+
+
+async def _handle_memory_triage_consolidation_stage(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """
+    Stage or revise one consolidation of several facts into one canonical fact.
+
+    The body names the facts (as their triage group ids) with the state
+    version the owner saw for each, the final wording's source fact, the
+    wording, and the scope. Revising adds the consolidation id and the
+    revision the owner saw.
+    """
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory triage request")
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        required = {"group_ids", "expected_state_versions", "canonical", "operator_note", "client_operation_id"}
+        optional = {"consolidation_id", "expected_revision"}
+        if not required <= set(payload) <= required | optional:
+            raise MemoryReconciliationReviewValidationError("Invalid memory consolidation")
+        versions = payload["expected_state_versions"]
+        consolidation_id = payload.get("consolidation_id")
+        expected_revision = payload.get("expected_revision")
+        if (
+            not isinstance(payload["group_ids"], list)
+            or not isinstance(versions, dict)
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in versions.values())
+            or not isinstance(payload["canonical"], dict)
+            or not isinstance(payload["operator_note"], str)
+            or not isinstance(payload["client_operation_id"], str)
+            or (consolidation_id is None) != (expected_revision is None)
+            or (consolidation_id is not None and not isinstance(consolidation_id, str))
+            or (
+                expected_revision is not None
+                and (not isinstance(expected_revision, int) or isinstance(expected_revision, bool))
+            )
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid memory consolidation")
+        allowed = frozenset(project.project_id for project in await service.allowed_projects(authority))
+        result = await service.reconciliation_triage.stage_consolidation(
+            authority.principal_id,
+            request.match_info["plan_id"],
+            group_ids=payload["group_ids"],
+            expected_state_versions=versions,
+            canonical=payload["canonical"],
+            operator_note=payload["operator_note"],
+            consolidation_id=consolidation_id,
+            expected_revision=expected_revision,
+            allowed_project_ids=allowed,
+            client_operation_id=payload["client_operation_id"],
+        )
+    except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
+        return _reconciliation_error_response(exc)
+    return _json_response({"version": 1, **result}, status=200)
+
+
+async def _handle_memory_triage_consolidation_cancel(
+    request: web.Request,
+    *,
+    authenticator: WorkshopClientAuthenticator,
+    service: WorkshopMemoryQueryService,
+) -> web.Response:
+    """Cancel a staged consolidation, restoring each fact's earlier decision."""
+    authority, error = await _memory_authority(request, authenticator=authenticator, service=service)
+    if error is not None:
+        return error
+    if request.query:
+        return _error_response(status=400, code="invalid_request", message="Invalid memory triage request")
+    assert authority is not None
+    try:
+        payload = await _memory_json_object(request)
+        if (
+            set(payload) != {"expected_revision", "client_operation_id"}
+            or not isinstance(payload["expected_revision"], int)
+            or isinstance(payload["expected_revision"], bool)
+            or not isinstance(payload["client_operation_id"], str)
+        ):
+            raise MemoryReconciliationReviewValidationError("Invalid memory consolidation")
+        result = await service.reconciliation_triage.cancel_consolidation(
+            authority.principal_id,
+            request.match_info["plan_id"],
+            request.match_info["consolidation_id"],
+            expected_revision=payload["expected_revision"],
             client_operation_id=payload["client_operation_id"],
         )
     except (KeyError, MemoryReconciliationReviewError, WorkshopMemoryValidationError) as exc:
@@ -12343,6 +12465,24 @@ def register_workshop_read_routes(
                     service=memory_queries,
                 )
 
+        async def handle_memory_triage_consolidations(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_consolidations(
+                    request, authenticator=authenticator, service=memory_queries
+                )
+
+        async def handle_memory_triage_consolidation_stage(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_consolidation_stage(
+                    request, authenticator=authenticator, service=memory_queries
+                )
+
+        async def handle_memory_triage_consolidation_cancel(request: web.Request) -> web.Response:
+            async with request_lock:
+                return await _handle_memory_triage_consolidation_cancel(
+                    request, authenticator=authenticator, service=memory_queries
+                )
+
         async def handle_memory_triage_recommend(request: web.Request) -> web.Response:
             async with request_lock:
                 return await _handle_memory_triage_recommend(
@@ -12388,6 +12528,7 @@ def register_workshop_read_routes(
         app.router.add_get(_MEMORY_RECONCILIATION_PATH, handle_memory_reconciliation_latest)
         app.router.add_get(_MEMORY_RECONCILIATION_CANDIDATES_PATH, handle_memory_reconciliation_candidates)
         app.router.add_get(_MEMORY_TRIAGE_GROUPS_PATH, handle_memory_triage_groups)
+        app.router.add_get(_MEMORY_TRIAGE_CONSOLIDATIONS_PATH, handle_memory_triage_consolidations)
         for method, path, handler, entrypoint in (
             (
                 "PATCH",
@@ -12436,6 +12577,18 @@ def register_workshop_read_routes(
                 _MEMORY_TRIAGE_APPLY_PATH,
                 handle_memory_triage_apply,
                 "memory_triage_apply",
+            ),
+            (
+                "POST",
+                _MEMORY_TRIAGE_CONSOLIDATIONS_PATH,
+                handle_memory_triage_consolidation_stage,
+                "memory_triage_consolidation_stage",
+            ),
+            (
+                "POST",
+                _MEMORY_TRIAGE_CONSOLIDATION_CANCEL_PATH,
+                handle_memory_triage_consolidation_cancel,
+                "memory_triage_consolidation_cancel",
             ),
         ):
             _register_workshop_capability_route(

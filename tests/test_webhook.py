@@ -944,6 +944,8 @@ class TestNotificationChatIdMutations:
                 "/v1/memory/reconciliation/triage/{plan_id}/safe/approve",
                 "/v1/memory/reconciliation/triage/{plan_id}/recommend",
                 "/v1/memory/reconciliation/triage/{plan_id}/apply",
+                "/v1/memory/reconciliation/triage/{plan_id}/consolidations",
+                "/v1/memory/reconciliation/triage/{plan_id}/consolidations/{consolidation_id}/cancel",
                 "/workshop",
                 "/workshop/",
                 "/workshop/app.css",

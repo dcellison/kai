@@ -2122,6 +2122,7 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
                 "AND s.claim_id = r.claim_id)",
             )
             legacy_unclassified, census_age = _legacy_census_summary(connection, tables)
+            staged_consolidations, consolidated_facts = _consolidation_summary(connection, tables)
             legacy_active, legacy_inactive = _legacy_admission_owner_counts(connection, tables)
             conflicts, oldest_conflict_days = _unresolved_conflict_summary(connection)
             failed_facts, failed_episodes, blocked, oldest_failure_days = _projection_failure_summary(
@@ -2151,6 +2152,7 @@ def workshop_memory_current_truth_status(db_path: Path, *, memory_enabled: bool 
         f"projection failed={failed_projections} (facts={failed_facts}, episodes={failed_episodes}), "
         f"blocked={blocked}"
         f"{f' (oldest failure={oldest_failure_days}d)' if failed_projections else ''}; "
+        f"consolidations staged={staged_consolidations} (facts={consolidated_facts}); "
         f"legacy admission active={legacy_active} (no applied audit), inactive={legacy_inactive} (audit applied); "
         "authority=canonical/current-only"
     )
@@ -2186,6 +2188,24 @@ def _unresolved_conflict_summary(connection: sqlite3.Connection) -> tuple[int, i
     if opened.tzinfo is None:
         opened = opened.replace(tzinfo=UTC)
     return count, max((datetime.now(UTC) - opened).days, 0)
+
+
+def _consolidation_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int, int]:
+    """
+    Count staged fact consolidations in open triage plans and the facts they cover.
+
+    A staged consolidation is a normal decision waiting for apply, so it is
+    reported for visibility and never counted as a gap.
+    """
+    if "memory_reconciliation_triage_consolidations" not in tables:
+        return 0, 0
+    row = connection.execute(
+        "SELECT COUNT(DISTINCT c.consolidation_id), COUNT(m.group_id) "
+        "FROM memory_reconciliation_triage_consolidations c "
+        "JOIN memory_reconciliation_triage_plans p ON p.plan_id = c.plan_id AND p.status = 'open' "
+        "LEFT JOIN memory_reconciliation_triage_consolidation_members m ON m.consolidation_id = c.consolidation_id"
+    ).fetchone()
+    return (int(row[0] or 0), int(row[1] or 0)) if row is not None else (0, 0)
 
 
 def _legacy_census_summary(connection: sqlite3.Connection, tables: set[str]) -> tuple[int | None, str | None]:

@@ -6730,6 +6730,88 @@ button:disabled {
   color: var(--color-success);
 }
 
+/* Consolidation: several legacy facts selected to become one current fact. */
+
+.memory-consolidation-facts {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.55rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.memory-consolidation-facts li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.25rem 0.6rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.55rem 0.65rem;
+  background: var(--color-canvas-inset);
+}
+
+.memory-consolidation-facts label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  color: var(--color-text);
+  font-size: 0.74rem;
+}
+
+.memory-consolidation-facts small {
+  grid-column: 1;
+  padding-left: 1.4rem;
+  color: var(--color-text-muted);
+  font-size: 0.66rem;
+}
+
+.memory-consolidation-facts .quiet-button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.3rem 0.5rem;
+  background: transparent;
+  color: var(--color-text-muted);
+  font: 600 0.66rem/1.3 var(--sans);
+  cursor: pointer;
+}
+
+.memory-consolidation-facts .quiet-button[aria-pressed="true"] {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.memory-consolidation-search {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--color-text-muted);
+  font-size: 0.66rem;
+  font-weight: 680;
+}
+
+.memory-consolidation-search input {
+  min-height: 2.15rem;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0.35rem;
+  padding: 0.45rem 0.6rem;
+  background: var(--color-canvas-inset);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.memory-consolidation-preview {
+  margin: 0;
+  color: var(--color-text-strong);
+  font-weight: 650;
+}
+
+.memory-related-groups .memory-consolidate-button {
+  border-color: var(--color-accent);
+  font-weight: 650;
+}
+
 /* Fact review: owner decisions on conflicted and forgotten facts. */
 
 .memory-review-state.retracted,

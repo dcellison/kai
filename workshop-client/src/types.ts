@@ -1518,6 +1518,20 @@ export interface WorkshopMemoryTriageSummary {
   status: "open" | "applied";
 }
 
+// A staged merge of several legacy facts into one canonical fact.
+export interface WorkshopMemoryConsolidation {
+  consolidationId: string;
+  content: string;
+  duplicatesExcluded: number;
+  groupIds: string[];
+  operatorNote: string;
+  revision: number;
+  scopeKey: string | null;
+  scopeKind: "global" | "project";
+  selectedFacts: number;
+  sourceMemoryId: string;
+}
+
 export interface WorkshopMemoryTriageGroup {
   bulkEligible: boolean;
   classification: string;
@@ -1530,9 +1544,14 @@ export interface WorkshopMemoryTriageGroup {
   };
   deterministic: boolean;
   evidence: WorkshopMemoryReconciliationEvidence[];
+  // The staged consolidation this fact belongs to, if any.
+  consolidationId: string | null;
   groupId: string;
   // Schema fields an incomplete legacy episode lacks; empty otherwise.
   missingFields: string[];
+  // Other fact groups the model recommendation links to this one,
+  // already checked against the plan by the server.
+  relatedGroupIds: string[];
   priorReviewEvidence: {
     candidateId: string;
     disposition: Exclude<WorkshopMemoryReconciliationDisposition, "pending">;
