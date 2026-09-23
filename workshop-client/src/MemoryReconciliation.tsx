@@ -97,8 +97,22 @@ function groupReference(groupId: string): string {
   return `Group ${groupId.replace(/^mtg_/, "").slice(0, 8)}`;
 }
 
+// A legacy episode saved without the fields canonical episodes require.
+// Kai does not invent them, so it can only be rejected or deferred.
+function isIncompleteEpisode(group: WorkshopMemoryTriageGroup | null): boolean {
+  return group?.classification === "incomplete_episode";
+}
+
+const MISSING_FIELD_LABELS: Record<string, string> = {
+  actors: "the people involved",
+  outcome_quality: "an outcome",
+};
+
 function initialExceptionDecision(group: WorkshopMemoryTriageGroup | null): ExceptionDecisionChoice {
   if (!group) return "defer";
+  if (isIncompleteEpisode(group)) {
+    return group.decision.disposition === "defer" ? "defer" : "reject";
+  }
   if (group.decision.disposition === "reject" || group.decision.disposition === "defer") {
     return group.decision.disposition;
   }
@@ -311,7 +325,15 @@ function ExceptionEditor({
 
       <section className="memory-detail-section">
         <p className="memory-section-label">Why this needs judgment</p>
-        <p>{group.rationale}</p>
+        {isIncompleteEpisode(group) ? (
+          <p>
+            This legacy episode was saved without{" "}
+            {group.missingFields.map((field) => MISSING_FIELD_LABELS[field] ?? field).join(" or ") || "required details"},
+            so it can't be kept as a canonical episode. Kai won't guess them. Reject it, or defer.
+          </p>
+        ) : (
+          <p>{group.rationale}</p>
+        )}
       </section>
 
       {Object.keys(recommendation).length > 0 && (
@@ -399,7 +421,9 @@ function ExceptionEditor({
           <p className="memory-section-label">Review</p>
           <label>Decision
             <select value={decisionChoice} onChange={(event) => setDecisionChoice(event.target.value as ExceptionDecisionChoice)}>
-              {(factEvidence || episodeEvidence) && <option value="approve">{approvalLabel}</option>}
+              {(factEvidence || episodeEvidence) && !isIncompleteEpisode(group) && (
+                <option value="approve">{approvalLabel}</option>
+              )}
               {factEvidence && <option value="obsolete">Mark obsolete</option>}
               <option value="reject">Reject</option>
               <option value="defer">Defer</option>

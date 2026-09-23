@@ -796,6 +796,157 @@ async def _apply_fact_event(connection: aiosqlite.Connection, event: StoredEvent
     raise ValueError("Unsupported temporal fact event type")
 
 
+_EPISODE_BASE_FIELDS = frozenset(
+    {
+        "owner_principal_id",
+        "runtime_profile_id",
+        "scope_kind",
+        "scope_key",
+        "content",
+        "occurred_from",
+        "occurred_until",
+        "observed_at",
+        "stored_at",
+        "reason",
+        "evidence",
+        "source_receipt_id",
+        "source_run_id",
+        "source_message_id",
+        "result_message_id",
+        "backend",
+        "provider",
+        "model",
+        "prompt_version",
+        "schema_version",
+        "migration_classification",
+        "migration_gaps",
+    }
+)
+_EPISODE_STRUCTURED_FIELDS = frozenset(
+    {
+        "goal",
+        "context",
+        "approach",
+        "outcome",
+        "outcome_quality",
+        "lessons",
+        "tags",
+        "actors",
+        "vector_metadata",
+        "similarity_fingerprint",
+    }
+)
+
+
+def _episode_values(payload: dict[str, Any], *, event_version: int) -> dict[str, object]:
+    """
+    Validate an episode-recorded payload and return its stored column values.
+
+    This is every check the projection makes that does not need the
+    database; ownership of the runtime profile is checked separately by
+    the caller. Keeping it pure lets reconciliation ask "would this
+    episode be accepted?" before it writes anything, with the exact rules
+    the projection enforces rather than a copy that could drift.
+    """
+    required = _EPISODE_BASE_FIELDS | _EPISODE_STRUCTURED_FIELDS if event_version == 2 else _EPISODE_BASE_FIELDS
+    if set(payload) not in {frozenset(required), frozenset(required | {"admission_authority"})}:
+        raise ValueError("Temporal episode payload has an invalid shape")
+    owner = PrincipalId(_required_text(payload.get("owner_principal_id"), field="owner_principal_id", maximum=128))
+    runtime = RuntimeProfileId(
+        _required_text(payload.get("runtime_profile_id"), field="runtime_profile_id", maximum=128)
+    )
+    scope_kind, scope_key = _scope(payload)
+    classification, gaps_json = _migration(payload)
+    admission_authority = resolve_memory_admission(classification, payload.get("admission_authority")).value
+    evidence_json = _evidence(payload, canonical=classification == LegacyMemoryClassification.CANONICAL.value)
+    occurred_from = _timestamp(payload.get("occurred_from"), field="occurred_from")
+    occurred_until = _timestamp(payload.get("occurred_until"), field="occurred_until")
+    if occurred_from is not None and occurred_until is not None and occurred_until < occurred_from:
+        raise ValueError("Temporal episode occurrence interval is invalid")
+    values: dict[str, object] = {
+        "owner_principal_id": owner,
+        "runtime_profile_id": runtime,
+        "scope_kind": scope_kind,
+        "scope_key": scope_key,
+        "content": _required_text(payload.get("content"), field="content", maximum=65536),
+        "occurred_from": occurred_from,
+        "occurred_until": occurred_until,
+        "observed_at": _timestamp(payload.get("observed_at"), field="observed_at"),
+        "stored_at": _timestamp(payload.get("stored_at"), field="stored_at", required=True),
+        "reason": _required_text(payload.get("reason"), field="reason", maximum=2048),
+        "evidence_json": evidence_json,
+        "source_receipt_id": _optional_text(payload.get("source_receipt_id"), field="source_receipt_id", maximum=128),
+        "source_run_id": _optional_text(payload.get("source_run_id"), field="source_run_id", maximum=128),
+        "source_message_id": _optional_text(payload.get("source_message_id"), field="source_message_id", maximum=128),
+        "result_message_id": _optional_text(payload.get("result_message_id"), field="result_message_id", maximum=128),
+        "backend": _optional_text(payload.get("backend"), field="backend", maximum=64),
+        "provider": _optional_text(payload.get("provider"), field="provider", maximum=64),
+        "model": _optional_text(payload.get("model"), field="model"),
+        "prompt_version": _optional_text(payload.get("prompt_version"), field="prompt_version", maximum=64),
+        "schema_version": _optional_text(payload.get("schema_version"), field="schema_version", maximum=64),
+        "migration_classification": classification,
+        "migration_gaps_json": gaps_json,
+        "admission_authority": admission_authority,
+        "goal": None,
+        "context": None,
+        "approach": None,
+        "outcome": None,
+        "outcome_quality": None,
+        "lessons": None,
+        "tags_json": "[]",
+        "actors_json": "[]",
+        "vector_metadata_json": "{}",
+        "similarity_fingerprint": None,
+    }
+    if event_version == 2:
+        outcome_quality = _required_text(payload.get("outcome_quality"), field="outcome_quality", maximum=16)
+        if outcome_quality not in {"success", "partial", "failure"}:
+            raise ValueError("Temporal episode outcome_quality is invalid")
+        similarity_fingerprint = _required_text(
+            payload.get("similarity_fingerprint"), field="similarity_fingerprint", maximum=64
+        )
+        if not _SHA256_PATTERN.fullmatch(similarity_fingerprint):
+            raise ValueError("Temporal episode similarity fingerprint is invalid")
+        values.update(
+            {
+                "goal": _required_text(payload.get("goal"), field="goal", maximum=300),
+                "context": _required_text(payload.get("context"), field="context", maximum=500),
+                "approach": _required_text(payload.get("approach"), field="approach", maximum=500),
+                "outcome": _required_text(payload.get("outcome"), field="outcome", maximum=500),
+                "outcome_quality": outcome_quality,
+                "lessons": _optional_text(payload.get("lessons"), field="lessons", maximum=500),
+                "tags_json": _string_list(payload.get("tags"), field="tags", maximum_items=5, maximum_length=50),
+                "actors_json": _string_list(
+                    payload.get("actors"), field="actors", maximum_items=10, maximum_length=100
+                ),
+                "vector_metadata_json": _vector_metadata(payload),
+                "similarity_fingerprint": similarity_fingerprint,
+            }
+        )
+    return values
+
+
+def validate_episode_payload(payload: dict[str, Any]) -> None:
+    """
+    Raise ValueError when a current-version episode payload would be rejected.
+
+    Reconciliation and triage call this before offering or applying an
+    episode, so a record that cannot be stored is caught while nothing
+    has been written yet.
+    """
+    _episode_values(payload, event_version=2)
+
+
+def validate_fact_revision_payload(payload: dict[str, Any]) -> None:
+    """
+    Raise ValueError when a fact revision payload would be rejected.
+
+    The same pure checks the projection applies to every created,
+    superseding, or restoring revision.
+    """
+    _revision_values(payload)
+
+
 async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEvent) -> None:
     envelope = event.envelope
     if envelope.aggregate_type != "memory_episode" or envelope.event_version not in {1, 2}:
@@ -803,49 +954,9 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
     episode_id = MemoryEpisodeId(str(envelope.aggregate_id))
     payload = envelope.payload
     if envelope.event_type == WorkshopEventType.MEMORY_EPISODE_RECORDED:
-        expected = {
-            "owner_principal_id",
-            "runtime_profile_id",
-            "scope_kind",
-            "scope_key",
-            "content",
-            "occurred_from",
-            "occurred_until",
-            "observed_at",
-            "stored_at",
-            "reason",
-            "evidence",
-            "source_receipt_id",
-            "source_run_id",
-            "source_message_id",
-            "result_message_id",
-            "backend",
-            "provider",
-            "model",
-            "prompt_version",
-            "schema_version",
-            "migration_classification",
-            "migration_gaps",
-        }
-        structured = {
-            "goal",
-            "context",
-            "approach",
-            "outcome",
-            "outcome_quality",
-            "lessons",
-            "tags",
-            "actors",
-            "vector_metadata",
-            "similarity_fingerprint",
-        }
-        required = expected | structured if envelope.event_version == 2 else expected
-        if set(payload) not in {frozenset(required), frozenset(required | {"admission_authority"})}:
-            raise ValueError("Temporal episode payload has an invalid shape")
-        owner = PrincipalId(_required_text(payload.get("owner_principal_id"), field="owner_principal_id", maximum=128))
-        runtime = RuntimeProfileId(
-            _required_text(payload.get("runtime_profile_id"), field="runtime_profile_id", maximum=128)
-        )
+        values = _episode_values(payload, event_version=envelope.event_version)
+        owner = PrincipalId(str(values["owner_principal_id"]))
+        runtime = RuntimeProfileId(str(values["runtime_profile_id"]))
         if envelope.actor_principal_id != owner:
             raise ValueError("Temporal episode creation must be attributed to its owner")
         await _require_owner_runtime(
@@ -854,38 +965,6 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
             principal_id=owner,
             runtime_profile_id=runtime,
         )
-        scope_kind, scope_key = _scope(payload)
-        classification, gaps_json = _migration(payload)
-        admission_authority = resolve_memory_admission(
-            classification,
-            payload.get("admission_authority"),
-        ).value
-        evidence_json = _evidence(payload, canonical=classification == LegacyMemoryClassification.CANONICAL.value)
-        occurred_from = _timestamp(payload.get("occurred_from"), field="occurred_from")
-        occurred_until = _timestamp(payload.get("occurred_until"), field="occurred_until")
-        if occurred_from is not None and occurred_until is not None and occurred_until < occurred_from:
-            raise ValueError("Temporal episode occurrence interval is invalid")
-        goal = context = approach = outcome = outcome_quality = lessons = None
-        tags_json = actors_json = "[]"
-        vector_metadata_json = "{}"
-        similarity_fingerprint = None
-        if envelope.event_version == 2:
-            goal = _required_text(payload.get("goal"), field="goal", maximum=300)
-            context = _required_text(payload.get("context"), field="context", maximum=500)
-            approach = _required_text(payload.get("approach"), field="approach", maximum=500)
-            outcome = _required_text(payload.get("outcome"), field="outcome", maximum=500)
-            outcome_quality = _required_text(payload.get("outcome_quality"), field="outcome_quality", maximum=16)
-            if outcome_quality not in {"success", "partial", "failure"}:
-                raise ValueError("Temporal episode outcome_quality is invalid")
-            lessons = _optional_text(payload.get("lessons"), field="lessons", maximum=500)
-            tags_json = _string_list(payload.get("tags"), field="tags", maximum_items=5, maximum_length=50)
-            actors_json = _string_list(payload.get("actors"), field="actors", maximum_items=10, maximum_length=100)
-            vector_metadata_json = _vector_metadata(payload)
-            similarity_fingerprint = _required_text(
-                payload.get("similarity_fingerprint"), field="similarity_fingerprint", maximum=64
-            )
-            if not _SHA256_PATTERN.fullmatch(similarity_fingerprint):
-                raise ValueError("Temporal episode similarity fingerprint is invalid")
         await connection.execute(
             "INSERT INTO memory_episodes ("
             "episode_id, workshop_id, owner_principal_id, runtime_profile_id, scope_kind, scope_key, "
@@ -900,38 +979,38 @@ async def _apply_episode_event(connection: aiosqlite.Connection, event: StoredEv
                 envelope.workshop_id,
                 owner,
                 runtime,
-                scope_kind,
-                scope_key,
-                _required_text(payload.get("content"), field="content", maximum=65536),
-                occurred_from,
-                occurred_until,
-                _timestamp(payload.get("observed_at"), field="observed_at"),
-                _timestamp(payload.get("stored_at"), field="stored_at", required=True),
-                _required_text(payload.get("reason"), field="reason", maximum=2048),
-                evidence_json,
-                _optional_text(payload.get("source_receipt_id"), field="source_receipt_id", maximum=128),
-                _optional_text(payload.get("source_run_id"), field="source_run_id", maximum=128),
-                _optional_text(payload.get("source_message_id"), field="source_message_id", maximum=128),
-                _optional_text(payload.get("result_message_id"), field="result_message_id", maximum=128),
-                _optional_text(payload.get("backend"), field="backend", maximum=64),
-                _optional_text(payload.get("provider"), field="provider", maximum=64),
-                _optional_text(payload.get("model"), field="model"),
-                _optional_text(payload.get("prompt_version"), field="prompt_version", maximum=64),
-                _optional_text(payload.get("schema_version"), field="schema_version", maximum=64),
-                classification,
-                gaps_json,
-                admission_authority,
+                values["scope_kind"],
+                values["scope_key"],
+                values["content"],
+                values["occurred_from"],
+                values["occurred_until"],
+                values["observed_at"],
+                values["stored_at"],
+                values["reason"],
+                values["evidence_json"],
+                values["source_receipt_id"],
+                values["source_run_id"],
+                values["source_message_id"],
+                values["result_message_id"],
+                values["backend"],
+                values["provider"],
+                values["model"],
+                values["prompt_version"],
+                values["schema_version"],
+                values["migration_classification"],
+                values["migration_gaps_json"],
+                values["admission_authority"],
                 event.position,
-                goal,
-                context,
-                approach,
-                outcome,
-                outcome_quality,
-                lessons,
-                tags_json,
-                actors_json,
-                vector_metadata_json,
-                similarity_fingerprint,
+                values["goal"],
+                values["context"],
+                values["approach"],
+                values["outcome"],
+                values["outcome_quality"],
+                values["lessons"],
+                values["tags_json"],
+                values["actors_json"],
+                values["vector_metadata_json"],
+                values["similarity_fingerprint"],
             ),
         )
         if envelope.event_version == 2:

@@ -21,8 +21,8 @@ from typing import Any
 from kai import memory
 from kai.memory import MemoryResult
 from kai.workshop.domain import MemoryEpisodeId, PrincipalId, RuntimeProfileId
-from kai.workshop.episode_history import EpisodeInput, MemoryEpisodeHistoryService
-from kai.workshop.fact_lifecycle import FactRevisionInput, MemoryFactLifecycleService
+from kai.workshop.episode_history import EpisodeInput, MemoryEpisodeHistoryService, validate_episode_input
+from kai.workshop.fact_lifecycle import FactRevisionInput, MemoryFactLifecycleService, validate_revision_input
 from kai.workshop.store import WorkshopEventStore
 from kai.workshop.temporal_memory import EpisodeFollowupRelationship, classify_legacy_temporal_metadata
 
@@ -497,7 +497,72 @@ def validate_sealed_review(audit: dict[str, Any], review: dict[str, Any]) -> Non
             approved_memory.update(memory_ids)
 
 
+# Placeholders for schema checks made before anything is written. The
+# checks cover field shapes and limits, not ownership, so any well-formed
+# identifiers do; the real owner and receipt are used at apply time.
+_VALIDATION_PRINCIPAL = PrincipalId("prn_" + "0" * 32)
+_VALIDATION_RUNTIME = RuntimeProfileId("rtp_" + "0" * 32)
+_VALIDATION_RECEIPT = "mrr_" + "0" * 32
+
+
+def action_schema_problem(rows: list[dict[str, Any]], action: dict[str, Any]) -> str | None:
+    """
+    Return why applying `action` to `rows` would fail the canonical schema, or None.
+
+    Builds exactly the fact revisions or episodes `apply_review` would
+    record for this action and runs the lifecycle's own pure checks on
+    them, so triage can keep an action out of bulk approval and apply can
+    refuse it before writing anything. Legacy metadata is used as stored;
+    nothing is filled in to make a record pass.
+    """
+    kind = action.get("kind")
+    try:
+        if kind == "record_episode_chain":
+            for row in rows:
+                validate_episode_input(
+                    _episode_spec(row, receipt_id=_VALIDATION_RECEIPT),
+                    principal_id=_VALIDATION_PRINCIPAL,
+                    runtime_profile_id=_VALIDATION_RUNTIME,
+                )
+        elif kind == "adopt_corrected":
+            source_id = action.get("source_memory_id")
+            source = next((row for row in rows if source_id is None or row["memory_id"] == source_id), rows[0])
+            validate_revision_input(
+                _fact_spec(
+                    source,
+                    receipt_id=_VALIDATION_RECEIPT,
+                    reason="Operator-corrected reconciliation of existing semantic memory.",
+                    action=action,
+                    evidence_rows=rows,
+                )
+            )
+        elif kind in {"adopt_as_current", "keep_first_retract_rest", "expire_all"}:
+            keeper = action.get("keeper_memory_id")
+            for row in rows:
+                validate_revision_input(
+                    _fact_spec(
+                        row,
+                        receipt_id=_VALIDATION_RECEIPT,
+                        reason="Operator-reviewed reconciliation of existing semantic memory.",
+                        evidence_rows=rows
+                        if kind == "keep_first_retract_rest" and row["memory_id"] == keeper
+                        else None,
+                    )
+                )
+    except (KeyError, ValueError) as exc:
+        return str(exc) or type(exc).__name__
+    return None
+
+
 def _validate_action(candidate: dict[str, Any], action: dict[str, Any]) -> None:
+    """Validate an action's shape for its evidence, then that applying it would pass the schema."""
+    _validate_action_shape(candidate, action)
+    problem = action_schema_problem(list(candidate["evidence"]), action)
+    if problem is not None:
+        raise MemoryReconciliationError(f"Approved action would be rejected by canonical memory: {problem}")
+
+
+def _validate_action_shape(candidate: dict[str, Any], action: dict[str, Any]) -> None:
     rows = candidate["evidence"]
     kind = action["kind"]
     row_kinds = {row["kind"] for row in rows}

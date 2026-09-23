@@ -81,6 +81,7 @@ const group: WorkshopMemoryTriageGroup = {
     validUntil: null,
   }],
   groupId: "mtg_test",
+  missingFields: [],
   priorReviewEvidence: [],
   proposedAction: { kind: "manual_edit_required" },
   rationale: "The evidence conflicts.",
@@ -159,6 +160,39 @@ describe("Memory reconciliation triage", () => {
     expect(screen.getByRole("button", { name: "Preview safe groups" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Analyze exceptions" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Apply plan" })).toBeDisabled();
+  });
+
+  it("offers only reject or defer for an episode missing required fields", async () => {
+    const incomplete: WorkshopMemoryTriageGroup = {
+      ...group,
+      classification: "incomplete_episode",
+      evidence: [{ ...group.evidence[0], kind: "episode", memoryId: "episode-1", text: "Deployed the fix" }],
+      groupId: "incomplete-1",
+      missingFields: ["actors", "outcome_quality"],
+      proposedAction: { kind: "manual_edit_required" },
+    };
+    vi.mocked(loadMemoryTriageGroups).mockImplementation(async (_token, _planId, options = {}) => ({
+      triage: summary,
+      groups: options.exceptionsOnly ? [incomplete] : safeGroups,
+      nextOffset: null,
+    }));
+    const user = userEvent.setup();
+    render(
+      <ConfirmationProvider>
+        <MemoryReconciliation allowedProjects={[]} onAuthenticationFailure={vi.fn()} onBack={vi.fn()} token="secret" />
+      </ConfirmationProvider>,
+    );
+
+    const decision = await screen.findByLabelText("Decision");
+    expect(screen.getByText(/saved without the people involved or an outcome/)).toBeInTheDocument();
+    expect(within(decision).queryByRole("option", { name: /approve|retain|adopt/i })).not.toBeInTheDocument();
+    expect(within(decision).getAllByRole("option").map((option) => option.getAttribute("value")))
+      .toEqual(["reject", "defer"]);
+    expect(decision).toHaveValue("reject");
+    await user.click(screen.getByRole("button", { name: "Save decision" }));
+
+    await waitFor(() => expect(saveMemoryTriageDecision).toHaveBeenCalled());
+    expect(vi.mocked(saveMemoryTriageDecision).mock.calls[0]?.[3]).toMatchObject({ disposition: "reject" });
   });
 
   it("saves one corrected exception instead of exposing hundreds of raw candidates", async () => {

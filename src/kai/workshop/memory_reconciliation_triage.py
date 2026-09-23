@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,6 +28,8 @@ from kai.workshop.memory_reconciliation_review import (
 )
 from kai.workshop.runtime_pool import WorkshopRuntimePool
 from kai.workshop.store import WorkshopEventStore
+
+log = logging.getLogger(__name__)
 
 PROMPT_VERSION = "memory_reconciliation_triage_v2"
 MAX_GROUPS = 100
@@ -361,11 +364,19 @@ class WorkshopMemoryReconciliationTriageService:
         )
         async with self._lock:
             async with self._store.connection.execute(
-                "SELECT plan_id, plan_sha256 FROM memory_reconciliation_triage_plans WHERE audit_id = ?",
+                "SELECT plan_id, plan_sha256, policy_version, status FROM memory_reconciliation_triage_plans "
+                "WHERE audit_id = ?",
                 (audit_id,),
             ) as cursor:
                 existing = await cursor.fetchone()
-            if existing is None:
+            if existing is not None and str(existing[2]) != str(plan["policy_version"]):
+                if str(existing[3]) != "open":
+                    # An applied plan is history: show it exactly as it was
+                    # applied, under the policy that produced it.
+                    row, stored = await self._plan_row(principal_id, str(existing[0]))
+                    return await self._summary(row, stored)
+                await self._replan(principal_id, str(existing[0]), str(existing[1]), str(existing[2]), plan)
+            elif existing is None:
                 now = _now()
                 connection = self._store.connection
                 try:
@@ -414,6 +425,140 @@ class WorkshopMemoryReconciliationTriageService:
                 raise MemoryReconciliationReviewConflict("Stored triage plan conflicts with the audit")
         row, stored = await self._plan_row(principal_id, str(plan["plan_id"]))
         return await self._summary(row, stored)
+
+    async def _replan(
+        self,
+        principal_id: PrincipalId,
+        old_plan_id: str,
+        old_plan_sha256: str,
+        old_policy_version: str,
+        plan: dict[str, Any],
+    ) -> None:
+        """
+        Replace an open plan built by an older policy with `plan`, keeping still-valid decisions.
+
+        A plan's id derives from its audit and policy, and each audit has
+        exactly one plan, so a policy change would otherwise make the stored
+        plan unloadable. A group's id is a digest of its evidence,
+        classification, and action, so a group the new policy left unchanged
+        has the same id and state in both plans: its disposition, action,
+        recommendation, note, and state version carry over as they are.
+        Groups the new policy changed start pending, and the decisions they
+        replace are recorded in `memory_reconciliation_operations` (the plan
+        document itself must stay exactly what the policy produces, because
+        every load compares it with a fresh rebuild).
+
+        The plan row keeps its place and is updated to the new id, so the
+        recommendation runs recorded against it move with it rather than
+        being dropped. Foreign keys are checked at commit, after the
+        children point at the new id. `review_version` increases so an open
+        Workshop page saving against the old plan gets a conflict.
+        Caller holds `self._lock`.
+        """
+        connection = self._store.connection
+        async with connection.execute(
+            "SELECT group_id, state_sha256, disposition, action_json, recommendation_json, operator_note, "
+            "state_version FROM memory_reconciliation_triage_groups WHERE plan_id = ?",
+            (old_plan_id,),
+        ) as cursor:
+            old_groups = {str(item[0]): item for item in await cursor.fetchall()}
+        kept = {
+            str(group["group_id"]): old_groups[str(group["group_id"])]
+            for group in plan["groups"]
+            if str(group["group_id"]) in old_groups
+            and str(old_groups[str(group["group_id"])][1]) == str(group["state_sha256"])
+        }
+        dropped = [
+            {"group_id": group_id, "disposition": str(item[2])}
+            for group_id, item in sorted(old_groups.items())
+            if group_id not in kept and str(item[2]) != "pending"
+        ]
+        now = _now()
+        record = {
+            "old_plan_id": old_plan_id,
+            "old_plan_sha256": old_plan_sha256,
+            "old_policy_version": old_policy_version,
+            "new_plan_id": plan["plan_id"],
+            "new_plan_sha256": plan["sha256"],
+            "kept": len(kept),
+            "dropped": dropped,
+        }
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute("PRAGMA defer_foreign_keys = ON")
+            cursor = await connection.execute(
+                "UPDATE memory_reconciliation_triage_plans SET plan_id = ?, plan_sha256 = ?, policy_version = ?, "
+                "group_count = ?, memory_count = ?, plan_json = ?, review_version = review_version + 1 "
+                "WHERE plan_id = ? AND status = 'open'",
+                (
+                    plan["plan_id"],
+                    plan["sha256"],
+                    plan["policy_version"],
+                    plan["group_count"],
+                    plan["memory_count"],
+                    _canonical(plan),
+                    old_plan_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MemoryReconciliationReviewConflict("Memory triage plan changed while it was being updated")
+            await connection.execute(
+                "UPDATE memory_reconciliation_triage_recommendations SET plan_id = ? WHERE plan_id = ?",
+                (plan["plan_id"], old_plan_id),
+            )
+            await connection.execute(
+                "DELETE FROM memory_reconciliation_triage_groups WHERE plan_id = ?", (old_plan_id,)
+            )
+            await connection.executemany(
+                "INSERT INTO memory_reconciliation_triage_groups ("
+                "plan_id, group_id, state_sha256, classification, resolution, deterministic, bulk_eligible, "
+                "memory_count, disposition, action_json, recommendation_json, operator_note, state_version, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        plan["plan_id"],
+                        group["group_id"],
+                        group["state_sha256"],
+                        group["classification"],
+                        group["resolution"],
+                        int(group["deterministic"]),
+                        int(group["bulk_eligible"]),
+                        len(group["evidence"]),
+                        str(kept[group["group_id"]][2]) if group["group_id"] in kept else "pending",
+                        str(kept[group["group_id"]][3]) if group["group_id"] in kept else _canonical(group["action"]),
+                        str(kept[group["group_id"]][4]) if group["group_id"] in kept else "{}",
+                        str(kept[group["group_id"]][5]) if group["group_id"] in kept else "",
+                        int(kept[group["group_id"]][6]) if group["group_id"] in kept else 0,
+                        now,
+                    )
+                    for group in plan["groups"]
+                ],
+            )
+            await connection.execute(
+                "INSERT OR IGNORE INTO memory_reconciliation_operations ("
+                "principal_id, client_operation_id, request_sha256, response_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(principal_id),
+                    f"replan:{old_plan_id}",
+                    _digest({"old": old_plan_sha256, "new": plan["sha256"]}),
+                    _canonical(record),
+                    now,
+                ),
+            )
+            await connection.commit()
+        except Exception:
+            await connection.rollback()
+            raise
+        log.info(
+            "Memory triage plan %s moved from policy %s to %s as %s: kept=%d, reopened=%d",
+            old_plan_id,
+            old_policy_version,
+            plan["policy_version"],
+            plan["plan_id"],
+            len(kept),
+            len(dropped),
+        )
 
     async def latest(
         self,
@@ -558,6 +703,9 @@ class WorkshopMemoryReconciliationTriageService:
                     },
                     "proposed_action": unchanged_prior_review_action or group["action"],
                     "prior_review_evidence": group["prior_review_evidence"],
+                    # Names of the schema fields an incomplete episode lacks;
+                    # empty for every other group.
+                    "missing_fields": list(group.get("missing_fields", [])),
                     "evidence": [self._client_evidence(item) for item in group["evidence"]],
                     "decision": state,
                 }

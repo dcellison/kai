@@ -19,7 +19,9 @@ from kai import memory_reconciliation
 
 PLAN_KIND = "kai.memory_reconciliation.triage_plan"
 PLAN_VERSION = 1
-POLICY_VERSION = "legacy_triage_v1"
+# v2 checks every deterministic group against the canonical schema before
+# offering it for bulk approval; see `_schema_checked`.
+POLICY_VERSION = "legacy_triage_v2"
 
 _TOKEN = re.compile(r"[a-z0-9]+")
 _CURRENT_WORDS = frozenset({"currently", "current", "now", "today", "latest"})
@@ -86,6 +88,7 @@ def _group(
     deterministic: bool,
     bulk_eligible: bool,
     prior_review_evidence: list[dict[str, Any]] | None = None,
+    missing_fields: list[str] | None = None,
 ) -> dict[str, Any]:
     ordered = sorted(evidence, key=lambda item: str(item["memory_id"]))
     state = {
@@ -100,6 +103,11 @@ def _group(
             prior_review_evidence or [], key=lambda item: (str(item["candidate_id"]), str(item["disposition"]))
         ),
     }
+    # Only groups that carry missing fields get the key, so every other
+    # group keeps the digest (and therefore the group id and any saved
+    # decision) it had before the key existed.
+    if missing_fields is not None:
+        state["missing_fields"] = sorted(missing_fields)
     state_sha256 = _digest(state)
     return {
         "group_id": f"mtg_{state_sha256[:32]}",
@@ -116,6 +124,120 @@ def _near_duplicate(left: dict[str, Any], right: dict[str, Any]) -> bool:
     if min(len(left_tokens), len(right_tokens)) < 4:
         return False
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens) >= 0.8
+
+
+def _missing_episode_fields(rows: list[dict[str, Any]]) -> list[str]:
+    """Name the episode fields the legacy metadata lacks that the schema requires."""
+    missing: set[str] = set()
+    for row in rows:
+        metadata = row.get("metadata") or {}
+        if metadata.get("outcome_quality") not in {"success", "partial", "failure"}:
+            missing.add("outcome_quality")
+        actors = metadata.get("actors")
+        if not isinstance(actors, list) or not any(isinstance(actor, str) and actor.strip() for actor in actors):
+            missing.add("actors")
+    return sorted(missing)
+
+
+# Batch classes gather many independent facts into one group per scope, so
+# a single row that would fail the schema must not pull the rest of its
+# batch out of bulk approval.
+_BATCH_CLASSIFICATIONS = frozenset({"stable_non_conflicting", "explicitly_expired"})
+
+
+def _schema_checked_groups(group: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Apply `_schema_checked`, splitting failing rows out of per-scope batches.
+
+    A batch of independent facts is split row by row: rows that would pass
+    stay together in the batch, and each failing row becomes its own review
+    group. Every other group is checked as one unit, because its rows form
+    one decision (duplicates, a chain of episodes).
+    """
+    if not group["deterministic"] or group["classification"] not in _BATCH_CLASSIFICATIONS:
+        return [_schema_checked(group)]
+    failing = [
+        row
+        for row in group["evidence"]
+        if memory_reconciliation.action_schema_problem([row], group["action"]) is not None
+    ]
+    if not failing:
+        return [group]
+    failing_ids = {str(row["memory_id"]) for row in failing}
+    passing = [row for row in group["evidence"] if str(row["memory_id"]) not in failing_ids]
+    groups = [
+        _schema_checked(
+            _group(
+                group["classification"],
+                [row],
+                resolution=group["resolution"],
+                rationale=group["rationale"],
+                action=group["action"],
+                deterministic=True,
+                bulk_eligible=True,
+                prior_review_evidence=list(group["prior_review_evidence"]),
+            )
+        )
+        for row in failing
+    ]
+    if passing:
+        groups.append(
+            _group(
+                group["classification"],
+                passing,
+                resolution=group["resolution"],
+                rationale=group["rationale"],
+                action=group["action"],
+                deterministic=True,
+                bulk_eligible=True,
+                prior_review_evidence=list(group["prior_review_evidence"]),
+            )
+        )
+    return groups
+
+
+def _schema_checked(group: dict[str, Any]) -> dict[str, Any]:
+    """
+    Keep a group deterministic only if applying its action would pass the schema.
+
+    Bulk approval promises the operator that an approved group applies
+    without judgment. A group whose action would be rejected by canonical
+    memory cannot keep that promise, so it goes to exception review. An
+    episode that fails becomes `incomplete_episode`: its legacy record
+    lacks required fields, and since Kai does not invent them the only
+    outcomes are rejecting or deferring it. A fact group keeps its
+    classification and says what failed.
+    """
+    if not group["deterministic"]:
+        return group
+    rows = list(group["evidence"])
+    problem = memory_reconciliation.action_schema_problem(rows, group["action"])
+    if problem is None:
+        return group
+    if group["action"].get("kind") == "record_episode_chain":
+        return _group(
+            "incomplete_episode",
+            rows,
+            resolution="needs_review",
+            rationale=(
+                "Legacy episode is missing an outcome quality or actors, so it cannot be kept as a canonical episode."
+            ),
+            action={"kind": "manual_edit_required"},
+            deterministic=False,
+            bulk_eligible=False,
+            prior_review_evidence=list(group["prior_review_evidence"]),
+            missing_fields=_missing_episode_fields(rows),
+        )
+    return _group(
+        group["classification"],
+        rows,
+        resolution="needs_review",
+        rationale=f"Applying the proposed action would be rejected by canonical memory: {problem}",
+        action={"kind": "manual_edit_required"},
+        deterministic=False,
+        bulk_eligible=False,
+        prior_review_evidence=list(group["prior_review_evidence"]),
+    )
 
 
 def build_triage_plan(
@@ -401,7 +523,7 @@ def build_triage_plan(
         )
 
     ordered = sorted(
-        authority_checked_groups,
+        [checked for group in authority_checked_groups for checked in _schema_checked_groups(group)],
         key=lambda item: (not item["deterministic"], item["classification"], item["group_id"]),
     )
     assigned = [str(item["memory_id"]) for group in ordered for item in group["evidence"]]

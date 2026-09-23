@@ -4249,9 +4249,13 @@ function parseMemoryTriageGroup(value: unknown): WorkshopMemoryTriageGroup | nul
     decision: value.decision,
   });
   if (!candidate) return null;
+  // Older servers omit the field; treat that as "nothing missing".
+  const missingFields = value.missing_fields === undefined ? [] : value.missing_fields;
+  if (!Array.isArray(missingFields) || !missingFields.every((field) => typeof field === "string")) return null;
   return {
     bulkEligible: value.bulk_eligible,
     classification: value.classification,
+    missingFields: missingFields as string[],
     decision: {
       ...candidate.decision,
       recommendation: value.decision.recommendation,

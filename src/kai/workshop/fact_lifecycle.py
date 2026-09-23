@@ -31,7 +31,7 @@ from kai.workshop.memory_current_truth import (
 from kai.workshop.memory_projection_status import ProjectionRetryResult
 from kai.workshop.projection import CanonicalConversationProjection
 from kai.workshop.store import IdempotencyConflictError, WorkshopEventStore
-from kai.workshop.temporal_memory import resolve_memory_admission
+from kai.workshop.temporal_memory import resolve_memory_admission, validate_fact_revision_payload
 
 log = logging.getLogger(__name__)
 
@@ -292,6 +292,21 @@ def _revision_payload(spec: FactRevisionInput, revision_id: MemoryRevisionId, *,
         ).value,
         "vector_metadata": metadata,
     }
+
+
+def validate_revision_input(spec: FactRevisionInput) -> None:
+    """
+    Raise ValueError when storing `spec` as a revision would be rejected, without writing.
+
+    Builds the same payload `create`, `supersede`, and `restore` append,
+    with a placeholder revision id, and runs the projection's own pure
+    checks on it.
+    """
+    try:
+        payload = _revision_payload(spec, MemoryRevisionId("mrv_" + "0" * 32), supersedes=None)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("Fact revision input has an invalid shape") from exc
+    validate_fact_revision_payload(payload)
 
 
 class MemoryFactLifecycleService:
