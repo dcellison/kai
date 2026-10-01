@@ -167,6 +167,89 @@ class TestWorkshopClientSessionAuthentication:
         finally:
             await store.close()
 
+    async def _expiry(self, store: WorkshopEventStore, session_id: ClientSessionId) -> str:
+        async with store.connection.execute(
+            "SELECT expires_at FROM workshop_client_sessions WHERE id = ?", (session_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        return str(row[0])
+
+    async def test_use_renews_the_session_one_idle_window_ahead(self, tmp_path: Path):
+        store, alice_id, _ = await _open_store(tmp_path / "kai.db")
+        clock = _Clock()
+        manager = _manager(store, clock)
+        try:
+            device = await manager.register_device(alice_id, "Alice laptop")
+            issued = await manager.issue_session(alice_id, device.device_id)
+            clock.value += timedelta(days=10)
+
+            assert await manager.authenticate_token(issued.token) is not None
+
+            assert await self._expiry(store, issued.session_id) == "2026-09-20T15:00:00.000000Z"
+        finally:
+            await store.close()
+
+    async def test_renewal_waits_until_it_moves_the_expiry_a_full_day(self, tmp_path: Path):
+        store, alice_id, _ = await _open_store(tmp_path / "kai.db")
+        clock = _Clock()
+        manager = _manager(store, clock)
+        try:
+            device = await manager.register_device(alice_id, "Alice laptop")
+            issued = await manager.issue_session(alice_id, device.device_id)
+            clock.value += timedelta(hours=23)
+            assert await manager.authenticate_token(issued.token) is not None
+            assert await self._expiry(store, issued.session_id) == "2026-09-10T15:00:00.000000Z"
+
+            clock.value += timedelta(hours=1)
+            assert await manager.authenticate_token(issued.token) is not None
+            assert await self._expiry(store, issued.session_id) == "2026-09-11T15:00:00.000000Z"
+        finally:
+            await store.close()
+
+    async def test_a_session_used_monthly_stays_valid_and_an_idle_one_expires(self, tmp_path: Path):
+        store, alice_id, _ = await _open_store(tmp_path / "kai.db")
+        clock = _Clock()
+        manager = _manager(store, clock)
+        try:
+            device = await manager.register_device(alice_id, "Alice laptop")
+            issued = await manager.issue_session(alice_id, device.device_id)
+            # Well past the original 30 days and the 90-day issuance limit.
+            for _ in range(5):
+                clock.value += timedelta(days=29)
+                assert await manager.authenticate_token(issued.token) is not None
+
+            clock.value += timedelta(days=30)
+
+            assert await manager.authenticate_token(issued.token) is None
+        finally:
+            await store.close()
+
+    async def test_short_expired_and_revoked_sessions_never_renew(self, tmp_path: Path):
+        store, alice_id, _ = await _open_store(tmp_path / "kai.db")
+        clock = _Clock()
+        manager = _manager(store, clock)
+        try:
+            device = await manager.register_device(alice_id, "Alice laptop")
+            short = await manager.issue_session(alice_id, device.device_id, lifetime=timedelta(minutes=5))
+            revoked = await manager.issue_session(alice_id, device.device_id)
+            short_expiry = await self._expiry(store, short.session_id)
+            revoked_expiry = await self._expiry(store, revoked.session_id)
+            assert await manager.revoke_session(alice_id, revoked.session_id) is True
+
+            clock.value += timedelta(minutes=4)
+            # A session issued deliberately short keeps its end.
+            assert await manager.authenticate_token(short.token) is not None
+            assert await self._expiry(store, short.session_id) == short_expiry
+            clock.value += timedelta(minutes=1)
+            assert await manager.authenticate_token(short.token) is None
+            assert await manager.authenticate_token(revoked.token) is None
+
+            assert await self._expiry(store, short.session_id) == short_expiry
+            assert await self._expiry(store, revoked.session_id) == revoked_expiry
+        finally:
+            await store.close()
+
     async def test_malformed_token_is_rejected_before_storage_access(self, tmp_path: Path):
         store, _, _ = await _open_store(tmp_path / "kai.db")
         manager = _manager(store, _Clock())
