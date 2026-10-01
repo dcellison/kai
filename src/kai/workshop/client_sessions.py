@@ -21,6 +21,15 @@ _TOKEN_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 _MAX_TOKEN_LENGTH = 512
 _DEFAULT_SESSION_LIFETIME = timedelta(days=30)
 _MAX_SESSION_LIFETIME = timedelta(days=90)
+# A session in use stays valid: each authentication moves its expiry to one
+# idle window after that request, so only a browser left unused for the
+# whole window has to enroll again. The idle window is the default session
+# lifetime, and only sessions issued for at least that long renew.
+# Revoking the session or its device still ends it immediately.
+_SESSION_IDLE_WINDOW = _DEFAULT_SESSION_LIFETIME
+# Renewal is skipped unless it would move the expiry by at least this much,
+# so a busy browser does not rewrite the expiry on every request.
+_SESSION_RENEWAL_STEP = timedelta(days=1)
 _DEFAULT_ENROLLMENT_LIFETIME = timedelta(minutes=10)
 _MAX_ENROLLMENT_LIFETIME = timedelta(hours=1)
 
@@ -231,7 +240,7 @@ class WorkshopClientSessionManager:
             await connection.execute("BEGIN IMMEDIATE")
             async with connection.execute(
                 "SELECT s.principal_id, s.device_id, s.token_hash, s.expires_at, "
-                "s.revoked_at, d.revoked_at FROM workshop_client_sessions s "
+                "s.revoked_at, d.revoked_at, s.created_at FROM workshop_client_sessions s "
                 "JOIN workshop_client_devices d ON d.id = s.device_id "
                 "AND d.principal_id = s.principal_id "
                 "JOIN principals p ON p.id = s.principal_id AND p.kind = 'human' "
@@ -252,10 +261,26 @@ class WorkshopClientSessionManager:
 
             principal_id = PrincipalId(str(row[0]))
             device_id = DeviceId(str(row[1]))
-            await connection.execute(
-                "UPDATE workshop_client_sessions SET last_seen_at = ? WHERE id = ? AND revoked_at IS NULL",
-                (now_text, session_id),
-            )
+            # Renewal happens only after the checks above: an expired or
+            # revoked session never comes back to life. Only sessions issued
+            # for at least the idle window renew; one issued deliberately
+            # short keeps its end. Renewal only ever extends, so a session
+            # that has renewed still meets that test. It never shortens a
+            # session issued for longer than the window either.
+            expires_at = _parse_timestamp(str(row[3]))
+            renewed_expiry = now + _SESSION_IDLE_WINDOW
+            renewable = expires_at - _parse_timestamp(str(row[6])) >= _SESSION_IDLE_WINDOW
+            if renewable and renewed_expiry - expires_at >= _SESSION_RENEWAL_STEP:
+                await connection.execute(
+                    "UPDATE workshop_client_sessions SET last_seen_at = ?, expires_at = ? "
+                    "WHERE id = ? AND revoked_at IS NULL",
+                    (now_text, _format_timestamp(renewed_expiry), session_id),
+                )
+            else:
+                await connection.execute(
+                    "UPDATE workshop_client_sessions SET last_seen_at = ? WHERE id = ? AND revoked_at IS NULL",
+                    (now_text, session_id),
+                )
             await connection.execute(
                 "UPDATE workshop_client_devices SET last_seen_at = ? "
                 "WHERE id = ? AND principal_id = ? AND revoked_at IS NULL",
