@@ -345,7 +345,14 @@ button:disabled {
   position: relative;
   display: grid;
   grid-template-rows: auto 1fr auto;
-  min-height: 100vh;
+  /* The body clips overflow so the app shell's panes scroll on their own,
+     so this page must be its own scroll container: exactly one viewport
+     tall, scrolling when the content is taller. A minimum height would let
+     it grow past the window instead, and the body would clip the bottom of
+     the enrollment form. dvh follows the visible area on mobile browsers;
+     vh is the fallback where dvh is unsupported. */
+  height: 100vh;
+  height: 100dvh;
   overflow: auto;
   background:
     linear-gradient(color-mix(in srgb, var(--color-accent) 3.5%, transparent) 1px, transparent 1px),
