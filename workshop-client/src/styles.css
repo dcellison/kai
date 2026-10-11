@@ -2329,9 +2329,15 @@ button.nav-heading {
   background: var(--color-panel);
 }
 
+/* The single column is pinned to the panel width. With an implicit auto
+   column the grid would grow to its widest child's min-content width, and
+   the header's no-wrap "Thread in <channel>" label plus its icons is wider
+   than a narrow panel, which pushed the icons and the replies past the
+   right edge. minmax(0, 1fr) lets the label truncate instead. */
 .thread-pane {
   flex: 1 1 auto;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto auto;
   min-width: 0;
   min-height: 0;
