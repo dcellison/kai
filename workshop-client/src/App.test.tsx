@@ -3620,10 +3620,14 @@ describe("Workshop React client", () => {
       name: "Archive channel",
     }) as HTMLButtonElement;
     const headerButtons = [...(archiveButton.closest("header")?.querySelectorAll("button") ?? [])];
-    const titleRow = archiveButton.closest(".context-channel-title-row");
-    expect(titleRow).not.toBeNull();
-    expect(titleRow).toContainElement(settingsButton);
-    expect(titleRow?.querySelector("h2")).toHaveTextContent("# Lifecycle qualification");
+    // The context header carries only the panel label and the actions; the
+    // conversation name is not repeated there.
+    const contextHeader = archiveButton.closest(".context-channel-header");
+    expect(contextHeader).not.toBeNull();
+    expect(contextHeader).toContainElement(settingsButton);
+    expect(contextHeader?.querySelector(".overline")).toHaveTextContent("Channel context");
+    expect(contextHeader?.querySelector("h2")).toBeNull();
+    expect(contextHeader).not.toHaveTextContent("Lifecycle qualification");
     const contextTitles = [
       ...(archiveButton.closest("aside")?.querySelectorAll(".context-section-title") ?? []),
     ].map((title) => title.textContent);
