@@ -716,6 +716,19 @@ button:disabled {
   margin-top: 0;
 }
 
+/* Section headings are buttons so a click collapses their section. Strip
+   the native button chrome so they render exactly like the original static
+   headings: no border, background, padding, or centered text. */
+button.nav-heading {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: none;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
 .nav-heading-row {
   display: flex;
   align-items: center;
