@@ -468,8 +468,32 @@ function NavSectionHeading({
       title={collapsed ? `Expand ${title}` : `Collapse ${title}`}
       onClick={onToggle}
     >
+      <SectionChevron expanded={!collapsed} />
       {title}
     </button>
+  );
+}
+
+/**
+ * Solid disclosure chevron shown before a collapsible section heading.
+ *
+ * It points right while the section is collapsed and rotates to point down
+ * when expanded. It sits inside the heading's own click target (the sidebar
+ * button or the context panel summary), so clicking it toggles the section
+ * just like clicking the heading text. Decorative only: the heading's
+ * aria-expanded or <details> open state carries the meaning for assistive
+ * technology.
+ */
+function SectionChevron({ expanded }: { expanded: boolean }): React.JSX.Element {
+  return (
+    <svg
+      aria-hidden="true"
+      className={`section-chevron${expanded ? " expanded" : ""}`}
+      focusable="false"
+      viewBox="0 0 8 8"
+    >
+      <path d="M2.5 1 6.5 4 2.5 7Z" fill="currentColor" />
+    </svg>
   );
 }
 
@@ -2691,7 +2715,10 @@ function ContextSection({
       }}
     >
       <summary className="context-section-toggle">
-        <h3 className="context-section-title">{title}</h3>
+        <h3 className="context-section-title">
+          <SectionChevron expanded={open} />
+          {title}
+        </h3>
         {action && (
           <span
             className="context-section-header-action"

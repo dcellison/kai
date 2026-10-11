@@ -1228,10 +1228,14 @@ describe("Workshop React client", () => {
     expect(contextSections).toHaveLength(4);
     expect(within(channelContext).queryByText("Connection")).toBeNull();
     expect(contextSections.every((section) => section.open)).toBe(true);
+    // The only icon in a section heading is its disclosure chevron, shown
+    // in the expanded orientation because every section starts open.
     expect(
-      contextSections.every(
-        (section) => section.querySelector("summary")?.querySelector("svg") === null,
-      ),
+      contextSections.every((section) => {
+        const icons = section.querySelector("summary")?.querySelectorAll("svg") ?? [];
+        return icons.length === 1 && icons[0].classList.contains("section-chevron") &&
+          icons[0].classList.contains("expanded");
+      }),
     ).toBe(true);
     expect(within(channelContext).getByText(
       "You can read and send messages in this channel. Mention an agent to direct a request to it.",
@@ -1762,6 +1766,8 @@ describe("Workshop React client", () => {
     expect(activity).toHaveAttribute("aria-expanded", "true");
     await user.click(activity);
     expect(activity).toHaveAttribute("aria-expanded", "false");
+    // The chevron inside the heading flips to the collapsed orientation.
+    expect(activity.querySelector(".section-chevron")).not.toHaveClass("expanded");
     for (const name of ["Mentions", "Following", "Reviews"]) {
       expect(within(navigationPanel).queryByRole("button", { name })).toBeNull();
     }
