@@ -730,6 +730,22 @@ button.nav-heading {
   cursor: pointer;
 }
 
+/* Solid chevron before every collapsible section heading in both side
+   panels. Sized to the heading's uppercase letters so it reads as part of
+   the label, and rotated rather than swapped so the state change animates. */
+.section-chevron {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-right: 0.3rem;
+  vertical-align: -0.02rem;
+  transition: transform 120ms ease;
+}
+
+.section-chevron.expanded {
+  transform: rotate(90deg);
+}
+
 .nav-heading-row {
   display: flex;
   align-items: center;
