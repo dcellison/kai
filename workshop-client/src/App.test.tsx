@@ -1227,17 +1227,12 @@ describe("Workshop React client", () => {
     );
     expect(contextSections).toHaveLength(4);
     expect(within(channelContext).queryByText("Connection")).toBeNull();
-    expect(contextSections.every((section) => !section.open)).toBe(true);
+    expect(contextSections.every((section) => section.open)).toBe(true);
     expect(
       contextSections.every(
         (section) => section.querySelector("summary")?.querySelector("svg") === null,
       ),
     ).toBe(true);
-    await user.click(
-      within(channelContext).getByText("Authority", {
-        selector: ".context-section-title",
-      }),
-    );
     expect(within(channelContext).getByText(
       "You can read and send messages in this channel. Mention an agent to direct a request to it.",
     )).toBeVisible();
@@ -1294,14 +1289,17 @@ describe("Workshop React client", () => {
       selector: ".context-section-title",
     });
     const authoritySection = authorityTitle.closest("details");
-    expect(authoritySection).not.toHaveAttribute("open");
+    // Sections start expanded, like the navigation sidebar.
+    expect(authoritySection).toHaveAttribute("open");
 
     await user.click(authorityTitle);
-    expect(authoritySection).toHaveAttribute("open");
+    expect(authoritySection).not.toHaveAttribute("open");
     expect(
       JSON.parse(localStorage.getItem("kai.workshop.context-sections.v1") ?? "null"),
-    ).toEqual({ Authority: true });
+    ).toEqual({ Authority: false });
 
+    // The collapsed choice survives a remount instead of falling back to
+    // the expanded default.
     firstRender.unmount();
     render(<App />);
     const restoredContext = await screen.findByLabelText("Channel context");
@@ -1309,7 +1307,7 @@ describe("Workshop React client", () => {
       within(restoredContext).getByText("Authority", {
         selector: ".context-section-title",
       }).closest("details"),
-    ).toHaveAttribute("open");
+    ).not.toHaveAttribute("open");
   });
 
   it("opens a new tab from the browser-scoped credential", async () => {
@@ -3832,11 +3830,11 @@ describe("Workshop React client", () => {
     render(<App />);
     const peopleSection = (await screen.findByRole("heading", { name: "People" }))
       .closest("details");
-    expect(peopleSection).not.toHaveAttribute("open");
+    expect(peopleSection).toHaveAttribute("open");
     await user.click(
       await screen.findByRole("button", { name: "Manage channel members" }),
     );
-    expect(peopleSection).not.toHaveAttribute("open");
+    expect(peopleSection).toHaveAttribute("open");
     const dialog = await screen.findByRole("dialog", { name: "People" });
     const daniel = within(dialog).getByRole("checkbox", { name: /Daniel/ });
     const scott = within(dialog).getByRole("checkbox", { name: /Scott/ });
@@ -4271,11 +4269,11 @@ describe("Workshop React client", () => {
     render(<App />);
     const agentsSection = (await screen.findByRole("heading", { name: "Agents" }))
       .closest("details");
-    expect(agentsSection).not.toHaveAttribute("open");
+    expect(agentsSection).toHaveAttribute("open");
     await user.click(
       await screen.findByRole("button", { name: "Manage channel agents" }),
     );
-    expect(agentsSection).not.toHaveAttribute("open");
+    expect(agentsSection).toHaveAttribute("open");
     const dialog = await screen.findByRole("dialog", { name: "Agents" });
     expect(within(dialog).getByText(/sponsored by Daniel/i)).toBeVisible();
     const kai = within(dialog).getByRole("checkbox", { name: /Kai/ });

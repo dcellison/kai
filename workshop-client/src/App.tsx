@@ -2648,11 +2648,13 @@ function ContextSection({
   revealTargetId?: string | null;
   title: string;
 }): React.JSX.Element {
-  const [open, setOpen] = useState(() => restoreContextSectionState()[title] ?? false);
+  // Sections start expanded, matching the navigation sidebar; only a section
+  // the human explicitly collapsed in this browser starts closed.
+  const [open, setOpen] = useState(() => restoreContextSectionState()[title] ?? true);
   const sectionRef = useRef<HTMLDetailsElement>(null);
 
   useEffect(() => {
-    setOpen(restoreContextSectionState()[title] ?? false);
+    setOpen(restoreContextSectionState()[title] ?? true);
   }, [title]);
 
   useEffect(() => {
@@ -2680,6 +2682,10 @@ function ContextSection({
       ref={sectionRef}
       onToggle={(event) => {
         const nextOpen = event.currentTarget.open;
+        // A <details> rendered open fires a toggle event on mount. Store only
+        // real changes so untouched sections keep following the default
+        // instead of being pinned open in browser storage.
+        if (nextOpen === open) return;
         setOpen(nextOpen);
         storeContextSectionState(title, nextOpen);
       }}
