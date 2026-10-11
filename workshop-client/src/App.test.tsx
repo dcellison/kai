@@ -3960,7 +3960,9 @@ describe("Workshop React client", () => {
     );
     expect(followThread).toHaveTextContent("");
     expect(followThread.querySelector("svg")).not.toBeNull();
-    expect(followThread).toHaveClass("panel-icon-button", "followed");
+    // Thread header actions use the sidebar's tool button so they match the
+    // sidebar heading icons in size.
+    expect(followThread).toHaveClass("nav-tool-button", "followed");
     expect(followThread.nextElementSibling).toBe(
       within(context).getByRole("button", { name: "Close thread" }),
     );
@@ -3984,9 +3986,15 @@ describe("Workshop React client", () => {
       "followed",
     );
     const closeThread = within(context).getByRole("button", { name: "Close thread" });
-    expect(closeThread).toHaveClass("panel-icon-button");
-    expect(closeThread).toHaveTextContent("×");
-    expect(closeThread.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+    expect(closeThread).toHaveClass("nav-tool-button");
+    expect(closeThread).toHaveTextContent("");
+    expect(closeThread.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+    // The header carries only the thread label and actions, no reply count.
+    const threadHeader = closeThread.closest(".thread-header");
+    expect(threadHeader?.querySelector(".overline")).toHaveTextContent(
+      "Thread in Wake policy qualification",
+    );
+    expect(threadHeader?.querySelector("h2")).toBeNull();
     const composer = within(context).getByLabelText("Reply in Wake policy qualification");
     expect(composer).toHaveAttribute("rows", "1");
     expect(composer).toHaveAttribute("placeholder", "Reply…");

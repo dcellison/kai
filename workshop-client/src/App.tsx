@@ -2589,6 +2589,18 @@ function SettingsIcon(): React.JSX.Element {
   );
 }
 
+/**
+ * Close glyph drawn as an SVG so it scales with the icon button like the
+ * other header icons; a text "×" would follow the font size instead.
+ */
+function CloseIcon(): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
 function ArchiveIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
@@ -3068,15 +3080,15 @@ function ThreadPane({
 
   return (
     <div className="thread-pane">
+      {/* One-line bar like the sidebar's "Kai Workshop" bar: the label on the
+          left, vertically centered, and the thread actions beside it. The
+          reply count is not repeated here; the thread itself shows it. */}
       <header className="thread-header">
-        <div>
-          <p className="overline">Thread in {channelName}</p>
-          <h2>{replies.length} {replies.length === 1 ? "reply" : "replies"}</h2>
-        </div>
+        <p className="overline">Thread in {channelName}</p>
         <div className="thread-header-actions">
           {activeStandingAgentIds.length > 0 && !readOnly && (
             <button
-              className="panel-icon-button"
+              className="nav-tool-button"
               type="button"
               aria-label="Suppress standing agents in this thread"
               title="Suppress standing agents in this thread"
@@ -3088,7 +3100,7 @@ function ThreadPane({
           )}
           {unreadState && !readOnly && (
             <button
-              className={`panel-icon-button thread-follow-button${unreadState.followed ? " followed" : ""}`}
+              className={`nav-tool-button thread-follow-button${unreadState.followed ? " followed" : ""}`}
               type="button"
               aria-label={unreadState.followed ? "Unfollow thread" : "Follow thread"}
               aria-pressed={unreadState.followed}
@@ -3104,13 +3116,13 @@ function ThreadPane({
             </button>
           )}
           <button
-            className="panel-icon-button"
+            className="nav-tool-button"
             type="button"
             aria-label="Close thread"
             title="Close thread"
             onClick={onClose}
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </div>
       </header>
