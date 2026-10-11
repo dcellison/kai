@@ -2589,14 +2589,6 @@ function SettingsIcon(): React.JSX.Element {
   );
 }
 
-function PlusIcon(): React.JSX.Element {
-  return (
-    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
-      <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-    </svg>
-  );
-}
-
 function ArchiveIcon(): React.JSX.Element {
   return (
     <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
@@ -6083,15 +6075,17 @@ function WorkshopView({
                 channel.kind === "group" &&
                 (channel.role === "owner" || workshop.role === "admin") &&
                 !channelIsArchived(channel) ? (
+                  // Same drawn plus as the sidebar's "Create channel" button so
+                  // the two panels' header actions match in size and style.
                   <button
-                    className="panel-icon-button"
+                    className="nav-add-button"
                     type="button"
                     aria-label="Manage channel members"
                     title="Manage channel members"
                     disabled={memberManagementLoading}
                     onClick={() => void openMemberManagement()}
                   >
-                    <PlusIcon />
+                    <span aria-hidden="true" />
                   </button>
                 ) : undefined
               }
@@ -6143,7 +6137,7 @@ function WorkshopView({
               action={
                 channel.role === "owner" && !channelIsArchived(channel) ? (
                   <button
-                    className="panel-icon-button"
+                    className="nav-tool-button"
                     type="button"
                     aria-label="Manage channel agents"
                     title="Manage channel agents"
@@ -6206,7 +6200,7 @@ function WorkshopView({
                       </span>
                       {observation ? (
                         <button
-                          className="panel-icon-button standing-agent-action"
+                          className="nav-tool-button standing-agent-action"
                           type="button"
                           aria-label={`Resume ${agent.name}'s standing observation`}
                           title={`Resume ${agent.name}'s standing observation`}
@@ -6217,7 +6211,7 @@ function WorkshopView({
                         </button>
                       ) : (standing || engaged) && (
                         <button
-                          className="panel-icon-button standing-agent-action"
+                          className="nav-tool-button standing-agent-action"
                           type="button"
                           aria-label={standing ? `Dismiss ${agent.name} from standing participation` : `Dismiss ${agent.name}`}
                           title={standing ? "Dismiss standing participant" : "Dismiss agent attention"}
@@ -6271,7 +6265,7 @@ function WorkshopView({
                         {channel.kind === "group" ? status.agentName : "Agent runtime"}
                       </p>
                       <button
-                        className="panel-icon-button runtime-fresh-session"
+                        className="nav-tool-button runtime-fresh-session"
                         type="button"
                         aria-label={`Start a fresh provider session for ${status.agentName}`}
                         title="Start fresh provider session"

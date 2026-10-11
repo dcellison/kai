@@ -2672,17 +2672,6 @@ button.nav-heading {
   margin-left: auto;
 }
 
-.context-section-header-action .panel-icon-button svg {
-  width: 1rem;
-  height: 1rem;
-  flex: none;
-}
-
-.context-section-header-action .panel-icon-button {
-  width: 1.5rem;
-  height: 1.5rem;
-}
-
 /* Body content lines up under the heading text, like sidebar entries. */
 .context-section-body {
   padding: 0 0.55rem 0.35rem;
@@ -2771,14 +2760,9 @@ button.nav-heading {
   height: 100%;
 }
 
-.standing-agent-action svg {
-  width: 1rem;
-  height: 1rem;
-}
-
+/* Sized by .nav-tool-button like every other context panel icon, so the
+   row actions match the sidebar's heading icons. */
 .standing-agent-action {
-  width: 1.8rem;
-  height: 1.8rem;
   flex: none;
 }
 
@@ -3294,14 +3278,14 @@ button.nav-heading {
   font-size: 0.72rem;
 }
 
-.thread-header .overline,
-.context-channel-header .overline {
+.thread-header .overline {
   margin-bottom: 0.2rem;
   font-size: 0.62rem;
 }
 
-/* Without a title below it the label needs no bottom margin; zero margin
-   lets the flex bar center it vertically, as .sidebar-title .overline is. */
+/* Styled like .sidebar-title .overline: it keeps the base .overline size so
+   "Channel context" matches "Kai Workshop", and with no title below it the
+   label needs no bottom margin, which lets the flex bar center it. */
 .context-channel-header .overline {
   min-width: 0;
   overflow: hidden;
@@ -3413,13 +3397,9 @@ button.nav-heading {
   white-space: nowrap;
 }
 
+/* Sized by .nav-tool-button; only kept from shrinking in the lane row. */
 .runtime-fresh-session {
   flex: 0 0 auto;
-}
-
-.runtime-fresh-session svg {
-  width: 1rem;
-  height: 1rem;
 }
 
 .context-section .settings-success {
