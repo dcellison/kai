@@ -142,6 +142,7 @@ const DRAFTS_KEY = "kai.workshop.drafts.v1";
 const VIEWPORTS_KEY = "kai.workshop.timeline-viewports.v1";
 const SIDEBAR_LAYOUT_KEY = "kai.workshop.sidebar-layout.v4";
 const CONTEXT_SECTION_STATE_KEY = "kai.workshop.context-sections.v1";
+const SIDEBAR_SECTION_STATE_KEY = "kai.workshop.sidebar-sections.v1";
 const TIMELINE_FOLLOW_DISTANCE_PX = 96;
 const UI_SCALE = 1.5;
 const MIN_SIDEBAR_WIDTH_PX = 176 * UI_SCALE;
@@ -397,6 +398,79 @@ function restoreSidebarLayout(): StoredSidebarLayout {
 
 function storeSidebarLayout(layout: StoredSidebarLayout): void {
   sessionStorage.setItem(SIDEBAR_LAYOUT_KEY, JSON.stringify(layout));
+}
+
+/**
+ * Read which navigation sidebar sections the human has collapsed.
+ *
+ * The record maps a section title ("Channels", "Agents", ...) to true when
+ * that section's entries are hidden. Missing titles are expanded, so a fresh
+ * browser shows every section. Like the context panel's section state, this
+ * lives in localStorage so the choice survives reloads and new tabs; it is a
+ * per-browser convenience, never shared state.
+ */
+function restoreSidebarSectionState(): Record<string, boolean> {
+  try {
+    const stored: unknown = JSON.parse(
+      localStorage.getItem(SIDEBAR_SECTION_STATE_KEY) ?? "null",
+    );
+    if (
+      typeof stored === "object" &&
+      stored !== null &&
+      !Array.isArray(stored) &&
+      Object.values(stored).every((value) => typeof value === "boolean")
+    ) {
+      return stored as Record<string, boolean>;
+    }
+  } catch {
+    // Malformed browser state has no authority.
+  }
+  return {};
+}
+
+/**
+ * Persist the full collapsed-section record for the navigation sidebar.
+ *
+ * Storage failures (private browsing, quota) are ignored because the
+ * in-memory state still drives the current page; only the memory of the
+ * choice across reloads is lost.
+ */
+function storeSidebarSectionState(state: Record<string, boolean>): void {
+  try {
+    localStorage.setItem(SIDEBAR_SECTION_STATE_KEY, JSON.stringify(state));
+  } catch {
+    // Browser storage is an optional layout convenience.
+  }
+}
+
+/**
+ * Clickable navigation section heading that collapses its section.
+ *
+ * It renders as a button carrying the same `nav-heading` class the static
+ * headings used, so it looks identical: the stylesheet strips the native
+ * button chrome and adds no chevron or hover treatment. `aria-expanded`
+ * tells assistive technology whether the entries below are shown.
+ */
+function NavSectionHeading({
+  collapsed,
+  onToggle,
+  title,
+}: {
+  collapsed: boolean;
+  onToggle: () => void;
+  title: string;
+}): React.JSX.Element {
+  return (
+    <button
+      className="nav-heading"
+      type="button"
+      aria-expanded={!collapsed}
+      title={collapsed ? `Expand ${title}` : `Collapse ${title}`}
+      onClick={onToggle}
+    >
+      {title}
+    </button>
+  );
 }
 
 const CONTEXT_LAYOUT_KEY = "kai.workshop.context-layout.v4";
@@ -3373,6 +3447,25 @@ function WorkshopView({
   const [awayFromBottom, setAwayFromBottom] = useState(false);
   const [readActivated, setReadActivated] = useState(readActivatedInitially);
   const [sidebarLayout, setSidebarLayout] = useState(restoreSidebarLayout);
+  // Sidebar sections the human collapsed by clicking their heading. Keyed by
+  // section title and persisted per browser.
+  const [collapsedNavSections, setCollapsedNavSections] = useState(
+    restoreSidebarSectionState,
+  );
+  // Flip one section and persist the whole record. The updater form keeps
+  // rapid clicks on different headings from overwriting each other.
+  const toggleNavSection = useCallback((title: string) => {
+    setCollapsedNavSections((current) => {
+      const next = { ...current, [title]: !current[title] };
+      storeSidebarSectionState(next);
+      return next;
+    });
+  }, []);
+  // A section's entries are hidden only in the full-width sidebar. The
+  // icon-only collapsed sidebar has no visible headings to expand them
+  // again, so it always shows every entry.
+  const navSectionHidden = (title: string): boolean =>
+    !sidebarLayout.collapsed && collapsedNavSections[title] === true;
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [contextWidth, setContextWidth] = useState(restoreContextWidth);
   const [resizingContext, setResizingContext] = useState(false);
@@ -4930,7 +5023,11 @@ function WorkshopView({
         <nav>
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
-              <p className="nav-heading">Channels</p>
+              <NavSectionHeading
+                collapsed={collapsedNavSections["Channels"] === true}
+                onToggle={() => toggleNavSection("Channels")}
+                title="Channels"
+              />
               <div className="nav-heading-actions">
                 <button
                   className="nav-tool-button"
@@ -4959,7 +5056,7 @@ function WorkshopView({
               </div>
             </div>
           )}
-          {workshop.channels
+          {!navSectionHidden("Channels") && workshop.channels
             .filter(
               (availableChannel) =>
                 availableChannel.kind === "group" &&
@@ -5006,7 +5103,11 @@ function WorkshopView({
 
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
-              <p className="nav-heading">Direct messages</p>
+              <NavSectionHeading
+                collapsed={collapsedNavSections["Direct messages"] === true}
+                onToggle={() => toggleNavSection("Direct messages")}
+                title="Direct messages"
+              />
               <div className="nav-heading-actions">
                 <button
                   className="nav-tool-button"
@@ -5029,7 +5130,7 @@ function WorkshopView({
               </div>
             </div>
           )}
-          {visibleDirectChannels.map((availableChannel) => {
+          {!navSectionHidden("Direct messages") && visibleDirectChannels.map((availableChannel) => {
                   const unreadCount = channelUnreadCount(unread.byChannel[availableChannel.channelId]);
                   const humanPeer = availableChannel.agents.length === 0
                     ? availableChannel.participants.find((participant) => participant.kind === "human")
@@ -5073,7 +5174,16 @@ function WorkshopView({
                   );
                 })}
 
-          <p className="nav-heading">Activity</p>
+          <NavSectionHeading
+            collapsed={collapsedNavSections["Activity"] === true}
+            onToggle={() => toggleNavSection("Activity")}
+            title="Activity"
+          />
+          {/* Activity spans the notification channels and the Mentions,
+              Following, and Reviews shortcuts, so one fragment hides all of
+              them together when the heading is collapsed. */}
+          {!navSectionHidden("Activity") && (
+          <>
           {workshop.channels
             .filter((availableChannel) => availableChannel.kind === "notification")
             .map((availableChannel) => {
@@ -5159,10 +5269,16 @@ function WorkshopView({
               </span>
             )}
           </button>
+          </>
+          )}
 
           {!sidebarLayout.collapsed && (
             <div className="nav-heading-row">
-              <p className="nav-heading">Agents</p>
+              <NavSectionHeading
+                collapsed={collapsedNavSections["Agents"] === true}
+                onToggle={() => toggleNavSection("Agents")}
+                title="Agents"
+              />
               <div className="nav-heading-actions">
                 {inactiveAgentEntries.length > 0 && (
                   <button
@@ -5187,7 +5303,7 @@ function WorkshopView({
               </div>
             </div>
           )}
-          {visibleAgents.map((agent) => {
+          {!navSectionHidden("Agents") && visibleAgents.map((agent) => {
             const engaged = engagedAgents.some(
               (candidate) => candidate.agentId === agent.agentId,
             );

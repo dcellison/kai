@@ -1747,6 +1747,44 @@ describe("Workshop React client", () => {
     ).toHaveAttribute("fill", "none");
   });
 
+  it("collapses a navigation section from its heading and remembers it", async () => {
+    const user = userEvent.setup();
+    sessionStorage.setItem(
+      "kai.workshop.read-session.v1",
+      JSON.stringify({ channelId, token: "session-secret" }),
+    );
+    vi.mocked(loadNavigation).mockResolvedValue(navigationWithGroup());
+
+    const { unmount } = render(<App />);
+
+    // Activity owns the Mentions, Following, and Reviews shortcuts, so
+    // collapsing it hides all three while the heading itself stays visible.
+    const navigationPanel = await screen.findByLabelText("Workshop navigation");
+    const activity = within(navigationPanel).getByRole("button", { name: "Activity" });
+    expect(activity).toHaveAttribute("aria-expanded", "true");
+    await user.click(activity);
+    expect(activity).toHaveAttribute("aria-expanded", "false");
+    for (const name of ["Mentions", "Following", "Reviews"]) {
+      expect(within(navigationPanel).queryByRole("button", { name })).toBeNull();
+    }
+    // Other sections are independent of the one that was collapsed.
+    expect(
+      within(navigationPanel).getByRole("button", { name: "Channels" }),
+    ).toHaveAttribute("aria-expanded", "true");
+
+    // The collapsed state persists per browser, so a fresh mount restores it.
+    unmount();
+    render(<App />);
+    const restoredPanel = await screen.findByLabelText("Workshop navigation");
+    const restored = within(restoredPanel).getByRole("button", { name: "Activity" });
+    expect(restored).toHaveAttribute("aria-expanded", "false");
+    expect(within(restoredPanel).queryByRole("button", { name: "Mentions" })).toBeNull();
+
+    // A second click expands the section again.
+    await user.click(restored);
+    expect(within(restoredPanel).getByRole("button", { name: "Mentions" })).toBeVisible();
+  });
+
   it("opens durable pull-request reviews from Activity navigation", async () => {
     const user = userEvent.setup();
     sessionStorage.setItem(
