@@ -47,12 +47,13 @@
   transform: rotate(45deg);
 }
 
+/* Matches in-section subheadings: sidebar entry size, sans. */
 .context-stack-panel > summary {
   cursor: pointer;
   color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 0.82rem;
-  font-weight: 540;
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  font-weight: 600;
 }
 
 .context-stack-inspector {
@@ -2595,39 +2596,55 @@ button.nav-heading {
   border-bottom: 1px solid var(--color-border);
 }
 
+/* Context panel sections mirror the navigation sidebar: no dividers between
+   sections, small uppercase headings, and no chevron or hover wash. The
+   heading row is still the native <summary>, so clicking it collapses the
+   section exactly as before. */
 .context-section {
-  border-bottom: 1px solid var(--color-border);
+  padding: 0 0.65rem;
 }
 
 .context-channel-header + .context-section {
   margin-top: 0.7rem;
 }
 
+/* Same vertical rhythm as the sidebar's .nav-heading-row. The min-height
+   matches the sidebar's 1.5rem header action buttons so rows with and
+   without an action line up. */
 .context-section-toggle {
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  min-height: 2rem;
-  padding: 0.25rem 1rem;
-  color: var(--color-text-strong);
+  min-height: 1.5rem;
+  margin: 0.58rem 0 0.21rem;
+  color: var(--color-text-muted);
   cursor: pointer;
 }
 
-.context-section-toggle:hover,
-.context-section-toggle:focus-visible {
-  background: color-mix(in srgb, var(--color-text) 4%, transparent);
-  outline: none;
+/* The shared details chevron stays on nested panels such as Context stack;
+   only the section headings drop it, as the sidebar headings have none. */
+.context-pane .context-section > summary::before {
+  content: none;
 }
 
+/* <summary> is not a button, so it misses the global button focus ring.
+   Give keyboard users the same accent outline the sidebar headings get. */
+.context-section-toggle:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Typography copied from .nav-heading so both panels' headings read as one
+   family. The horizontal margin matches the sidebar heading inset. */
 .context-section-toggle .context-section-title {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  margin: 0;
-  font-family: var(--serif);
-  font-size: 1rem;
-  font-weight: 540;
+  margin: 0 0.55rem;
+  color: var(--color-text-muted);
+  font-family: var(--sans);
+  font-size: 0.63rem;
+  font-weight: 740;
+  letter-spacing: 0.13em;
   text-overflow: ellipsis;
+  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -2650,16 +2667,20 @@ button.nav-heading {
   height: 1.5rem;
 }
 
+/* Body content lines up under the heading text, like sidebar entries. */
 .context-section-body {
-  padding: 0 1rem 0.68rem;
+  padding: 0 0.55rem 0.35rem;
 }
 
+/* Subheadings inside a section (Runtime diagnostics) sit below the small
+   section heading, so they use the sidebar entry size instead of the old
+   1rem serif that would now outweigh the heading above them. */
 .context-section h3 {
   margin: 0.23rem 0 0.38rem;
   color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1rem;
-  font-weight: 540;
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  font-weight: 600;
 }
 
 .context-section p {
@@ -2821,6 +2842,11 @@ button.nav-heading {
 .agent-attention-section strong,
 .agent-attention-section small {
   display: block;
+}
+
+/* People and agent names match the sidebar's channel entry size. */
+.agent-attention-section strong {
+  font-size: 0.8rem;
 }
 
 .agent-attention-section small {
