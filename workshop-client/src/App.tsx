@@ -123,6 +123,7 @@ import { usePrincipalEvents } from "./usePrincipalEvents";
 import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
+import { CloseIcon } from "./icons";
 import {
   ActionPalette,
   type WorkshopActionPaletteEntry,
@@ -2585,18 +2586,6 @@ function SettingsIcon(): React.JSX.Element {
         strokeLinejoin="round"
         strokeWidth="1.5"
       />
-    </svg>
-  );
-}
-
-/**
- * Close glyph drawn as an SVG so it scales with the icon button like the
- * other header icons; a text "×" would follow the font size instead.
- */
-function CloseIcon(): React.JSX.Element {
-  return (
-    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
-      <path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
     </svg>
   );
 }
@@ -5504,7 +5493,6 @@ function WorkshopView({
           principalEvents={principalEvents}
           runActive={activeResponseRuns.length > 0}
           token={agentToken}
-          workshopName={workshop.name}
         />
       ) : workspacesOpen ? (
         <WorkspacesWorkspace
@@ -5573,14 +5561,12 @@ function WorkshopView({
           connection={connection}
           inbox={inbox}
           onOpen={onOpenHumanNotification}
-          workshopName={workshop.name}
         />
       ) : followingOpen ? (
         <FollowingThreads
           connection={connection}
           following={following}
           onOpen={onOpenFollowedThread}
-          workshopName={workshop.name}
         />
       ) : reviewsOpen ? (
         <ReviewsWorkspace
@@ -5590,22 +5576,15 @@ function WorkshopView({
           onReviewPullRequest={() => setReviewDialogOpen(true)}
           revision={reviewRevision}
           session={settingsSession}
-          workshopName={workshop.name}
         />
       ) : (
         <>
       <section className="conversation-pane">
+        {/* One-line bar like the side panels' headers: the conversation name
+            styled as the sidebar's "Kai Workshop" label, vertically centered,
+            with the connection state on the right. */}
         <header className="conversation-header">
-          <div>
-            <p className="breadcrumbs">
-              {workshop.name} / {channel.kind === "notification"
-                ? "Activity"
-                : channel.kind === "direct"
-                  ? "Direct messages"
-                  : "Channels"}
-            </p>
-            <h2>{symbol} {channelName}</h2>
-          </div>
+          <h2>{symbol} {channelName}</h2>
           <div className="conversation-actions">
             <ConnectionIndicator connection={connection} />
             <button

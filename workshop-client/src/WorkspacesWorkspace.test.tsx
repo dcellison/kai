@@ -176,7 +176,7 @@ describe("Workspaces workspace", () => {
     renderWorkspace();
 
     expect(await screen.findByRole("heading", { name: "Workspaces", level: 1 })).toBeVisible();
-    expect(screen.getByText("Kai Workshop / Workspaces")).toBeVisible();
+    expect(document.querySelector(".breadcrumbs")).toBeNull();
     expect(screen.queryByText("Workspace", { selector: ".overline" })).not.toBeInTheDocument();
     expect(screen.getAllByText("/srv/kai")[0].closest("button")).toBeVisible();
     await user.click(screen.getByRole("button", { name: /qualification-1520/ }));

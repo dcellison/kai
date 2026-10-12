@@ -27,6 +27,7 @@ import {
   retryMemoryProjections,
 } from "./api";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { BackIcon } from "./icons";
 import type {
   WorkshopMemoryConflictSummary,
   WorkshopMemoryForgottenFact,
@@ -357,9 +358,9 @@ export function FactReview({
     <section className="memory-workspace memory-reconciliation-workspace" aria-label="Fact review">
       <div className="memory-browser-pane">
         <header className="memory-header">
-          <div><p className="breadcrumbs">Kai Workshop / Memory</p><h1>Fact review</h1></div>
-          <button className="panel-icon-button" type="button" aria-label="Back to memories" title="Back to memories" onClick={onBack}>
-            <span aria-hidden="true">←</span>
+          <h1>Fact review</h1>
+          <button className="nav-tool-button" type="button" aria-label="Back to memories" title="Back to memories" onClick={onBack}>
+            <BackIcon />
           </button>
         </header>
         <div className="memory-browser-scroll">

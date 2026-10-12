@@ -21,7 +21,6 @@ export function MentionsInbox({
   connection,
   inbox,
   onOpen,
-  workshopName,
 }: {
   connection: ConnectionState;
   inbox: HumanNotificationState & {
@@ -31,7 +30,6 @@ export function MentionsInbox({
     setRead: (notification: WorkshopHumanNotification, read: boolean) => Promise<void>;
   };
   onOpen: (notification: WorkshopHumanNotification) => boolean;
-  workshopName: string;
 }): React.JSX.Element {
   const [navigationError, setNavigationError] = useState<string | null>(null);
   return (
@@ -52,7 +50,6 @@ export function MentionsInbox({
         connection={connection}
         symbol="@"
         title="Mentions"
-        workshopName={workshopName}
       />
 
       <div className="mentions-summary" aria-live="polite">

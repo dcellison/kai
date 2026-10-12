@@ -64,13 +64,12 @@ describe("ReviewsWorkspace", () => {
           onReviewPullRequest={onReviewPullRequest}
           revision={0}
           session={session}
-          workshopName="Kai Workshop"
         />
       </ConfirmationProvider>,
     );
 
     expect(await screen.findByRole("heading", { name: "Reviews" })).toBeVisible();
-    expect(screen.getByText("Kai Workshop / Activity")).toBeVisible();
+    expect(document.querySelector(".breadcrumbs")).toBeNull();
     expect(screen.getByText("dcellison/kai#1695")).toBeVisible();
     expect(screen.getByText(/^Completed ·/)).toBeVisible();
     expect(screen.getByText("1 collection warning")).toBeVisible();
@@ -110,7 +109,6 @@ describe("ReviewsWorkspace", () => {
           onReviewPullRequest={vi.fn()}
           revision={0}
           session={session}
-          workshopName="Kai Workshop"
         />
       </ConfirmationProvider>,
     );

@@ -1515,7 +1515,8 @@ describe("Workshop React client", () => {
     expect(mentionsHeading).toBeVisible();
     const mentionsHeader = mentionsHeading.closest("header");
     expect(mentionsHeader).toHaveClass("conversation-header");
-    expect(within(mentionsHeader!).getByText("Kai Workshop / Activity")).toBeVisible();
+    // Center headers carry only the title and actions; no breadcrumb line.
+    expect(mentionsHeader!.querySelector(".breadcrumbs")).toBeNull();
     expect(within(mentionsHeader!).getByRole("status")).toHaveTextContent("Live");
     expect(within(mentionsHeader!).queryByRole("button", { name: "Back to conversation" }))
       .toBeNull();
@@ -1668,7 +1669,7 @@ describe("Workshop React client", () => {
     expect(followingHeading).toBeVisible();
     const followingHeader = followingHeading.closest("header");
     expect(followingHeader).toHaveClass("conversation-header");
-    expect(within(followingHeader!).getByText("Kai Workshop / Activity")).toBeVisible();
+    expect(followingHeader!.querySelector(".breadcrumbs")).toBeNull();
     expect(within(followingHeader!).getByRole("status")).toHaveTextContent("Live");
     expect(within(followingHeader!).queryByRole("button", { name: "Back to conversation" }))
       .toBeNull();
@@ -1801,7 +1802,7 @@ describe("Workshop React client", () => {
 
     await user.click(await screen.findByRole("button", { name: "Reviews" }));
     expect(await screen.findByRole("heading", { name: "Reviews", level: 2 })).toBeVisible();
-    expect(screen.getByText("Kai Workshop / Activity")).toBeVisible();
+    expect(document.querySelector(".breadcrumbs")).toBeNull();
     expect(screen.getByText("No on-demand reviews yet.")).toBeVisible();
     expect(window.location.search).toBe("?view=reviews");
     expect(loadReviewJobs).toHaveBeenCalledTimes(1);
@@ -2117,9 +2118,11 @@ describe("Workshop React client", () => {
     const backToConversation = screen.getByRole("button", {
       name: "Back to conversation",
     });
-    expect(backToConversation).toHaveClass("panel-icon-button");
-    expect(backToConversation).toHaveTextContent("←");
-    expect(backToConversation.querySelector("span")).toHaveAttribute(
+    // Header actions use the sidebar's tool button and a drawn arrow, so
+    // they match the sidebar heading icons in size.
+    expect(backToConversation).toHaveClass("nav-tool-button");
+    expect(backToConversation).toHaveTextContent("");
+    expect(backToConversation.querySelector("svg")).toHaveAttribute(
       "aria-hidden",
       "true",
     );
@@ -2140,7 +2143,7 @@ describe("Workshop React client", () => {
     await user.click(await screen.findByRole("button", { name: "Daniel profile" }));
     await user.click(screen.getByRole("menuitem", { name: /Workspaces/ }));
     expect(await screen.findByRole("heading", { name: "Workspaces", level: 1 })).toBeVisible();
-    expect(screen.getByText("Kai Workshop / Workspaces")).toBeVisible();
+    expect(document.querySelector(".breadcrumbs")).toBeNull();
     expect(screen.queryByText("Personal", { selector: ".nav-heading" })).toBeNull();
     expect(screen.getByRole("region", { name: "Authorized workspaces" })).toBeVisible();
     expect(loadWorkspaceGrants).toHaveBeenCalledTimes(1);
@@ -3374,7 +3377,10 @@ describe("Workshop React client", () => {
     await openContextSection("Authority");
     expect(screen.getByText("GitHub")).toBeVisible();
     expect(screen.getByText("Durable notification feed")).toBeVisible();
-    expect(screen.getByText("Kai Workshop / Activity")).toBeVisible();
+    // The conversation header names the channel without a breadcrumb line.
+    const conversationHeader = document.querySelector(".conversation-header");
+    expect(conversationHeader?.querySelector(".breadcrumbs")).toBeNull();
+    expect(conversationHeader?.querySelector("h2")).toHaveTextContent("GitHub notifications");
     expect(
       screen.getByText("Active delivery: GitHub → GitHub notifications"),
     ).toBeVisible();
@@ -4601,7 +4607,7 @@ describe("Workshop React client", () => {
     await user.click(manageKai);
 
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();
-    expect(screen.getByText("Kai Workshop / Agents")).toBeVisible();
+    expect(document.querySelector(".breadcrumbs")).toBeNull();
     expect(within(manageKai).getByLabelText("Open")).toHaveClass("live-pip");
     expect(screen.getByRole("heading", { name: "Kai", level: 2 })).toBeVisible();
     expect(screen.queryByText("Owner runtime")).toBeNull();
@@ -4617,11 +4623,13 @@ describe("Workshop React client", () => {
     });
     expect(createAgent).toBeVisible();
     expect(closeAgents).toBeVisible();
-    expect(createAgent).toHaveClass("panel-icon-button");
-    expect(closeAgents).toHaveClass("panel-icon-button");
+    // Same buttons as the sidebar headings: the drawn plus and a tool button
+    // with an SVG cross.
+    expect(createAgent).toHaveClass("nav-add-button");
+    expect(closeAgents).toHaveClass("nav-tool-button");
     expect(createAgent.parentElement).toBe(closeAgents.parentElement);
     expect(createAgent.querySelector("span")).toHaveAttribute("aria-hidden", "true");
-    expect(closeAgents.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+    expect(closeAgents.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
     expect(streamPrincipalEvents).toHaveBeenCalledTimes(1);
 
     const startConversation = screen.getByRole("button", {

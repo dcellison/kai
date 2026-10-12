@@ -57,7 +57,6 @@ export function ReviewsWorkspace({
   onReviewPullRequest,
   revision,
   session,
-  workshopName,
 }: {
   connection: ConnectionState;
   onAuthenticationFailure: (message: string) => void;
@@ -65,7 +64,6 @@ export function ReviewsWorkspace({
   onReviewPullRequest: () => void;
   revision: number;
   session: WorkshopSession;
-  workshopName: string;
 }): React.JSX.Element {
   const confirm = useConfirmation();
   const [reviews, setReviews] = useState<WorkshopReviewJobs | null>(null);
@@ -166,7 +164,7 @@ export function ReviewsWorkspace({
         actions={(
           <button
             aria-label="Review pull request"
-            className="panel-icon-button reviews-launch-button"
+            className="nav-tool-button reviews-launch-button"
             title="Review pull request"
             type="button"
             onClick={onReviewPullRequest}
@@ -177,7 +175,6 @@ export function ReviewsWorkspace({
         connection={connection}
         symbol={<PullRequestIcon />}
         title="Reviews"
-        workshopName={workshopName}
       />
 
       <div className="reviews-summary" aria-live="polite">
