@@ -1003,13 +1003,10 @@ function MemoryExplorerContent({
     <section className="memory-workspace" aria-label="Memory workspace">
       <div className="memory-browser-pane">
         <header className="memory-header">
-          <div>
-            <p className="breadcrumbs">Kai Workshop / Memory</p>
-            <h1>Memory</h1>
-          </div>
+          <h1>Memory</h1>
           <div className="memory-header-actions">
             <button
-              className="panel-icon-button fact-review-button"
+              className="nav-tool-button fact-review-button"
               type="button"
               aria-label={waitingOnOwner > 0 ? `Fact review, ${waitingOnOwner} waiting on you` : "Fact review"}
               title="Fact review"
@@ -1021,7 +1018,7 @@ function MemoryExplorerContent({
               )}
             </button>
             <button
-              className="panel-icon-button"
+              className="nav-tool-button"
               type="button"
               aria-label="Review legacy memory"
               title="Review legacy memory"

@@ -74,6 +74,7 @@ import type {
 import { applyWorkshopTheme } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 import { HumanAvatar } from "./HumanAvatar";
+import { BackIcon } from "./icons";
 
 const MAX_AVATAR_UPLOAD_BYTES = 256 * 1024;
 const AVATAR_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -1427,23 +1428,18 @@ function SettingsWorkspaceContent({
     >
       {!nativeRuntime && (
       <header className="settings-header">
-        <div>
-          <p className="breadcrumbs">
-            {agentRuntime ? "Agent runtime" : "Kai Workshop / Settings"}
-          </p>
-          <h1 id={titleId}>
-            {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
-          </h1>
-        </div>
+        <h1 id={titleId}>
+          {agentRuntime ? `${runtimeLabel} settings` : "Settings"}
+        </h1>
         {!nativeRuntime && (
           <button
-            className="panel-icon-button"
+            className="nav-tool-button"
             type="button"
             aria-label={agentRuntime ? "Back to agent" : "Back to conversation"}
             title={agentRuntime ? "Back to agent" : "Back to conversation"}
             onClick={onClose}
           >
-            <span aria-hidden="true">←</span>
+            <BackIcon />
           </button>
         )}
       </header>

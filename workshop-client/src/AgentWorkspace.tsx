@@ -25,6 +25,7 @@ import {
   type AgentDefinitionFormState,
 } from "./AgentCreationDialog";
 import { AGENT_CAPABILITIES, COLLABORATION_TOOLS } from "./agentChoices";
+import { CloseIcon } from "./icons";
 import type {
   WorkshopAgentCapability,
   WorkshopAgentDefinition,
@@ -366,7 +367,6 @@ export function AgentWorkspace({
   principalEvents,
   runActive,
   token,
-  workshopName,
 }: {
   activeChannelId: string;
   initialCreating: boolean;
@@ -389,7 +389,6 @@ export function AgentWorkspace({
   principalEvents: WorkshopPrincipalEvents;
   runActive: boolean;
   token: string;
-  workshopName: string;
 }): React.JSX.Element {
   const confirm = useConfirmation();
   const [definitions, setDefinitions] = useState<WorkshopAgentDefinition[]>([]);
@@ -870,15 +869,14 @@ export function AgentWorkspace({
 
   return (
     <main className="agent-workspace" aria-label="Agents workspace">
+      {/* One-line bar like the side panels: the title styled as the sidebar's
+          "Kai Workshop" label with the agent counts beside it, centered. */}
       <header className="agent-workspace-header">
-        <div>
-          <p className="breadcrumbs">{workshopName} / Agents</p>
-          <div className="agent-workspace-title">
-            <h1>Agents</h1>
-            <p>
-              {counts.ready} ready · {counts.drafts} drafts · {counts.needsAttention} need attention · {principalName}
-            </p>
-          </div>
+        <div className="agent-workspace-title">
+          <h1>Agents</h1>
+          <p>
+            {counts.ready} ready · {counts.drafts} drafts · {counts.needsAttention} need attention · {principalName}
+          </p>
         </div>
         <div className="agent-header-actions">
           <span className={`agent-live-state ${principalEvents.connection.tone}`} role="status">
@@ -886,7 +884,7 @@ export function AgentWorkspace({
           </span>
           <div className="agent-header-controls">
             <button
-                className="panel-icon-button"
+                className="nav-add-button"
                 type="button"
                 aria-label="Create agent"
                 title="Create agent"
@@ -897,16 +895,16 @@ export function AgentWorkspace({
                   onCreateAgent();
                 }}
               >
-                <span aria-hidden="true">+</span>
+                <span aria-hidden="true" />
             </button>
             <button
-              className="panel-icon-button"
+              className="nav-tool-button"
               type="button"
               aria-label="Close agents"
               title="Close agents"
               onClick={onClose}
             >
-              <span aria-hidden="true">×</span>
+              <CloseIcon />
             </button>
           </div>
         </div>

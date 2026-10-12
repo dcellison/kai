@@ -32,6 +32,7 @@ import type {
   WorkshopWorkspaceGrants,
 } from "./types";
 import { useConfirmation } from "./ConfirmationDialog";
+import { BackIcon } from "./icons";
 
 function WorkspaceAddIcon(): React.JSX.Element {
   return (
@@ -348,14 +349,11 @@ export function WorkspacesWorkspace({
     <main className="workspaces-workspace" aria-label="Workspaces">
       <section className="workspaces-browser-pane">
         <header className="workspaces-header">
-          <div>
-            <p className="breadcrumbs">Kai Workshop / Workspaces</p>
-            <h1>Workspaces</h1>
-          </div>
+          <h1>Workspaces</h1>
           <div className="workspaces-header-actions">
-            <button className="panel-icon-button" type="button" aria-label="Create workspace" title="Create private workspace" disabled={busy} onClick={() => setCreateOpen(true)}><WorkspaceAddIcon /></button>
-            <button className="panel-icon-button" type="button" aria-label="Add existing workspace" title="Add existing workspace" disabled={busy} onClick={() => setAddOpen(true)}><ExistingWorkspaceIcon /></button>
-            <button className="panel-icon-button" type="button" aria-label="Back to conversation" title="Back to conversation" onClick={onClose}><span aria-hidden="true">←</span></button>
+            <button className="nav-tool-button" type="button" aria-label="Create workspace" title="Create private workspace" disabled={busy} onClick={() => setCreateOpen(true)}><WorkspaceAddIcon /></button>
+            <button className="nav-tool-button" type="button" aria-label="Add existing workspace" title="Add existing workspace" disabled={busy} onClick={() => setAddOpen(true)}><ExistingWorkspaceIcon /></button>
+            <button className="nav-tool-button" type="button" aria-label="Back to conversation" title="Back to conversation" onClick={onClose}><BackIcon /></button>
           </div>
         </header>
 

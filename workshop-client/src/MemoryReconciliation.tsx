@@ -12,6 +12,7 @@ import {
 } from "./api";
 import { AuthenticationError } from "./api";
 import { useConfirmation } from "./ConfirmationDialog";
+import { BackIcon } from "./icons";
 import { MarkdownMessage } from "./MarkdownMessage";
 import { ConsolidationEditor } from "./MemoryConsolidation";
 import type {
@@ -701,9 +702,9 @@ export function MemoryReconciliation({
     <section className="memory-workspace memory-reconciliation-workspace" aria-label="Memory reconciliation">
       <div className="memory-browser-pane">
         <header className="memory-header">
-          <div><p className="breadcrumbs">Kai Workshop / Memory</p><h1>Legacy triage</h1></div>
-          <button className="panel-icon-button" type="button" aria-label="Back to memories" title="Back to memories" onClick={onBack}>
-            <span aria-hidden="true">←</span>
+          <h1>Legacy triage</h1>
+          <button className="nav-tool-button" type="button" aria-label="Back to memories" title="Back to memories" onClick={onBack}>
+            <BackIcon />
           </button>
         </header>
         <div className="memory-browser-scroll">

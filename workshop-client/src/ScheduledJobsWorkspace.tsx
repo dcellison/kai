@@ -15,6 +15,7 @@ import {
 import type { WorkshopScheduledJob, WorkshopSession } from "./types";
 import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 import { useConfirmation } from "./ConfirmationDialog";
+import { BackIcon } from "./icons";
 
 interface ScheduledJobsDetailPanelLayout {
   width: number;
@@ -145,7 +146,7 @@ export function ScheduledJobsWorkspace({
   return (
     <main className="workspaces-workspace scheduled-jobs-workspace" aria-label="Scheduled jobs">
       <section className="workspaces-browser-pane">
-        <header className="workspaces-header"><div><p className="breadcrumbs">Kai Workshop / Scheduled jobs</p><h1>Scheduled jobs</h1></div><div className="workspaces-header-actions"><button className="panel-icon-button" type="button" aria-label="Back to conversation" title="Back to conversation" onClick={onClose}><span aria-hidden="true">←</span></button></div></header>
+        <header className="workspaces-header"><h1>Scheduled jobs</h1><div className="workspaces-header-actions"><button className="nav-tool-button" type="button" aria-label="Back to conversation" title="Back to conversation" onClick={onClose}><BackIcon /></button></div></header>
         {(notice || error) && <div className="workspaces-notices" aria-live="polite">{notice && <p className="settings-notice" role="status">{notice}</p>}{error && <p className="settings-error" role="alert">{error}</p>}</div>}
         <section className="scheduled-job-catalogue" aria-label="Active scheduled jobs">
           {loading ? <p className="workspaces-empty">Loading scheduled jobs…</p> : jobs.length === 0 ? <div className="scheduled-jobs-empty"><ClockIcon /><h2>No active scheduled jobs</h2><p>Jobs created through Kai will appear here for inspection and cancellation.</p></div> : <>{renderGroup("Upcoming", oneTimeJobs)}{renderGroup("Recurring", recurringJobs)}</>}

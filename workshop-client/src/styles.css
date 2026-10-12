@@ -1259,12 +1259,6 @@ button.nav-heading {
   border-bottom: 1px solid var(--color-border);
 }
 
-.breadcrumbs {
-  margin: 0 0 0.2rem;
-  color: var(--color-text-muted);
-  font-size: 0.62rem;
-}
-
 .context-pane h2 {
   margin: 0;
   color: var(--color-text-strong);
@@ -1273,11 +1267,17 @@ button.nav-heading {
   font-weight: 560;
 }
 
-/* The conversation name uses the .overline treatment that "Kai Workshop"
-   gets in the sidebar (font, size, weight, spacing, accent colour) with no
-   margin, so the flex bar centers it. A long name truncates rather than
-   wrapping or pushing the connection state off the bar. */
-.conversation-header h2 {
+/* Every center pane header title (conversations, Activity views, Agents,
+   Workspaces, Scheduled jobs, Settings, Memory) uses the .overline
+   treatment that "Kai Workshop" gets in the sidebar (font, size, weight,
+   spacing, accent colour) with no margin, so its flex bar centers it. A
+   long title truncates rather than wrapping or pushing the actions off the
+   bar. */
+.conversation-header h2,
+.agent-workspace-header h1,
+.workspaces-header h1,
+.settings-header h1,
+.memory-header h1 {
   min-width: 0;
   overflow: hidden;
   margin: 0;
@@ -3601,22 +3601,15 @@ button.nav-heading {
   padding: 0.36rem 1.25rem;
 }
 
-.workspaces-header h1 {
-  margin: 0;
-}
-
-.workspaces-header h1 {
-  color: var(--color-text-strong);
-  font: 560 1.08rem var(--serif);
-}
-
+/* Header buttons are .nav-tool-button, which sizes their icons to match
+   the sidebar heading icons; the gap matches .nav-heading-actions. */
 .workspaces-header-actions {
   display: flex;
+  flex: none;
   align-items: center;
-  gap: 0.15rem;
+  gap: 0.08rem;
 }
 
-.workspaces-header-actions svg,
 .workspaces-workspace .workspace-project-detail svg {
   width: 1rem;
   height: 1rem;
@@ -3982,18 +3975,20 @@ button.nav-heading {
   gap: 0.35rem;
 }
 
+/* The Activity title symbol sits inside the small uppercase label, so it
+   is sized to the label's letters rather than to a full-size icon. */
 .activity-heading-symbol {
   display: inline-grid;
-  width: 1rem;
-  height: 1rem;
+  width: 0.85rem;
+  height: 0.85rem;
   place-items: center;
   flex: 0 0 auto;
 }
 
 .activity-heading-symbol svg {
   display: block;
-  width: 1rem;
-  height: 1rem;
+  width: 0.85rem;
+  height: 0.85rem;
 }
 
 .mentions-summary {
@@ -4350,23 +4345,11 @@ button.nav-heading {
   border-bottom: 1px solid var(--color-border);
 }
 
-.agent-workspace-header > div:first-child {
-  display: grid;
-  min-width: 0;
-  gap: 0;
-}
-
 .agent-workspace-title {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   min-width: 0;
   gap: 0.65rem;
-}
-
-.agent-workspace-header h1 {
-  margin: 0;
-  color: var(--color-text-strong);
-  font: 560 1.08rem var(--serif);
 }
 
 .agent-workspace-title > p {
@@ -4418,8 +4401,9 @@ button.nav-heading {
   gap: 0.75rem;
 }
 
+/* Matches .nav-heading-actions; the buttons are the sidebar's own. */
 .agent-header-controls {
-  gap: 0.15rem;
+  gap: 0.08rem;
 }
 
 .agent-live-state {
@@ -5196,14 +5180,6 @@ button.nav-heading {
   background: var(--color-canvas);
 }
 
-.settings-header h1 {
-  margin: 0;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.08rem;
-  font-weight: 560;
-}
-
 .settings-section-navigation {
   min-width: 0;
   overflow-x: auto;
@@ -5732,11 +5708,6 @@ button.nav-heading {
 .reviews-summary strong {
   color: var(--color-accent);
   font-size: 1rem;
-}
-
-.reviews-launch-button svg {
-  width: 1rem;
-  height: 1rem;
 }
 
 .reviews-error {
@@ -6494,14 +6465,6 @@ button.nav-heading {
   background: var(--color-canvas);
 }
 
-.memory-header h1 {
-  margin: 0;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.08rem;
-  font-weight: 560;
-}
-
 .memory-header-actions {
   display: flex;
   align-items: center;
@@ -6876,11 +6839,6 @@ button.nav-heading {
 
 .fact-review-button {
   position: relative;
-}
-
-.fact-review-button svg {
-  width: 1.25rem;
-  height: 1.25rem;
 }
 
 /* Count of open conflicts, pinned to the button corner like an unread count. */

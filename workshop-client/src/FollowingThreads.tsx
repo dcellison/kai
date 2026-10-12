@@ -37,14 +37,12 @@ export function FollowingThreads({
   connection,
   following,
   onOpen,
-  workshopName,
 }: {
   connection: ConnectionState;
   following: FollowedThreadClientState & {
     unfollow: (thread: WorkshopFollowedThread) => Promise<void>;
   };
   onOpen: (thread: WorkshopFollowedThread) => boolean;
-  workshopName: string;
 }): React.JSX.Element {
   const [navigationError, setNavigationError] = useState<string | null>(null);
   return (
@@ -53,7 +51,6 @@ export function FollowingThreads({
         connection={connection}
         symbol={<BellIcon />}
         title="Following"
-        workshopName={workshopName}
       />
 
       <div className="following-summary" aria-live="polite">
