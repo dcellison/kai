@@ -5595,17 +5595,11 @@ function WorkshopView({
       ) : (
         <>
       <section className="conversation-pane">
+        {/* One-line bar like the side panels' headers: the conversation name
+            styled as the sidebar's "Kai Workshop" label, vertically centered,
+            with the connection state on the right. */}
         <header className="conversation-header">
-          <div>
-            <p className="breadcrumbs">
-              {workshop.name} / {channel.kind === "notification"
-                ? "Activity"
-                : channel.kind === "direct"
-                  ? "Direct messages"
-                  : "Channels"}
-            </p>
-            <h2>{symbol} {channelName}</h2>
-          </div>
+          <h2>{symbol} {channelName}</h2>
           <div className="conversation-actions">
             <ConnectionIndicator connection={connection} />
             <button

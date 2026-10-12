@@ -3374,7 +3374,10 @@ describe("Workshop React client", () => {
     await openContextSection("Authority");
     expect(screen.getByText("GitHub")).toBeVisible();
     expect(screen.getByText("Durable notification feed")).toBeVisible();
-    expect(screen.getByText("Kai Workshop / Activity")).toBeVisible();
+    // The conversation header names the channel without a breadcrumb line.
+    const conversationHeader = document.querySelector(".conversation-header");
+    expect(conversationHeader?.querySelector(".breadcrumbs")).toBeNull();
+    expect(conversationHeader?.querySelector("h2")).toHaveTextContent("GitHub notifications");
     expect(
       screen.getByText("Active delivery: GitHub → GitHub notifications"),
     ).toBeVisible();

@@ -1265,13 +1265,29 @@ button.nav-heading {
   font-size: 0.62rem;
 }
 
-.conversation-header h2,
 .context-pane h2 {
   margin: 0;
   color: var(--color-text-strong);
   font-family: var(--serif);
   font-size: 1.08rem;
   font-weight: 560;
+}
+
+/* The conversation name uses the .overline treatment that "Kai Workshop"
+   gets in the sidebar (font, size, weight, spacing, accent colour) with no
+   margin, so the flex bar centers it. A long name truncates rather than
+   wrapping or pushing the connection state off the bar. */
+.conversation-header h2 {
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  color: var(--color-accent);
+  font-size: 0.68rem;
+  font-weight: 720;
+  letter-spacing: 0.16em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .conversation-actions {
