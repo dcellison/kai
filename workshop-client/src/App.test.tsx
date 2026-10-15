@@ -3382,7 +3382,7 @@ describe("Workshop React client", () => {
     ).toBeVisible();
     await openContextSection("Authority");
     expect(screen.getByText("GitHub")).toBeVisible();
-    expect(screen.getByText("Durable notification feed")).toBeVisible();
+    expect(screen.getByText("Notifications", { selector: ".overline" })).toBeVisible();
     // The conversation header names the channel without a breadcrumb line.
     const conversationHeader = document.querySelector(".conversation-header");
     expect(conversationHeader?.querySelector(".breadcrumbs")).toBeNull();
@@ -3632,6 +3632,11 @@ describe("Workshop React client", () => {
       name: "Archive channel",
     }) as HTMLButtonElement;
     const headerButtons = [...(archiveButton.closest("header")?.querySelectorAll("button") ?? [])];
+    // A group channel introduces itself in plain language.
+    expect(screen.getByText("Channel", { selector: ".channel-introduction .overline" })).toBeVisible();
+    expect(
+      screen.getByText("Everyone in this channel sees the same messages, in every browser and app."),
+    ).toBeVisible();
     // The context header carries only the panel label and the actions; the
     // conversation name is not repeated there.
     const contextHeader = archiveButton.closest(".context-channel-header");
@@ -4368,11 +4373,13 @@ describe("Workshop React client", () => {
     expect(
       screen.getByRole("heading", { name: `Welcome to ${guidedAgentName}` }),
     ).toBeVisible();
+    // An agent direct message names its own agent in plain language.
+    expect(screen.getByText("Direct message", { selector: ".overline" })).toBeVisible();
     expect(screen.getByText(
-      `Messages below come from ${guidedAgentName}’s durable conversation history across every connected client.`,
+      `Your conversation with ${guidedAgentName} is the same in every browser and app.`,
     )).toBeVisible();
     expect(screen.queryByText(
-      "Messages below come from Kai’s durable conversation history across every connected client.",
+      "Your conversation with Kai is the same in every browser and app.",
     )).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Scott" }));

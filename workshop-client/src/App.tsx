@@ -5610,12 +5610,14 @@ function WorkshopView({
           <div className={`channel-introduction ${channel.kind === "notification" ? "notification" : ""}`}>
             <span className="channel-symbol">{symbol}</span>
             <div>
+              {/* Plain labels that say what the conversation is, not how the
+                  server stores it. */}
               <p className="overline">
                 {channel.kind === "notification"
-                  ? "Durable notification feed"
+                  ? "Notifications"
                   : channel.kind === "direct"
-                    ? "Direct conversation"
-                    : "Canonical conversation"}
+                    ? "Direct message"
+                    : "Channel"}
               </p>
               <h3>
                 {humanDirect
@@ -5631,7 +5633,9 @@ function WorkshopView({
                   ? "Authenticated GitHub activity appears here live and is delivered to every configured client."
                   : humanDirect
                     ? `Messages here are private to you and ${channelName}.`
-                    : `Messages below come from ${channelName}’s durable conversation history across every connected client.`}
+                    : channel.kind === "direct"
+                      ? `Your conversation with ${channelName} is the same in every browser and app.`
+                      : "Everyone in this channel sees the same messages, in every browser and app."}
               </p>
               {channel.kind === "notification" && notificationPreferences && (
                 <p className="notification-routing-summary">
