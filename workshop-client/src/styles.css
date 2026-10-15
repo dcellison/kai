@@ -1247,16 +1247,27 @@ button.nav-heading {
 }
 
 /* Every center pane header title (conversations, Activity views, Agents,
-   Workspaces, Scheduled jobs, Settings, Memory) uses the .overline
-   treatment that "Kai Workshop" gets in the sidebar (font, size, weight,
-   spacing, accent colour) with no margin, so its flex bar centers it. A
-   long title truncates rather than wrapping or pushing the actions off the
-   bar. */
+   Workspaces, Scheduled jobs, Settings, Memory), every dialog title, and
+   every detail panel title uses the .overline treatment that "Kai Workshop"
+   gets in the sidebar (font, size, weight, spacing, accent colour) with no
+   margin, so its flex row centers it. A long title truncates rather than
+   wrapping or pushing the actions off the row. */
 .conversation-header h2,
 .agent-workspace-header h1,
 .workspaces-header h1,
 .settings-header h1,
-.memory-header h1 {
+.memory-header h1,
+.channel-creation-dialog h2,
+.channel-archive-header h2,
+.agent-creation-header h2,
+.workspace-creation-header h2,
+.action-palette h2,
+.review-dialog h2,
+.memory-editor h2,
+.confirmation-dialog h2,
+.memory-confirm h2,
+.workspace-detail-heading h2,
+.memory-detail-header h2 {
   min-width: 0;
   overflow: hidden;
   margin: 0;
@@ -2897,7 +2908,6 @@ button.nav-heading {
   padding: 1rem;
 }
 
-.review-dialog > header,
 .review-list > li {
   display: flex;
   align-items: flex-start;
@@ -2905,17 +2915,11 @@ button.nav-heading {
   gap: 0.75rem;
 }
 
-.review-dialog h2,
-.review-dialog .overline {
-  margin: 0;
-}
-
-.review-dialog h2 {
-  margin-top: 0.15rem;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.05rem;
-  font-weight: 540;
+.review-dialog > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
 }
 
 .review-dialog form {
@@ -2963,23 +2967,10 @@ button.nav-heading {
 
 .action-palette > header {
   display: flex;
-  align-items: start;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
   padding: 1rem 1rem 0.65rem;
-}
-
-.action-palette h2,
-.action-palette .overline {
-  margin: 0;
-}
-
-.action-palette h2 {
-  margin-top: 0.15rem;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.05rem;
-  font-weight: 540;
 }
 
 .action-palette-search {
@@ -3109,12 +3100,12 @@ button.nav-heading {
   box-shadow: 0 1.4rem 4rem color-mix(in srgb, var(--color-shadow-base) 55%, transparent);
 }
 
-.channel-creation-dialog h2 {
-  margin: 0.35rem 0 0.55rem;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.05rem;
-  font-weight: 540;
+/* These dialogs put the title directly above the body instead of in a
+   header row, so the title keeps a gap below it. */
+.channel-creation-dialog > h2,
+.confirmation-dialog > h2,
+.memory-confirm > h2 {
+  margin-bottom: 0.75rem;
 }
 
 .channel-creation-dialog form,
@@ -3223,7 +3214,7 @@ button.nav-heading {
 
 .channel-archive-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 0.8rem;
 }
@@ -3284,10 +3275,6 @@ button.nav-heading {
   white-space: nowrap;
 }
 
-.channel-archive-header h2 {
-  margin-bottom: 0;
-}
-
 .channel-archive-list {
   display: grid;
   gap: 0.35rem;
@@ -3316,15 +3303,14 @@ button.nav-heading {
   color: var(--color-text-muted);
 }
 
+/* Row actions in the archive dialogs are .nav-tool-button, sized like the
+   sidebar heading icons; the gap matches .nav-heading-actions. Center
+   keeps the "Continue setup" text button level with the icons. */
 .channel-archive-actions {
   display: flex;
   flex: 0 0 auto;
-  gap: 0.15rem;
-}
-
-.channel-archive-actions svg {
-  width: 1rem;
-  height: 1rem;
+  align-items: center;
+  gap: 0.08rem;
 }
 
 .inactive-agent-sections {
@@ -3842,15 +3828,6 @@ button.nav-heading {
   white-space: pre-wrap;
 }
 
-.workspace-detail-heading h2 {
-  color: var(--color-text-strong);
-  font: 560 1rem var(--serif);
-}
-
-.workspace-detail-heading .overline {
-  margin-bottom: 0.2rem;
-  font-size: 0.62rem;
-}
 
 .workspace-detail dl {
   display: grid;
@@ -4659,9 +4636,12 @@ button.nav-heading {
   margin-top: 0.85rem;
 }
 
-.agent-section-heading,
-.agent-creation-header {
+.agent-section-heading {
   align-items: flex-start;
+  margin-bottom: 0.75rem;
+}
+
+.agent-creation-header {
   margin-bottom: 0.75rem;
 }
 
@@ -6023,8 +6003,7 @@ button.nav-heading {
 .workspace-settings-heading .panel-icon-button svg,
 .workspace-grant-list .panel-icon-button svg,
 .workspace-deletion-list .panel-icon-button svg,
-.workspace-secret-card .panel-icon-button svg,
-.workspace-creation-header .panel-icon-button svg {
+.workspace-secret-card .panel-icon-button svg {
   width: 1rem;
   height: 1rem;
   fill: none;
@@ -6218,14 +6197,9 @@ button.nav-heading {
 
 .workspace-creation-header {
   display: flex;
-  align-items: start;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
-}
-
-.workspace-creation-header .overline,
-.workspace-creation-header h2 {
-  margin-block-start: 0;
 }
 
 .workspace-creation-dialog > p {
@@ -7390,7 +7364,6 @@ button.nav-heading {
   background: var(--color-panel);
 }
 
-.memory-detail-header h2,
 .memory-detail-empty h2 {
   margin: 0;
   color: var(--color-text-strong);
@@ -7399,14 +7372,6 @@ button.nav-heading {
   font-weight: 540;
 }
 
-.memory-detail-header h2 {
-  font-size: 1rem;
-}
-
-.memory-detail-header .overline {
-  margin-bottom: 0.2rem;
-  font-size: 0.62rem;
-}
 
 .memory-detail-section {
   border-bottom: 1px solid var(--color-border);
@@ -7508,14 +7473,6 @@ button.nav-heading {
   box-shadow: 0 1rem 3rem color-mix(in srgb, var(--color-overlay-shadow) 45%, transparent);
 }
 
-.confirmation-dialog h2 {
-  margin: 0.25rem 0 0.65rem;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.05rem;
-  font-weight: 540;
-}
-
 .confirmation-dialog > p:not(.overline) {
   color: var(--color-text);
   font-size: 0.8rem;
@@ -7538,14 +7495,6 @@ button.nav-heading {
   padding: 1.2rem;
   background: var(--color-panel);
   box-shadow: 0 1rem 3rem color-mix(in srgb, var(--color-overlay-shadow) 45%, transparent);
-}
-
-.memory-confirm h2 {
-  margin: 0.25rem 0 0.65rem;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.05rem;
-  font-weight: 540;
 }
 
 .memory-confirm > p:not(.overline),
@@ -7584,19 +7533,11 @@ button.nav-heading {
 
 .memory-editor > header {
   display: flex;
-  align-items: start;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
   border-bottom: 1px solid var(--color-border);
   padding: 1.15rem 1.3rem;
-}
-
-.memory-editor h2 {
-  margin: 0;
-  color: var(--color-text-strong);
-  font-family: var(--serif);
-  font-size: 1.05rem;
-  font-weight: 550;
 }
 
 .memory-editor form {

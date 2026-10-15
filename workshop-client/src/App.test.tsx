@@ -3672,7 +3672,7 @@ describe("Workshop React client", () => {
     expect(screen.queryByLabelText("Message Lifecycle qualification")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Archived channels" }));
-    const archiveDialog = screen.getByRole("dialog", { name: "Archive" });
+    const archiveDialog = screen.getByRole("dialog", { name: "Channel archive" });
     expect(archiveDialog).toHaveTextContent("Lifecycle qualification");
     await user.click(
       within(archiveDialog).getByRole("button", {
@@ -3752,7 +3752,7 @@ describe("Workshop React client", () => {
     });
     expect(archivedDirectMessages).toHaveClass("nav-tool-button");
     await user.click(archivedDirectMessages);
-    const archiveDialog = screen.getByRole("dialog", { name: "Archive" });
+    const archiveDialog = screen.getByRole("dialog", { name: "Direct message archive" });
     expect(archiveDialog).toHaveTextContent("Scott");
     await user.click(
       within(archiveDialog).getByRole("button", {
@@ -3862,7 +3862,7 @@ describe("Workshop React client", () => {
       await screen.findByRole("button", { name: "Manage channel members" }),
     );
     expect(peopleSection).toHaveAttribute("open");
-    const dialog = await screen.findByRole("dialog", { name: "People" });
+    const dialog = await screen.findByRole("dialog", { name: "Channel members" });
     const daniel = within(dialog).getByRole("checkbox", { name: /Daniel/ });
     const scott = within(dialog).getByRole("checkbox", { name: /Scott/ });
     expect(daniel).toBeChecked();
@@ -4238,7 +4238,7 @@ describe("Workshop React client", () => {
       name: "Dismiss Kai from standing participation",
     })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Channel settings" }));
-    const settings = await screen.findByRole("dialog", { name: "Channel settings" });
+    const settings = await screen.findByRole("dialog", { name: /^Settings for # / });
     const policy = within(settings).getByRole("checkbox", { name: /Standing participation/ });
     expect(policy).toBeChecked();
     expect(within(settings).getByText("Host limits")).toBeVisible();
@@ -4279,7 +4279,7 @@ describe("Workshop React client", () => {
     });
     expect(screen.queryByRole("button", { name: "Archive channel" })).toBeNull();
     await user.click(settingsButton);
-    const settings = await screen.findByRole("dialog", { name: "Channel settings" });
+    const settings = await screen.findByRole("dialog", { name: /^Settings for # / });
     expect(within(settings).getByRole("checkbox", {
       name: /Standing participation/,
     })).toBeDisabled();
@@ -4309,7 +4309,7 @@ describe("Workshop React client", () => {
       await screen.findByRole("button", { name: "Manage channel agents" }),
     );
     expect(agentsSection).toHaveAttribute("open");
-    const dialog = await screen.findByRole("dialog", { name: "Agents" });
+    const dialog = await screen.findByRole("dialog", { name: "Channel agents" });
     expect(within(dialog).getByText(/sponsored by Daniel/i)).toBeVisible();
     const kai = within(dialog).getByRole("checkbox", { name: /Kai/ });
     expect(kai).toBeChecked();
@@ -4517,7 +4517,7 @@ describe("Workshop React client", () => {
     await user.click(
       screen.getByRole("button", { name: "Your drafts and archived agents" }),
     );
-    const archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
+    const archive = await screen.findByRole("dialog", { name: "Agent drafts and archive" });
     expect(within(archive).getByText("Kai")).toBeVisible();
     const openArchivedConversation = within(archive).getByRole("button", {
       name: "Open archived conversation with Kai",
@@ -4527,7 +4527,7 @@ describe("Workshop React client", () => {
       within(archive).getByRole("button", { name: "View archived agent Kai" }),
     ).toBeVisible();
     await user.click(openArchivedConversation);
-    expect(screen.queryByRole("dialog", { name: "Drafts and archive" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Agent drafts and archive" })).toBeNull();
     expect(
       await screen.findByText(
         "This agent has been archived. This conversation is read-only.",
@@ -4575,7 +4575,7 @@ describe("Workshop React client", () => {
     await userEvent.setup().click(
       screen.getByRole("button", { name: "Your drafts and archived agents" }),
     );
-    const archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
+    const archive = await screen.findByRole("dialog", { name: "Agent drafts and archive" });
     expect(
       within(archive).getByRole("button", {
         name: "Open archived conversation with Kai",
@@ -4605,9 +4605,10 @@ describe("Workshop React client", () => {
     const closeCreation = within(creationDialog).getByRole("button", {
       name: "Close agent creation",
     });
-    expect(closeCreation).toHaveClass("panel-icon-button");
+    // Dialog close buttons match the sidebar heading icons.
+    expect(closeCreation).toHaveClass("nav-tool-button");
     expect(closeCreation).toHaveAttribute("title", "Close agent creation");
-    expect(closeCreation.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+    expect(closeCreation.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
     expect(within(creationDialog).queryByRole("button", { name: "Cancel" })).toBeNull();
     expect(within(creationDialog).getByRole("heading", { name: "Identity" })).toBeVisible();
     expect(within(creationDialog).getByLabelText("Agent creation progress")).toHaveTextContent(
@@ -5180,7 +5181,7 @@ describe("Workshop React client", () => {
     await user.click(
       sidebar.getByRole("button", { name: "Your drafts and archived agents" }),
     );
-    let archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
+    let archive = await screen.findByRole("dialog", { name: "Agent drafts and archive" });
     expect(within(archive).getByText("Archived specialist")).toBeVisible();
     expect(within(archive).getByText("@archived_specialist · Archived")).toBeVisible();
     expect(within(archive).getByText("Daniel draft")).toBeVisible();
@@ -5201,7 +5202,7 @@ describe("Workshop React client", () => {
     await user.click(
       sidebar.getByRole("button", { name: "Your drafts and archived agents" }),
     );
-    archive = await screen.findByRole("dialog", { name: "Drafts and archive" });
+    archive = await screen.findByRole("dialog", { name: "Agent drafts and archive" });
     await user.click(
       within(archive).getByRole("button", {
         name: "View archived agent Archived specialist",

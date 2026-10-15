@@ -7,6 +7,7 @@ import {
   submitReviewJob,
 } from "./api";
 import type { WorkshopReviewJobs, WorkshopSession } from "./types";
+import { CloseIcon } from "./icons";
 
 function operationId(): string {
   const bytes = new Uint8Array(12);
@@ -96,9 +97,9 @@ export function ReviewDialog({
         role="dialog"
       >
         <header>
-          <div><p className="overline">GitHub</p><h2 id="review-dialog-title">Review pull request</h2></div>
-          <button className="panel-icon-button" type="button" aria-label="Close review" title="Close" onClick={onClose}>
-            <span aria-hidden="true">×</span>
+          <h2 id="review-dialog-title">Review pull request</h2>
+          <button className="nav-tool-button" type="button" aria-label="Close review" title="Close" onClick={onClose}>
+            <CloseIcon />
           </button>
         </header>
         {loading ? <p role="status">Loading authorized repositories…</p> : snapshot ? (
