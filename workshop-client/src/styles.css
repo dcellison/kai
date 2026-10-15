@@ -645,28 +645,6 @@ button:disabled {
   gap: 0.45rem;
 }
 
-.sidebar-toggle {
-  display: inline-grid;
-  place-items: center;
-  width: 1.75rem;
-  height: 1.75rem;
-  padding: 0;
-  border: 1px solid var(--color-border-strong);
-  border-radius: 0.32rem;
-  background: transparent;
-  color: var(--color-text-muted);
-  font-size: 1.15rem;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.sidebar-toggle:hover,
-.sidebar-toggle:focus-visible {
-  border-color: color-mix(in srgb, var(--color-accent) 65%, transparent);
-  color: var(--color-accent);
-  outline: none;
-}
-
 .sidebar-resize-handle {
   position: absolute;
   z-index: 4;
@@ -949,10 +927,13 @@ button.nav-heading {
   background: var(--color-success);
 }
 
+/* Same text size as .channel-link so agent names read like channel and
+   direct message names. */
 .agent-link {
   grid-template-columns: 1.05rem minmax(0, 1fr) auto;
   gap: 0.58rem;
   padding: 0.25rem 0.65rem;
+  font-size: 0.8rem;
 }
 
 .agent-link.active {
@@ -1026,14 +1007,12 @@ button.nav-heading {
   font-size: 0.6rem;
 }
 
-.agent-link strong,
 .sidebar-footer strong {
   display: block;
   color: var(--color-text-strong);
   font-size: 0.76rem;
 }
 
-.agent-link small,
 .sidebar-footer small {
   display: block;
   margin-top: 0.08rem;

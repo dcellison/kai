@@ -123,7 +123,7 @@ import { usePrincipalEvents } from "./usePrincipalEvents";
 import type { WorkshopPrincipalEvents } from "./usePrincipalEvents";
 import { applyWorkshopTheme, clearWorkshopThemeHint } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
-import { CloseIcon } from "./icons";
+import { ChevronIcon, CloseIcon } from "./icons";
 import {
   ActionPalette,
   type WorkshopActionPaletteEntry,
@@ -5033,15 +5033,17 @@ function WorkshopView({
             <p className="overline">Kai Workshop</p>
           </div>
           <div className="sidebar-header-actions">
+            {/* The sidebar's own tool button, so the toggle matches the other
+                sidebar icons: no outline until hovered or focused. */}
             <button
-              className="sidebar-toggle"
+              className="nav-tool-button sidebar-toggle"
               type="button"
               aria-label={sidebarLayout.collapsed ? "Expand navigation" : "Collapse navigation"}
               aria-expanded={!sidebarLayout.collapsed}
               title={sidebarLayout.collapsed ? "Expand navigation" : "Collapse navigation"}
               onClick={toggleSidebar}
             >
-              <span aria-hidden="true">{sidebarLayout.collapsed ? "›" : "‹"}</span>
+              <ChevronIcon direction={sidebarLayout.collapsed ? "right" : "left"} />
             </button>
           </div>
         </header>
@@ -5346,9 +5348,8 @@ function WorkshopView({
                 <span className="mini-avatar">
                   {agent.displayName.slice(0, 1).toUpperCase()}
                 </span>
-                <span>
-                  <strong>{agent.displayName}</strong>
-                </span>
+                {/* Plain weight like channel and direct message names. */}
+                <span>{agent.displayName}</span>
                 {selected && <span className="live-pip" aria-label="Open" />}
               </button>
             );
