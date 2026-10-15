@@ -74,7 +74,7 @@ import type {
 import { applyWorkshopTheme } from "./theme";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
 import { HumanAvatar } from "./HumanAvatar";
-import { BackIcon } from "./icons";
+import { BackIcon, CloseIcon } from "./icons";
 
 const MAX_AVATAR_UPLOAD_BYTES = 256 * 1024;
 const AVATAR_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -2067,14 +2067,11 @@ function SettingsWorkspaceContent({
               aria-labelledby="workspace-secret-title"
             >
               <header className="workspace-creation-header">
-                <div>
-                  <p className="overline">Write-only value</p>
-                  <h2 id="workspace-secret-title">
-                    {workspaceSecretEditing ? "Replace workspace secret" : "Add workspace secret"}
-                  </h2>
-                </div>
+                <h2 id="workspace-secret-title">
+                  {workspaceSecretEditing ? "Replace workspace secret" : "Add workspace secret"}
+                </h2>
                 <button
-                  className="panel-icon-button"
+                  className="nav-tool-button"
                   type="button"
                   aria-label="Close workspace secret entry"
                   title="Close workspace secret entry"
@@ -2087,7 +2084,7 @@ function SettingsWorkspaceContent({
                     setWorkspaceSecretError(null);
                   }}
                 >
-                  <span aria-hidden="true">×</span>
+                  <CloseIcon />
                 </button>
               </header>
               <p>Kai stores the value without returning it to this or any other client.</p>

@@ -25,6 +25,7 @@ import {
   searchMemories,
 } from "./api";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { CloseIcon } from "./icons";
 import { FactReview } from "./FactReview";
 import { MemoryReconciliation, MemoryReviewIcon } from "./MemoryReconciliation";
 import { ConfirmationProvider, useConfirmation } from "./ConfirmationDialog";
@@ -300,21 +301,18 @@ function MemoryEditorDialog({
     <div className="memory-confirm-backdrop memory-editor-backdrop">
       <section className="memory-editor" role="dialog" aria-modal="true" aria-labelledby="memory-editor-title">
         <header>
-          <div>
-            <p className="overline">{editing ? "Edit memory" : "New explicit memory"}</p>
-            <h2 id="memory-editor-title">
-              {editing ? `Correct ${isEpisode ? "episode" : "fact"}` : "Create fact"}
-            </h2>
-          </div>
+          <h2 id="memory-editor-title">
+            {editing ? `Correct ${isEpisode ? "episode" : "fact"}` : "Create fact"}
+          </h2>
           <button
             type="button"
-            className="panel-icon-button"
+            className="nav-tool-button"
             aria-label="Close memory editor"
             title="Close memory editor"
             disabled={saving}
             onClick={() => void closeSafely()}
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </header>
         <form onSubmit={(event) => void submit(event)}>
@@ -435,10 +433,7 @@ function MemoryDetailPane({
   return (
     <div className="memory-detail-scroll">
       <header className="memory-detail-header">
-        <div>
-          <p className="overline">Memory detail</p>
-          <h2>{detail.kind === "episode" ? "Episode" : "Fact"}</h2>
-        </div>
+        <h2>{detail.kind === "episode" ? "Episode" : "Fact"}</h2>
         <span className={`memory-kind ${detail.kind}`}>{detail.kind}</span>
       </header>
 
@@ -1377,7 +1372,6 @@ function MemoryExplorerContent({
       {pendingMutation && (
         <div className="memory-confirm-backdrop">
           <section className="memory-confirm" role="dialog" aria-modal="true" aria-labelledby="memory-confirm-title">
-            <p className="overline">Confirm memory change</p>
             <h2 id="memory-confirm-title">
               {pendingMutation.operation === "delete"
                 ? `Forget ${pendingMutation.ids.length} ${pendingMutation.ids.length === 1 ? "memory" : "memories"}?`

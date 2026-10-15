@@ -16,6 +16,7 @@ import { useMemo, useState } from "react";
 
 import { AuthenticationError, cancelMemoryConsolidation, stageMemoryConsolidation } from "./api";
 import { useConfirmation } from "./ConfirmationDialog";
+import { BackIcon } from "./icons";
 import type { WorkshopMemoryConsolidation, WorkshopMemoryTriageGroup } from "./types";
 
 // Search results stay short enough to scan; refine the query for more.
@@ -185,12 +186,9 @@ export function ConsolidationEditor({
   return (
     <section className="memory-reconciliation-detail memory-consolidation" aria-label="Consolidate facts">
       <header className="memory-detail-header">
-        <div>
-          <p className="overline">{consolidation ? "Saved consolidation" : "Consolidate facts"}</p>
-          <h2>Several facts, one current fact</h2>
-        </div>
-        <button type="button" className="panel-icon-button" aria-label="Back to the fact" title="Back to the fact" onClick={onClose}>
-          <span aria-hidden="true">←</span>
+        <h2>{consolidation ? "Saved consolidation" : "Consolidate facts"}</h2>
+        <button type="button" className="nav-tool-button" aria-label="Back to the fact" title="Back to the fact" onClick={onClose}>
+          <BackIcon />
         </button>
       </header>
 

@@ -345,10 +345,7 @@ function ExceptionEditor({
   return (
     <form className="memory-reconciliation-detail" onSubmit={(event) => void submit(event)}>
       <header className="memory-detail-header">
-        <div>
-          <p className="overline">Exception review</p>
-          <h2>{formatLabel(group.classification)}</h2>
-        </div>
+        <h2>{formatLabel(group.classification)}</h2>
         <span className={`memory-review-state ${decisionBadge(group.decision).className}`}>
           {decisionBadge(group.decision).label}
         </span>

@@ -8,6 +8,7 @@ import {
 } from "react";
 
 import type { WorkshopCapabilityAvailability } from "./types";
+import { CloseIcon } from "./icons";
 
 export interface WorkshopActionPaletteEntry {
   capability: WorkshopCapabilityAvailability;
@@ -107,18 +108,15 @@ export function ActionPalette({
         role="dialog"
       >
         <header>
-          <div>
-            <p className="overline">Kai Workshop</p>
-            <h2>Help and actions</h2>
-          </div>
+          <h2>Help and actions</h2>
           <button
             aria-label="Close help and actions"
-            className="panel-icon-button"
+            className="nav-tool-button"
             onClick={onClose}
             title="Close"
             type="button"
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </header>
         <label className="action-palette-search">

@@ -456,7 +456,7 @@ export function FactReview({
           {tab === "conflicts" && selectedConflict ? (
             <>
               <header className="memory-detail-header">
-                <div><p className="overline">Unresolved conflict</p><h2>Which version is true?</h2></div>
+                <h2>Which version is true?</h2>
                 <span className="memory-review-state unresolved_conflict">conflict</span>
               </header>
               <p className="memory-review-explanation">
@@ -493,7 +493,7 @@ export function FactReview({
           ) : tab === "forgotten" && selectedForgotten ? (
             <>
               <header className="memory-detail-header">
-                <div><p className="overline">{selectedForgotten.state === "expired" ? "Expired fact" : "Forgotten fact"}</p><h2>Restore to current?</h2></div>
+                <h2>{selectedForgotten.state === "expired" ? "Restore expired fact?" : "Restore forgotten fact?"}</h2>
                 <span className={`memory-review-state ${selectedForgotten.state}`}>{selectedForgotten.state}</span>
               </header>
               <section className="memory-detail-section">
@@ -516,7 +516,7 @@ export function FactReview({
           ) : tab === "sync" && selectedSync ? (
             <>
               <header className="memory-detail-header">
-                <div><p className="overline">{selectedSync.kind === "fact" ? "Fact" : "Episode"} not in search</p><h2>Retry search sync?</h2></div>
+                <h2>Retry search sync for this {selectedSync.kind === "fact" ? "fact" : "episode"}?</h2>
                 <span className="memory-review-state failed">failed</span>
               </header>
               <section className="memory-detail-section">

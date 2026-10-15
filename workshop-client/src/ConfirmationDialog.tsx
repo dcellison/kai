@@ -72,7 +72,6 @@ export function ConfirmationProvider({ children }: { children: ReactNode }): Rea
             aria-labelledby="confirmation-dialog-title"
             aria-describedby="confirmation-dialog-message"
           >
-            <p className="overline">Confirm action</p>
             <h2 id="confirmation-dialog-title">Continue?</h2>
             <p id="confirmation-dialog-message">{request.message}</p>
             <div>

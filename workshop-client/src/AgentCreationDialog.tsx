@@ -3,6 +3,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { AgentProvisioningInput } from "./api";
 import { AGENT_CAPABILITIES, COLLABORATION_TOOLS } from "./agentChoices";
 import { useConfirmation } from "./ConfirmationDialog";
+import { CloseIcon } from "./icons";
 import type {
   WorkshopAgentCapability,
   WorkshopAgentCreationBackendOption,
@@ -461,23 +462,18 @@ export function AgentCreationDialog({
       >
         <form className="agent-editor" onSubmit={submit}>
           <div className="agent-creation-header">
-            <div>
-              <p className="overline">
-                {resumeInput ? "Saved agent setup" : resumeDraft ? "Draft agent" : "New software participant"}
-              </p>
-              <h2 id="create-agent-title">
-                {resumeInput || resumeDraft ? `Continue ${form.displayName}` : "Create agent"}
-              </h2>
-            </div>
+            <h2 id="create-agent-title">
+              {resumeInput || resumeDraft ? `Continue ${form.displayName}` : "Create agent"}
+            </h2>
             <button
-              className="panel-icon-button"
+              className="nav-tool-button"
               type="button"
               aria-label="Close agent creation"
               title="Close agent creation"
               onClick={() => void close()}
               disabled={busy}
             >
-              <span aria-hidden="true">×</span>
+              <CloseIcon />
             </button>
           </div>
 

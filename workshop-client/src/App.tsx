@@ -1651,7 +1651,6 @@ function ChannelCreationDialog({
   return (
     <div className="modal-backdrop">
       <section className="channel-creation-dialog" role="dialog" aria-modal="true" aria-labelledby="create-channel-title">
-        <p className="overline">New conversation space</p>
         <h2 id="create-channel-title">Create channel</h2>
         {originName && <p>Start from <strong>{originName}</strong>.</p>}
         <form onSubmit={(event) => void submit(event)}>
@@ -1759,19 +1758,16 @@ function HumanConversationDialog({
         aria-labelledby="human-conversation-title"
       >
         <header className="channel-archive-header">
-          <div>
-            <p className="overline">Direct messages</p>
-            <h2 id="human-conversation-title">Start a conversation</h2>
-          </div>
+          <h2 id="human-conversation-title">Start a conversation</h2>
           <button
-            className="panel-icon-button"
+            className="nav-tool-button"
             type="button"
             aria-label="Close people picker"
             title="Close"
             disabled={busyPrincipalId !== null}
             onClick={onCancel}
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </header>
         {people === null && !error && (
@@ -1882,8 +1878,7 @@ function ChannelAgentManagementDialog({
   return (
     <div className="modal-backdrop">
       <section className="channel-creation-dialog" role="dialog" aria-modal="true" aria-labelledby="manage-channel-agents-title">
-        <p className="overline">Channel management</p>
-        <h2 id="manage-channel-agents-title">Agents</h2>
+        <h2 id="manage-channel-agents-title">Channel agents</h2>
         <p>
           Attached agents use the runtime explicitly sponsored by your enabled
           direct agent. Shared channels never inject that sponsor’s personal
@@ -2003,8 +1998,7 @@ function ChannelMemberManagementDialog({
   return (
     <div className="modal-backdrop">
       <section className="channel-creation-dialog" role="dialog" aria-modal="true" aria-labelledby="manage-channel-members-title">
-        <p className="overline">Channel management</p>
-        <h2 id="manage-channel-members-title">People</h2>
+        <h2 id="manage-channel-members-title">Channel members</h2>
         <p>
           Members can read this private channel and mention its people and agents.
           The channel owner is permanent; ownership transfer is not available.
@@ -2080,19 +2074,16 @@ function ChannelSettingsDialog({
         aria-labelledby="channel-settings-title"
       >
         <header className="channel-archive-header">
-          <div>
-            <p className="overline"># {channelName}</p>
-            <h2 id="channel-settings-title">Channel settings</h2>
-          </div>
+          <h2 id="channel-settings-title">Settings for # {channelName}</h2>
           <button
-            className="panel-icon-button"
+            className="nav-tool-button"
             type="button"
             aria-label="Close channel settings"
             title="Close channel settings"
             disabled={busy}
             onClick={onClose}
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </header>
         <section className="channel-settings-section" aria-labelledby="channel-participation-title">
@@ -2168,18 +2159,15 @@ function ArchivedChannelsDialog({
         aria-labelledby="channel-archive-title"
       >
         <header className="channel-archive-header">
-          <div>
-            <p className="overline">Channels</p>
-            <h2 id="channel-archive-title">Archive</h2>
-          </div>
+          <h2 id="channel-archive-title">Channel archive</h2>
           <button
-            className="panel-icon-button"
+            className="nav-tool-button"
             type="button"
             aria-label="Close channel archive"
             title="Close channel archive"
             onClick={onClose}
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </header>
         {channels.length === 0 ? (
@@ -2196,7 +2184,7 @@ function ArchivedChannelsDialog({
                 </span>
                 <span className="channel-archive-actions">
                   <button
-                    className="panel-icon-button"
+                    className="nav-tool-button"
                     type="button"
                     aria-label={`View archived channel ${channelDisplayName(channel)}`}
                     title="View archived channel"
@@ -2206,7 +2194,7 @@ function ArchivedChannelsDialog({
                   </button>
                   {channel.role === "owner" && (
                     <button
-                      className="panel-icon-button"
+                      className="nav-tool-button"
                       type="button"
                       aria-label={`Restore channel ${channelDisplayName(channel)}`}
                       title="Restore channel"
@@ -2248,18 +2236,15 @@ function ArchivedDirectMessagesDialog({
         aria-labelledby="direct-message-archive-title"
       >
         <header className="channel-archive-header">
-          <div>
-            <p className="overline">Direct messages</p>
-            <h2 id="direct-message-archive-title">Archive</h2>
-          </div>
+          <h2 id="direct-message-archive-title">Direct message archive</h2>
           <button
-            className="panel-icon-button"
+            className="nav-tool-button"
             type="button"
             aria-label="Close direct-message archive"
             title="Close direct-message archive"
             onClick={onClose}
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </header>
         {channels.length === 0 ? (
@@ -2278,7 +2263,7 @@ function ArchivedDirectMessagesDialog({
                 </span>
                 <span className="channel-archive-actions">
                   <button
-                    className="panel-icon-button"
+                    className="nav-tool-button"
                     type="button"
                     aria-label={`View archived direct message ${channelDisplayName(channel)}`}
                     title="View archived direct message"
@@ -2287,7 +2272,7 @@ function ArchivedDirectMessagesDialog({
                     <ViewIcon />
                   </button>
                   <button
-                    className="panel-icon-button"
+                    className="nav-tool-button"
                     type="button"
                     aria-label={`Restore direct message ${channelDisplayName(channel)}`}
                     title="Restore direct message"
@@ -2351,7 +2336,7 @@ function InactiveAgentsDialog({
             )}
             {agent.conversationChannelId && (
               <button
-                className="panel-icon-button"
+                className="nav-tool-button"
                 type="button"
                 aria-label={`Open archived conversation with ${agent.displayName}`}
                 title="Open archived conversation"
@@ -2362,7 +2347,7 @@ function InactiveAgentsDialog({
             )}
             {agent.definitionId && agent.state === "Archived" && (
               <button
-                className="panel-icon-button"
+                className="nav-tool-button"
                 type="button"
                 aria-label={`View archived agent ${agent.displayName}`}
                 title="View archived agent"
@@ -2385,18 +2370,15 @@ function InactiveAgentsDialog({
         aria-labelledby="inactive-agents-title"
       >
         <header className="channel-archive-header">
-          <div>
-            <p className="overline">Agents</p>
-            <h2 id="inactive-agents-title">Drafts and archive</h2>
-          </div>
+          <h2 id="inactive-agents-title">Agent drafts and archive</h2>
           <button
-            className="panel-icon-button"
+            className="nav-tool-button"
             type="button"
             aria-label="Close drafts and archive"
             title="Close drafts and archive"
             onClick={onClose}
           >
-            <span aria-hidden="true">×</span>
+            <CloseIcon />
           </button>
         </header>
         {agents.length === 0 ? (
