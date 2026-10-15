@@ -1748,6 +1748,12 @@ describe("Workshop React client", () => {
     expect(
       within(navigationPanel).getByRole("button", { name: "Following" }).querySelector("svg"),
     ).toHaveAttribute("fill", "none");
+    // The collapse toggle is a standard sidebar tool button with a drawn
+    // chevron, so it is centered and shows no outline until hovered.
+    const toggle = within(navigationPanel).getByRole("button", { name: "Collapse navigation" });
+    expect(toggle).toHaveClass("nav-tool-button");
+    expect(toggle).toHaveTextContent("");
+    expect(toggle.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
   });
 
   it("collapses a navigation section from its heading and remembers it", async () => {
@@ -4604,6 +4610,9 @@ describe("Workshop React client", () => {
     expect(screen.queryByRole("dialog", { name: "Create agent" })).toBeNull();
     expect(window.location.search).toBe("?view=agents");
     const manageKai = screen.getByRole("button", { name: "Manage Kai" });
+    // Agent names render at plain weight like channel names, not in <strong>.
+    expect(manageKai).toHaveTextContent("Kai");
+    expect(manageKai.querySelector("strong")).toBeNull();
     await user.click(manageKai);
 
     expect(await screen.findByRole("heading", { name: "Agents", level: 1 })).toBeVisible();

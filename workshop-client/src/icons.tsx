@@ -23,6 +23,26 @@ export function BackIcon(): React.JSX.Element {
   );
 }
 
+/**
+ * Chevron for the sidebar collapse toggle: points left to collapse the
+ * expanded sidebar and right to expand the collapsed one. Drawn rather
+ * than typed as "‹"/"›" because those glyphs sit off-center in their line
+ * box, so they never lined up vertically inside the button.
+ */
+export function ChevronIcon({ direction }: { direction: "left" | "right" }): React.JSX.Element {
+  return (
+    <svg aria-hidden="true" fill="none" focusable="false" viewBox="0 0 24 24">
+      <path
+        d={direction === "left" ? "M15 6l-6 6 6 6" : "M9 6l6 6-6 6"}
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
 /** Cross for "Close ..." header actions. */
 export function CloseIcon(): React.JSX.Element {
   return (
